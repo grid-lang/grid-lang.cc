@@ -111,7 +111,7 @@ class Parser:
                 self.pos += 1
                 value = self._expression()
                 return Assignment(target, value)
-        # Handle array assignments with @ symbol (e.g., [@A1] : list = {5, 6, 7})
+        # Handle array assignments with @ symbol (e.g., [@A1] : list = {5, 6, 7} or [@B2] := b)
         elif token.type == 'ARRAY_START':
             self.pos += 1  # Skip '@'
             if not self._match('CELL_ADDRESS'):
@@ -120,7 +120,7 @@ class Parser:
             self.pos += 1
             
             # Check for named array assignment
-            array_name = None
+            array_name = True  # Default to True for @ array assignments
             if self._match('VAR_DECL'):
                 self.pos += 1  # Skip ':'
                 if not self._match('IDENTIFIER'):
@@ -133,8 +133,16 @@ class Parser:
                 raise SyntaxError(self._error("Expected ':=' or '=' after cell address"))
             self.pos += 1
             
+            # Check if this is a variable reference (e.g., [@B2] := b)
+            if self._match('IDENTIFIER'):
+                var_name = self.tokens[self.pos].value
+                self.pos += 1
+                # Create an assignment with the Variable as the value and array_name set
+                return Assignment(CellReference(start_cell), Variable(var_name), array_name)
+            
+            # Otherwise, expect array values
             if not self._match('ARRAY_VALUES'):
-                raise SyntaxError(self._error("Expected array values"))
+                raise SyntaxError(self._error("Expected array values or variable name"))
             values = self.tokens[self.pos].value
             self.pos += 1
             
@@ -159,6 +167,7 @@ class Parser:
                     elif value.type == 'CELL_ADDRESS':
                         evaluated_values.append(CellReference(value.value))
             
+            # Create an assignment with array_name set and ArrayValues as the value
             return Assignment(CellReference(start_cell), ArrayValues(evaluated_values), array_name)
         # Handle non-spatial variable assignments (e.g., :X = 10)
         elif token.type == 'VAR_DECL':
@@ -168,8 +177,61 @@ class Parser:
                 self.pos += 1
                 if self._match('OPERATOR', '='):
                     self.pos += 1
-                    value = self._expression()
-                    return Assignment(Variable(var_name), value)
+                    # Check if this is an array assignment
+                    if self._match('ARRAY_VALUES'):
+                        array_token = self.tokens[self.pos]
+                        self.pos += 1
+                        
+                        # Process the array values into a list of objects
+                        processed_values = []
+                        
+                        # First check if we only have simple expressions (just numbers)
+                        has_simple_values = True
+                        for val in array_token.value:
+                            if val.type == 'EXPRESSION':
+                                exp_tokens = val.value
+                                if len(exp_tokens) == 1 and exp_tokens[0].type == 'NUMBER':
+                                    continue
+                                else:
+                                    has_simple_values = False
+                                    break
+                            elif val.type != 'COMMA':
+                                has_simple_values = False
+                                break
+                        
+                        # For simple values, convert to Number objects
+                        if has_simple_values:
+                            for val in array_token.value:
+                                if val.type == 'EXPRESSION':
+                                    exp_tokens = val.value
+                                    if len(exp_tokens) == 1 and exp_tokens[0].type == 'NUMBER':
+                                        # Simple number
+                                        processed_values.append(Number(exp_tokens[0].value))
+                                elif val.type != 'COMMA':
+                                    # Add other token types directly
+                                    processed_values.append(val)
+                            
+                            return Assignment(Variable(var_name), ArrayValues(processed_values))
+                        
+                        # For more complex expressions
+                        for val in array_token.value:
+                            if val.type == 'EXPRESSION':
+                                # Create a temporary parser for the expression tokens
+                                temp_parser = Parser(val.value)
+                                temp_parser.pos = 0
+                                expr = temp_parser._expression()
+                                processed_values.append(expr)
+                            elif val.type == 'COMMA':
+                                # Skip commas
+                                continue
+                            else:
+                                # Handle other token types
+                                processed_values.append(val)
+                        
+                        return Assignment(Variable(var_name), ArrayValues(processed_values))
+                    else:
+                        value = self._expression()
+                        return Assignment(Variable(var_name), value)
         
         raise SyntaxError(self._error("Invalid syntax"))
 
