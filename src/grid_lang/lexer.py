@@ -42,20 +42,64 @@ class Lexer:
             # Handle identifiers and keywords
             elif char.isalpha():
                 word = self._read_word()
-                if word in self.keywords:
-                    self.tokens.append(Token('FUNCTION', word, self.line, self.column - len(word)))
-                    # Special handling for function calls with cell ranges
+                if word.upper() in self.keywords:
+                    self.tokens.append(Token('FUNCTION', word.upper(), self.line, self.column - len(word)))
+                    # Skip whitespace
+                    while self.pos < len(self.text) and self.text[self.pos].isspace():
+                        if self.text[self.pos] == '\n':
+                            self.line += 1
+                            self.column = 1
+                        else:
+                            self.column += 1
+                        self.pos += 1
+                    # Handle function calls with cell ranges
                     if self.pos < len(self.text) and self.text[self.pos] == '[':
                         self.pos += 1  # Skip '['
                         self.column += 1
-                        self.tokens.append(self._function_cell_address())
+                        # Check if this is a range function call
+                        cell_token = self._cell_address()
+                        self.tokens.append(cell_token)
                         if self.pos < len(self.text) and self.text[self.pos] == ':':
                             self.tokens.append(Token('RANGE_SEP', ':', self.line, self.column))
                             self.pos += 1
                             self.column += 1
-                            self.tokens.append(self._function_cell_address())
+                            self.tokens.append(self._cell_address())
                         if self.pos < len(self.text) and self.text[self.pos] == ']':
                             self.pos += 1  # Skip ']'
+                            self.column += 1
+                    # Handle function calls with arguments in curly braces
+                    elif self.pos < len(self.text) and self.text[self.pos] == '{':
+                        values = self._function_args()
+                        self.tokens.append(Token('FUNCTION_ARGS', values, self.line, self.column - 1))
+                    # Handle function calls with parentheses
+                    elif self.pos < len(self.text) and self.text[self.pos] == '(':
+                        self.pos += 1  # Skip '('
+                        self.column += 1
+                        # Skip whitespace
+                        while self.pos < len(self.text) and self.text[self.pos].isspace():
+                            if self.text[self.pos] == '\n':
+                                self.line += 1
+                                self.column = 1
+                            else:
+                                self.column += 1
+                            self.pos += 1
+                        # Handle cell range
+                        if self.pos < len(self.text) and self.text[self.pos] == '[':
+                            self.pos += 1  # Skip '['
+                            self.column += 1
+                            cell_token = self._cell_address()
+                            self.tokens.append(cell_token)
+                            if self.pos < len(self.text) and self.text[self.pos] == ':':
+                                self.tokens.append(Token('RANGE_SEP', ':', self.line, self.column))
+                                self.pos += 1
+                                self.column += 1
+                                self.tokens.append(self._cell_address())
+                            if self.pos < len(self.text) and self.text[self.pos] == ']':
+                                self.pos += 1  # Skip ']'
+                                self.column += 1
+                        # Skip closing parenthesis
+                        if self.pos < len(self.text) and self.text[self.pos] == ')':
+                            self.pos += 1  # Skip ')'
                             self.column += 1
                 else:
                     self.tokens.append(Token('IDENTIFIER', word.upper(), self.line, self.column - len(word)))
@@ -88,16 +132,38 @@ class Lexer:
                 if self.pos < len(self.text) and self.text[self.pos] == ']':
                     self.pos += 1
                     self.column += 1
-                # Check for named array assignment
+                # Check for variable declaration or array name
                 if self.pos < len(self.text) and self.text[self.pos] == ':':
                     self.pos += 1  # Skip ':'
                     self.column += 1
-                    # Read the array name
+                    # Skip whitespace
+                    while self.pos < len(self.text) and self.text[self.pos].isspace():
+                        if self.text[self.pos] == '\n':
+                            self.line += 1
+                            self.column = 1
+                        else:
+                            self.column += 1
+                        self.pos += 1
+                    # Read the name
                     name = self._read_word()
-                    self.tokens.append(Token('ARRAY_NAME', name.upper(), self.line, self.column - len(name)))
+                    # Check if this is an array assignment
+                    if self.tokens[-2].type == 'ARRAY_START':
+                        self.tokens.append(Token('ARRAY_NAME', name.upper(), self.line, self.column - len(name)))
+                    else:
+                        self.tokens.append(Token('VAR_DECL', ':', self.line, self.column - len(name) - 1))
+                        self.tokens.append(Token('IDENTIFIER', name.upper(), self.line, self.column - len(name)))
             # Handle array or variable references (e.g., {X})
             elif char == '{':
-                self.tokens.append(self._array_values())
+                print(f"Found curly brace at position {self.pos}")
+                print(f"Previous token: {self.tokens[-1] if self.tokens else 'None'}")
+                # Check if this is a function argument list
+                if self.pos > 0 and self.tokens and self.tokens[-1].type == 'FUNCTION':
+                    print("Handling function arguments")
+                    values = self._function_args()
+                    self.tokens.append(Token('FUNCTION_ARGS', values, self.line, self.column - 1))
+                else:
+                    print("Handling array values")
+                    self.tokens.append(self._handle_array_values())
             # Handle operators and range separators
             elif char == ':':
                 if self.pos + 1 < len(self.text) and self.text[self.pos + 1] == '=':
@@ -110,22 +176,21 @@ class Lexer:
                     while next_pos < len(self.text) and self.text[next_pos].isspace():
                         next_pos += 1
                     if next_pos < len(self.text) and self.text[next_pos].isalpha():
-                        # Only treat as VAR_DECL if it's not after a cell address
-                        if not (len(self.tokens) > 0 and self.tokens[-1].type == 'CELL_ADDRESS'):
-                            self.tokens.append(Token('VAR_DECL', ':', self.line, self.column))
-                            self.pos += 1
-                            self.column += 1
-                        else:
-                            self.tokens.append(Token('ARRAY_NAME_SEP', ':', self.line, self.column))
-                            self.pos += 1
-                            self.column += 1
+                        self.tokens.append(Token('VAR_DECL', ':', self.line, self.column))
+                        self.pos += 1
+                        self.column += 1
                     else:
                         self.tokens.append(Token('RANGE_SEP', ':', self.line, self.column))
                         self.pos += 1
                         self.column += 1
             # Handle arithmetic operators
-            elif char in '=+-*/':
+            elif char in '=+-*/^':
                 self.tokens.append(Token('OPERATOR', char, self.line, self.column))
+                self.column += 1
+                self.pos += 1
+            # Handle parentheses
+            elif char in '()':
+                self.tokens.append(Token('PAREN', char, self.line, self.column))
                 self.column += 1
                 self.pos += 1
             else:
@@ -135,6 +200,11 @@ class Lexer:
     # Helper methods for tokenization
     def _skip_comment(self):
         while self.pos < len(self.text) and self.text[self.pos] != '\n':
+            self.pos += 1
+            self.column += 1
+        if self.pos < len(self.text) and self.text[self.pos] == '\n':
+            self.line += 1
+            self.column = 1
             self.pos += 1
 
     def _read_word(self):
@@ -148,11 +218,46 @@ class Lexer:
     def _number(self):
         result = ''
         start_col = self.column
-        while self.pos < len(self.text) and (self.text[self.pos].isdigit() or self.text[self.pos] in '-.'):
+        # Handle negative numbers
+        if self.pos < len(self.text) and self.text[self.pos] == '-':
             result += self.text[self.pos]
             self.pos += 1
             self.column += 1
-        return Token('NUMBER', float(result) if '.' in result else int(result), self.line, start_col)
+        
+        # Read integer part
+        while self.pos < len(self.text) and self.text[self.pos].isdigit():
+            result += self.text[self.pos]
+            self.pos += 1
+            self.column += 1
+            
+        # Handle decimal point
+        if self.pos < len(self.text) and self.text[self.pos] == '.':
+            result += self.text[self.pos]
+            self.pos += 1
+            self.column += 1
+            # Read decimal part
+            while self.pos < len(self.text) and self.text[self.pos].isdigit():
+                result += self.text[self.pos]
+                self.pos += 1
+                self.column += 1
+                
+        # Handle scientific notation (e.g., 1.2e3, 1.2E-3)
+        if self.pos < len(self.text) and self.text[self.pos].lower() == 'e':
+            result += self.text[self.pos]
+            self.pos += 1
+            self.column += 1
+            # Handle exponent sign
+            if self.pos < len(self.text) and self.text[self.pos] in '+-':
+                result += self.text[self.pos]
+                self.pos += 1
+                self.column += 1
+            # Read exponent digits
+            while self.pos < len(self.text) and self.text[self.pos].isdigit():
+                result += self.text[self.pos]
+                self.pos += 1
+                self.column += 1
+                
+        return Token('NUMBER', float(result), self.line, start_col)
 
     def _cell_address(self):
         result = ''
@@ -185,7 +290,151 @@ class Lexer:
             self.column += 1
         return Token('DYNAMIC_VALUE', result.upper(), self.line, start_col)
 
-    def _array_values(self):
+    def _handle_array_values(self):
+        """Handle array values between curly braces."""
+        values = []
+        self.pos += 1  # Skip '{'
+        self.column += 1
+        
+        while self.pos < len(self.text) and self.text[self.pos] != '}':
+            if self.text[self.pos].isspace():
+                self.pos += 1
+                self.column += 1
+                continue
+                
+            # Skip commas
+            if self.text[self.pos] == ',':
+                values.append(Token('COMMA', ',', self.line, self.column))
+                self.pos += 1
+                self.column += 1
+                continue
+                
+            # Start of a new value
+            start_pos = self.pos
+            start_col = self.column
+            expr_tokens = []
+            
+            # Read until we hit a comma or closing brace
+            while self.pos < len(self.text) and self.text[self.pos] != ',' and self.text[self.pos] != '}':
+                char = self.text[self.pos]
+                
+                # Skip whitespace
+                if char.isspace():
+                    self.pos += 1
+                    self.column += 1
+                    continue
+                
+                # Handle expressions in parentheses
+                if char == '(':
+                    expr_tokens.append(Token('PAREN', '(', self.line, self.column))
+                    self.pos += 1
+                    self.column += 1
+                    continue
+                    
+                if char == ')':
+                    expr_tokens.append(Token('PAREN', ')', self.line, self.column))
+                    self.pos += 1
+                    self.column += 1
+                    continue
+                    
+                # Handle operators
+                if char in '+-*/^':
+                    expr_tokens.append(Token('OPERATOR', char, self.line, self.column))
+                    self.pos += 1
+                    self.column += 1
+                    continue
+                    
+                # Handle numbers
+                if char.isdigit() or char == '-':
+                    num_str = ''
+                    if char == '-':
+                        num_str += char
+                        self.pos += 1
+                        self.column += 1
+                    
+                    while (self.pos < len(self.text) and 
+                           (self.text[self.pos].isdigit() or 
+                            self.text[self.pos] == '.' or 
+                            self.text[self.pos] == 'e' or 
+                            self.text[self.pos] == 'E')):
+                        num_str += self.text[self.pos]
+                        self.pos += 1
+                        self.column += 1
+                    
+                    # Handle exponent sign
+                    if (self.pos < len(self.text) and 
+                        self.text[self.pos - 1].lower() == 'e' and 
+                        self.text[self.pos] in '+-'):
+                        num_str += self.text[self.pos]
+                        self.pos += 1
+                        self.column += 1
+                        # Read exponent digits
+                        while (self.pos < len(self.text) and 
+                               self.text[self.pos].isdigit()):
+                            num_str += self.text[self.pos]
+                            self.pos += 1
+                            self.column += 1
+                    
+                    try:
+                        expr_tokens.append(Token('NUMBER', float(num_str), self.line, self.column - len(num_str)))
+                    except ValueError:
+                        raise ValueError(f"Invalid number format: {num_str}")
+                    continue
+                    
+                # Handle identifiers
+                if char.isalpha():
+                    id_str = ''
+                    while (self.pos < len(self.text) and 
+                           (self.text[self.pos].isalnum() or 
+                            self.text[self.pos] == '_')):
+                        id_str += self.text[self.pos]
+                        self.pos += 1
+                        self.column += 1
+                    expr_tokens.append(Token('IDENTIFIER', id_str.upper(), self.line, self.column - len(id_str)))
+                    continue
+                    
+                # Handle cell references
+                if char == '[':
+                    self.pos += 1
+                    self.column += 1
+                    cell_ref = ''
+                    while (self.pos < len(self.text) and 
+                           self.text[self.pos] != ']' and 
+                           not self.text[self.pos].isspace()):
+                        cell_ref += self.text[self.pos]
+                        self.pos += 1
+                        self.column += 1
+                    if self.text[self.pos] == ']':
+                        self.pos += 1
+                        self.column += 1
+                    expr_tokens.append(Token('CELL_ADDRESS', cell_ref.upper(), self.line, self.column - len(cell_ref) - 2))
+                    continue
+                
+                # Skip any other characters
+                self.pos += 1
+                self.column += 1
+            
+            # Add the expression tokens to the values list
+            if expr_tokens:
+                values.append(Token('EXPRESSION', expr_tokens, self.line, start_col))
+        
+        if self.text[self.pos] == '}':
+            self.pos += 1
+            self.column += 1
+            
+        return Token('ARRAY_VALUES', values, self.line, self.column - 1)
+
+    def _function_cell_address(self):
+        result = ''
+        start_col = self.column
+        while self.pos < len(self.text) and self.text[self.pos] != ']' and self.text[self.pos] != ':':
+            result += self.text[self.pos]
+            self.pos += 1
+            self.column += 1
+        return Token('CELL_ADDRESS', result.upper(), self.line, start_col)
+
+    def _function_args(self):
+        """Reads function arguments enclosed in curly braces."""
         values = []
         start_col = self.column
         self.pos += 1  # Skip '{'
@@ -200,18 +449,28 @@ class Lexer:
                 else:
                     self.column += 1
                 self.pos += 1
-            
             if self.pos >= len(self.text) or self.text[self.pos] == '}':
                 break
                 
-            # Read a number
+            # Read a value
             if self.text[self.pos].isdigit() or self.text[self.pos] == '-':
-                num_token = self._number()
-                values.append(num_token.value)
+                values.append(self._number())
+            elif self.text[self.pos].isalpha():
+                values.append(Token('IDENTIFIER', self._read_word().upper(), self.line, self.column))
+            elif self.text[self.pos] == '[':
+                # Handle cell reference
+                self.pos += 1  # Skip '['
+                self.column += 1
+                cell_token = self._cell_address()
+                values.append(cell_token)
+                # Skip closing bracket
+                if self.pos < len(self.text) and self.text[self.pos] == ']':
+                    self.pos += 1  # Skip ']'
+                    self.column += 1
             else:
-                raise SyntaxError(f"Unexpected character in array: {self.text[self.pos]} at line {self.line}, column {self.column}")
+                raise SyntaxError(f"Unexpected character in function arguments: {self.text[self.pos]} at line {self.line}, column {self.column}")
             
-            # Skip comma and whitespace
+            # Skip whitespace
             while self.pos < len(self.text) and self.text[self.pos].isspace():
                 if self.text[self.pos] == '\n':
                     self.line += 1
@@ -220,21 +479,13 @@ class Lexer:
                     self.column += 1
                 self.pos += 1
                 
+            # Skip comma
             if self.pos < len(self.text) and self.text[self.pos] == ',':
                 self.pos += 1
                 self.column += 1
                 
         if self.pos < len(self.text) and self.text[self.pos] == '}':
-            self.pos += 1
+            self.pos += 1  # Skip '}'
             self.column += 1
             
-        return Token('ARRAY_VALUES', values, self.line, start_col)
-
-    def _function_cell_address(self):
-        result = ''
-        start_col = self.column
-        while self.pos < len(self.text) and self.text[self.pos] != ']' and self.text[self.pos] != ':':
-            result += self.text[self.pos]
-            self.pos += 1
-            self.column += 1
-        return Token('CELL_ADDRESS', result.upper(), self.line, start_col) 
+        return values
