@@ -1,3 +1,4 @@
+' comment
 : a = 51
 : b = (a + 15) / 1.2e3
 : c = sum{a, b}
