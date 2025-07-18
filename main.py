@@ -1,34 +1,19 @@
+# <xaiArtifact artifact_id="9592cb0a-5bd6-4283-b60e-23d5eb595d32" artifact_version_id="3ea58d55-8ecd-4316-8c99-7f17ecd6aaba" title="main.py" contentType="text/python">
 import sys
-import os
-from gridlang.compiler import GridLangCompiler
+from compiler import GridLangCompiler
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: grid <filename.grid> [--debug]")
-        return
 
-    filename = sys.argv[1]
-    debug = '--debug' in sys.argv
-
-    if not os.path.isfile(filename):
-        print(f"File not found: {filename}")
-        return
-
-    with open(filename, 'r') as file:
-        code = file.read()
-
+def run_tests(args):
     compiler = GridLangCompiler()
-    compiler.run(code)
-
-    if debug:
-        output_csv = filename.replace('.grid', '.csv')
-        compiler.export_to_csv(output_csv)
-        for cell in sorted(compiler.grid):
-            print(f"{cell} = {compiler.grid[cell]}")
-        print(f"CSV exported to: {output_csv}")
+    if len(args) == 2 and args[0] == "-r":
+        with open(args[1]) as file:
+            compiler.run(file.read())
     else:
-        for cell in sorted(compiler.grid):
-            print(f"{cell} = {compiler.grid[cell]}")
+        compiler.run_tests_independent(args)
+
 
 if __name__ == '__main__':
-    main()
+    try:
+        run_tests(sys.argv[1:])
+    except Exception as e:
+        sys.exit(1)
