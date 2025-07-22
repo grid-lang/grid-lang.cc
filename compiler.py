@@ -4,6 +4,7 @@ import pyarrow as pa
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
 from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref
+import csv
 
 
 class Scope:
@@ -1704,6 +1705,49 @@ class GridLangCompiler:
         self.grid[cell] = value.to_pylist() if isinstance(
             value, pa.Array) else value
         self._cell_var_map[cell] = var
+
+    def export_to_csv(self, filename):
+        max_col = 0
+        max_row = 0
+        cell_data = {}
+
+        for cell, value in self.grid.items():
+            try:
+                col_str, row = self._split_cell(cell)
+            except ValueError:
+                continue
+            col = self._col_to_num(col_str)
+            max_col = max(max_col, col)
+            max_row = max(max_row, row)
+            cell_data[(row, col)] = value
+
+        with open(filename, 'w', newline='') as f:
+            writer = csv.writer(f)
+            for r in range(1, max_row + 1):
+                row_data = []
+                for c in range(1, max_col + 1):
+                    val = cell_data.get((r, c), '')
+                    row_data.append(val if val is not None else '')
+                writer.writerow(row_data)
+
+    def _split_cell(self, ref):
+        match = re.match(r'([A-Z]+)(\d+)', ref)
+        if not match:
+            raise ValueError(f"Invalid cell reference: {ref}")
+        return match.group(1), int(match.group(2))
+
+    def _col_to_num(self, col):
+        num = 0
+        for c in col:
+            num = num * 26 + ord(c) - ord('A') + 1
+        return num
+
+    def _num_to_col(self, num):
+        result = ''
+        while num:
+            num, rem = divmod(num - 1, 26)
+            result = chr(65 + rem) + result
+        return result
 
     def run_tests_independent(self, tests):
         tests_data = [

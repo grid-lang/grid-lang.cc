@@ -6,7 +6,8 @@
 import re
 import math
 import pyarrow as pa
-from utils import validate_cell_ref  # Utility for validating cell references
+# Utility for validating cell references
+from utils import validate_cell_ref
 
 
 class ExpressionEvaluator:
