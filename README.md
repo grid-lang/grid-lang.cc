@@ -12,7 +12,7 @@ GridLang is a Python-based tool for compiling and processing `.grid` files. This
 
 ## Installation
 
-Follow these steps to clone or download the `gridlang_public` repository, install the package, and run the `grid` command.
+Follow these steps to clone or download the `grid-lang.cc` repository, install the package, and run the `grid` command.
 
 ### 1. Clone or Download the Repository
 
@@ -22,22 +22,22 @@ Follow these steps to clone or download the `gridlang_public` repository, instal
 2. Clone the repository using:
 
    ```bash
-   git clone https://github.com/your-username/gridlang_public.git
+   git clone https://github.com/grid-lang/grid-lang.cc.git
    ```
 
 3. Navigate to the project directory:
    ```bash
-   cd gridlang_public
+   cd grid-lang.cc
    ```
 
 #### Option 2: Download as ZIP
 
 1. Go to the repository’s webpage (e.g., on GitHub).
 2. Click the green **Code** button and select **Download ZIP**.
-3. Extract the ZIP file to a folder (e.g., `gridlang_public`).
+3. Extract the ZIP file to a folder (e.g., `grid-lang.cc`).
 4. Navigate to the project directory in a terminal:
    ```bash
-   cd path/to/gridlang_public
+   cd path/to/grid-lang.cc
    ```
 
 ### 2. Set Up a Virtual Environment (Recommended)
@@ -143,7 +143,7 @@ The `grid` command processes `.grid` files using the `GridLangCompiler`. It supp
 
 ### Creating a Sample `.grid` File
 
-Create a file named `example.grid` in the `gridlang_public` directory:
+Create a file named `example.grid` in the `grid-lang.cc` directory:
 
 ```
 A1 = 42
@@ -169,7 +169,7 @@ B2 = Hello
 ## Project Structure
 
 ```
-gridlang_public/
+grid-lang.cc/
 ├── setup.py         # Package configuration
 ├── main.py          # Entry point for the grid command
 ├── compiler.py      # Contains the GridLangCompiler class
@@ -181,7 +181,7 @@ gridlang_public/
 ## Troubleshooting
 
 - **Error: `ModuleNotFoundError: No module named 'main'`**:
-  - Ensure `main.py`, `compiler.py`, `array_handler.py`, and `expression.py` are in the `gridlang_public` directory.
+  - Ensure `main.py`, `compiler.py`, `array_handler.py`, and `expression.py` are in the `grid-lang.cc` directory.
   - For `setup.py`, reinstall:
     ```bash
     pip uninstall gridlang
@@ -223,8 +223,8 @@ gridlang_public/
 
 ## License
 
-MIT License
+LGPLv3.0
 
 ## Contact
 
-Open an issue or pull request on the `gridlang_public` repository.
+Open an issue or pull request on the `grid-lang.cc` repository.
