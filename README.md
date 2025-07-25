@@ -87,7 +87,7 @@ grid --help
 This should display:
 
 ```
-Usage: grid [-r] <filename.grid> [--debug]
+Usage: grid <filename.grid> [--debug]
 ```
 
 If you see a `command not found` error, add the Python `Scripts` directory to your PATH:
@@ -134,11 +134,6 @@ The `grid` command processes `.grid` files using the `GridLangCompiler`. It supp
 
    ```bash
    grid example.grid --debug
-   ```
-
-3. **Run with `-r` flag**:
-   ```bash
-   grid -r example.grid
    ```
 
 ### Creating a Sample `.grid` File

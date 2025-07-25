@@ -19,10 +19,9 @@ cell-based data and printing results. It supports optional flags for running and
 debugging.
 
 Usage:
-    grid [-r] <filename.grid> [--debug]
+    grid <filename.grid> [--debug]
 
 Options:
-    -r              Optional flag to run the compiler (same as omitting -r).
     --debug         Export results to a CSV file (requires implementation in compiler.py).
     --help          Display this help message.
 
@@ -50,25 +49,16 @@ Examples:
             ... (same as above)
             CSV exported to: example.csv
 
-    3. Use -r flag (equivalent to no -r):
-        grid -r example.grid
-
 Notes:
     - Ensure the `.grid` file exists in the current directory or provide a full path.
     - The --debug option requires the `export_to_csv` method in `compiler.py` to be implemented.
-    - Run from the `gridlang_public` directory or after installing via `pip install .`.
+    - Run from the `grid-lang.cc` directory or after installing via `pip install .`.
 
-For issues, see the README.md in the gridlang_public repository.
+For issues, see the README.md in the grid-lang.cc repository.
         """)
         return
 
-    if args[0] == "-r":
-        if len(args) < 2:
-            print("Usage: grid -r <filename.grid> [--debug]")
-            return
-        filename = args[1]
-    else:
-        filename = args[0]
+    filename = args[0]
 
     if not os.path.isfile(filename):
         print(f"File not found: {filename}")
