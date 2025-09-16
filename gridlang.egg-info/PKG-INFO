@@ -1,3 +1,34 @@
+Metadata-Version: 2.4
+Name: gridlang
+Version: 0.1
+Summary: A Python-based tool for compiling and processing .grid files
+Home-page: https://github.com/grid-lang/grid-lang.cc
+Author: GridLang Team
+License: LGPLv3.0
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.7
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+License-File: LICENSE.md
+Requires-Dist: pyarrow
+Dynamic: author
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
 # GridLang
 
 GridLang is a Python-based tool for compiling and processing `.grid` files. This repository contains the source code for the `grid` command-line tool, which uses the `GridLangCompiler` to process input files, handle inputs/outputs, run tests, and optionally export results to CSV format.
@@ -32,7 +63,7 @@ Follow these steps to clone or download the `grid-lang.cc` repository, install t
 
 #### Option 2: Download as ZIP
 
-1. Go to the repository’s webpage (e.g., on GitHub).
+1. Go to the repositoryâ€™s webpage (e.g., on GitHub).
 2. Click the green **Code** button and select **Download ZIP**.
 3. Extract the ZIP file to a folder (e.g., `grid-lang.cc`).
 4. Navigate to the project directory in a terminal:
@@ -60,7 +91,7 @@ Install the package and its dependencies using `setuptools`:
 pip install .
 ```
 
-This installs the `gridlang` package, its dependency (`pyarrow`), and creates the `grid` command in your Python environment’s `Scripts` directory (e.g., `C:\Users\johndoe\AppData\Local\Programs\Python\Python311\Scripts` on Windows). The entry point is defined in `setup.py` as `grid=main:main`.
+This installs the `gridlang` package, its dependency (`pyarrow`), and creates the `grid` command in your Python environmentâ€™s `Scripts` directory (e.g., `C:\Users\johndoe\AppData\Local\Programs\Python\Python311\Scripts` on Windows). The entry point is defined in `setup.py` as `grid=main:main`.
 
 #### Option 2: Create a Standalone Executable with PyInstaller
 
@@ -199,22 +230,22 @@ B2 = Hello
 
 ```
 grid-lang.cc/
-├── setup.py           # Package configuration and entry point (grid=main:main)
-├── main.py            # CLI entry point; routes to program or test mode
-├── compiler.py        # GridLangCompiler orchestration
-├── executor.py        # Core execution engine used by compiler.run
-├── parser.py          # Parsing helpers for types/dimensions
-├── type_processor.py  # Type definition parsing and execution
-├── control_flow.py    # FOR/loop and control-flow handling
-├── scope.py           # Variable scoping, inputs/outputs, constraints
-├── expression.py      # Expression parsing/evaluation
-├── array_handler.py   # Array operations, dimensions, labels
-├── utils.py           # Utility helpers (cell refs, column/row math)
-├── example.grid       # Example GridLang program
-├── binsearch.grid     # Example program using arguments
-├── example.csv        # Example CSV output (debug)
-├── README.md          # This file
-└── build/             # Build artifacts (if present)
+â”œâ”€â”€ setup.py           # Package configuration and entry point (grid=main:main)
+â”œâ”€â”€ main.py            # CLI entry point; routes to program or test mode
+â”œâ”€â”€ compiler.py        # GridLangCompiler orchestration
+â”œâ”€â”€ executor.py        # Core execution engine used by compiler.run
+â”œâ”€â”€ parser.py          # Parsing helpers for types/dimensions
+â”œâ”€â”€ type_processor.py  # Type definition parsing and execution
+â”œâ”€â”€ control_flow.py    # FOR/loop and control-flow handling
+â”œâ”€â”€ scope.py           # Variable scoping, inputs/outputs, constraints
+â”œâ”€â”€ expression.py      # Expression parsing/evaluation
+â”œâ”€â”€ array_handler.py   # Array operations, dimensions, labels
+â”œâ”€â”€ utils.py           # Utility helpers (cell refs, column/row math)
+â”œâ”€â”€ example.grid       # Example GridLang program
+â”œâ”€â”€ binsearch.grid     # Example program using arguments
+â”œâ”€â”€ example.csv        # Example CSV output (debug)
+â”œâ”€â”€ README.md          # This file
+â””â”€â”€ build/             # Build artifacts (if present)
 ```
 
 ## Troubleshooting
