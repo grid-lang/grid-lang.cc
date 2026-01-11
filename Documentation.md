@@ -187,15 +187,15 @@ A list of values inside braces `{}` forms an _array_. If the values are separate
 
 If values are separated with a semicolon `;` a new row starts, and the array becomes two-dimensional.
 
-Edit _scratch.grid_ again:
+Edit _scratch.grid_ to use a two-dimensional array:
 
 ```vb
 [A1] := "Cookie Sales"
 [A2:E2] := {"Sales Rep", "Region", "# Orders", "Total Sales", "Avg Order"}
-[A3:D6] := {
-  "Frank", "West", 268, 72707;
-  "Harry", "North", 224, 41676;
-  "Janet", "North", 286, 87858;
+[A3:D6] := { _
+  "Frank", "West", 268, 72707; _
+  "Harry", "North", 224, 41676; _
+  "Janet", "North", 286, 87858; _
   "Martha", "East", 228, 49017}
 [E3:E6] := @ [D] / [C]
 Return [E3]
@@ -218,13 +218,76 @@ End CookieSales
 
 [A1] := "Cookie Sales"
 [A2:E2] := {"Sales Rep", "Region", "# Orders", "Total Sales", "Avg Order"}
-[^A3] := {
-  new CookieSales with (SalesRep = "Frank", Region = "West", Orders = 268, Total = 72707),
-  new CookieSales with (SalesRep = "Harry", Region = "North", Orders = 224, Total = 41676),
-  new CookieSales with (SalesRep = "Janet", Region = "North", Orders = 286, Total = 87858),
+[^A3] := { _
+  new CookieSales with (SalesRep = "Frank", Region = "West", Orders = 268, Total = 72707), _
+  new CookieSales with (SalesRep = "Harry", Region = "North", Orders = 224, Total = 41676), _
+  new CookieSales with (SalesRep = "Janet", Region = "North", Orders = 286, Total = 87858), _
   new CookieSales with (SalesRep = "Martha", Region = "East", Orders = 228, Total = 49017)}
 Return [E3]
 ```
 
 The hat `^` before an address indicates the top-left corner of a range.
-The fields of the objects are distributed in the cells of a row, which means the grid contents remain the same as before.
+The fields of each object are distributed in the cells of a row, which means the grid contents remain the same as before.
+
+The average value is calculated using a formula. You can try adding more calculated fields to the type.
+
+## Named Variables
+
+The grid is not the only place that can hold values.
+
+Create a new file called _variables.grid_ with the contents:
+
+```vb
+: result = $"The result is {n - value}"
+For n init 5
+Let value = 2
+Return result
+```
+
+That defines three named variables, _result_, _n_ and _value_ using three different ways.
+
+There is not one way better than the others. All have their own merits.
+
+For example, _n_ is assigned a value using **init** which means it can receive a new value later.
+
+## Updating a Variable With Push
+
+Edit _variables.grid_ to update _n_ with a new value:
+
+```vb
+: result = $"The result is {n - value}"
+For n init 5
+Let value = 2
+Push n = n * 2.2
+Return result
+```
+
+The **push** instruction is used to update a variable and all the variables that depend on it.
+
+```bash
+> grid variables.grid
+The result is 9
+```
+
+Try to output the result before **push**:
+
+```vb
+: result = $"The result is {n - value}"
+For n init 5
+Let value = 2
+Return result
+Push n = n * 2.2
+Return result
+```
+
+When **return** is used multiple times it gives multiple outputs.
+
+```bash
+> grid variables.grid
+The result is 3
+The result is 9
+```
+
+Note how _result_ which depends on _n_ is being updated by `Push n`. A **Grid** program can contain **push** instructions that affect previously defined variables.
+
+That property is essential to keep named variables and the grid consistent over time.
