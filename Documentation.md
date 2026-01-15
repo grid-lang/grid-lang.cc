@@ -233,15 +233,15 @@ The average value is calculated using a formula. You can try adding more calcula
 
 ## More Constraints
 
-We can declare the type of a variable, but we could be even more specific.
+We have seen how to declare the type of an input or a field but we could be even more specific.
 
-Edit _scratch.grid_ to give a unit for the sales total and specify that it is always positive:
+Edit _scratch.grid_ to make the number of orders an integer number between one and ten thousand, specify that the sales total is always positive and give it a unit:
 
 ```vb
 Define CookieSales as Type
-  : SalesRep as Text
+  : SalesRep as Text not null
   : Region as Text
-  : Orders as Number
+  : Orders as Number in 1 to 10000
   : Total as Number of Dollar >= 0
   : Average = Total / Orders
 End CookieSales
@@ -265,7 +265,7 @@ Define Credit as Type(Number) of Dollar >= 0
 End Credit
 ```
 
-Now 'Credit' can be used instead of 'Number'.
+Now 'Credit' can be used instead of 'Number' in the field declaration and its constraints will be automatically applied to the field.
 
 ## Named Variables
 
