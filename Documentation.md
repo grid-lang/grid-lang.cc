@@ -75,7 +75,7 @@ Note that **Grid** is case-insensitive.
 
 ## Default Value
 
-It was mentioned before that a missing value is read from the default input. For example:
+A missing input value must be entered through the keyboard. For example:
 
 ```bash
 > grid helloworld.grid
@@ -90,7 +90,7 @@ Input name as text or = "World"
 Return $"Hello, {name}!"
 ```
 
-If the name cannot be read from the command parameters as text, its value becomes "World".
+Now if the name cannot be read from the command parameters as text, its value becomes "World".
 
 ```bash
 > grid helloworld.grid
@@ -230,6 +230,42 @@ The hat `^` before an address indicates the top-left corner of a range.
 The fields of each object are distributed in the cells of a row, which means the grid contents remain the same as before.
 
 The average value is calculated using a formula. You can try adding more calculated fields to the type.
+
+## More Constraints
+
+We can declare the type of a variable, but we could be even more specific.
+
+Edit _scratch.grid_ to give a unit for the sales total and specify that it is always positive:
+
+```vb
+Define CookieSales as Type
+  : SalesRep as Text
+  : Region as Text
+  : Orders as Number
+  : Total as Number of Dollar >= 0
+  : Average = Total / Orders
+End CookieSales
+
+[A1] := "Cookie Sales"
+[A2:E2] := {"Sales Rep", "Region", "# Orders", "Total Sales", "Avg Order"}
+[^A3] := { _
+  new CookieSales with (SalesRep = "Frank", Region = "West", Orders = 268, Total = 72707), _
+  new CookieSales with (SalesRep = "Harry", Region = "North", Orders = 224, Total = 41676), _
+  new CookieSales with (SalesRep = "Janet", Region = "North", Orders = 286, Total = 87858), _
+  new CookieSales with (SalesRep = "Martha", Region = "East", Orders = 228, Total = 49017)}
+Return [E3]
+```
+
+Note that two numbers must use the same unit if you want to add them together.
+
+If you like, you can define a custom type to avoid typing the same constraints every time:
+
+```vb
+Define Credit as Type(Number) of Dollar >= 0
+End Credit
+```
+
+Now 'Credit' can be used instead of 'Number'.
 
 ## Named Variables
 
