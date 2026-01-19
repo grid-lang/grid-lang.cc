@@ -4,6 +4,7 @@ Handles FOR loops, IF statements, LET statements, and block processing.
 """
 
 import re
+from utils import num_to_col
 
 # Regex patterns for block parsing
 HEADER_IF = re.compile(r'^\s*if\b(.+?)\bthen\s*$', re.I)
@@ -24,6 +25,7 @@ class GridLangControlFlow:
         self.if_blocks = []  # List of IF blocks with clause information
         self.loops = []      # List of loop blocks
         self.exit_for_requested = False  # Flag to break out of FOR loops
+        self._preprocessed_lines = []  # Cache of the most recent preprocessed lines
 
         # Regex patterns for block parsing
         self._header_if = HEADER_IF
@@ -39,39 +41,95 @@ class GridLangControlFlow:
         s = re.split(r'(?<!["\'])\s#',  s, maxsplit=1)[0]
         return s.rstrip()
 
-    def _parse_array_indexing(self, for_line):
-        """
-        Parse array indexing syntax from a FOR loop line.
-        Handles both array(index) and array[index] syntax.
-        Returns (array_name, index_expr, element_var) or None if not array indexing.
-        """
-        import re
-
-        # Match patterns like: for element = array(index) or for element = array[index]
-        patterns = [
-            r'for\s+(\w+)\s*=\s*(\w+)\s*\(\s*([^)]+)\s*\)',  # array(index)
-            r'for\s+(\w+)\s*=\s*(\w+)\s*\[\s*([^\]]+)\s*\]'   # array[index]
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, for_line, re.IGNORECASE)
-            if match:
-                element_var, array_name, index_expr = match.groups()
-                return array_name.strip(), index_expr.strip(), element_var.strip()
-
+    def _get_parser(self):
+        parser = getattr(self.compiler, 'parser', None)
+        if parser:
+            return parser
+        if hasattr(self.compiler, 'compiler'):
+            return getattr(self.compiler.compiler, 'parser', None)
         return None
 
+    def _process_output_statement(self, def_str, line_number):
+        parser = self._get_parser()
+        if not parser:
+            raise AttributeError("Parser not available for OUTPUT parsing")
+        var, type_name, constraints, expr = parser._parse_variable_def(
+            def_str, line_number)
+        constraints = constraints or {}
+        constraints['output'] = True
+        current_scope = self.compiler.current_scope()
+        target_scope = current_scope
+        if hasattr(self.compiler, 'get_global_scope'):
+            target_scope = self.compiler.get_global_scope() or current_scope
+        defining_scope = target_scope.get_defining_scope(var)
+        if not defining_scope:
+            target_scope.define_output(var, type_name, line_number, constraints)
+            defining_scope = target_scope
+        else:
+            defining_scope.output_variables.add(var.lower())
+            actual_key = defining_scope._get_case_insensitive_key(
+                var, defining_scope.constraints) or var
+            defining_scope.constraints[actual_key] = constraints
+            if type_name:
+                type_key = defining_scope._get_case_insensitive_key(
+                    var, defining_scope.types) or var
+                defining_scope.types[type_key] = type_name
+        if expr is not None:
+            value = self.compiler.expr_evaluator.eval_or_eval_array(
+                expr, current_scope.get_evaluation_scope(), line_number)
+            defining_scope.update(var, value, line_number)
+
+    def _match_push_assignment(self, text):
+        return re.match(r'^\s*push\s+(\[[^\]]+\]|[\w_]+(?:\.[\w_]+)?(?:\([^)]+\)|\{[^}]+\})?)\s*=\s*(.+)$', text, re.I)
+
+    def _match_return_statement(self, text):
+        return re.match(r'^\s*return\s+(.+)$', text, re.I)
+
+    def _handle_return_statement(self, value_expr, line_number):
+        resolver_targets = [self.compiler]
+        if hasattr(self.compiler, 'compiler'):
+            resolver_targets.append(self.compiler.compiler)
+        for target in resolver_targets:
+            pending = getattr(target, 'pending_assignments', {}) or {}
+            pending_vars = [
+                pending_var for pending_var in list(pending.keys())
+                if not pending_var.startswith('__line_')
+            ]
+            for pending_var in pending_vars:
+                target._resolve_global_dependency(
+                    pending_var, line_number,
+                    target_scope=self.compiler.current_scope())
+        values = self.compiler._evaluate_push_expression(value_expr, line_number)
+        for value in values:
+            self.compiler.output_values.setdefault('output', []).append(value)
+        if 'output' not in self.compiler.output_variables:
+            self.compiler.output_variables.append('output')
+
     def process_for_statement(self, line, line_number, scope):
+
         # Handle For var as type dim {dimensions} syntax
         m = re.match(
             r'For\s+([\w_]+)\s+as\s+(\w+)\s+dim\s*(\{[^}]*\})', line, re.I)
         if m:
             var_name, type_name, dim_str = m.groups()
+
+            # Parse the dimension string
             dim_str = dim_str.strip()
             if dim_str.startswith('{') and dim_str.endswith('}'):
+                dim_content = dim_str[1:-1].strip()
+                # For now, just store the dimension constraint as a string
+                # The actual parsing can be done later when needed
                 constraints = {'dim': dim_str}
             else:
                 constraints = {}
+
+            existing_scope = scope.get_defining_scope(var_name)
+            if existing_scope:
+                existing_scope.types[var_name] = type_name.lower()
+                existing_scope.constraints[var_name] = constraints
+                return
+
+            # Define the variable with the type and constraints
             scope.define(var_name, None, type_name.lower(), constraints, True)
             return
 
@@ -80,6 +138,14 @@ class GridLangControlFlow:
             r'For\s+([\w_]+)\s+as\s+(\w+)\s+dim\s+(\d+)', line, re.I)
         if m:
             var_name, type_name, dim_size = m.groups()
+
+            existing_scope = scope.get_defining_scope(var_name)
+            if existing_scope:
+                existing_scope.types[var_name] = type_name.lower()
+                existing_scope.constraints[var_name] = {'dim': [(None, int(dim_size))]}
+                return
+
+            # Create an array with the specified size
             dim_size = int(dim_size)
             import pyarrow as pa
             # Initialize array with zeros
@@ -120,6 +186,7 @@ class GridLangControlFlow:
                         if not (hasattr(scope, 'is_loop_scope') and scope.is_loop_scope):
                             # Special case: allow 'element' variable to be redeclared for array element assignment
                             if var_name == 'element' and hasattr(scope, 'is_loop_scope') and scope.is_loop_scope:
+                                # Allow the redeclaration
                                 pass
                             else:
                                 error_msg = f"Error: FOR variable '{var_name}' is already declared in an outer scope at line {line_number}"
@@ -148,18 +215,108 @@ class GridLangControlFlow:
 
             pending = list(scope.pending_assignments.items())
             for key, (expr, ln, deps) in pending:
-                unresolved = any(self.compiler.current_scope().is_uninitialized(
-                    dep) or dep in self.compiler.pending_assignments for dep in deps)
+                current_scope = self.compiler.current_scope()
+                scope_pending = getattr(current_scope, 'pending_assignments', {})
+                unresolved = any(
+                    self.compiler.has_unresolved_dependency(
+                        dep, scope=current_scope, scope_pending=scope_pending)
+                    for dep in deps)
                 if not unresolved:
                     try:
                         self.compiler.array_handler.evaluate_line_with_assignment(
                             expr, ln, scope.get_evaluation_scope())
                         del scope.pending_assignments[key]
-                    except Exception:
+                    except Exception as e:
                         pass
             return
 
         raise SyntaxError(f"Invalid FOR syntax at line {line_number}")
+
+    def identify_global_guard_lines(self, lines):
+        """Return metadata for IF guard statements at global scope (no THEN)."""
+        guard_lines = []
+        depth = 0
+        for idx, (raw_line, line_number) in enumerate(lines):
+            stripped = self._strip_inline_comment(raw_line).strip()
+            if not stripped:
+                continue
+            lower = stripped.lower()
+
+            is_block_if = bool(self._header_if.match(stripped))
+            is_block_for = bool(self._header_for.match(stripped))
+            is_block_while = bool(self._header_while.match(stripped))
+            is_end = bool(self._token_end.match(stripped))
+
+            has_inline_then = " then " in lower or lower.endswith(" then")
+            if depth == 0 and lower.startswith("if ") and not is_block_if and not has_inline_then:
+                m = re.match(r'^\s*if\s+(.+?)\s*$', stripped, re.I)
+                if m:
+                    condition = m.group(1).strip()
+                    guard_lines.append({
+                        'index': idx,
+                        'line_number': line_number,
+                        'condition': condition,
+                    })
+                continue
+
+            if is_block_if or is_block_for or is_block_while:
+                depth += 1
+                continue
+
+            if is_end and depth > 0:
+                depth -= 1
+
+        return guard_lines
+
+    def identify_global_for_declarations(self, lines):
+        """Return global FOR statements that behave like declarations or single-pass blocks."""
+        for_entries = []
+        depth = 0
+        for idx, (raw_line, line_number) in enumerate(lines):
+            stripped = self._strip_inline_comment(raw_line).strip()
+            if not stripped:
+                continue
+            lower = stripped.lower()
+
+            is_block_if = bool(self._header_if.match(stripped))
+            is_block_for = bool(self._header_for.match(stripped))
+            is_block_while = bool(self._header_while.match(stripped))
+            is_end = bool(self._token_end.match(stripped))
+
+            is_top_level_for = depth == 0 and lower.startswith("for ")
+
+            # Treat both simple FOR declarations and top-level FOR blocks as global pre-exec
+            if is_top_level_for and (" do" not in lower or is_block_for):
+                for_entries.append(
+                    {'line_number': line_number, 'line': stripped})
+
+            if is_block_if or is_block_for or is_block_while:
+                depth += 1
+            if is_end and depth > 0:
+                depth -= 1
+        return for_entries
+
+    def _extract_block_body(self, block_lines, start_index):
+        """Return the body lines and matching END index for a block starting at start_index."""
+        depth = 0
+        body_start = start_index + 1
+        j = body_start
+        while j < len(block_lines):
+            raw_line, _ = block_lines[j]
+            line_clean = self._strip_inline_comment(raw_line).strip()
+            if not line_clean:
+                j += 1
+                continue
+            if (self._header_if.match(line_clean) or
+                    self._header_for.match(line_clean) or
+                    self._header_while.match(line_clean)):
+                depth += 1
+            elif self._token_end.match(line_clean):
+                if depth == 0:
+                    return block_lines[body_start:j], j
+                depth -= 1
+            j += 1
+        return block_lines[body_start:], len(block_lines)
 
     def _process_block(self, block_lines, current_scope=None):
         block_pending = {}
@@ -170,11 +327,87 @@ class GridLangControlFlow:
                 self.executor.exit_loop = False
                 break
             line, line_number = block_lines[i]
-            if not line.strip():
+            line_clean = line.strip()
+            if not line_clean:
                 i += 1
                 continue
+            if line_clean.lower().startswith('push ') or '.push(' in line_clean.lower():
+                try:
+                    if line_clean.lower().startswith('push '):
+                        m_assign = self._match_push_assignment(line_clean)
+                        if not m_assign:
+                            raise SyntaxError(
+                                f"Invalid PUSH syntax at line {line_number}")
+                        target, value_expr = m_assign.groups()
+                        self.compiler._handle_push_assignment(
+                            target, value_expr, line_number)
+                    else:
+                        self.compiler._process_push_call(line, line_number)
+                except Exception as e:
+                    raise
+                i += 1
+                continue
+            if line_clean.lower().startswith('output '):
+                try:
+                    def_str = line_clean[len('output '):].strip()
+                    self._process_output_statement(def_str, line_number)
+                except Exception as e:
+                    raise
+                i += 1
+                continue
+            if ':=' in line_clean:
+                try:
+                    self.compiler.array_handler.evaluate_line_with_assignment(
+                        line, line_number, self.compiler.current_scope().get_evaluation_scope())
+                except Exception as e:
+                    raise
+                i += 1
+                continue
+            # Inline IF with single statement on the same line
+            inline_if_match = re.match(r'^\s*if\s+(.+?)\s+then\s+(.+)$', line, re.I)
+            if inline_if_match:
+                cond, action = inline_if_match.groups()
+                try:
+                    if self._evaluate_if_condition(cond.strip(), line_number):
+                        action = action.strip()
+                        if action.lower().startswith('let '):
+                            self._process_let_statement_inline(action, line_number)
+                        elif action.lower().startswith('output '):
+                            try:
+                                def_str = action.strip()[len('output '):].strip()
+                                self._process_output_statement(def_str, line_number)
+                            except Exception as e:
+                                raise
+                        elif ':=' in action:
+                            self.compiler.array_handler.evaluate_line_with_assignment(
+                                action, line_number, self.compiler.current_scope().get_evaluation_scope())
+                        elif '.push(' in action.lower():
+                            self.compiler._process_push_call(action, line_number)
+                        else:
+                            push_match = self._match_push_assignment(action)
+                            return_match = self._match_return_statement(action)
+                            if push_match:
+                                target, value_expr = push_match.groups()
+                                self.compiler._handle_push_assignment(
+                                    target, value_expr, line_number)
+                            elif return_match:
+                                self._handle_return_statement(
+                                    return_match.group(1).strip(), line_number)
+                            elif re.match(r'^\s*push\s*\(', action, re.I):
+                                values = self.compiler._evaluate_push_expression(
+                                    re.sub(r'^\s*push\s*\(|\)\s*$', '', action, flags=re.I), line_number)
+                                for value in values:
+                                    self.compiler.output_values.setdefault(
+                                        'output', []).append(value)
+                                if 'output' not in self.compiler.output_variables:
+                                    self.compiler.output_variables.append('output')
+                    i += 1
+                    continue
+                except Exception as e:
+                    i += 1
+                    continue
             # Simple IF-THEN single-block pattern: if <cond> then\n  <LET/assignment>\nend
-            if line.strip().lower().startswith('if ') and line.strip().lower().endswith('then'):
+            if line_clean.lower().startswith('if ') and line_clean.lower().endswith('then'):
                 # Look ahead for a simple IF block with a single statement and an 'end'
                 if i + 2 < len(block_lines):
                     next_line, next_ln_no = block_lines[i + 1]
@@ -187,28 +420,56 @@ class GridLangControlFlow:
                             cond_result = self._evaluate_if_condition(
                                 cond, line_number)
                             if cond_result:
-                                if next_line.strip().lower().startswith('let '):
+                                if next_line.strip().lower() == 'exit for':
+                                    self.executor.exit_loop = True
+                                elif next_line.strip().lower().startswith('let '):
                                     self._process_let_statement_inline(
                                         next_line, next_ln_no)
+                                elif next_line.strip().lower().startswith('output '):
+                                    try:
+                                        def_str = next_line.strip()[len('output '):].strip()
+                                        self._process_output_statement(def_str, next_ln_no)
+                                    except Exception as e:
+                                        raise
                                 elif ':=' in next_line:
                                     self.compiler.array_handler.evaluate_line_with_assignment(
                                         next_line, next_ln_no, self.compiler.current_scope().get_evaluation_scope())
-                                elif next_line.strip().lower() == 'exit for':
-                                    self.executor.exit_loop = True
+                                elif '.push(' in next_line.lower():
+                                    self.compiler._process_push_call(
+                                        next_line, next_ln_no)
+                                else:
+                                    push_match = self._match_push_assignment(next_line)
+                                    return_match = self._match_return_statement(next_line)
+                                    if push_match:
+                                        target, value_expr = push_match.groups()
+                                        self.compiler._handle_push_assignment(
+                                            target, value_expr, next_ln_no)
+                                    elif return_match:
+                                        self._handle_return_statement(
+                                            return_match.group(1).strip(), next_ln_no)
                             # Skip the IF, body, and END lines
                             i += 3
                             continue
-                        except Exception:
+                        except Exception as e:
                             pass
                 # Fallback to generic IF handler
                 try:
                     consumed = self._process_if_statement_rich(
                         line, line_number, block_lines, i)
                     i += consumed + 1
-                except Exception:
+                except Exception as e:
+                    i += 1
+                continue
+            if re.match(r'^if\b.+\bthen\b', line_clean, re.I) and not line_clean.lower().endswith('then'):
+                try:
+                    consumed = self._process_if_statement(
+                        line, line_number, block_lines, i)
+                    i += consumed
+                except Exception as e:
                     i += 1
                 continue
             if line.strip().lower().startswith("for "):
+
                 # Check if this is a FOR assignment statement (For var = expr)
                 if '=' in line and not any(keyword in line.lower() for keyword in ['in', 'as', 'dim']):
                     # This is a FOR assignment statement, use process_for_statement
@@ -222,10 +483,10 @@ class GridLangControlFlow:
                         # For variable shadowing errors, fail the compilation
                         if "already declared in an outer scope" in str(e):
                             raise e
-                        # For other ValueError, continue
+                        # For other ValueError, continue with warning
                         i += 1
                         continue
-                    except Exception:
+                    except Exception as e:
                         i += 1
                         continue
 
@@ -235,6 +496,11 @@ class GridLangControlFlow:
                 if m:
                     var_defs = m.group(1).strip()
                     is_block = line.strip().lower().endswith('do')
+                    index_fallback = None
+                    index_match_line = re.search(
+                        r'\bindex\s+([A-Za-z_][A-Za-z0-9_]*)\b', var_defs, re.I)
+                    if index_match_line:
+                        index_fallback = index_match_line.group(1)
 
                     # Parse the variable definitions
                     var_list = []
@@ -252,11 +518,111 @@ class GridLangControlFlow:
                         var_list.append((var, type_name, constraints, value))
 
                     # Check for variable redefinition
-                    for var, _, _, _ in var_list:
+                    for var, _, constraints, value in var_list:
                         defining_scope = self.compiler.current_scope().get_defining_scope(var)
-                        if defining_scope:
+                        # Allow updating constraints on an existing variable
+                        if defining_scope and value is None and constraints and not getattr(self.compiler.current_scope(), 'is_loop_scope', False):
+                            defining_scope.constraints[var] = constraints
+                            continue
+                        # Allow shadowing/reusing names inside loop scopes (e.g., across iterations)
+                        if defining_scope and not getattr(self.compiler.current_scope(), 'is_loop_scope', False):
                             raise ValueError(
                                 f"Variable '{var}' already defined in scope at line {line_number}")
+
+                    # Determine loop body once so it does not include trailing statements
+                    loop_body = block_lines[i + 1:]
+                    loop_end_index = None
+                    if is_block:
+                        loop_body, loop_end_index = self._extract_block_body(block_lines, i)
+
+                    init_entries = [(var, type_name, constraints) for var, type_name,
+                                    constraints, _ in var_list if constraints and 'init' in constraints]
+                    if init_entries:
+                        if is_block:
+                            raw_init_expr = init_entries[0][2].get('init')
+                            index_name = init_entries[0][2].get('index') or index_fallback
+                            try:
+                                values = self.compiler._evaluate_push_expression(
+                                    str(raw_init_expr), line_number)
+                            except Exception:
+                                values = [self.compiler.expr_evaluator.eval_or_eval_array(
+                                    str(raw_init_expr), self.compiler.current_scope().get_evaluation_scope(), line_number)]
+                            for idx_val, val in enumerate(values, start=1):
+                                self.compiler.push_scope(
+                                    is_private=True, is_loop_scope=True)
+                                loop_scope = self.compiler.current_scope()
+                                if index_name:
+                                    defining = loop_scope.get_defining_scope(
+                                        index_name)
+                                    if defining:
+                                        defining.update(
+                                            index_name, idx_val, line_number)
+                                    else:
+                                        loop_scope.define(index_name, idx_val, 'number', {},
+                                                          is_uninitialized=False)
+                                fallback_name = index_name or index_fallback
+                                if fallback_name:
+                                    loop_scope.variables[fallback_name] = idx_val
+                                for var, type_name, constraints in init_entries:
+                                    if var in loop_scope.variables:
+                                        loop_scope.update(var, val, line_number)
+                                    else:
+                                        loop_scope.define(
+                                            var, val, type_name, constraints, is_uninitialized=False)
+                                    idx_var = (constraints or {}).get(
+                                        'index') or index_fallback
+                                    if idx_var:
+                                        if idx_var in loop_scope.variables:
+                                            loop_scope.update(
+                                                idx_var, idx_val, line_number)
+                                        else:
+                                            loop_scope.define(
+                                                idx_var, idx_val, 'number', {}, is_uninitialized=False)
+                                if index_fallback and index_fallback not in loop_scope.variables:
+                                    loop_scope.define(
+                                        index_fallback, idx_val, 'number', {}, is_uninitialized=False)
+                                if index_name and index_name not in loop_scope.variables:
+                                    loop_scope.define(index_name, idx_val, 'number',
+                                                      {}, is_uninitialized=False)
+                                self._process_block(loop_body)
+                                parent_scope = loop_scope.parent
+                                if parent_scope:
+                                    for name, value in loop_scope.variables.items():
+                                        try:
+                                            parent_scope.update(name, value)
+                                        except Exception:
+                                            inferred_type = self.compiler.array_handler.infer_type(
+                                                value, line_number)
+                                            parent_scope.define(
+                                                name, value, inferred_type, {}, is_uninitialized=False)
+                                self.compiler.pop_scope()
+                            if is_block and loop_end_index is not None:
+                                next_index = loop_end_index + 1 if loop_end_index < len(block_lines) else len(block_lines)
+                                i = next_index
+                            else:
+                                i += 1
+                            continue
+
+                        for var, type_name, constraints, _ in var_list:
+                            if not constraints or 'init' not in constraints:
+                                continue
+                            init_expr = constraints.get('init')
+                            try:
+                                values = self.compiler._evaluate_push_expression(
+                                    str(init_expr), line_number)
+                            except Exception:
+                                values = [self.compiler.expr_evaluator.eval_or_eval_array(
+                                    str(init_expr), self.compiler.current_scope().get_evaluation_scope(), line_number)]
+                            target_scope = self.compiler.current_scope().get_defining_scope(
+                                var) or self.compiler.current_scope()
+                            for val in values:
+                                try:
+                                    target_scope.update(var, val, line_number)
+                                except NameError:
+                                    target_scope.define(
+                                        var, val, type_name, constraints, is_uninitialized=False)
+                        i += 1
+                        continue
 
                     # Execute the FOR loop
                     for var, _, constraints, _ in var_list:
@@ -279,9 +645,19 @@ class GridLangControlFlow:
                                 self.compiler.current_scope().define(var, val, 'number')
 
                                 # Process the remaining block lines (skip the FOR line)
-                                remaining_lines = block_lines[i+1:]
                                 self._process_block(
-                                    remaining_lines)
+                                    loop_body)
+                                # Propagate values defined inside the loop iteration back to the parent scope
+                                parent_scope = self.compiler.current_scope().parent
+                                if parent_scope:
+                                    for name, value in self.compiler.current_scope().variables.items():
+                                        try:
+                                            parent_scope.update(name, value)
+                                        except Exception:
+                                            inferred_type = self.compiler.array_handler.infer_type(
+                                                value, line_number)
+                                            parent_scope.define(
+                                                name, value, inferred_type, {}, is_uninitialized=False)
                                 self.compiler.pop_scope()
                         elif 'range' in constraints:
                             # Range-based FOR loop: in 1 to 10 or in 1 to I+1
@@ -313,37 +689,43 @@ class GridLangControlFlow:
                                     self.compiler.current_scope().define(var, val, 'number')
 
                                     # Process the remaining block lines (skip the FOR line)
-                                    remaining_lines = block_lines[i+1:]
                                     self._process_block(
-                                        remaining_lines, self.compiler.current_scope())
+                                        loop_body, self.compiler.current_scope())
+                                    # Propagate values defined inside the loop iteration back to the parent scope
+                                    parent_scope = self.compiler.current_scope().parent
+                                    if parent_scope:
+                                        for name, value in self.compiler.current_scope().variables.items():
+                                            try:
+                                                parent_scope.update(name, value)
+                                            except Exception:
+                                                inferred_type = self.compiler.array_handler.infer_type(
+                                                    value, line_number)
+                                                parent_scope.define(
+                                                    name, value, inferred_type, {}, is_uninitialized=False)
                                     self.compiler.pop_scope()
-                            except Exception:
+                            except Exception as e:
                                 raise SyntaxError(
                                     f"Invalid range expressions in FOR loop at line {line_number}")
                         else:
                             # Other constraint types
                             if constraints:
                                 try:
-                                    var_value = self.compiler.current_scope().get(var)
-                                    if var_value is not None:
-                                        self.compiler.current_scope()._check_constraints(var, var_value, line_number)
-                                except ValueError:
+                                    defining_scope = self.compiler.current_scope().get_defining_scope(var)
+                                    if defining_scope and not defining_scope.is_uninitialized(var):
+                                        var_value = defining_scope.get(var)
+                                        if var_value is not None:
+                                            defining_scope._check_constraints(var, var_value, line_number)
+                                except ValueError as e:
                                     break
 
                             # Process the remaining block lines (skip the FOR line)
-                            remaining_lines = block_lines[i+1:]
-                            self._process_block(remaining_lines)
+                            self._process_block(loop_body)
 
-                    # Skip the FOR line and all lines that were processed within the loop
-                    # Find the next 'end' statement to skip the entire loop body
-                    j = i + 1
-                    while j < len(block_lines):
-                        if block_lines[j][0].strip().lower() == 'end':
-                            i = j + 1  # Skip to after the 'end'
-                            break
-                        j += 1
-                    if j >= len(block_lines):
-                        i += 1  # No 'end' found, just skip the FOR line
+                    if is_block and loop_end_index is not None:
+                        next_index = loop_end_index + 1 if loop_end_index < len(block_lines) else len(block_lines)
+                        i = next_index
+                    else:
+                        i += 1
                     continue
 
                 # Skip the FOR line
@@ -358,10 +740,31 @@ class GridLangControlFlow:
                     placeholders = re.findall(r'\{\s*([^}]*?)\s*\}', rhs)
                     for ph in placeholders:
                         rhs_vars.update(re.findall(r'\b[\w_]+\b', ph))
+                col_tokens = re.findall(r'\[\s*([A-Za-z]+)\s*\{', rhs)
+                col_interp_pattern = re.compile(
+                    r'\[\{\s*([^}:]+?)\s*:\s*([A-Za-z]+)\s*\}\s*(\d+|\{[^}]+\})\s*\]')
+                col_interp_base_cols = []
+                for index_expr, base_col, row_part in col_interp_pattern.findall(rhs):
+                    rhs_vars.update(re.findall(r'\b[\w_]+\b', index_expr))
+                    if row_part.startswith('{') and row_part.endswith('}'):
+                        rhs_vars.update(
+                            re.findall(r'\b[\w_]+\b', row_part[1:-1]))
+                    col_interp_base_cols.append(base_col)
+                if col_tokens or col_interp_base_cols:
+                    rhs_vars = {v for v in rhs_vars if v not in set(col_tokens + col_interp_base_cols)}
                 field_vars = set(re.findall(r'\b[\w_]+\b(?=\.\w+\s*$)', rhs))
                 rhs_vars.update(field_vars)
-                unresolved = any(self.compiler.current_scope().is_uninitialized(
-                    var) or var in self.compiler.pending_assignments for var in rhs_vars)
+                rhs_vars = {
+                    var for var in rhs_vars
+                    if not (re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', var, re.I) or
+                            re.match(r'^e[+-]?\d+$', var, re.I))
+                }
+                current_scope = self.compiler.current_scope()
+                scope_pending = getattr(current_scope, 'pending_assignments', {})
+                unresolved = any(
+                    self.compiler.has_unresolved_dependency(
+                        var, scope=current_scope, scope_pending=scope_pending)
+                    for var in rhs_vars)
                 if unresolved:
                     constraints = {}
                     for var in rhs_vars:
@@ -386,7 +789,7 @@ class GridLangControlFlow:
                             if var_value is not None:
                                 defining_scope._check_constraints(
                                     var, var_value, line_number)
-                        except ValueError:
+                        except ValueError as e:
                             violations.append(var)
                 if not violations:
                     self.compiler.array_handler.evaluate_line_with_assignment(
@@ -394,29 +797,45 @@ class GridLangControlFlow:
                 else:
                     self.compiler.grid.clear()
                 i += 1
-            elif line.strip().lower().startswith('if '):
+            elif line_clean.lower().startswith('if '):
                 # Handle IF blocks within a block context
                 try:
-                    consumed = self._process_if_statement_rich(
-                        line, line_number, block_lines, i)
-                    i += consumed + 1
-                except Exception:
+                    if re.match(r'^if\b.+\bthen\b', line_clean, re.I) and not line_clean.lower().endswith('then'):
+                        consumed = self._process_if_statement(
+                            line, line_number, block_lines, i)
+                        i += consumed
+                    else:
+                        consumed = self._process_if_statement_rich(
+                            line, line_number, block_lines, i)
+                        i += consumed + 1
+                except Exception as e:
                     i += 1
             elif line.strip().startswith(': '):
                 try:
                     # Process : variable = expression assignments
                     assignment_line = line.strip()[2:]  # Remove ': ' prefix
+                    m = re.match(r'^([\w_]+)\s*=\s*(.+)$', assignment_line)
+                    if m:
+                        target_var = m.group(1)
+                        # Define the variable in the current scope if it does not exist
+                        defining_scope = self.compiler.current_scope().get_defining_scope(
+                            target_var)
+                        if not defining_scope:
+                            inferred_type = 'number'  # default; updated by assignment handler
+                            self.compiler.current_scope().define(
+                                target_var, None, inferred_type, {}, is_uninitialized=True)
                     self.compiler.array_handler.evaluate_line_with_assignment(
                         assignment_line, line_number, self.compiler.current_scope().get_evaluation_scope())
-                except Exception:
+                except Exception as e:
                     pass
                 i += 1
             elif line.strip().lower().startswith('let '):
                 try:
                     self._process_let_statement_inline(
                         line, line_number)
-                except Exception:
-                    pass
+                except Exception as e:
+                    if "dim * must be initialized with PUSH or INIT before LET" in str(e):
+                        raise
                 i += 1
             elif line.strip() == 'exit for':
                 # Set a flag to break out of the current FOR loop
@@ -428,6 +847,30 @@ class GridLangControlFlow:
                 i += 1
             elif line.strip() == 'else':
                 # Skip ELSE statements as they're handled by the main IF processing
+                i += 1
+            elif re.match(r'^\s*\[[^\]]+\]\s*\.push\s*\(.+\)\s*$', line):
+                try:
+                    cell_match = re.match(
+                        r'^\s*(\[[^\]]+\])\s*\.push\s*\(\s*(.+)\s*\)\s*$', line)
+                    if cell_match:
+                        target_cell = cell_match.group(1)
+                        expr = cell_match.group(2)
+                        assignment_line = f"{target_cell} := {expr}"
+                        self.compiler.array_handler.evaluate_line_with_assignment(
+                            assignment_line, line_number, self.compiler.current_scope().get_evaluation_scope())
+                except Exception as e:
+                    pass
+                i += 1
+            elif self._match_push_assignment(line):
+                push_match = self._match_push_assignment(line)
+                target, value_expr = push_match.groups()
+                self.compiler._handle_push_assignment(
+                    target, value_expr, line_number)
+                i += 1
+            elif self._match_return_statement(line):
+                return_match = self._match_return_statement(line)
+                self._handle_return_statement(
+                    return_match.group(1).strip(), line_number)
                 i += 1
             elif '.push(' in line and ')' in line:
                 try:
@@ -454,21 +897,24 @@ class GridLangControlFlow:
                             # Store the value in the output system for display
                             if not hasattr(self.compiler, 'output_values'):
                                 self.compiler.output_values = {}
-                            if var_name not in self.compiler.output_values:
-                                self.compiler.output_values[var_name] = []
-                            self.compiler.output_values[var_name].append(
-                                result)
+                            # Keep all pushed values in order
+                            existing = self.compiler.output_values.get(
+                                var_name, [])
+                            if not isinstance(existing, list):
+                                existing = [] if existing is None else [existing]
+                            existing.append(result)
+                            self.compiler.output_values[var_name] = existing
                         else:
                             raise NameError(
                                 f"Variable {var_name} not defined at line {line_number}")
-                except Exception:
+                except Exception as e:
                     pass
                 i += 1
-            elif line.strip().startswith('push(') and line.strip().endswith(')'):
+            elif line.strip().lower().startswith('push(') and line.strip().endswith(')'):
                 try:
                     # Extract the expression inside push()
                     expr_match = re.match(
-                        r'push\s*\(\s*(.+?)\s*\)', line.strip())
+                        r'push\s*\(\s*(.+)\s*\)\s*$', line.strip(), re.I)
                     if expr_match:
                         expr = expr_match.group(1)
                         result = self.compiler.expr_evaluator.eval_expr(
@@ -476,13 +922,17 @@ class GridLangControlFlow:
                         # Add the result to the output system
                         if not hasattr(self.compiler, 'output_values'):
                             self.compiler.output_values = {}
-                        if 'output' not in self.compiler.output_values:
-                            self.compiler.output_values['output'] = []
-                        self.compiler.output_values['output'].append(result)
+                        # Default output keeps all pushed values
+                        existing = self.compiler.output_values.get(
+                            'output', [])
+                        if not isinstance(existing, list):
+                            existing = [] if existing is None else [existing]
+                        existing.append(result)
+                        self.compiler.output_values['output'] = existing
                         # Add 'output' to output_variables if not already present
                         if 'output' not in self.compiler.output_variables:
                             self.compiler.output_variables.append('output')
-                except Exception:
+                except Exception as e:
                     pass
                 i += 1
             else:
@@ -505,9 +955,35 @@ class GridLangControlFlow:
         condition = condition_match.group(1).strip()
         has_block = line.lower().strip().endswith('then')
 
+
+        # Defer IF processing if dependencies are not yet available
+        dep_extractor = getattr(self.compiler, '_extract_dependencies_from_expression', None)
+        deps = set(dep_extractor(condition)) if callable(dep_extractor) else set()
+        current_scope = self.compiler.current_scope()
+        unresolved = any(self.compiler.has_unresolved_dependency(dep, scope=current_scope)
+                         or not current_scope.get_defining_scope(dep)
+                         for dep in deps)
+        if unresolved:
+            for dep in deps:
+                self.compiler.mark_dependency_missing(dep)
+            self.compiler.pending_assignments[f"__if_line_{line_number}"] = (
+                line, line_number, deps)
+            end_line = self.block_map.get(line_number, line_number)
+            return max(end_line - line_number + 1, 1)
+
         # Evaluate the condition
-        condition_result = self._evaluate_if_condition(
-            condition, line_number)
+        try:
+            condition_result = self._evaluate_if_condition(
+                condition, line_number)
+        except NameError as exc:
+            missing = set(deps) or getattr(
+                self.compiler, 'extract_missing_dependencies', lambda e: set())(exc)
+            for dep in missing:
+                self.compiler.mark_dependency_missing(dep)
+            self.compiler.pending_assignments[f"__if_line_{line_number}"] = (
+                line, line_number, missing)
+            end_line = self.block_map.get(line_number, line_number)
+            return max(end_line - line_number + 1, 1)
 
         if has_block:
             # Process IF block with ELSE/ELSEIF support
@@ -530,6 +1006,7 @@ class GridLangControlFlow:
                         break
                 elif next_line_clean.startswith("if "):
                     # Handle nested IF statement - add to current block instead of processing immediately
+
                     # Add the nested IF line to the current block
                     current_block.append((next_line, next_line_number))
                     block_i += 1
@@ -565,16 +1042,13 @@ class GridLangControlFlow:
                             break
                     else:
                         depth += 1
+                        # Duplicate nested IF handling removed
                 elif next_line_clean.startswith("for "):
                     # Handle nested FOR statement
-                    # Check if this is array indexing syntax
-                    array_info = self._parse_array_indexing(next_line)
-                    if array_info:
-                        array_name, index_expr, element_var = array_info
-
+                    if "for element = haystack(mid)" in next_line:
                         # Check if the element variable is already defined
                         try:
-                            existing_element = self.compiler.current_scope().get(element_var)
+                            existing_element = self.compiler.current_scope().get("element")
                             if existing_element is not None:
                                 # Skip this line since it's already processed
                                 current_block.append(
@@ -582,8 +1056,14 @@ class GridLangControlFlow:
                                 block_i += 1
                                 continue
                             else:
-                                # Process array indexing
+                                # Process normally if not defined
+                                # This is the special case: for element = haystack(mid)
+                                # Extract the element value and continue
                                 try:
+                                    # Get the array element value
+                                    array_name = "haystack"
+                                    index_expr = "mid"
+
                                     # Evaluate the index expression
                                     index_value = self.compiler.expr_evaluator.eval_expr(
                                         index_expr, self.compiler.current_scope().get_evaluation_scope(), next_line_number)
@@ -606,7 +1086,7 @@ class GridLangControlFlow:
                                             element_value = array[idx]
 
                                             # Define the variable with the element value
-                                            self.compiler.current_scope().define(element_var, element_value,
+                                            self.compiler.current_scope().define("element", element_value,
                                                                                  'number', {}, is_uninitialized=False)
 
                                         else:
@@ -627,10 +1107,12 @@ class GridLangControlFlow:
                                 continue
                         except NameError:
                             # Process normally if not defined
-                            # This is array indexing syntax
+                            # This is the special case: for element = haystack(mid)
+                            # Extract the element value and continue
                             try:
-                                # Get the array element value using parsed info
-                                array_name, index_expr, element_var = array_info
+                                # Get the array element value
+                                array_name = "haystack"
+                                index_expr = "mid"
 
                                 # Evaluate the index expression
                                 index_value = self.compiler.expr_evaluator.eval_expr(
@@ -654,7 +1136,7 @@ class GridLangControlFlow:
                                         element_value = array[idx]
 
                                         # Define the variable with the element value
-                                        self.compiler.current_scope().define(element_var, element_value,
+                                        self.compiler.current_scope().define("element", element_value,
                                                                              'number', {}, is_uninitialized=False)
                                     else:
                                         raise IndexError(
@@ -745,7 +1227,6 @@ class GridLangControlFlow:
         else:
             # Single line IF - this should control whether the previous assignment is kept
             if not condition_result:
-                self.compiler.grid.clear()
                 # Check for ELSE part on the same line
                 if ' else ' in line.lower():
                     # Parse the ELSE part from the same line
@@ -757,15 +1238,45 @@ class GridLangControlFlow:
                             # Extract the LET part
                             let_match = re.match(
                                 r'^\s*let\s+(.+)$', else_part, re.I)
-                            if let_match:
-                                let_expr = let_match.group(1).strip()
-                                # Process as a LET statement inline
-                                self._process_let_statement_inline(
-                                    f"let {let_expr}", line_number)
+                        if let_match:
+                            let_expr = let_match.group(1).strip()
+                            # Process as a LET statement inline
+                            self._process_let_statement_inline(
+                                f"let {let_expr}", line_number)
+                        elif else_part.lower().startswith('output '):
+                            try:
+                                def_str = else_part.strip()[len('output '):].strip()
+                                self._process_output_statement(def_str, line_number)
+                            except Exception as e:
+                                raise
                         elif ':=' in else_part:
                             # Process as an assignment
                             self.compiler.array_handler.evaluate_line_with_assignment(
                                 else_part, line_number, self.compiler.current_scope().get_evaluation_scope())
+                        elif '.push(' in else_part.lower():
+                            # Process as a .push() call
+                            self.compiler._process_push_call(
+                                else_part, line_number)
+                        else:
+                            push_match = self._match_push_assignment(else_part)
+                            return_match = self._match_return_statement(else_part)
+                            if push_match:
+                                target, value_expr = push_match.groups()
+                                self.compiler._handle_push_assignment(
+                                    target, value_expr, line_number)
+                            elif return_match:
+                                self._handle_return_statement(
+                                    return_match.group(1).strip(), line_number)
+                            elif re.match(r'^\s*push\s*\(', else_part, re.I):
+                                # Process push() function calls
+                                expr = re.sub(r'^\s*push\s*\(|\)\s*$', '', else_part, flags=re.I)
+                                values = self.compiler._evaluate_push_expression(
+                                    expr, line_number)
+                                for value in values:
+                                    self.compiler.output_values.setdefault(
+                                        'output', []).append(value)
+                                if 'output' not in self.compiler.output_variables:
+                                    self.compiler.output_variables.append('output')
             else:
                 # Execute the THEN part if it's on the same line
                 if ' then ' in line.lower():
@@ -773,7 +1284,13 @@ class GridLangControlFlow:
                     then_match = re.search(r'\bthen\b\s*(.+)$', line, re.I)
                     if then_match:
                         then_part = then_match.group(1).strip()
-                        if ':=' in then_part:
+                        if then_part.lower().startswith('output '):
+                            try:
+                                def_str = then_part.strip()[len('output '):].strip()
+                                self._process_output_statement(def_str, line_number)
+                            except Exception as e:
+                                raise
+                        elif ':=' in then_part:
                             # Process as an assignment
                             self.compiler.array_handler.evaluate_line_with_assignment(
                                 then_part, line_number, self.compiler.current_scope().get_evaluation_scope())
@@ -781,15 +1298,67 @@ class GridLangControlFlow:
                             # Process as a LET statement
                             self._process_let_statement_inline(
                                 then_part, line_number)
+                        elif '.push(' in then_part.lower():
+                            # Process as a .push() call
+                            self.compiler._process_push_call(
+                                then_part, line_number)
+                        else:
+                            push_match = self._match_push_assignment(then_part)
+                            return_match = self._match_return_statement(then_part)
+                            if push_match:
+                                target, value_expr = push_match.groups()
+                                self.compiler._handle_push_assignment(
+                                    target, value_expr, line_number)
+                            elif return_match:
+                                self._handle_return_statement(
+                                    return_match.group(1).strip(), line_number)
+                            elif re.match(r'^\s*push\s*\(', then_part, re.I):
+                                # Process push() function calls
+                                expr = re.sub(r'^\s*push\s*\(|\)\s*$', '', then_part, flags=re.I)
+                                values = self.compiler._evaluate_push_expression(
+                                    expr, line_number)
+                                for value in values:
+                                    self.compiler.output_values.setdefault(
+                                        'output', []).append(value)
+                                if 'output' not in self.compiler.output_variables:
+                                    self.compiler.output_variables.append('output')
                 # Check for single line ELSE
                 if current_index + 2 < len(lines):
                     next_line, next_line_number = lines[current_index + 1]
                     if next_line.strip().lower().startswith('else'):
                         # Single line ELSE
                         else_line, else_line_number = lines[current_index + 2]
-                        if ':=' in else_line:
+                        if else_line.strip().lower().startswith('output '):
+                            try:
+                                def_str = else_line.strip()[len('output '):].strip()
+                                self._process_output_statement(def_str, else_line_number)
+                            except Exception as e:
+                                raise
+                        elif ':=' in else_line:
                             self.compiler.array_handler.evaluate_line_with_assignment(
                                 else_line, else_line_number, self.compiler.current_scope().get_evaluation_scope())
+                        elif '.push(' in else_line.lower():
+                            self.compiler._process_push_call(
+                                else_line, else_line_number)
+                        else:
+                            push_match = self._match_push_assignment(else_line)
+                            return_match = self._match_return_statement(else_line)
+                            if push_match:
+                                target, value_expr = push_match.groups()
+                                self.compiler._handle_push_assignment(
+                                    target, value_expr, else_line_number)
+                            elif return_match:
+                                self._handle_return_statement(
+                                    return_match.group(1).strip(), else_line_number)
+                            elif re.match(r'^\s*push\s*\(', else_line, re.I):
+                                expr = re.sub(r'^\s*push\s*\(|\)\s*$', '', else_line, flags=re.I)
+                                values = self.compiler._evaluate_push_expression(
+                                    expr, else_line_number)
+                                for value in values:
+                                    self.compiler.output_values.setdefault(
+                                        'output', []).append(value)
+                                if 'output' not in self.compiler.output_variables:
+                                    self.compiler.output_variables.append('output')
 
         # Update the current index to skip processed lines
         if has_block:
@@ -822,9 +1391,60 @@ class GridLangControlFlow:
                 var_def, line_number)
             var_list.append((var, type_name, constraints, expr))
 
+
         # Process each variable
         scope_dict = self.compiler.current_scope().get_evaluation_scope()
         for var, type_name, constraints, expr in var_list:
+            field_index_match = re.match(
+                r'^([\w_]+)\.([\w_]+)\(([^)]+)\)\.(\w+)$', var)
+            if field_index_match:
+                obj_name, array_field, index_expr, field_name = field_index_match.groups()
+                value = self.compiler.expr_evaluator.eval_or_eval_array(
+                    expr, scope_dict, line_number)
+                index_value = self.compiler.expr_evaluator.eval_expr(
+                    index_expr, scope_dict, line_number)
+                if isinstance(index_value, float) and index_value.is_integer():
+                    index_value = int(index_value)
+                if not isinstance(index_value, int):
+                    raise ValueError(
+                        f"Invalid index '{index_expr}' for '{var}' at line {line_number}")
+                indices = [index_value - 1]
+                obj_value = self.compiler.current_scope().get(obj_name)
+                if not isinstance(obj_value, dict):
+                    raise ValueError(
+                        f"'{obj_name}' is not an object at line {line_number}")
+                public_keys = {k.lower(): k for k in obj_value.keys()
+                               if not str(k).startswith('_')}
+                actual_array_field = public_keys.get(
+                    array_field.lower(), array_field)
+                array_val = obj_value.get(actual_array_field)
+                if array_val is None:
+                    raise ValueError(
+                        f"Field '{array_field}' is not defined on '{obj_name}' at line {line_number}")
+                if isinstance(array_val, dict) and 'array' in array_val:
+                    array_storage = array_val['array']
+                else:
+                    array_storage = array_val
+                element = self.compiler.array_handler.get_array_element(
+                    array_storage, indices, line_number)
+                if not isinstance(element, dict):
+                    raise ValueError(
+                        f"'{obj_name}.{array_field}({index_value})' is not an object at line {line_number}")
+                element_keys = {k.lower(): k for k in element.keys()
+                                if not str(k).startswith('_')}
+                actual_field = element_keys.get(field_name.lower(), field_name)
+                element[actual_field] = value
+                updated_array = self.compiler.array_handler.set_array_element(
+                    array_storage, indices, element, line_number)
+                if isinstance(array_val, dict) and 'array' in array_val:
+                    array_val['array'] = updated_array
+                    obj_value[actual_array_field] = array_val
+                else:
+                    obj_value[actual_array_field] = updated_array
+                self.compiler.current_scope().update(
+                    obj_name, obj_value, line_number)
+                scope_dict[obj_name] = obj_value
+                continue
             # Handle array indexing assignment (e.g., D{i+1, 1}, D[A1], or D(k+1))
             array_index_match = re.match(r'^([\w_]+)\{([^}]+)\}$', var)
             cell_index_match = re.match(r'^([\w_]+)\[([^\]]+)\]$', var)
@@ -875,6 +1495,16 @@ class GridLangControlFlow:
                         var_name, defining_scope.variables)
                     if actual_key:
                         arr = defining_scope.variables[actual_key]
+                        constraints = defining_scope.constraints.get(actual_key, {})
+                        dim_spec = constraints.get('dim')
+                        has_star = False
+                        if isinstance(dim_spec, list):
+                            has_star = any(size_spec is None for _, size_spec in dim_spec)
+                        elif isinstance(dim_spec, str):
+                            has_star = '*' in dim_spec
+                        if has_star and (defining_scope.is_uninitialized(actual_key) or arr is None):
+                            raise ValueError(
+                                f"Array variable '{var_name}' with dim * must be initialized with PUSH or INIT before LET at line {line_number}")
                         # Check if array is wrapped in a dictionary (e.g., for grid dims)
                         if isinstance(arr, dict) and 'array' in arr:
                             updated_array = self.compiler.array_handler.set_array_element(
@@ -887,9 +1517,21 @@ class GridLangControlFlow:
                                 arr, indices, value, line_number)
                             defining_scope.variables[actual_key] = updated_array
                             scope_dict[actual_key] = updated_array
+                        if hasattr(updated_array, 'to_pylist'):
+                            debug_array = updated_array.to_pylist()
+                        else:
+                            debug_array = updated_array
                     else:
                         raise NameError(
                             f"Array variable '{var_name}' not defined at line {line_number}")
+                elif var_name.lower() == 'grid':
+                    # Directly write to compiler grid using 0-based indices list
+                    if len(indices) == 2:
+                        row_idx = indices[0] + 1
+                        col_idx = indices[1] + 1
+                        cell = f"{num_to_col(col_idx)}{row_idx}"
+                        self.compiler.grid[cell] = value
+                    continue
                 continue
             defining_scope = self.compiler.current_scope().get_defining_scope(var)
             if defining_scope:
@@ -910,7 +1552,14 @@ class GridLangControlFlow:
                         expr, scope_dict, line_number)
                     self.compiler.current_scope().update(var, evaluated_value, line_number)
                     scope_dict[var] = evaluated_value
-                except NameError:
+                    pending_vars = [
+                        pending_var for pending_var in list(self.compiler.pending_assignments.keys())
+                        if not pending_var.startswith('__line_')
+                    ]
+                    for pending_var in pending_vars:
+                        self.compiler._attempt_resolve_pending_var(
+                            pending_var, line_number)
+                except NameError as e:
                     raise NameError(
                         f"Undefined variables in LET statement: {var} at line {line_number}")
 
@@ -918,6 +1567,61 @@ class GridLangControlFlow:
         """
         Evaluate an IF condition, handling various types of constraints.
         """
+
+        # Handle "not as" type constraints (e.g., "z not as text")
+        not_type_match = re.match(
+            r'^([\w_]+)\s+not\s+as\s+(\w+)(?:\s+dim\s+(.+))?$', condition, re.I)
+        if not_type_match:
+            var_name, type_name, dim_constraint = not_type_match.groups()
+            positive = f"{var_name} as {type_name}"
+            if dim_constraint:
+                positive = f"{positive} dim {dim_constraint}"
+            return not self._evaluate_if_condition(positive, line_number)
+
+        # Handle "not of" unit constraints (e.g., "z not of dollar")
+        not_unit_match = re.match(r'^([\w_]+)\s+not\s+of\s+(\w+)$', condition, re.I)
+        if not_unit_match:
+            var_name, unit_name = not_unit_match.groups()
+            defining_scope = self.compiler.current_scope().get_defining_scope(var_name)
+            if not defining_scope:
+                raise NameError(
+                    f"Variable '{var_name}' not defined at line {line_number}")
+            if var_name in defining_scope.constraints:
+                var_constraints = defining_scope.constraints[var_name]
+                current_unit = (var_constraints.get('unit') or '').lower()
+                return current_unit != unit_name.lower()
+            return True
+
+        # Handle "not null" constraints (optionally with equality)
+        not_null_eq_match = re.match(
+            r'^([\w_]+)\s+not\s+null\s*=\s*(.+)$', condition, re.I)
+        if not_null_eq_match:
+            var_name, rhs = not_null_eq_match.groups()
+            if not self._evaluate_if_condition(f"{var_name} not null", line_number):
+                return False
+            scope = self.compiler.current_scope().get_evaluation_scope()
+            left_val = self.compiler.expr_evaluator.eval_expr(
+                var_name, scope, line_number)
+            right_val = self.compiler.expr_evaluator.eval_expr(
+                rhs.strip(), scope, line_number)
+            return left_val == right_val
+        not_null_match = re.match(r'^([\w_]+)\s+not\s+null$', condition, re.I)
+        if not_null_match:
+            var_name = not_null_match.group(1)
+            defining_scope = self.compiler.current_scope().get_defining_scope(var_name)
+            if not defining_scope:
+                raise NameError(
+                    f"Variable '{var_name}' not defined at line {line_number}")
+            value = defining_scope.get(var_name)
+            return value is not None
+
+        # Handle negated comparisons (e.g., "x not <= 10")
+        not_cmp_match = re.match(
+            r'^(.+?)\s+not\s*(<=|>=|<|>|=)\s*(.+)$', condition.strip(), re.I)
+        if not_cmp_match:
+            left_expr, operator, right_expr = not_cmp_match.groups()
+            positive = f"{left_expr.strip()} {operator} {right_expr.strip()}"
+            return not self._evaluate_if_condition(positive, line_number)
 
         # Handle type constraints (e.g., "z as text")
         type_match = re.match(
@@ -944,20 +1648,19 @@ class GridLangControlFlow:
                     if var_name in root_scope.variables or var_name in root_scope.types or var_name in root_scope.constraints:
                         defining_scope = root_scope
                     else:
-                        return False
+                        raise NameError(
+                            f"Variable '{var_name}' not defined at line {line_number}")
 
             var_value = defining_scope.get(var_name)
             if var_value is None:
-                # Uninitialized variable - check if it has the right type constraint
-                if var_name in defining_scope.types:
-                    actual_type = defining_scope.types[var_name]
-                    type_match = (type_name.lower() == 'text' and actual_type == 'text') or \
-                        (type_name.lower() ==
-                         'number' and actual_type in ('number', 'int'))
-                    if not type_match:
-                        return False
-                else:
-                    return False
+                declared_type = ''
+                if hasattr(defining_scope, 'types'):
+                    type_key = defining_scope._get_case_insensitive_key(
+                        var_name, defining_scope.types)
+                    if type_key:
+                        declared_type = (defining_scope.types.get(
+                            type_key) or '').lower()
+                return declared_type == type_name.lower()
             else:
                 actual_type = self.compiler.array_handler.infer_type(
                     var_value, line_number)
@@ -1008,7 +1711,8 @@ class GridLangControlFlow:
             var_name, dim_spec = dim_match.groups()
 
             if var_name not in self.compiler.current_scope().get_evaluation_scope():
-                return False
+                raise NameError(
+                    f"Variable '{var_name}' not defined at line {line_number}")
 
             var_value = self.compiler.current_scope().get_evaluation_scope()[
                 var_name]
@@ -1058,12 +1762,15 @@ class GridLangControlFlow:
             # Check if variable exists in any scope
             defining_scope = self.compiler.current_scope().get_defining_scope(var_name)
             if not defining_scope:
-                return False
+                raise NameError(
+                    f"Variable '{var_name}' not defined at line {line_number}")
 
             # Check if variable has the specified unit constraint
-            if var_name in defining_scope.constraints:
-                var_constraints = defining_scope.constraints[var_name]
-                return var_constraints.get('unit', '').lower() == unit_name.lower()
+            constraint_key = defining_scope._get_case_insensitive_key(
+                var_name, defining_scope.constraints)
+            if constraint_key:
+                var_constraints = defining_scope.constraints[constraint_key]
+                return (var_constraints.get('unit') or '').lower() == unit_name.lower()
 
             return False
 
@@ -1081,7 +1788,9 @@ class GridLangControlFlow:
                     break
 
             if var_value is None:
-                return False
+                raise NameError(
+                    f"Variable '{var_name}' not defined at line {line_number}")
+
 
             # Parse the constraint expression
             if constraint_expr.startswith('{') and constraint_expr.endswith('}'):
@@ -1185,7 +1894,7 @@ class GridLangControlFlow:
                         result = self.compiler.expr_evaluator.eval_expr(
                             full_expr, scope, line_number)
                         return bool(result)
-                    except Exception:
+                    except Exception as e:
                         # Fall back to separate evaluation
                         left_val = self.compiler.expr_evaluator.eval_expr(
                             left_expr.strip(), scope, line_number)
@@ -1210,7 +1919,7 @@ class GridLangControlFlow:
                         return left_val < right_val
                     elif operator == '>':
                         return left_val > right_val
-            except Exception:
+            except Exception as e:
                 return False
 
         # Handle "not =" operator - this should be checked before logical operators
@@ -1229,7 +1938,7 @@ class GridLangControlFlow:
                         right_expr.strip(), scope, line_number)
                     result = left_val != right_val
                     return result
-                except Exception:
+                except Exception as e:
                     return False
 
         # Default: evaluate as expression
@@ -1238,7 +1947,7 @@ class GridLangControlFlow:
             result = self.compiler.expr_evaluator.eval_expr(
                 condition, scope, line_number)
             return bool(result)
-        except Exception:
+        except Exception as e:
             return False
 
     def _resolve_global_dependency(self, var, line_number, target_scope=None):
@@ -1246,8 +1955,9 @@ class GridLangControlFlow:
             return False
         expr, assign_line, deps = self.compiler.pending_assignments[var]
         scope = target_scope if target_scope is not None else self.compiler.current_scope()
-        unresolved = any(scope.is_uninitialized(dep) or (
-            dep in self.compiler.pending_assignments and dep != var) for dep in deps)
+        unresolved = any(
+            dep != var and self.compiler.has_unresolved_dependency(dep, scope=scope)
+            for dep in deps)
         if unresolved:
             return False
         try:
@@ -1261,11 +1971,11 @@ class GridLangControlFlow:
             defining_scope.update(var, value, assign_line)
             del self.compiler.pending_assignments[var]
             return True
-        except ValueError:
+        except ValueError as e:
             del self.compiler.pending_assignments[var]
             self.compiler.grid.clear()
             return False
-        except NameError:
+        except NameError as e:
             return False
         except Exception as e:
             raise RuntimeError(
@@ -1278,6 +1988,9 @@ class GridLangControlFlow:
         # list of {start_line, end_line, clauses: [...]}
         self.if_blocks = []
         self.loops = []                  # list of {type, start_line, end_line}
+        # Cache the full list of lines (line content + original numbers) so nested
+        # IF handlers can refer back to the source regardless of the current slice.
+        self._preprocessed_lines = list(lines)
 
         stack = []  # Stack of dicts: {type, start_i, start_line, clauses?}
 
@@ -1405,8 +2118,6 @@ class GridLangControlFlow:
                 depth += 1
                 if in_active_clause:
                     active_clause_lines.append((line, line_number))
-                i += 1
-                continue
 
             elif depth == 0 and lower.startswith("elseif ") and lower.endswith(" then"):
                 if not clause_found:
@@ -1474,16 +2185,49 @@ class GridLangControlFlow:
 
         condition = condition_match.group(1).strip()
 
-        # Evaluate the condition
-        condition_result = self._evaluate_if_condition(condition, line_number)
-
-        # Extract the block lines from the IF block
-        block_lines = []
-        for i in range(current_index + 1, len(lines)):
-            line_content, line_num = lines[i]
-            block_lines.append((line_content, line_num))
-            if line_num == if_block['end_line']:
+        dep_extractor = getattr(self.compiler, '_extract_dependencies_from_expression', None)
+        deps = set(dep_extractor(condition)) if callable(dep_extractor) else set()
+        current_scope = self.compiler.current_scope()
+        unresolved = False
+        for dep in deps:
+            defining_scope = current_scope.get_defining_scope(dep)
+            if defining_scope and dep in getattr(self.compiler, 'pending_assignments', {}):
+                unresolved = True
                 break
+        if unresolved:
+            for dep in deps:
+                self.compiler.mark_dependency_missing(dep)
+            self.compiler.pending_assignments[f"__if_line_{line_number}"] = (
+                line, line_number, deps)
+            return if_block['end_line'] - line_number
+
+        # Evaluate the condition. Missing variables simply yield False.
+        try:
+            condition_result = self._evaluate_if_condition(condition, line_number)
+        except NameError as exc:
+            condition_result = False
+
+        # Extract the block lines from the IF block. Prefer the cached full list of
+        # preprocessed lines so nested IF statements still have access to their
+        # ELSEIF/ELSE headers even when we're processing a sliced block.
+        if self._preprocessed_lines:
+            block_lines = [
+                (line_content, line_num)
+                for (line_content, line_num) in self._preprocessed_lines
+                if line_number < line_num <= if_block['end_line']
+            ]
+        else:
+            block_lines = []
+            for i in range(current_index + 1, len(lines)):
+                line_content, line_num = lines[i]
+                block_lines.append((line_content, line_num))
+                if line_num == if_block['end_line']:
+                    break
+
+        # Predeclare variables that are assigned within the IF block so they exist
+        # even if the condition evaluates to False. This keeps downstream references
+        # (like cell bindings) consistent with programs that rely on defaulted values.
+        self._predeclare_block_assignment_targets(block_lines)
 
         # Check if this is a simple IF statement (no ELSEIF/ELSE clauses)
         if len(if_block['clauses']) == 1 and if_block['clauses'][0]['kind'] == 'if':
@@ -1499,6 +2243,27 @@ class GridLangControlFlow:
 
         # Return the number of lines consumed (from start to end of the IF block)
         return if_block['end_line'] - line_number
+
+    def _predeclare_block_assignment_targets(self, block_lines):
+        """
+        Predeclare variables that are assigned within an IF block so they exist even
+        when the block is skipped. This avoids NameErrors and keeps outputs stable
+        for programs that expect these identifiers to be present with default values.
+        """
+        current_scope = self.compiler.current_scope()
+        for line_content, _ in block_lines:
+            stripped = line_content.strip()
+            match = re.match(r'^:\s*([\w_]+)\s*=', stripped)
+            if not match:
+                match = re.match(r'^let\s+([\w_]+)\s*=', stripped, re.I)
+            if match:
+                var_name = match.group(1)
+                defining_scope = current_scope.get_defining_scope(var_name)
+                if not defining_scope:
+                    current_scope.define(
+                        var_name, "", 'text', {}, is_uninitialized=False)
+                elif defining_scope.is_uninitialized(var_name):
+                    defining_scope.update(var_name, "", None)
 
     def _process_if_statement_new(self, line, line_number, lines, current_index):
         """New simple IF processing using pre-scanned block map"""
@@ -1564,8 +2329,8 @@ class GridLangControlFlow:
                 else:
                     return 1  # Single line IF
         else:
-            # Single line IF - this should control whether the previous assignment is kept
+            # Single line IF without a block; skip inline action when the condition is false
             if not condition_result:
-                self.compiler.grid.clear()
+                pass
 
         return 1

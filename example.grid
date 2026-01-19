@@ -8,3 +8,5 @@ For V as tensor with (name = "V", grid DIM {4, 4, 3} = var)
 [B1] := V.grid{4, 4, 2}
 [C1] := V.name
 [D1] := V.grid{1, 1, 3}
+
+Return [B1]

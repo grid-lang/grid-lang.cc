@@ -6,7 +6,7 @@
 import re
 import pyarrow as pa
 # Utilities for cell and column operations
-from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, prod
+from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, prod, public_type_fields, object_public_keys, public_object_view
 from functools import reduce
 import operator
 
@@ -118,10 +118,13 @@ class ArrayHandler:
         :param line_number: Line number.
         :param scope: Optional scope; defaults to global variables.
         """
+        assignment_op = None
         # Handle both := and = assignments
         if ':=' in line:
+            assignment_op = ':='
             target_part, expr_part = map(str.strip, line.split(':=', 1))
         elif '=' in line:
+            assignment_op = '='
             target_part, expr_part = map(str.strip, line.split('=', 1))
         else:
             return
@@ -144,7 +147,6 @@ class ArrayHandler:
         sr, er = None, None
         var_name, dim_name, dim_index = None, None, None
         indices = None
-        is_simple_var_assignment = False
 
         # Parse target type
         if '[' in target_part and ']' in target_part and not target_part.startswith('[') and '!' not in target_part:
@@ -188,140 +190,141 @@ class ArrayHandler:
                 except ValueError as e:
                     raise SyntaxError(
                         f"Invalid cell reference '{inside}': {e} at line {line_number}")
-            elif inside.startswith('@'):
+            elif inside.startswith('^'):
                 target = inside[1:].strip()
                 if not target:
                     raise SyntaxError(
-                        f"Invalid array target '[@]' at line {line_number}")
+                        f"Invalid array target '[^]' at line {line_number}")
                 try:
                     validate_cell_ref(target)
                     is_harr = True
                 except ValueError as e:
                     raise SyntaxError(
                         f"Invalid array reference '{inside}': {e} at line {line_number}")
-            elif ':' in inside:
-                rm = re.match(r'^([A-Za-z]+\d+)\s*:\s*([A-Za-z]+\d+)$', inside)
-                if rm:
-                    sr, er = rm.groups()
-                    try:
-                        validate_cell_ref(sr)
-                        validate_cell_ref(er)
-                        is_range = True
-                    except ValueError as e:
-                        raise SyntaxError(
-                            f"Invalid range references '{inside}': {e} at line {line_number}")
+            else:
+                resolved = self.compiler.expr_evaluator._resolve_column_interpolated_cell(
+                    inside, scope, line_number)
+                if resolved:
+                    target = resolved
+                elif ':' in inside:
+                    rm = re.match(r'^([A-Za-z]+\d+)\s*:\s*([A-Za-z]+\d+)$', inside)
+                    if rm:
+                        sr, er = rm.groups()
+                        try:
+                            validate_cell_ref(sr)
+                            validate_cell_ref(er)
+                            is_range = True
+                        except ValueError as e:
+                            raise SyntaxError(
+                                f"Invalid range references '{inside}': {e} at line {line_number}")
+                    else:
+                        try:
+                            final_inside = self.compiler.expr_evaluator._process_interpolation(
+                                f'$"{inside}"', scope, line_number)
+                            rm = re.match(
+                                r'^([A-Za-z]+\d+)\s*:\s*([A-Za-z]+\d+)$', final_inside)
+                            if rm:
+                                sr, er = rm.groups()
+                                validate_cell_ref(sr)
+                                validate_cell_ref(er)
+                                is_range = True
+                            else:
+                                raise SyntaxError(
+                                    f"Interpolated range '{final_inside}' is invalid at line {line_number}")
+                        except Exception as e:
+                            raise SyntaxError(
+                                f"Error interpolating range '{inside}': {e} at line {line_number}")
                 else:
                     try:
                         final_inside = self.compiler.expr_evaluator._process_interpolation(
                             f'$"{inside}"', scope, line_number)
-                        rm = re.match(
-                            r'^([A-Za-z]+\d+)\s*:\s*([A-Za-z]+\d+)$', final_inside)
-                        if rm:
-                            sr, er = rm.groups()
-                            validate_cell_ref(sr)
-                            validate_cell_ref(er)
-                            is_range = True
+                        if re.match(r'^[A-Za-z]+\d+$', final_inside):
+                            validate_cell_ref(final_inside)
+                            target = final_inside
+                        elif final_inside.startswith('^'):
+                            target = final_inside[1:].strip()
+                            validate_cell_ref(target)
+                            is_harr = True
                         else:
                             raise SyntaxError(
-                                f"Interpolated range '{final_inside}' is invalid at line {line_number}")
+                                f"Interpolated target '{final_inside}' is invalid at line {line_number}")
                     except Exception as e:
                         raise SyntaxError(
-                            f"Error interpolating range '{inside}': {e} at line {line_number}")
-            else:
-                try:
-                    final_inside = self.compiler.expr_evaluator._process_interpolation(
-                        f'$"{inside}"', scope, line_number)
-                    if re.match(r'^[A-Za-z]+\d+$', final_inside):
-                        validate_cell_ref(final_inside)
-                        target = final_inside
-                    elif final_inside.startswith('@'):
-                        target = final_inside[1:].strip()
-                        validate_cell_ref(target)
-                        is_harr = True
-                    else:
-                        raise SyntaxError(
-                            f"Interpolated target '{final_inside}' is invalid at line {line_number}")
-                except Exception as e:
-                    raise SyntaxError(
-                        f"Error interpolating '{inside}': {e} at line {line_number}")
+                            f"Error interpolating '{inside}': {e} at line {line_number}")
         else:
-            # Handle simple variable assignments (e.g., result := 10)
-            if re.match(r'^[\w_]+$', target_part):
-                var_name = target_part
-                # Check if variable exists in any scope
-                defining_scope = self.compiler.current_scope().get_defining_scope(var_name)
-                if not defining_scope:
-                    raise NameError(
-                        f"Variable '{var_name}' not defined at line {line_number}")
-                # Set flag to indicate this is a simple variable assignment
-                is_simple_var_assignment = True
-            else:
+            # GridLang only allows assignments to grid addresses.
+            raise SyntaxError(
+                f"Invalid assignment target: '{target_part}' at line {line_number}. "
+                "Use [address] := value.")
+
+        implicit_expr = None
+        if expr_part.lstrip().startswith('@'):
+            implicit_expr = expr_part.lstrip()[1:].strip()
+            if not implicit_expr:
                 raise SyntaxError(
-                    f"Invalid assignment target: '{target_part}' at line {line_number}")
+                    f"Missing expression after '@' at line {line_number}")
 
         # Evaluate RHS
-        try:
-            # Check if this is an array operation by looking for array literals
-            # Array literals start with { and contain comma-separated values
-            array_literal_pattern = r'\{[^}]*,[^}]*\}'
-            array_literals = re.findall(array_literal_pattern, expr_part)
+        if implicit_expr is None:
+            try:
+                # Check if this is an array operation by looking for array literals
+                # Array literals start with { and contain comma-separated values
+                array_literal_pattern = r'\{[^}]*,[^}]*\}'
+                array_literals = re.findall(array_literal_pattern, expr_part)
 
-            if '+' in expr_part and len(array_literals) >= 2:
-                value = self.evaluate_array_operation(expr_part, line_number)
-            else:
-                value = self.compiler.expr_evaluator.eval_or_eval_array(
-                    expr_part, scope, line_number)
-        except Exception as e:
-            raise
-
-        # Handle simple variable assignments (e.g., result := 10)
-        if is_simple_var_assignment:
-            # Update the variable in its defining scope
-            defining_scope.update(var_name, value, line_number)
-            return
+                if '+' in expr_part and len(array_literals) >= 2:
+                    value = self.evaluate_array_operation(expr_part, line_number)
+                else:
+                    value = self.compiler.expr_evaluator.eval_or_eval_array(
+                        expr_part, scope, line_number)
+            except Exception as e:
+                raise
 
         # Handle special reshaping for array of two-field objects in horizontal assignment
         is_array_of_two_field_objects = False
         object_type_name = None
         values_per_object = 0
-        reshaped_value = value
-        if is_harr and expr_part.startswith('{') and expr_part.endswith('}'):
-            inner = expr_part[1:-1].strip()
-            elements = [elem.strip()
-                        for elem in inner.split(',') if elem.strip()]
-            # Check if all elements exist in scope
-            all_elements_exist = True
-            element_values = {}
-            for elem in elements:
-                try:
-                    element_values[elem] = self.compiler.current_scope().get(
-                        elem)
-                except NameError:
-                    all_elements_exist = False
-                    break
+        reshaped_value = None
+        if implicit_expr is None:
+            reshaped_value = value
+            if is_harr and expr_part.startswith('{') and expr_part.endswith('}'):
+                inner = expr_part[1:-1].strip()
+                elements = [elem.strip()
+                            for elem in inner.split(',') if elem.strip()]
+                # Check if all elements exist in scope
+                all_elements_exist = True
+                element_values = {}
+                for elem in elements:
+                    try:
+                        element_values[elem] = self.compiler.current_scope().get(
+                            elem)
+                    except NameError:
+                        all_elements_exist = False
+                        break
 
-            if all_elements_exist:
-                first_elem = element_values[elements[0]]
-                if isinstance(first_elem, dict):
-                    for type_name, fields in self.compiler.types_defined.items():
-                        if set(first_elem.keys()) == set(fields.keys()) and len(fields) == 2:
-                            object_type_name = type_name
-                            values_per_object = 2
-                            break
-                if object_type_name:
-                    is_array_of_two_field_objects = all(
-                        isinstance(element_values[elem], dict) and
-                        set(element_values[elem].keys()) == set(
-                            self.compiler.types_defined[object_type_name].keys())
-                        for elem in elements
-                    )
-            if is_array_of_two_field_objects:
-                if isinstance(value, list) and value and isinstance(value[0], list):
-                    flat_inner = value[0]
-                    num_objects = len(elements)
-                    if len(flat_inner) == num_objects * values_per_object:
-                        reshaped_value = [
-                            flat_inner[i * values_per_object:(i + 1) * values_per_object] for i in range(num_objects)]
+                if all_elements_exist:
+                    first_elem = element_values[elements[0]]
+                    if isinstance(first_elem, dict):
+                        for type_name, fields in self.compiler.types_defined.items():
+                            field_defs = public_type_fields(fields)
+                            if object_public_keys(first_elem) == set(field_defs.keys()) and len(field_defs) == 2:
+                                object_type_name = type_name
+                                values_per_object = 2
+                                break
+                    if object_type_name:
+                        is_array_of_two_field_objects = all(
+                            isinstance(element_values[elem], dict) and
+                            object_public_keys(element_values[elem]) == set(
+                                public_type_fields(self.compiler.types_defined[object_type_name]).keys())
+                            for elem in elements
+                        )
+                if is_array_of_two_field_objects:
+                    if isinstance(value, list) and value and isinstance(value[0], list):
+                        flat_inner = value[0]
+                        num_objects = len(elements)
+                        if len(flat_inner) == num_objects * values_per_object:
+                            reshaped_value = [
+                                flat_inner[i * values_per_object:(i + 1) * values_per_object] for i in range(num_objects)]
 
         # Perform assignment based on target type
         if is_index_selector:
@@ -335,18 +338,113 @@ class ArrayHandler:
             if value is None:  # Read operation
                 return result
         elif is_harr:
+            if implicit_expr is not None:
+                raise SyntaxError(
+                    f"Implicit intersection '@' is not supported for horizontal array targets at line {line_number}")
             self._assign_horizontal_array(
                 target, reshaped_value, expr_part, is_array_of_two_field_objects, line_number)
+            if (assignment_op == ':=' and
+                    re.match(r'^[A-Za-z_][\w_]*$', expr_part) and
+                    not getattr(self.compiler.current_scope(), 'is_private', False)):
+                source_var = expr_part
+                try:
+                    self.compiler.current_scope().get(source_var)
+                    existing = self.compiler._cell_array_map.get(target)
+                    if existing and existing.lower() != source_var.lower():
+                        raise SyntaxError(
+                            f"Cell '{target}' already mapped to '{existing}' at line {line_number}")
+                    conflict = self.compiler._cell_var_map.get(target)
+                    if conflict and conflict.lower() != source_var.lower():
+                        raise SyntaxError(
+                            f"Cell '{target}' already mapped to '{conflict}' at line {line_number}")
+                    self.compiler._cell_array_map[target] = source_var
+                except Exception:
+                    pass
         elif is_range:
-            self.assign_range(sr, er, value, line_number)
+            if implicit_expr is not None:
+                self.assign_implicit_intersection_range(
+                    sr, er, implicit_expr, scope, line_number)
+            else:
+                self.assign_range(sr, er, value, line_number)
         else:
+            if implicit_expr is not None:
+                col, row = split_cell(target)
+                value = self._evaluate_implicit_intersection(
+                    implicit_expr, int(row), scope, line_number)
             if isinstance(value, pa.Array):
                 value = value.to_pylist()
             elif isinstance(value, pa.Scalar):
                 py_value = value.as_py()
                 value = int(py_value) if isinstance(
                     py_value, float) and py_value.is_integer() else py_value
+            # Enforce cell-bound variable constraints before writing to grid.
+            bound_var = self.compiler._cell_var_map.get(target)
+            if bound_var:
+                defining_scope = self.compiler.current_scope().get_defining_scope(
+                    bound_var)
+                if defining_scope:
+                    defining_scope.update(bound_var, value, line_number)
+                else:
+                    inferred_type = self.compiler.array_handler.infer_type(
+                        value, line_number)
+                    if inferred_type == 'int':
+                        inferred_type = 'number'
+                    self.compiler.current_scope().define(
+                        bound_var, value, inferred_type, {}, is_uninitialized=False)
+            # Track equality bindings so future updates propagate to the cell.
+            # Avoid creating bindings inside private/loop scopes to prevent later iterations
+            # from overwriting previously written cells (e.g., FOR index loops).
+            if (assignment_op == ':=' and
+                    re.match(r'^[A-Za-z_][\w_]*$', expr_part) and
+                    not getattr(self.compiler.current_scope(), 'is_private', False)):
+                source_var = expr_part
+                try:
+                    # Ensure the source variable exists before binding
+                    self.compiler.current_scope().get(source_var)
+                    # Only bind if no conflicting mapping exists
+                    existing = self.compiler._cell_var_map.get(target)
+                    if existing and existing.lower() != source_var.lower():
+                        raise SyntaxError(
+                            f"Cell '{target}' already mapped to '{existing}' at line {line_number}")
+                    self.compiler._cell_var_map[target] = source_var
+                except Exception:
+                    pass
+            if isinstance(value, dict) and ('_type_name' in value or '_hidden_fields' in value):
+                value = public_object_view(value)
             self.compiler.grid[target] = value
+
+    def _rewrite_implicit_intersection(self, expr, row_number):
+        pattern = re.compile(r'\[\s*\^?([A-Za-z]+)\s*\]')
+        return pattern.sub(lambda m: f"[{m.group(1)}{{{row_number}}}]", expr)
+
+    def _evaluate_implicit_intersection(self, expr, row_number, scope, line_number=None):
+        rewritten = self._rewrite_implicit_intersection(expr, row_number)
+        return self.compiler.expr_evaluator.eval_or_eval_array(
+            rewritten, scope, line_number)
+
+    def assign_implicit_intersection_range(self, sr_ref, er_ref, expr, scope, line_number=None):
+        scs, sro = split_cell(sr_ref)
+        ecs, ero = split_cell(er_ref)
+        sc, ec = col_to_num(scs), col_to_num(ecs)
+        sr, er = int(sro), int(ero)
+        num_cols = ec - sc + 1
+        num_rows = er - sr + 1
+        if num_cols < 1 or num_rows < 1:
+            raise ValueError(
+                f"Invalid range: {num_cols}x{num_rows} at line {line_number}")
+
+        for r in range(sr, er + 1):
+            for c in range(sc, ec + 1):
+                cell = num_to_col(c) + str(r)
+                value = self._evaluate_implicit_intersection(
+                    expr, r, scope, line_number)
+                if isinstance(value, pa.Array):
+                    value = value.to_pylist()
+                elif isinstance(value, pa.Scalar):
+                    py_value = value.as_py()
+                    value = int(py_value) if isinstance(
+                        py_value, float) and py_value.is_integer() else py_value
+                self.compiler.grid[cell] = value
 
     def evaluate_array_operation(self, expr, line_number=None):
         """
@@ -461,8 +559,22 @@ class ArrayHandler:
         try:
             arr = self.compiler.current_scope().get(var_name)
         except NameError:
-            raise NameError(
-                f"Variable '{var_name}' not defined at line {line_number}")
+            if value is None:
+                raise NameError(
+                    f"Variable '{var_name}' not defined at line {line_number}")
+            # Auto-initialize array to fit requested indices
+            max_idx = [int(i) if isinstance(i, (int, float)) else 0 for i in indices]
+            if len(max_idx) == 1:
+                arr = [None] * (max_idx[0] + 1)
+            elif len(max_idx) == 2:
+                arr = [[None] * (max_idx[1] + 1) for _ in range(max_idx[0] + 1)]
+            else:
+                arr = [[[None for _ in range(max_idx[2] + 1)]
+                        for _ in range(max_idx[1] + 1)]
+                       for _ in range(max_idx[0] + 1)]
+            self.compiler.current_scope().define(var_name, arr)
+        if isinstance(arr, pa.Array):
+            arr = arr.to_pylist()
         shape = self.get_array_shape(arr, line_number)
 
         # Handle cell reference index
@@ -485,19 +597,27 @@ class ArrayHandler:
                 return result
             else:  # Write
                 flat_value = self.flatten_array(value, line_number)
-                flat_arr = arr.flatten().to_pylist()
-                inner_size = shape[1]
-                outer_size = shape[0]
-                flat_arr = flat_arr + [0] * \
-                    (inner_size * outer_size - len(flat_arr))
-                idx = col_idx
-                flat_arr[idx] = float(flat_value[0]) if flat_value else 0
-                new_values = pa.array(flat_arr, type=pa.float64())
-                self.compiler.current_scope().update(var_name, pa.ListArray.from_arrays(
-                    offsets=pa.array(
-                        [i * inner_size for i in range(outer_size + 1)], type=pa.int32()),
-                    values=new_values
-                ))
+                if isinstance(arr, list):
+                    if not arr:
+                        arr.append([])
+                    while len(arr[0]) <= col_idx:
+                        arr[0].append(None)
+                    arr[0][col_idx] = flat_value[0] if flat_value else None
+                    self.compiler.current_scope().update(var_name, arr, line_number)
+                else:
+                    flat_arr = arr.flatten().to_pylist()
+                    inner_size = shape[1]
+                    outer_size = shape[0]
+                    flat_arr = flat_arr + [0] * \
+                        (inner_size * outer_size - len(flat_arr))
+                    idx = col_idx
+                    flat_arr[idx] = float(flat_value[0]) if flat_value else 0
+                    new_values = pa.array(flat_arr, type=pa.float64())
+                    self.compiler.current_scope().update(var_name, pa.ListArray.from_arrays(
+                        offsets=pa.array(
+                            [i * inner_size for i in range(outer_size + 1)], type=pa.int32()),
+                        values=new_values
+                    ))
 
         else:
             # Numeric indices
@@ -505,34 +625,65 @@ class ArrayHandler:
                 raise ValueError(
                     f"Expected {len(shape)} indices, got {len(indices)} at line {line_number}")
             flat_value = self.flatten_array(value, line_number)
-            inner_size = shape[1] if len(shape) > 1 else 1
-            outer_size = shape[0] if shape else 10
-            flat_arr = arr.flatten().to_pylist() if isinstance(
-                arr, pa.ListArray) else arr.to_pylist() + [0] * (inner_size * outer_size - len(arr))
-            idx = 0
-            for i, index in enumerate(indices):
-                try:
-                    idx_val = int(index) - 1
-                except ValueError:
-                    raise ValueError(
-                        f"Invalid index '{index}' for dimension {i} at line {line_number}")
-                if idx_val < 0 or idx_val >= shape[i]:
-                    raise ValueError(
-                        f"Index {idx_val + 1} out of bounds at line {line_number}")
-                idx += idx_val * (inner_size if i == 0 else 1)
-            if value is None:  # Read
-                result = flat_arr[idx]
-                return result
-            flat_arr[idx] = float(flat_value[0]) if flat_value else 0
-            new_values = pa.array(flat_arr, type=pa.float64())
-            if len(shape) > 1:
-                self.compiler.current_scope().update(var_name, pa.ListArray.from_arrays(
-                    offsets=pa.array(
-                        [i * inner_size for i in range(outer_size + 1)], type=pa.int32()),
-                    values=new_values
-                ))
+            if isinstance(arr, list):
+                def _ensure(lst, idxs, val):
+                    if len(idxs) == 1:
+                        while len(lst) <= idxs[0]:
+                            lst.append(None)
+                        lst[idxs[0]] = val
+                    else:
+                        while len(lst) <= idxs[0]:
+                            lst.append([])
+                        if not isinstance(lst[idxs[0]], list):
+                            lst[idxs[0]] = []
+                        _ensure(lst[idxs[0]], idxs[1:], val)
+                idx_list = []
+                for index in indices:
+                    try:
+                        idx_val = int(index) - 1
+                    except ValueError:
+                        raise ValueError(
+                            f"Invalid index '{index}' at line {line_number}")
+                    idx_list.append(max(idx_val, 0))
+                if value is None:
+                    # Read path
+                    ref = arr
+                    for j, idx_val in enumerate(idx_list):
+                        if not isinstance(ref, list) or idx_val >= len(ref):
+                            return None
+                        ref = ref[idx_val]
+                    return ref
+                _ensure(arr, idx_list, flat_value[0] if flat_value else None)
+                self.compiler.current_scope().update(var_name, arr, line_number)
             else:
-                self.compiler.current_scope().update(var_name, new_values)
+                inner_size = shape[1] if len(shape) > 1 else 1
+                outer_size = shape[0] if shape else 10
+                flat_arr = arr.flatten().to_pylist() if isinstance(
+                    arr, pa.ListArray) else arr.to_pylist() + [0] * (inner_size * outer_size - len(arr))
+                idx = 0
+                for i, index in enumerate(indices):
+                    try:
+                        idx_val = int(index) - 1
+                    except ValueError:
+                        raise ValueError(
+                            f"Invalid index '{index}' for dimension {i} at line {line_number}")
+                    if idx_val < 0 or idx_val >= shape[i]:
+                        raise ValueError(
+                            f"Index {idx_val + 1} out of bounds at line {line_number}")
+                    idx += idx_val * (inner_size if i == 0 else 1)
+                if value is None:  # Read
+                    result = flat_arr[idx]
+                    return result
+                flat_arr[idx] = float(flat_value[0]) if flat_value else 0
+                new_values = pa.array(flat_arr, type=pa.float64())
+                if len(shape) > 1:
+                    self.compiler.current_scope().update(var_name, pa.ListArray.from_arrays(
+                        offsets=pa.array(
+                            [i * inner_size for i in range(outer_size + 1)], type=pa.int32()),
+                        values=new_values
+                    ))
+                else:
+                    self.compiler.current_scope().update(var_name, new_values)
 
     def _assign_dim_selector(self, var_name, dim_name, dim_index, value, line_number=None):
         """
@@ -544,6 +695,28 @@ class ArrayHandler:
         :param line_number: Line number.
         :return: Read value if value is None.
         """
+        # Special-case: allow writing directly to the compiler grid via grid{row, col}
+        if var_name.lower() == 'grid' and len(indices) == 2:
+            try:
+                row_idx = int(indices[0])
+                col_idx = int(indices[1])
+                if row_idx < 1:
+                    row_idx += 1
+                if col_idx < 1:
+                    col_idx += 1
+            except ValueError:
+                raise ValueError(
+                    f"Invalid grid indices {indices} at line {line_number}")
+            if row_idx < 1 or col_idx < 1:
+                raise ValueError(
+                    f"Grid indices must be >= 1 at line {line_number}")
+            cell = f"{num_to_col(col_idx)}{row_idx}"
+            if value is None:
+                return self.compiler.grid.get(cell)
+            flat_value = self.flatten_array(value, line_number)
+            self.compiler.grid[cell] = flat_value[0] if flat_value else None
+            return
+
         try:
             arr = self.compiler.current_scope().get(var_name)
         except NameError:
@@ -603,6 +776,14 @@ class ArrayHandler:
         :param line_number: Line number.
         """
         if isinstance(value, dict):
+            # Special-case: spill an object's grid mapping when keys are (row, col) tuples
+            if value and all(isinstance(k, tuple) and len(k) == 2 for k in value.keys()):
+                start_col = col_to_num(target[0:re.search(r'\d', target).start()])
+                start_row = int(target[re.search(r'\d', target).start():])
+                for (row, col), val in value.items():
+                    cell_to_assign = f"{num_to_col(start_col + (col - 1))}{start_row + (row - 1)}"
+                    self.compiler.grid[cell_to_assign] = val
+                return
             flattened_values = self.flatten_object_fields(value, line_number)
             for i, val in enumerate(flattened_values):
                 cell_to_assign = offset_cell(target, i, 0)
@@ -612,17 +793,20 @@ class ArrayHandler:
             type_name = None
             if all(isinstance(item, dict) for item in value):
                 for t_name, fields in self.compiler.types_defined.items():
-                    if all(set(fields.keys()) == set(item.keys()) for item in value):
+                    public_fields = set(public_type_fields(fields).keys())
+                    if public_fields and all(object_public_keys(item) == public_fields for item in value):
                         is_object_array = True
                         type_name = t_name
                         break
-            if is_object_array:
-                for row_idx, item in enumerate(value):
-                    flattened_values = self.flatten_object_fields(
-                        item, line_number)
-                    for col_idx, val in enumerate(flattened_values):
-                        cell_to_assign = offset_cell(target, col_idx, row_idx)
-                        self.compiler.grid[cell_to_assign] = val
+                if is_object_array:
+                    for row_idx, item in enumerate(value):
+                        flattened_values = self.flatten_object_fields(
+                            item, line_number)
+                        for col_idx, val in enumerate(flattened_values):
+                            cell_to_assign = offset_cell(
+                                target, col_idx, row_idx)
+                            self.compiler.grid[cell_to_assign] = val
+                    return
             elif is_array_of_two_field_objects:
                 num_objects = len(value)
                 start_col = col_to_num(
@@ -811,30 +995,32 @@ class ArrayHandler:
         if isinstance(obj, dict):
             type_name = None
             for name, fields in self.compiler.types_defined.items():
-                if set(fields.keys()) == set(obj.keys()):
+                if object_public_keys(obj) == set(public_type_fields(fields).keys()):
                     type_name = name
                     break
             if type_name:
-                fields = self.compiler.types_defined[type_name.lower()]
+                fields = public_type_fields(
+                    self.compiler.types_defined[type_name.lower()])
                 for field in fields.keys():
-                    value = obj[field]
+                    value = obj.get(field)
                     if isinstance(value, dict):
                         nested_type = None
                         for n_name, n_fields in self.compiler.types_defined.items():
-                            if set(n_fields.keys()) == set(value.keys()):
+                            if object_public_keys(value) == set(public_type_fields(n_fields).keys()):
                                 nested_type = n_name
                                 break
                         if nested_type:
-                            nested_fields = self.compiler.types_defined[nested_type]
+                            nested_fields = public_type_fields(
+                                self.compiler.types_defined[nested_type])
                             for n_field in nested_fields.keys():
-                                result.append(value[n_field])
+                                result.append(value.get(n_field))
                         else:
                             result.extend([value[k]
-                                          for k in sorted(value.keys())])
+                                           for k in sorted(object_public_keys(value))])
                     else:
                         result.append(value)
             else:
-                result.extend([obj[k] for k in sorted(obj.keys())])
+                result.extend([obj[k] for k in sorted(object_public_keys(obj))])
         else:
             result.append(obj)
         return result
@@ -1020,11 +1206,119 @@ class ArrayHandler:
         :param line_number: Line number.
         :return: Reshaped value.
         """
-        if var not in self.compiler.dimensions:
+        dims = None
+        if var in self.compiler.dimensions:
+            dims = self.compiler.dimensions[var]
+        else:
+            scope = self.compiler.current_scope().get_defining_scope(var)
+            if scope:
+                actual_key = scope._get_case_insensitive_key(
+                    var, scope.constraints) or var
+                dim_spec = scope.constraints.get(actual_key, {}).get('dim')
+                if isinstance(dim_spec, dict) and 'dims' in dim_spec:
+                    dims = dim_spec['dims']
+                elif isinstance(dim_spec, list):
+                    dims = dim_spec
+                elif isinstance(dim_spec, str):
+                    dim_str = dim_spec.strip()
+                    if dim_str.lower().startswith('dim '):
+                        dim_str = dim_str[4:].strip()
+                    if dim_str.startswith('{') and dim_str.endswith('}'):
+                        dim_content = dim_str[1:-1].strip()
+                        parts = [p.strip()
+                                 for p in dim_content.split(',') if p.strip()]
+                        parsed_dims = []
+                        for part in parts:
+                            if ':' in part:
+                                name, size = map(str.strip, part.split(':', 1))
+                                size_spec = self.compiler._parse_dim_size(
+                                    size, line_number)
+                                parsed_dims.append((name, size_spec))
+                            else:
+                                size_spec = self.compiler._parse_dim_size(
+                                    part, line_number)
+                                parsed_dims.append((None, size_spec))
+                        dims = parsed_dims
+                    elif dim_str:
+                        size_spec = self.compiler._parse_dim_size(
+                            dim_str, line_number)
+                        dims = [(None, size_spec)]
+                if dims is not None:
+                    self.compiler.dimensions[var] = dims
+
+        if dims is None:
             return value
-        dims = self.compiler.dimensions[var]
+        scope = self.compiler.current_scope().get_defining_scope(var) or self.compiler.current_scope()
+        resolved_dims = []
+        for name, size_spec in dims:
+            if isinstance(size_spec, str):
+                try:
+                    eval_scope = scope.get_full_scope()
+                    size_val = self.compiler.expr_evaluator.eval_expr(
+                        size_spec, eval_scope, line_number)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Failed to evaluate dimension size '{size_spec}' for '{var}' at line {line_number}: {exc}")
+                if isinstance(size_val, bool):
+                    raise ValueError(
+                        f"Invalid dimension size '{size_spec}' for '{var}' at line {line_number}")
+                if isinstance(size_val, float) and not size_val.is_integer():
+                    raise ValueError(
+                        f"Dimension size '{size_spec}' for '{var}' is not an integer at line {line_number}")
+                if not isinstance(size_val, (int, float)):
+                    raise ValueError(
+                        f"Invalid dimension size '{size_spec}' for '{var}' at line {line_number}")
+                size_spec = int(size_val)
+            resolved_dims.append((name, size_spec))
+        dims = resolved_dims
+        self.compiler.dimensions[var] = dims
+        if dims == []:
+            if isinstance(value, (pa.Array, pa.ListArray)):
+                value = value.to_pylist()
+            if isinstance(value, list):
+                if len(value) == 1:
+                    return value[0]
+                if len(value) == 0:
+                    return None
+                raise ValueError(
+                    f"Dimension constraint for '{var}' expects a scalar at line {line_number}")
+            return value
 
         # Handle scalar broadcasting
+        var_type = None
+        scope = self.compiler.current_scope().get_defining_scope(var)
+        if scope:
+            actual_key = scope._get_case_insensitive_key(var, scope.types) or var
+            var_type = scope.types.get(actual_key)
+        if var_type is None:
+            var_type = self.compiler.types.get(var)
+
+        if isinstance(value, dict) and var_type and var_type.lower() in self.compiler.types_defined:
+            import copy
+            shape = []
+            for _, size_spec in dims:
+                if isinstance(size_spec, tuple):
+                    start, end = size_spec
+                    dim_size = end - start + 1
+                elif size_spec is None:
+                    dim_size = 1
+                else:
+                    dim_size = size_spec
+                shape.append(dim_size)
+            total = 1
+            for dim in shape:
+                total *= dim
+            flat_vals = [copy.deepcopy(value) for _ in range(total)]
+            if len(shape) == 1:
+                return flat_vals
+            reshaped = []
+            stride = shape[1] if len(shape) > 1 else 1
+            for i in range(shape[0]):
+                start = i * stride
+                row = flat_vals[start:start + stride]
+                reshaped.append(row)
+            return reshaped
+
         if not isinstance(value, (list, pa.Array, pa.ListArray)) or isinstance(value, (int, float, str)):
             shape = []
             num_stars = sum(1 for _, size_spec in dims if size_spec is None)
@@ -1116,6 +1410,30 @@ class ArrayHandler:
         :param line_number: Line number for error reporting.
         :return: Updated array.
         """
+
+        # Allow dynamic list-backed arrays (e.g., object arrays)
+        if array is None or isinstance(array, list):
+            if not indices:
+                raise ValueError(
+                    f"Expected at least one index at line {line_number}")
+            # Build/expand nested lists as needed
+            if array is None:
+                array = []
+            current = array
+            for depth, idx in enumerate(indices):
+                # Grow current list to fit index
+                while len(current) <= idx:
+                    current.append(None)
+                if depth == len(indices) - 1:
+                    current[idx] = value
+                else:
+                    if current[idx] is None:
+                        current[idx] = []
+                    if not isinstance(current[idx], list):
+                        raise TypeError(
+                            f"Expected list at depth {depth} for indices {indices} at line {line_number}")
+                    current = current[idx]
+            return array
 
         # Handle simple arrays (like DoubleArray)
         if not isinstance(array, pa.ListArray):

@@ -49,3 +49,50 @@ def prod(iterable):
     for x in iterable:
         result *= x
     return result
+
+
+def public_type_fields(type_def: dict):
+    """Return only the user-declared public fields of a type (ignore internal/hidden metadata keys)."""
+    if not isinstance(type_def, dict):
+        return {}
+    hidden = type_def.get('_hidden_fields', set())
+    if not isinstance(hidden, (set, list, tuple)):
+        hidden = set()
+    hidden = {str(h).lower() for h in hidden}
+    return {
+        k: v for k, v in type_def.items()
+        if not str(k).startswith('_') and str(k).lower() not in hidden
+    }
+
+
+def object_public_keys(obj: dict):
+    """Return the set of keys on an object, excluding internal/hidden metadata keys."""
+    if not isinstance(obj, dict):
+        return set()
+    hidden = obj.get('_hidden_fields', set())
+    if not isinstance(hidden, (set, list, tuple)):
+        hidden = set()
+    hidden = {str(h).lower() for h in hidden}
+    return {
+        k for k in obj.keys()
+        if not str(k).startswith('_')
+        and str(k) != 'grid'
+        and not str(k).startswith('$')
+        and str(k).lower() not in hidden
+    }
+
+
+def public_object_view(obj):
+    """Return a view of an object containing only public fields (recursively)."""
+    if not isinstance(obj, dict):
+        return obj
+    result = {}
+    for key in object_public_keys(obj):
+        val = obj.get(key)
+        if isinstance(val, dict):
+            result[key] = public_object_view(val)
+        elif isinstance(val, list):
+            result[key] = [public_object_view(v) for v in val]
+        else:
+            result[key] = val
+    return result
