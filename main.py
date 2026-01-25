@@ -5,8 +5,8 @@ from compiler import GridLangCompiler
 
 def run_grid_program(args):
     """Run a Grid program with command line arguments"""
-    if len(args) < 1:
-        print("Usage: python main.py <grid_file> [arg1] [arg2] ...")
+    if len(args) < 1 or args[0] in ("-h", "--help"):
+        print("Usage: grid <grid_file> [arg1] [arg2] ...")
         return
 
     grid_file = args[0]
