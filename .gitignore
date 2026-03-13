@@ -1,0 +1,13 @@
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Local environments
+venv/
+.venv/
+
+# Generated debug exports
+*.csv

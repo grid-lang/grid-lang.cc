@@ -1,3 +1,5 @@
+import csv
+import os
 import re
 import math
 import sys
@@ -5,7 +7,7 @@ import copy
 import pyarrow as pa
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
-from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys
+from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value
 from scope import Scope
 from control_flow import GridLangControlFlow
 from type_processor import GridLangTypeProcessor
@@ -148,18 +150,15 @@ class GridLangCompiler:
                     if hidden:
                         type_def['_hidden_fields'] = hidden
 
-                    parent_constraints = parent_def.get(
-                        '_constraints', {}) or {}
+                    parent_constraints = parent_def.get('_constraints', {}) or {}
                     child_constraints = type_def.get('_constraints', {}) or {}
                     if parent_constraints or child_constraints:
                         merged = dict(parent_constraints)
                         merged.update(child_constraints)
                         type_def['_constraints'] = merged
 
-                    parent_field_constraints = parent_def.get(
-                        '_field_constraints', {}) or {}
-                    child_field_constraints = type_def.get(
-                        '_field_constraints', {}) or {}
+                    parent_field_constraints = parent_def.get('_field_constraints', {}) or {}
+                    child_field_constraints = type_def.get('_field_constraints', {}) or {}
                     if parent_field_constraints or child_field_constraints:
                         merged_fields = dict(parent_field_constraints)
                         merged_fields.update(child_field_constraints)
@@ -230,7 +229,35 @@ class GridLangCompiler:
         if hidden_fields:
             obj['_hidden_fields'] = set(hidden_fields)
         obj.setdefault('grid', {})
+        try:
+            self._recompute_computed_fields(obj, line_number=line_number)
+        except Exception:
+            pass
         return obj
+
+    def _recompute_computed_fields(self, obj, line_number=None, changed_field=None):
+        """Recompute computed fields for a custom type instance when dependencies change."""
+        if not isinstance(obj, dict):
+            return
+        type_name = obj.get('_type_name')
+        if not type_name:
+            return
+        type_def = self.types_defined.get(str(type_name).lower(), {})
+        computed = type_def.get('_computed_fields') or {}
+        if not computed:
+            return
+        eval_scope = self.type_processor._build_type_eval_scope(obj, {})
+        for field_name, expr in computed.items():
+            # Avoid self-referential loops for the changed field
+            if changed_field and str(field_name).lower() == str(changed_field).lower():
+                continue
+            try:
+                val = self.expr_evaluator.eval_or_eval_array(
+                    str(expr), eval_scope, line_number)
+            except Exception:
+                continue
+            obj[field_name] = val
+            eval_scope[field_name] = val
 
     def current_scope(self):
         return self.scopes[-1]
@@ -275,8 +302,10 @@ class GridLangCompiler:
         # Capture the final root-scope variables for callers that need them
         try:
             self._last_scope_vars = extracted.current_scope().variables.copy()
+            self._last_scope_types = extracted.current_scope().types.copy()
         except Exception:
             self._last_scope_vars = {}
+            self._last_scope_types = {}
 
         # Copy back any changes to attributes
         for attr in ['grid', 'scopes', 'expr_evaluator', 'array_handler', 'types_defined',
@@ -315,7 +344,7 @@ class GridLangCompiler:
                     body_line, body_ln = lines[i]
                     stripped = body_line.strip().lower()
                     # Track nested control blocks so generic END inside the body doesn't terminate the function
-                    if stripped.startswith(('for ', 'while ', 'if ')):
+                    if stripped.startswith(('for ', 'while ', 'when ', 'if ')):
                         block_depth += 1
                     if stripped.startswith('end'):
                         # Named end takes precedence
@@ -343,8 +372,7 @@ class GridLangCompiler:
                         except Exception:
                             parsed_var, parsed_type, parsed_constraints = None, None, {}
                         if parsed_var:
-                            var_list = (parsed_constraints or {}).get(
-                                'var_list') if parsed_constraints else None
+                            var_list = (parsed_constraints or {}).get('var_list') if parsed_constraints else None
                             names = var_list if var_list else [parsed_var]
                             inputs.extend(names)
                             for name in names:
@@ -369,8 +397,7 @@ class GridLangCompiler:
                     'code_lines': code_lines
                 }
                 if def_kind == 'privatehelper':
-                    type_name = func_name.split(
-                        '.')[0] if '.' in func_name else None
+                    type_name = func_name.split('.')[0] if '.' in func_name else None
                     if not type_name:
                         raise SyntaxError(
                             f"PrivateHelper '{func_name}' missing type prefix at line {line_number}")
@@ -437,8 +464,7 @@ class GridLangCompiler:
                 for idx, _vals in array_args:
                     dim_spec = None
                     if idx < len(input_defs):
-                        dim_spec = input_defs[idx].get(
-                            'constraints', {}).get('dim')
+                        dim_spec = input_defs[idx].get('constraints', {}).get('dim')
                     if isinstance(dim_spec, str) and dim_spec.replace(' ', '') == '{}':
                         continue
                     should_vectorize = True
@@ -449,9 +475,7 @@ class GridLangCompiler:
                         should_vectorize = False
                         array_args = []
                         lengths = set()
-                    if not should_vectorize:
-                        pass
-                    else:
+                    if should_vectorize:
                         count = lengths.pop() if lengths else 0
                         results = []
                         for i in range(count):
@@ -543,8 +567,7 @@ class GridLangCompiler:
                 normalized_outputs[k] = [v]
 
         def _pick_default():
-            target_names = func_def['outputs'] if func_def['outputs'] else [
-                'output']
+            target_names = func_def['outputs'] if func_def['outputs'] else ['output']
             for out_name in target_names:
                 if out_name in normalized_outputs:
                     return normalized_outputs[out_name]
@@ -611,8 +634,7 @@ class GridLangCompiler:
                 if isinstance(entry, dict):
                     normalized.append(entry)
                 else:
-                    normalized.append(
-                        {'name': entry, 'default': None, 'type': None})
+                    normalized.append({'name': entry, 'default': None, 'type': None})
             return normalized
 
         inputs_list = _normalize_inputs(inputs_list)
@@ -666,8 +688,7 @@ class GridLangCompiler:
                 value_dict.update(
                     {name: val for name, val in input_values.items() if name in public_fields})
                 if value_dict:
-                    immutable = value_dict.setdefault(
-                        '_immutable_fields', set())
+                    immutable = value_dict.setdefault('_immutable_fields', set())
                     immutable.update(n.lower() for n in value_dict.keys())
             return value_dict
 
@@ -680,8 +701,7 @@ class GridLangCompiler:
 
         value_dict = {}
         input_values = {}
-        target_names = [entry['name'] for entry in inputs_list] if inputs_list else list(
-            public_fields.keys())
+        target_names = [entry['name'] for entry in inputs_list] if inputs_list else list(public_fields.keys())
         for field_name, val in zip(target_names, args):
             if inputs_list:
                 input_values[field_name] = val
@@ -750,11 +770,37 @@ class GridLangCompiler:
                 return raw_value
         return raw_value
 
+    def _coerce_with_field_value(self, field_type, field_value, line_number=None):
+        """Coerce WITH-assigned values into declared custom field types when possible."""
+        if not isinstance(field_type, str):
+            return field_value
+        expected_type = field_type.lower()
+        if expected_type not in self.types_defined:
+            return field_value
+        if isinstance(field_value, (list, pa.Array)):
+            return self._convert_array_to_object(expected_type, field_value, line_number)
+        if isinstance(field_value, dict):
+            actual_type = field_value.get('_type_name')
+            if actual_type and self._is_type_compatible(actual_type, expected_type):
+                return field_value
+            public_fields = self._get_public_type_fields(expected_type)
+            if public_fields and object_public_keys(field_value) == set(public_fields.keys()):
+                coerced = dict(field_value)
+                coerced['_type_name'] = expected_type
+                hidden_fields = self.types_defined.get(expected_type, {}).get('_hidden_fields', set())
+                if hidden_fields and '_hidden_fields' not in coerced:
+                    coerced['_hidden_fields'] = set(hidden_fields)
+                coerced.setdefault('grid', {})
+                return coerced
+        return field_value
+
     def _apply_with_constraints(self, value, with_constraints, scope, line_number=None, type_name=None):
         """Apply WITH clause values to a newly created object."""
         if not with_constraints or not isinstance(value, dict):
             return value
         field_map = {}
+        public_fields = {}
+        assigned_fields = set()
         if type_name and type_name.lower() in self.types_defined:
             public_fields = self._get_public_type_fields(type_name)
             field_map = {k.lower(): k for k in public_fields}
@@ -762,17 +808,25 @@ class GridLangCompiler:
             field_map = {k.lower(): k for k in object_public_keys(value)}
         for key, raw_value in with_constraints.items():
             key_name = field_map.get(str(key).lower(), key)
-            value[key_name] = self._evaluate_with_value(
-                raw_value, scope, line_number)
+            coerced_value = self._evaluate_with_value(raw_value, scope, line_number)
+            declared_field_type = public_fields.get(key_name)
+            if declared_field_type:
+                coerced_value = self._coerce_with_field_value(
+                    declared_field_type, coerced_value, line_number)
+            value[key_name] = coerced_value
+            assigned_fields.add(str(key_name).lower())
             if type_name:
                 self._check_type_field_constraints(
-                    type_name, key_name, value[key_name], value, line_number)
+                    type_name, key_name, value[key_name], value, scope, line_number)
+        if assigned_fields:
+            immutable = value.setdefault('_immutable_fields', set())
+            immutable.update(assigned_fields)
         if type_name and type_name.lower() in self.types_defined:
             self._recompute_type_fields_after_with(
                 type_name, value, scope, line_number)
         return value
 
-    def _check_type_field_constraints(self, type_name, field_name, value, value_dict, line_number=None):
+    def _check_type_field_constraints(self, type_name, field_name, value, value_dict, scope, line_number=None):
         type_def = self.types_defined.get(type_name.lower())
         if not type_def or not isinstance(type_def, dict):
             return
@@ -788,6 +842,12 @@ class GridLangCompiler:
         if not constraints:
             return
         tmp_scope = Scope(self)
+        if hasattr(scope, 'get_full_scope'):
+            tmp_scope.variables.update(scope.get_full_scope())
+        elif isinstance(scope, dict):
+            tmp_scope.variables.update(scope)
+        if hasattr(self.current_scope(), 'get_full_scope'):
+            tmp_scope.variables.update(self.current_scope().get_full_scope())
         if isinstance(value_dict, dict):
             for k, v in value_dict.items():
                 if not str(k).startswith('_'):
@@ -807,8 +867,7 @@ class GridLangCompiler:
             for entry in (type_def.get('_inputs') or [])
             if isinstance(entry, dict)
         }
-        field_names = {k.lower()
-                       for k in self._get_public_type_fields(type_def)}
+        field_names = {k.lower() for k in self._get_public_type_fields(type_def)}
         eval_scope = {}
         if hasattr(self.current_scope(), 'get_full_scope'):
             eval_scope = self.current_scope().get_full_scope()
@@ -1101,8 +1160,7 @@ class GridLangCompiler:
                     defining = None
                 if defining:
                     try:
-                        defining.update(
-                            var_name, copy.deepcopy(val), line_number)
+                        defining.update(var_name, copy.deepcopy(val), line_number)
                     except Exception:
                         try:
                             defining.update(var_name, val, line_number)
@@ -1122,6 +1180,9 @@ class GridLangCompiler:
         assignment = self.pending_assignments[var]
         expr, assign_line, deps = assignment[:3]
         constraints = assignment[3] if len(assignment) > 3 else {}
+        cell_refs = self._extract_cell_refs(str(expr))
+        if cell_refs and not all(ref in self.grid for ref in cell_refs):
+            return False
         scope = target_scope if target_scope is not None else self.current_scope()
         unresolved = any(
             dep != var and self.has_unresolved_dependency(dep, scope=scope)
@@ -1165,15 +1226,22 @@ class GridLangCompiler:
                 f"Error resolving global dependency '{var}': {e} at line {assign_line}")
 
     def _resolve_pending_assignments(self):
+        self._resolve_pending_assignments_main_loop()
+        block_pending = self._resolve_block_pending_assignments()
+        if self.pending_assignments or block_pending:
+            unresolved = list(self.pending_assignments.keys()
+                              ) + list(block_pending.keys())
+            raise RuntimeError(f"Unresolved assignments: {unresolved}")
+
+    def _resolve_pending_assignments_main_loop(self):
         max_attempts = len(self.pending_assignments) + 10
         attempt = 0
         while self.pending_assignments and attempt < max_attempts:
             unresolved_before = set(self.pending_assignments.keys())
             for var, assignment in sorted(self.pending_assignments.items(), key=lambda x: (x[0].startswith('__line_'), int(x[0].replace('__line_', '') if x[0].startswith('__line_') else '0'))):
                 expr, line_number, deps = assignment[:3]
-                if var in deps and not var.startswith('__line_'):
-                    raise ValueError(
-                        f"Self-referential assignment '{var} = {expr}' at line {line_number}")
+                self._validate_pending_assignment_not_self_referential(
+                    var, expr, deps, line_number)
                 if var.startswith("__line_"):
                     target, rhs = expr.split(':=')
                     target, rhs = target.strip(), rhs.strip()
@@ -1239,8 +1307,7 @@ class GridLangCompiler:
                                     actual_key = defining_scope._get_case_insensitive_key(
                                         var, defining_scope.types)
                                     if actual_key:
-                                        type_name = defining_scope.types.get(
-                                            actual_key)
+                                        type_name = defining_scope.types.get(actual_key)
                                 value = self._apply_with_constraints(
                                     value, constraints.get('with', {}),
                                     scope.get_full_scope(), line_number,
@@ -1286,8 +1353,7 @@ class GridLangCompiler:
                                 actual_key = defining_scope._get_case_insensitive_key(
                                     target, defining_scope.types)
                                 if actual_key:
-                                    type_name = defining_scope.types.get(
-                                        actual_key)
+                                    type_name = defining_scope.types.get(actual_key)
                             value = self._apply_with_constraints(
                                 value, constraints.get('with', {}),
                                 scope.get_full_scope(), line_number,
@@ -1302,10 +1368,7 @@ class GridLangCompiler:
                             except ValueError as e:
                                 violations.append(var)
                                 self.grid.clear()
-                        if not violations:
-                            del self.pending_assignments[var]
-                        else:
-                            del self.pending_assignments[var]
+                        del self.pending_assignments[var]
                     except ValueError as e:
                         del self.pending_assignments[var]
                         self.grid.clear()
@@ -1325,6 +1388,12 @@ class GridLangCompiler:
                 break
             attempt += 1
 
+    def _validate_pending_assignment_not_self_referential(self, var, expr, deps, line_number):
+        if var in deps and not var.startswith('__line_'):
+            raise ValueError(
+                f"Self-referential assignment '{var} = {expr}' at line {line_number}")
+
+    def _resolve_block_pending_assignments(self):
         block_pending = {}
         for scope in self.scopes:
             if hasattr(scope, 'pending_assignments'):
@@ -1384,8 +1453,7 @@ class GridLangCompiler:
                             actual_key = defining_scope._get_case_insensitive_key(
                                 var, defining_scope.types)
                             if actual_key:
-                                type_name = defining_scope.types.get(
-                                    actual_key)
+                                type_name = defining_scope.types.get(actual_key)
                         value = self._apply_with_constraints(
                             value, constraints.get('with', {}),
                             scope.get_full_scope(), line_number,
@@ -1404,10 +1472,7 @@ class GridLangCompiler:
             except Exception as e:
                 raise RuntimeError(
                     f"Error resolving block assignment '{var}': {e} at line {line_number}")
-        if self.pending_assignments or block_pending:
-            unresolved = list(self.pending_assignments.keys()
-                              ) + list(block_pending.keys())
-            raise RuntimeError(f"Unresolved assignments: {unresolved}")
+        return block_pending
 
     def _parse_variable_def(self, def_str, line_number):
         """Delegate to parser."""
@@ -1424,7 +1489,7 @@ class GridLangCompiler:
         tokens = re.findall(r'[A-Za-z_][A-Za-z0-9_]*', cleaned)
         filtered = set()
         keyword_exclusions = {
-            'to', 'and', 'or', 'not', 'then', 'do', 'step', 'by', 'in'
+            'to', 'and', 'or', 'not', 'then', 'do', 'step', 'by', 'in', 'new'
         }
         for tok in tokens:
             if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', tok, re.I):
@@ -1597,8 +1662,7 @@ class GridLangCompiler:
                     try:
                         scope.variables[name] = value
                         scope.types[name] = seed_types.get(name)
-                        scope.constraints[name] = seed_constraints.get(
-                            name, {})
+                        scope.constraints[name] = seed_constraints.get(name, {})
                         scope.uninitialized.discard(name)
                     except Exception:
                         pass
@@ -1663,6 +1727,7 @@ class GridLangCompiler:
             line_number += 1
             s = line.rstrip()
 
+
             # Skip empty lines or full-line comments
             if not s or s.startswith("'"):
                 continue
@@ -1689,13 +1754,12 @@ class GridLangCompiler:
                 leading_ws, rest = init_match.groups()
                 s = f"{leading_ws}Let{rest}"
 
+            # Preserve WHEN blocks for runtime handling.
+
             # Normalize brackets like [ A 12 ] → [A12]
             s = re.sub(r'\[\s*([A-Z]+)\s+[A-Z]*(\d+)\s*\]', r'[\1\2]', s)
 
-            if in_multiline:
-                # Multiline string/push handling below.
-                pass
-            else:
+            if not in_multiline:
                 # Handle underscore line continuation (e.g., array literals)
                 if in_continuation:
                     s = f"{continuation_line} {s.lstrip()}".rstrip()
@@ -1719,28 +1783,55 @@ class GridLangCompiler:
                     type_parent = parsed_parent
                     type_constraints = parsed_constraints or {}
                     type_def_lines = []
+                    type_block_depth = 0
                     continue
                 # Other definitions (functions/subprocesses) are handled later
                 in_type_def = False
 
             # Handle lines inside a type definition block
             if in_type_def:
-                end_pattern = rf'^\s*end(\s+type|\s+{re.escape(type_name)})\s*$'
-                if re.match(end_pattern, s, re.I):
-                    in_type_def = False
-                    type_def = self._parse_type_def(
-                        type_def_lines, line_number)
-                    if type_parent:
-                        type_def['_parent'] = type_parent
-                    if type_constraints:
-                        type_def['_constraints'] = type_constraints
-                    self.types_defined[type_name.lower()] = type_def
-                    continue
+                stripped = s.strip()
+                stripped_lower = stripped.lower()
+                end_pattern = rf'^\s*end(\s+type|\s+{re.escape(type_name)})?\s*$'
+                if (re.match(r'^\s*(for|while|when)\b', stripped, re.I) and stripped_lower.endswith('do')) or (
+                    re.match(r'^\s*if\b', stripped, re.I) and stripped_lower.endswith('then')
+                ):
+                    type_block_depth += 1
+                if stripped_lower.startswith('end'):
+                    if re.match(end_pattern, s, re.I) and type_block_depth == 0:
+                        in_type_def = False
+                        type_def = self._parse_type_def(
+                            type_def_lines, line_number)
+                        if type_parent:
+                            type_def['_parent'] = type_parent
+                        if type_constraints:
+                            type_def['_constraints'] = type_constraints
+                        self.types_defined[type_name.lower()] = type_def
+                        continue
+                    if type_block_depth > 0:
+                        type_block_depth = max(0, type_block_depth - 1)
                 type_def_lines.append(s.lstrip())
                 continue
 
+            def _has_unclosed_interpolation(text):
+                start = text.find('$"')
+                if start == -1:
+                    return False
+                i = start + 2
+                while i < len(text):
+                    ch = text[i]
+                    if ch == '"' and (i == 0 or text[i - 1] != '\\'):
+                        return False
+                    i += 1
+                return True
+
+            # Handle multiline declarations (e.g., : template = $" ... multiline ... ")
+            if s.startswith(':') and _has_unclosed_interpolation(s):
+                current_line = s
+                in_multiline = True
+                continue
             # Handle multiline assignments (e.g., [^A1] := $" ... multiline ... ")
-            if ':=' in s and s.startswith('[') and '$"' in s and not s.endswith('"'):
+            if ':=' in s and s.startswith('[') and _has_unclosed_interpolation(s):
                 current_line = s
                 in_multiline = True
                 continue
@@ -1768,8 +1859,6 @@ class GridLangCompiler:
                     lines.append((current_line, line_number))
                     current_line = ""
                     in_multiline = False
-                else:
-                    pass
                 continue
 
             # Collect dim declarations separately
@@ -1811,6 +1900,40 @@ class GridLangCompiler:
         for line, line_number in dim_lines:
             self._collect_global_declarations(line, line_number)
 
+        for line, line_number in lines:
+            stripped = line.strip()
+            lowered = stripped.lower()
+            if not lowered.startswith('for '):
+                continue
+            if re.search(r'\bdo\b', lowered):
+                continue
+            if re.search(r'\bgrid\s+dim\b', lowered):
+                continue
+            var_match = re.match(r'^\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\b', stripped, re.I)
+            dim_match = re.search(r'\bdim\s+(\{[^}]+\})', stripped, re.I)
+            if not (var_match and dim_match):
+                continue
+            var = var_match.group(1)
+            dim_expr = dim_match.group(1).strip()
+            dim_parts = dim_expr[1:-1].split(',') if dim_expr.startswith('{') else [dim_expr]
+            dims = []
+            for part in dim_parts:
+                part = part.strip()
+                if not part:
+                    continue
+                if ':' in part:
+                    name, size = map(str.strip, part.split(':', 1))
+                    size_spec = self._parse_dim_size(size, line_number)
+                    dims.append((name, size_spec))
+                else:
+                    size_spec = self._parse_dim_size(part, line_number)
+                    dims.append((None, size_spec))
+            if dims:
+                self.dimensions.setdefault(var, dims)
+                self.dim_names.setdefault(
+                    var, {name: idx for idx, (name, _) in enumerate(dims) if name})
+                self.dim_labels.setdefault(var, {})
+
         # Track block depth to avoid treating nested ':' declarations as global
         depth = 0
         type_depth = 0
@@ -1820,7 +1943,8 @@ class GridLangCompiler:
             is_block_start = (
                 (stripped.startswith('if ') and stripped.endswith('then')) or
                 (stripped.startswith('for ') and stripped.endswith('do')) or
-                (stripped.startswith('while ') and stripped.endswith('do'))
+                (stripped.startswith('while ') and stripped.endswith('do')) or
+                (stripped.startswith('when ') and stripped.endswith('do'))
             )
             is_end = stripped == 'end'
 
@@ -1873,8 +1997,9 @@ class GridLangCompiler:
             default_value = expr
             var_names = constraints.pop('var_list', [var])
             for var_name in var_names:
-                effective_type = 'array' if constraints.get(
-                    'dim') else (type_name or None)
+                is_custom_type = type_name and type_name.lower() in self.types_defined
+                effective_type = type_name.lower(
+                ) if is_custom_type else ('array' if constraints.get('dim') else (type_name or None))
                 self.current_scope().define_input(
                     var_name, effective_type, default_value, line_number, constraints)
             return
@@ -1934,8 +2059,9 @@ class GridLangCompiler:
                 var = None
             if var and (type_name or constraints):
                 constraints = constraints or {}
-                effective_type = 'array' if constraints.get(
-                    'dim') else (type_name or 'unknown')
+                is_custom_type = type_name and type_name.lower() in self.types_defined
+                effective_type = type_name.lower(
+                ) if is_custom_type else ('array' if constraints.get('dim') else (type_name or 'unknown'))
                 self.current_scope().types.setdefault(var, effective_type)
                 if constraints.get('dim'):
                     dims = constraints['dim']
@@ -1961,122 +2087,23 @@ class GridLangCompiler:
                         else:
                             size = size_spec
                         shape.append(size)
-                    pa_type = pa.float64() if effective_type in (
-                        'number', 'array') else pa.string()
-                    value = self.array_handler.create_array(
-                        shape, 0 if effective_type in ('number', 'array') else '', pa_type, line_number)
-                    self.current_scope().define(
-                        var, value, effective_type, constraints, is_uninitialized=False, line_number=line_number)
+                    if is_custom_type:
+                        value = self.array_handler.create_object_array(
+                            shape, None, line_number)
+                        self.current_scope().define(
+                            var, value, type_name.lower(), constraints, is_uninitialized=False, line_number=line_number)
+                    else:
+                        pa_type = pa.float64() if effective_type in (
+                            'number', 'array') else pa.string()
+                        value = self.array_handler.create_array(
+                            shape, 0 if effective_type in ('number', 'array') else '', pa_type, line_number)
+                        self.current_scope().define(
+                            var, value, effective_type, constraints, is_uninitialized=False, line_number=line_number)
                 else:
                     self.current_scope().define(
                         var, None, effective_type, constraints, is_uninitialized=True, line_number=line_number)
                 return
-        m_new = re.match(
-            r'^([\w_]+)\s*=\s*new\s+(\w+)\s*(\{|\()(.*)$', a, re.I)
-        if m_new:
-            var, type_name, opener, remainder = m_new.groups()
-            if type_name.lower() not in self.types_defined:
-                raise SyntaxError(
-                    f"Type '{type_name}' not defined at line {line_number}")
-            pairs = {'{': '}', '(': ')'}
-            closer = pairs[opener]
-
-            # Locate the argument segment, honoring nested delimiters
-            start_pos = a.find(opener, m_new.start(3))
-            stack = [closer]
-            values_str = None
-            trailing = ""
-            for i, ch in enumerate(a[start_pos + 1:], start_pos + 1):
-                if ch in pairs:
-                    stack.append(pairs[ch])
-                elif stack and ch == stack[-1]:
-                    stack.pop()
-                    if not stack:
-                        values_str = a[start_pos + 1:i]
-                        trailing = a[i + 1:].strip()
-                        break
-                elif ch in pairs.values():
-                    raise SyntaxError(
-                        f"Mismatched delimiter in constructor at line {line_number}: {a}")
-
-            if values_str is None:
-                raise SyntaxError(
-                    f"Unclosed constructor for '{type_name}' at line {line_number}: {a}")
-            with_assignments = {}
-            if trailing:
-                if trailing.lower().startswith('with'):
-                    with_assignments = self._parse_with_clause(
-                        trailing, line_number=line_number)
-                else:
-                    raise SyntaxError(
-                        f"Unexpected characters after constructor at line {line_number}: {trailing}")
-
-            def _split_args(arg_text):
-                args = []
-                current = ""
-                nest_stack = []
-                for ch in arg_text + ',':
-                    if ch == ',' and not nest_stack:
-                        if current.strip():
-                            args.append(current.strip())
-                        current = ""
-                        continue
-                    current += ch
-                    if ch in pairs:
-                        nest_stack.append(pairs[ch])
-                    elif nest_stack and ch == nest_stack[-1]:
-                        nest_stack.pop()
-                    elif ch in pairs.values():
-                        raise SyntaxError(
-                            f"Mismatched delimiter in constructor arguments at line {line_number}: {a}")
-                if nest_stack:
-                    raise SyntaxError(
-                        f"Unbalanced constructor arguments at line {line_number}: {a}")
-                return [arg for arg in args if arg.strip()]
-
-            values = _split_args(values_str)
-            type_fields = self.types_defined[type_name.lower()]
-            actual_fields = self._get_public_type_fields(type_fields)
-            inputs_list = type_fields.get('_inputs', [])
-
-            expected_args = len(
-                inputs_list) if inputs_list else len(actual_fields)
-
-            if not values and values_str.strip() == '':
-                value_dict = self._instantiate_type(
-                    type_name, [], line_number, allow_default_if_empty=True, var_name=var)
-                if with_assignments:
-                    value_dict = self._apply_with_constraints(
-                        value_dict,
-                        with_assignments,
-                        self.current_scope().get_full_scope(),
-                        line_number,
-                        type_name=type_name)
-                self.current_scope().define(var, value_dict, type_name)
-            else:
-                all_literals = all(re.match(r'^-?\d*\.?\d+$|^\".*\"$', v)
-                                   for v in values)
-                evaluated_args = [self.expr_evaluator.eval_expr(
-                    value, self.current_scope().get_full_scope(), line_number) for value in values]
-                value_dict = self._instantiate_type(
-                    type_name, evaluated_args, line_number, allow_default_if_empty=False, var_name=var)
-                if with_assignments:
-                    value_dict = self._apply_with_constraints(
-                        value_dict,
-                        with_assignments,
-                        self.current_scope().get_full_scope(),
-                        line_number,
-                        type_name=type_name)
-                self.current_scope().define(var, value_dict, type_name)
-                if not all_literals:
-                    deps = self._extract_identifier_tokens(values_str)
-                    if var in deps:
-                        raise ValueError(
-                            f"Self-referential assignment '{var} = new {type_name}{{{values_str}}}' at line {line_number}")
-                    self.pending_assignments[var] = (
-                        f"new {type_name}{{{values_str}}}", line_number, deps)
-                # End constructor handling
-            # After processing a constructor-style declaration, we're done
+        if self._handle_constructor_global_declaration(a, line_number):
             return
 
         # Fallback: handle INIT-only declarations (no '=')
@@ -2098,120 +2125,213 @@ class GridLangCompiler:
             return
 
         if expr is not None:
-            var_def, expr = map(str.strip, (var_def, expr))
-            var, type_name, constraints, value = self._parse_variable_def(
-                var_def, line_number)
-            dim_spec = constraints.get('dim')
-            if dim_spec:
-                dims = dim_spec
-                if isinstance(dims, dict) and 'dims' in dims:
-                    dims = dims['dims']
-                if isinstance(dims, list):
-                    self.dimensions[var] = dims
-                    self.dim_names[var] = {
-                        name: idx for idx, (name, _) in enumerate(dims) if name}
-                    self.dim_labels[var] = {}
-            if value is not None:
-                constraints['constant'] = expr
-            elif expr:  # Store constraint expression even when value is None
-                constraints['constant'] = expr
-            self.current_scope().types.setdefault(var, type_name or 'unknown')
-
-            # Try to evaluate simple literals immediately
-            evaluated_value = None
-            is_uninitialized = True
-            if expr:
-                base_expr, with_text = self._split_new_with_expr(expr)
-                if with_text:
-                    with_assignments = self._parse_with_clause(
-                        with_text, line_number)
-                    deps = set()
-                    for value_expr in with_assignments.values():
-                        deps |= self._extract_identifier_tokens(value_expr)
-                else:
-                    # Extract dependencies, but exclude quoted strings and numeric literals
-                    deps = set()
-                    interpolation_only = False
-                    if expr.strip().startswith('$"') and expr.strip().endswith('"'):
-                        for match in re.finditer(r'\{([^{}]*)\}', expr):
-                            deps |= self._extract_identifier_tokens(
-                                match.group(1))
-                        interpolation_only = True
-                    if not interpolation_only:
-                        # Skip quoted strings when looking for dependencies
-                        expr_no_quotes = re.sub(r'"[^"]*"', '', expr)
-                        expr_no_quotes = re.sub(r"'[^']*'", '', expr_no_quotes)
-
-                        # Strip numeric literals (including scientific notation) before tokenizing
-                        expr_no_numbers = re.sub(
-                            r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?',
-                            ' ', expr_no_quotes, flags=re.I)
-                        # Strip cell references/ranges like [A1] or [A1:D1]
-                        expr_no_numbers = re.sub(
-                            r'\[[^\]]*\]', ' ', expr_no_numbers)
-                        # Find potential dependencies, but filter out numeric literals and built-in functions
-                        potential_deps = re.findall(
-                            r'\b[\w_]+\b', expr_no_numbers)
-                        built_in_functions = {
-                            'sum', 'rows', 'sqrt', 'min', 'max', 'abs', 'int', 'float', 'str', 'len',
-                            'to', 'step', 'by', 'mod', 'div', 'and', 'or', 'not', 'new'}
-                        known_funcs = set(
-                            getattr(self, 'functions', {}).keys())
-                        known_subs = set(
-                            getattr(self, 'subprocesses', {}).keys())
-                        known_types = set(
-                            getattr(self, 'types_defined', {}).keys())
-                        member_suffixes = {name.split(
-                            '.', 1)[1] for name in known_funcs if '.' in name}
-                        deps = set()
-                        for dep in potential_deps:
-                            # Skip if it's a numeric literal (including negative numbers)
-                            if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', dep, re.I) or re.match(r'^e[+-]?\d+$', dep, re.I):
-                                continue
-                            dep_lower = dep.lower()
-                            if dep_lower in built_in_functions:
-                                continue
-                            if dep_lower in known_funcs or dep_lower in known_subs or dep_lower in known_types:
-                                continue
-                            if dep_lower in member_suffixes:
-                                continue
-                            deps.add(dep)
-
-                if var in deps:
-                    raise ValueError(
-                        f"Self-referential assignment '{var} = {expr}' at line {line_number}")
-
-                # If no dependencies and it's a simple literal, evaluate immediately
-                is_simple_literal = (expr.startswith('"') and expr.endswith('"') or
-                                     expr.startswith("'") and expr.endswith("'") or
-                                     expr.replace('.', '').replace('-', '').isdigit() or
-                                     (expr.startswith('{') and expr.endswith('}') and
-                                     all(item.strip().replace('-', '').replace('.', '').isdigit()
-                                         for item in expr[1:-1].split(','))))
-                if not deps and is_simple_literal:
-                    try:
-                        evaluated_value = self.expr_evaluator.eval_expr(
-                            expr, self.current_scope().get_evaluation_scope(), line_number)
-                        if constraints.get('with'):
-                            evaluated_value = self._apply_with_constraints(
-                                evaluated_value,
-                                constraints.get('with', {}),
-                                self.current_scope().get_full_scope(),
-                                line_number,
-                                type_name=type_name)
-                        is_uninitialized = False
-                    except Exception as e:
-                        self.pending_assignments[var] = (
-                            expr, line_number, deps, constraints)
-                else:
-                    self.pending_assignments[var] = (
-                        expr, line_number, deps, constraints)
-
-            self.current_scope().define(var, evaluated_value, type_name or 'unknown',
-                                        constraints, is_uninitialized=is_uninitialized)
+            self._handle_global_assignment_expression(
+                var_def, expr, line_number)
             return
         raise SyntaxError(
             f"Invalid global definition syntax: {line} at line {line_number}")
+
+    def _handle_constructor_global_declaration(self, declaration, line_number=None):
+        m_new = re.match(
+            r'^([\w_]+)\s*=\s*new\s+(\w+)\s*(\{|\()(.*)$', declaration, re.I)
+        if not m_new:
+            return False
+        var, type_name, opener, _ = m_new.groups()
+        if type_name.lower() not in self.types_defined:
+            raise SyntaxError(
+                f"Type '{type_name}' not defined at line {line_number}")
+        pairs = {'{': '}', '(': ')'}
+        closer = pairs[opener]
+        start_pos = declaration.find(opener, m_new.start(3))
+        stack = [closer]
+        values_str = None
+        trailing = ""
+        for i, ch in enumerate(declaration[start_pos + 1:], start_pos + 1):
+            if ch in pairs:
+                stack.append(pairs[ch])
+            elif stack and ch == stack[-1]:
+                stack.pop()
+                if not stack:
+                    values_str = declaration[start_pos + 1:i]
+                    trailing = declaration[i + 1:].strip()
+                    break
+            elif ch in pairs.values():
+                raise SyntaxError(
+                    f"Mismatched delimiter in constructor at line {line_number}: {declaration}")
+        if values_str is None:
+            raise SyntaxError(
+                f"Unclosed constructor for '{type_name}' at line {line_number}: {declaration}")
+        with_assignments = {}
+        if trailing:
+            if trailing.lower().startswith('with'):
+                with_assignments = self._parse_with_clause(
+                    trailing, line_number=line_number)
+            else:
+                raise SyntaxError(
+                    f"Unexpected characters after constructor at line {line_number}: {trailing}")
+
+        def _split_args(arg_text):
+            args = []
+            current = ""
+            nest_stack = []
+            for ch in arg_text + ',':
+                if ch == ',' and not nest_stack:
+                    if current.strip():
+                        args.append(current.strip())
+                    current = ""
+                    continue
+                current += ch
+                if ch in pairs:
+                    nest_stack.append(pairs[ch])
+                elif nest_stack and ch == nest_stack[-1]:
+                    nest_stack.pop()
+                elif ch in pairs.values():
+                    raise SyntaxError(
+                        f"Mismatched delimiter in constructor arguments at line {line_number}: {declaration}")
+            if nest_stack:
+                raise SyntaxError(
+                    f"Unbalanced constructor arguments at line {line_number}: {declaration}")
+            return [arg for arg in args if arg.strip()]
+
+        values = _split_args(values_str)
+        type_fields = self.types_defined[type_name.lower()]
+        actual_fields = self._get_public_type_fields(type_fields)
+        inputs_list = type_fields.get('_inputs', [])
+        _ = len(inputs_list) if inputs_list else len(actual_fields)
+        if not values and values_str.strip() == '':
+            value_dict = self._instantiate_type(
+                type_name, [], line_number, allow_default_if_empty=True, var_name=var)
+            if with_assignments:
+                value_dict = self._apply_with_constraints(
+                    value_dict,
+                    with_assignments,
+                    self.current_scope().get_full_scope(),
+                    line_number,
+                    type_name=type_name)
+            self.current_scope().define(var, value_dict, type_name)
+            return True
+        all_literals = all(re.match(r'^-?\d*\.?\d+$|^\".*\"$', v)
+                           for v in values)
+        evaluated_args = [self.expr_evaluator.eval_expr(
+            value, self.current_scope().get_full_scope(), line_number) for value in values]
+        value_dict = self._instantiate_type(
+            type_name, evaluated_args, line_number, allow_default_if_empty=False, var_name=var)
+        if with_assignments:
+            value_dict = self._apply_with_constraints(
+                value_dict,
+                with_assignments,
+                self.current_scope().get_full_scope(),
+                line_number,
+                type_name=type_name)
+        self.current_scope().define(var, value_dict, type_name)
+        if not all_literals:
+            deps = self._extract_identifier_tokens(values_str)
+            if var in deps:
+                raise ValueError(
+                    f"Self-referential assignment '{var} = new {type_name}{{{values_str}}}' at line {line_number}")
+            self.pending_assignments[var] = (
+                f"new {type_name}{{{values_str}}}", line_number, deps)
+        return True
+
+    def _handle_global_assignment_expression(self, var_def, expr, line_number=None):
+        var_def, expr = map(str.strip, (var_def, expr))
+        var, type_name, constraints, value = self._parse_variable_def(
+            var_def, line_number)
+        dim_spec = constraints.get('dim')
+        if dim_spec:
+            dims = dim_spec
+            if isinstance(dims, dict) and 'dims' in dims:
+                dims = dims['dims']
+            if isinstance(dims, list):
+                self.dimensions[var] = dims
+                self.dim_names[var] = {
+                    name: idx for idx, (name, _) in enumerate(dims) if name}
+                self.dim_labels[var] = {}
+        if value is not None:
+            constraints['constant'] = expr
+        elif expr:
+            constraints['constant'] = expr
+        self.current_scope().types.setdefault(var, type_name or 'unknown')
+        evaluated_value = None
+        is_uninitialized = True
+        if expr:
+            base_expr, with_text = self._split_new_with_expr(expr)
+            if with_text:
+                with_assignments = self._parse_with_clause(with_text, line_number)
+                deps = set()
+                for value_expr in with_assignments.values():
+                    deps |= self._extract_identifier_tokens(value_expr)
+            else:
+                deps = set()
+                interpolation_only = False
+                if expr.strip().startswith('$"') and expr.strip().endswith('"'):
+                    for match in re.finditer(r'(?<!\{)\{(?![\{\*])([^{}]*)\}', expr):
+                        deps |= self._extract_identifier_tokens(match.group(1))
+                    interpolation_only = True
+                if not interpolation_only:
+                    expr_no_quotes = re.sub(r'"[^"]*"', '', expr)
+                    expr_no_quotes = re.sub(r"'[^']*'", '', expr_no_quotes)
+                    expr_no_numbers = re.sub(
+                        r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?',
+                        ' ', expr_no_quotes, flags=re.I)
+                    expr_no_numbers = re.sub(r'\[[^\]]*\]', ' ', expr_no_numbers)
+                    potential_deps = re.findall(r'\b[\w_]+\b', expr_no_numbers)
+                    built_in_functions = {
+                        'sum', 'rows', 'sqrt', 'min', 'max', 'abs', 'int', 'float', 'str', 'len',
+                        'to', 'step', 'by', 'mod', 'div', 'and', 'or', 'not', 'new'}
+                    known_funcs = set(getattr(self, 'functions', {}).keys())
+                    known_subs = set(getattr(self, 'subprocesses', {}).keys())
+                    known_types = set(getattr(self, 'types_defined', {}).keys())
+                    member_suffixes = {name.split('.', 1)[1]
+                                       for name in known_funcs if '.' in name}
+                    deps = set()
+                    for dep in potential_deps:
+                        if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', dep, re.I) or re.match(r'^e[+-]?\d+$', dep, re.I):
+                            continue
+                        dep_lower = dep.lower()
+                        if dep_lower in built_in_functions:
+                            continue
+                        if dep_lower in known_funcs or dep_lower in known_subs or dep_lower in known_types:
+                            continue
+                        if dep_lower in member_suffixes:
+                            continue
+                        deps.add(dep)
+            if var in deps:
+                raise ValueError(
+                    f"Self-referential assignment '{var} = {expr}' at line {line_number}")
+            is_simple_literal = (
+                expr.startswith('"') and expr.endswith('"') or
+                expr.startswith("'") and expr.endswith("'") or
+                expr.replace('.', '').replace('-', '').isdigit() or
+                (expr.startswith('{') and expr.endswith('}') and
+                 all(
+                     (item.strip().replace('-', '').replace('.', '').isdigit() or
+                      (item.strip().startswith('"') and item.strip().endswith('"')) or
+                      (item.strip().startswith("'") and item.strip().endswith("'")))
+                     for item in expr[1:-1].split(',')
+                     if item.strip()
+                 ))
+            )
+            if not deps and is_simple_literal:
+                try:
+                    evaluated_value = self.expr_evaluator.eval_expr(
+                        expr, self.current_scope().get_evaluation_scope(), line_number)
+                    if constraints.get('with'):
+                        evaluated_value = self._apply_with_constraints(
+                            evaluated_value,
+                            constraints.get('with', {}),
+                            self.current_scope().get_full_scope(),
+                            line_number,
+                            type_name=type_name)
+                    is_uninitialized = False
+                except Exception as e:
+                    self.pending_assignments[var] = (
+                        expr, line_number, deps, constraints)
+            else:
+                self.pending_assignments[var] = (
+                    expr, line_number, deps, constraints)
+        self.current_scope().define(var, evaluated_value, type_name or 'unknown',
+                                    constraints, is_uninitialized=is_uninitialized)
 
     def _parse_dim_size(self, size_str, line_number=None):
         """Delegate to parser."""
@@ -2229,7 +2349,10 @@ class GridLangCompiler:
                 raise SyntaxError(
                     f"Dimension '{dim_name}' not found in variable '{var_name}' at line {line_number}")
             dim_idx = self.dim_names[var_name][dim_name]
-            array = self.current_scope().get(var_name)
+            try:
+                array = self.current_scope().get(var_name)
+            except Exception:
+                array = None
             expected_size = None
             if array is not None:
                 shape = self.array_handler.get_array_shape(array, line_number)
@@ -2308,10 +2431,10 @@ class GridLangCompiler:
 
     def _process_cell_binding_declaration(self, line, line_number=None):
         """Process lines like [A1]: width as number to bind variables to cells."""
-        m = re.match(r'^\[\s*\^?([A-Za-z]+\d+)\s*\]\s*:\s*(.+)$', line, re.I)
+        m = re.match(r'^\[\s*(\^?)([A-Za-z]+\d+)\s*\]\s*:\s*(.+)$', line, re.I)
         if not m:
             return False
-        cell_ref, rhs = m.groups()
+        caret_flag, cell_ref, rhs = m.groups()
         cell_ref = cell_ref.upper()
         rhs = rhs.strip()
         validate_cell_ref(cell_ref)
@@ -2343,16 +2466,26 @@ class GridLangCompiler:
                 defining_scope.types[type_key] = type_name
 
         # Prevent conflicting mappings.
-        existing = self._cell_var_map.get(cell_ref)
-        if existing and existing.lower() != var.lower():
-            raise SyntaxError(
-                f"Cell '{cell_ref}' already mapped to '{existing}' at line {line_number}")
-        for mapped_cell, mapped_var in self._cell_var_map.items():
-            if mapped_var.lower() == var.lower() and mapped_cell != cell_ref:
+        if caret_flag:
+            existing = self._cell_array_map.get(cell_ref)
+            if existing and existing.lower() != var.lower():
                 raise SyntaxError(
-                    f"Variable '{var}' already mapped to cell '{mapped_cell}' at line {line_number}")
-
-        self._cell_var_map[cell_ref] = var
+                    f"Cell '{cell_ref}' already mapped to '{existing}' at line {line_number}")
+            for mapped_cell, mapped_var in self._cell_array_map.items():
+                if mapped_var.lower() == var.lower() and mapped_cell != cell_ref:
+                    raise SyntaxError(
+                        f"Variable '{var}' already mapped to cell '{mapped_cell}' at line {line_number}")
+            self._cell_array_map[cell_ref] = var
+        else:
+            existing = self._cell_var_map.get(cell_ref)
+            if existing and existing.lower() != var.lower():
+                raise SyntaxError(
+                    f"Cell '{cell_ref}' already mapped to '{existing}' at line {line_number}")
+            for mapped_cell, mapped_var in self._cell_var_map.items():
+                if mapped_var.lower() == var.lower() and mapped_cell != cell_ref:
+                    raise SyntaxError(
+                        f"Variable '{var}' already mapped to cell '{mapped_cell}' at line {line_number}")
+            self._cell_var_map[cell_ref] = var
 
         # If the variable already has a value, reflect it in the grid immediately.
         try:
@@ -2408,6 +2541,71 @@ class GridLangCompiler:
             return output_str
         return output_str[:max_length-3] + "..."
 
+    def _debug_export_value(self, value):
+        """Format runtime values for debug CSV output."""
+        if isinstance(value, pa.Array):
+            value = value.to_pylist()
+        if isinstance(value, dict):
+            value = public_object_view(value)
+        elif isinstance(value, list):
+            normalized = []
+            for item in value:
+                if isinstance(item, dict):
+                    normalized.append(public_object_view(item))
+                elif isinstance(item, pa.Array):
+                    normalized.append(item.to_pylist())
+                else:
+                    normalized.append(item)
+            value = normalized
+        return format_display_value(value)
+
+    def _iter_debug_output_rows(self):
+        """Yield pushed output values as a single-column fallback export."""
+        output_values = getattr(self, 'output_values', {}) or {}
+        for _, values in output_values.items():
+            if values is None:
+                continue
+            if not isinstance(values, list):
+                values = [values]
+            for value in values:
+                yield [self._debug_export_value(value)]
+
+    def _build_debug_grid_rows(self):
+        """Return the populated grid laid out as a CSV matrix."""
+        cell_values = {}
+        max_row = 0
+        max_col = 0
+        for cell, value in (self.grid or {}).items():
+            cell_text = str(cell).upper()
+            try:
+                column_text, row_text = split_cell(cell_text)
+            except Exception:
+                continue
+            row_num = int(row_text)
+            col_num = col_to_num(column_text)
+            max_row = max(max_row, row_num)
+            max_col = max(max_col, col_num)
+            cell_values[(row_num, col_num)] = self._debug_export_value(value)
+
+        rows = []
+        for row_num in range(1, max_row + 1):
+            row_values = []
+            for col_num in range(1, max_col + 1):
+                row_values.append(cell_values.get((row_num, col_num), ''))
+            rows.append(row_values)
+        return rows
+
+    def export_to_csv(self, grid_file):
+        """Export the grid as a CSV matrix, or outputs as a single column if no grid exists."""
+        output_path = os.path.splitext(os.path.abspath(grid_file))[0] + '.csv'
+        rows = self._build_debug_grid_rows()
+        if not rows:
+            rows = list(self._iter_debug_output_rows() or [])
+        with open(output_path, 'w', newline='', encoding='utf-8') as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerows(rows)
+        return output_path
+
     def _is_keyword(self, line, keyword):
         """Case-insensitive keyword check"""
         return line.strip().lower() == keyword.lower()
@@ -2441,10 +2639,8 @@ class GridLangCompiler:
                 constraints = global_scope.constraints.get(actual_key, {})
                 comparison_keys = ('<', '<=', '>', '>=', '<>')
                 type_union = constraints.get('type_union')
-                union_allows_text = isinstance(
-                    type_union, (list, tuple, set)) and 'text' in type_union
-                union_allows_number = isinstance(
-                    type_union, (list, tuple, set)) and 'number' in type_union
+                union_allows_text = isinstance(type_union, (list, tuple, set)) and 'text' in type_union
+                union_allows_number = isinstance(type_union, (list, tuple, set)) and 'number' in type_union
                 union_number_only = union_allows_number and not union_allows_text
                 needs_number = union_number_only or (var_type == 'number' and not union_allows_text) or any(
                     key in constraints for key in comparison_keys + ('range',)) or any(
@@ -2497,8 +2693,6 @@ class GridLangCompiler:
                     except RuntimeError as exc:
                         print(f"Warning: {exc}")
                         break
-                else:
-                    pass
 
             actual_key = global_scope._get_case_insensitive_key(
                 input_var, global_scope.variables) or input_var
@@ -2522,10 +2716,8 @@ class GridLangCompiler:
         constraints = global_scope.constraints.get(actual_key, {})
         comparison_keys = ('<', '<=', '>', '>=', '<>')
         type_union = constraints.get('type_union')
-        union_allows_text = isinstance(
-            type_union, (list, tuple, set)) and 'text' in type_union
-        union_allows_number = isinstance(
-            type_union, (list, tuple, set)) and 'number' in type_union
+        union_allows_text = isinstance(type_union, (list, tuple, set)) and 'text' in type_union
+        union_allows_number = isinstance(type_union, (list, tuple, set)) and 'number' in type_union
         union_number_only = union_allows_number and not union_allows_text
         needs_number = union_number_only or (var_type == 'number' and not union_allows_text) or any(
             key in constraints for key in comparison_keys + ('range',)) or any(
@@ -2577,8 +2769,7 @@ class GridLangCompiler:
                 if union_allows_text and union_allows_number:
                     display_type = 'text or number'
                 else:
-                    display_type = 'number' if needs_number else (
-                        var_type or 'value')
+                    display_type = 'number' if needs_number else (var_type or 'value')
                 print(f"Invalid input. Please enter a valid {display_type}.")
             except KeyboardInterrupt:
                 print("\nExiting...")

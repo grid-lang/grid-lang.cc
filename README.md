@@ -98,7 +98,7 @@ grid --help
 This should display:
 
 ```
-Usage: grid <filename.grid> [--debug]
+Usage: grid <filename.grid> [arg1] [arg2] ... [--debug]
 ```
 
 If you see a `command not found` error, add the Python `Scripts` directory to your PATH:
@@ -122,11 +122,10 @@ dist\grid\grid.exe example.grid
 
 ## Usage
 
-The `grid` command processes `.grid` files using the `GridLangCompiler`. It supports two primary modes:
+The `grid` command processes `.grid` files using the `GridLangCompiler`. It supports these primary modes:
 
 - **Run a `.grid` program**: Processes the input file, accepts positional program arguments, and prints results.
-- **Debug mode**: Adds `--debug` to also export the computed values (variables and grid cells) to a CSV file via `export_to_csv`.
-- **Test mode**: When not providing a `.grid` file as the first argument (or when using flags), test utilities run via `GridLangTestRunner`.
+- **Debug mode**: Adds `--debug` to export the populated grid as an actual CSV matrix named after the `.grid` file. If the program does not write any grid cells, the CSV falls back to pushed outputs in a single column.
 
 ### Example Commands
 

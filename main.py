@@ -3,26 +3,52 @@ import sys
 from compiler import GridLangCompiler
 
 
-def run_grid_program(args):
-    """Run a Grid program with command line arguments"""
-    if len(args) < 1 or args[0] in ("-h", "--help"):
-        print("Usage: grid <grid_file> [arg1] [arg2] ...")
-        return
+def _parse_cli_args(args):
+    """Parse runner flags while preserving positional program arguments."""
+    debug_enabled = False
+    program_args = []
+    passthrough_args = False
+
+    if args and args[0] in ("-h", "--help"):
+        return None, [], False, True
+    if not args:
+        return None, [], False, False
 
     grid_file = args[0]
-    program_args = args[1:]  # Command line arguments for the program
+    for arg in args[1:]:
+        if passthrough_args:
+            program_args.append(arg)
+        elif arg == "--":
+            passthrough_args = True
+        elif arg == "--debug":
+            debug_enabled = True
+        else:
+            program_args.append(arg)
+    return grid_file, program_args, debug_enabled, False
+
+
+def run_grid_program(args):
+    """Run a Grid program with command line arguments"""
+    grid_file, program_args, debug_enabled, show_help = _parse_cli_args(args)
+    if show_help:
+        print("Usage: grid <grid_file> [arg1] [arg2] ... [--debug]")
+        return
+    if not grid_file:
+        print("Usage: grid <grid_file> [arg1] [arg2] ... [--debug]")
+        return
 
     try:
         with open(grid_file, 'r') as file:
             code = file.read()
 
-
         compiler = GridLangCompiler()
         # Prompt for missing inputs when no CLI arguments are provided and stdin is interactive
         compiler.prompt_missing_inputs = (
             len(program_args) == 0 and sys.stdin.isatty())
-        result = compiler.run(code, program_args)
-
+        compiler.run(code, program_args)
+        if debug_enabled:
+            csv_path = compiler.export_to_csv(grid_file)
+            print(f"Debug CSV written to {csv_path}")
 
     except FileNotFoundError:
         print(f"Error: Grid file '{grid_file}' not found")

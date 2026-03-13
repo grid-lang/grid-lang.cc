@@ -7,8 +7,14 @@ import re
 import math
 import random
 import pyarrow as pa
-# Utility for validating cell references
-from utils import validate_cell_ref, col_to_num, num_to_col, object_public_keys
+from utils import (
+    validate_cell_ref,
+    col_to_num,
+    num_to_col,
+    object_public_keys,
+    get_case_insensitive_key,
+)
+
 
 
 class CaseInsensitiveDict(dict):
@@ -84,82 +90,10 @@ class ExpressionEvaluator:
         if binary_op_match and not is_grid_dim:
             return self.eval_expr(expr, scope, line_number)
 
-        # Handle grid indexing (e.g., var.grid{1,2})
-        if is_grid_dim and re.match(r'^([\w_]+)\.grid\{([\d,\s]+)\}$', expr, re.I):
-            var_name, indices_str = re.match(
-                r'^([\w_]+)\.grid\{([\d,\s]+)\}$', expr, re.I).groups()
-            indices = [int(i.strip()) for i in indices_str.split(',')]
-            if isinstance(scope, dict):
-                scope_lookup = scope
-            elif hasattr(scope, 'get_evaluation_scope'):
-                scope_lookup = scope.get_evaluation_scope()
-            elif hasattr(scope, 'get_full_scope'):
-                scope_lookup = scope.get_full_scope()
-            else:
-                scope_lookup = {}
-            tensor = scope_lookup.get(var_name)
-            if tensor is None:
-                tensor = scope_lookup.get(
-                    var_name.lower(), scope_lookup.get(var_name.upper()))
-            if tensor is None and hasattr(self.compiler, 'current_scope'):
-                try:
-                    tensor = self.compiler.current_scope().get(var_name)
-                except Exception:
-                    tensor = None
-            if tensor is not None:
-                if isinstance(tensor, dict) and 'grid' in tensor and 'original_shape' in tensor:
-                    array = tensor['grid']
-                    original_shape = tensor['original_shape']
-
-                    # Convert 1-based indices to 0-based indices
-                    adjusted_indices = [idx - 1 for idx in indices]
-
-                    try:
-                        result = self.compiler.array_handler.get_array_element(
-                            array, adjusted_indices, line_number, original_shape=original_shape)
-                        return result
-                    except (IndexError, ValueError) as e:
-                        raise IndexError(
-                            f"Invalid indices {indices_str} for '{var_name}.grid': {e} at line {line_number}")
-                raise TypeError(
-                    f"Variable '{var_name}' does not have a 'grid' or 'original_shape' field at line {line_number}")
-
-        # Handle field access (e.g., var.field)
-        if is_grid_dim and re.match(r'^[\w_]+\.\w+$', expr):
-            var, field = expr.split('.')
-            if isinstance(scope, dict):
-                scope_lookup = scope
-            elif hasattr(scope, 'get_evaluation_scope'):
-                scope_lookup = scope.get_evaluation_scope()
-            elif hasattr(scope, 'get_full_scope'):
-                scope_lookup = scope.get_full_scope()
-            else:
-                scope_lookup = {}
-            if f"{var}.{field}" in scope_lookup:
-                return scope_lookup[f"{var}.{field}"]
-            tensor = scope_lookup.get(var)
-            if tensor is None:
-                tensor = scope_lookup.get(
-                    var.lower(), scope_lookup.get(var.upper()))
-            if tensor is None and hasattr(self.compiler, 'current_scope'):
-                try:
-                    tensor = self.compiler.current_scope().get(var)
-                except Exception:
-                    tensor = None
-            if tensor is not None:
-                if isinstance(tensor, dict) and field in tensor:
-                    return tensor[field]
-                if isinstance(tensor, pa.ListArray):
-                    shape = self.compiler.array_handler.get_array_shape(
-                        tensor, line_number)
-                    zero_indices = [1] * len(shape)
-                    first_element = self.compiler.array_handler.get_array_element(
-                        tensor, zero_indices, line_number, return_struct=True)
-                    if isinstance(first_element, dict) and field in first_element:
-                        return first_element[field]
-
-                raise NameError(
-                    f"Cannot access field '{field}' of '{var}' at line {line_number}")
+        handled, value = self._try_eval_grid_dim_special_access(
+            expr, scope, line_number, is_grid_dim)
+        if handled:
+            return value
 
         # Handle dimension constraints (e.g., expr dim {dims})
         if 'dim' in expr.lower() and not is_grid_dim:
@@ -235,55 +169,141 @@ class ExpressionEvaluator:
         if expr in scope:
             return scope[expr]
 
-        # Handle member calls on arrays (e.g., hand1.Name())
         if not is_grid_dim:
-            m_member_array = re.match(r'^([\w_]+)\.([\w_]+)\((.*)\)$', expr)
-            if m_member_array:
-                obj_name, method_name, args_part = m_member_array.groups()
-                obj_value = None
-                try:
-                    obj_value = scope.get(obj_name)
-                except Exception:
-                    try:
-                        obj_value = self.compiler.current_scope().get(obj_name)
-                    except Exception:
-                        obj_value = None
-                if isinstance(obj_value, (list, tuple, pa.Array)):
-                    if isinstance(obj_value, pa.Array):
-                        obj_list = obj_value.to_pylist()
-                    else:
-                        obj_list = list(obj_value)
-                    args_list = []
-                    if args_part.strip():
-                        args_list = [a.strip()
-                                     for a in re.split(r',(?![^{]*})', args_part) if a.strip()]
-                    evaluated_args = [self.eval_or_eval_array(
-                        a, scope, line_number) for a in args_list]
-                    results = []
-                    for elem in obj_list:
-                        if not isinstance(elem, dict):
-                            continue
-                        element_type = elem.get('_type_name')
-                        if not element_type:
-                            for t_name, t_def in getattr(self.compiler, 'types_defined', {}).items():
-                                public_fields = self.compiler._get_public_type_fields(
-                                    t_def)
-                                if public_fields and object_public_keys(elem) == set(public_fields.keys()):
-                                    element_type = t_name
-                                    break
-                        if not element_type:
-                            continue
-                        func_key = self.compiler._resolve_member_function(
-                            element_type, method_name)
-                        if func_key and func_key in getattr(self.compiler, 'functions', {}):
-                            results.append(self.compiler.call_function(
-                                func_key, [elem] + evaluated_args, instance_type=element_type))
-                    if results:
-                        return results
-
+            handled, value = self._try_eval_member_array_call(
+                expr, scope, line_number)
+            if handled:
+                return value
             return self.eval_expr(expr, scope, line_number)
 
         raise NameError(f"Name '{expr}' not defined at line {line_number}")
+
+    def _get_scope_lookup(self, scope):
+        if isinstance(scope, dict):
+            return scope
+        if hasattr(scope, 'get_evaluation_scope'):
+            return scope.get_evaluation_scope()
+        if hasattr(scope, 'get_full_scope'):
+            return scope.get_full_scope()
+        return {}
+
+    def _get_scope_value_case_insensitive(self, scope_lookup, var_name):
+        tensor = scope_lookup.get(var_name)
+        if tensor is None:
+            tensor = scope_lookup.get(
+                var_name.lower(), scope_lookup.get(var_name.upper()))
+        if tensor is None and hasattr(self.compiler, 'current_scope'):
+            try:
+                tensor = self.compiler.current_scope().get(var_name)
+            except Exception:
+                tensor = None
+        return tensor
+
+    def _try_eval_grid_dim_special_access(self, expr, scope, line_number, is_grid_dim):
+        if not is_grid_dim:
+            return False, None
+        grid_match = re.match(r'^([\w_]+)\.grid\{([\d,\s]+)\}$', expr, re.I)
+        if grid_match:
+            var_name, indices_str = grid_match.groups()
+            indices = [int(i.strip()) for i in indices_str.split(',')]
+            scope_lookup = self._get_scope_lookup(scope)
+            tensor = self._get_scope_value_case_insensitive(scope_lookup, var_name)
+            if tensor is None:
+                return False, None
+            if isinstance(tensor, dict) and 'grid' in tensor and 'original_shape' in tensor:
+                array = tensor['grid']
+                original_shape = tensor['original_shape']
+                adjusted_indices = [idx - 1 for idx in indices]
+                try:
+                    result = self.compiler.array_handler.get_array_element(
+                        array, adjusted_indices, line_number, original_shape=original_shape)
+                    return True, result
+                except (IndexError, ValueError) as e:
+                    raise IndexError(
+                        f"Invalid indices {indices_str} for '{var_name}.grid': {e} at line {line_number}")
+            raise TypeError(
+                f"Variable '{var_name}' does not have a 'grid' or 'original_shape' field at line {line_number}")
+        field_match = re.match(r'^([\w_]+)\.(\w+)$', expr)
+        if not field_match:
+            return False, None
+        var, field = field_match.groups()
+        scope_lookup = self._get_scope_lookup(scope)
+        dotted_key = get_case_insensitive_key(scope_lookup, f"{var}.{field}")
+        if dotted_key:
+            return True, scope_lookup[dotted_key]
+        var_key = get_case_insensitive_key(scope_lookup, var)
+        tensor = scope_lookup.get(var_key) if var_key else None
+        if tensor is None:
+            tensor = self._get_scope_value_case_insensitive(scope_lookup, var)
+        if tensor is None:
+            return False, None
+        if isinstance(tensor, dict):
+            actual_field = get_case_insensitive_key(tensor, field) or field
+            if actual_field in tensor:
+                if (hasattr(self.compiler, '_is_hidden_field') and
+                        self.compiler._is_hidden_field(tensor, actual_field) and
+                        not getattr(self.compiler, '_allow_hidden_field_access', False)):
+                    raise PermissionError(
+                        f"Hidden field '{field}' is not accessible at line {line_number}")
+                return True, tensor[actual_field]
+        if isinstance(tensor, pa.ListArray):
+            shape = self.compiler.array_handler.get_array_shape(
+                tensor, line_number)
+            zero_indices = [1] * len(shape)
+            first_element = self.compiler.array_handler.get_array_element(
+                tensor, zero_indices, line_number, return_struct=True)
+            if isinstance(first_element, dict):
+                actual_field = get_case_insensitive_key(
+                    first_element, field) or field
+                if actual_field in first_element:
+                    return True, first_element[actual_field]
+        raise NameError(
+            f"Cannot access field '{field}' of '{var}' at line {line_number}")
+
+    def _try_eval_member_array_call(self, expr, scope, line_number):
+        m_member_array = re.match(r'^([\w_]+)\.([\w_]+)\((.*)\)$', expr)
+        if not m_member_array:
+            return False, None
+        obj_name, method_name, args_part = m_member_array.groups()
+        obj_value = None
+        try:
+            obj_value = scope.get(obj_name)
+        except Exception:
+            try:
+                obj_value = self.compiler.current_scope().get(obj_name)
+            except Exception:
+                obj_value = None
+        if not isinstance(obj_value, (list, tuple, pa.Array)):
+            return False, None
+        obj_list = obj_value.to_pylist() if isinstance(
+            obj_value, pa.Array) else list(obj_value)
+        args_list = []
+        if args_part.strip():
+            args_list = [a.strip()
+                         for a in re.split(r',(?![^{]*})', args_part) if a.strip()]
+        evaluated_args = [self.eval_or_eval_array(
+            a, scope, line_number) for a in args_list]
+        results = []
+        for elem in obj_list:
+            if not isinstance(elem, dict):
+                continue
+            element_type = elem.get('_type_name')
+            if not element_type:
+                for t_name, t_def in getattr(self.compiler, 'types_defined', {}).items():
+                    public_fields = self.compiler._get_public_type_fields(t_def)
+                    if public_fields and object_public_keys(elem) == set(public_fields.keys()):
+                        element_type = t_name
+                        break
+            if not element_type:
+                continue
+            func_key = self.compiler._resolve_member_function(
+                element_type, method_name)
+            if func_key and func_key in getattr(self.compiler, 'functions', {}):
+                results.append(self.compiler.call_function(
+                    func_key, [elem] + evaluated_args, instance_type=element_type))
+        if results:
+            return True, results
+        return False, None
 
     def _parse_dim_size(self, size_str, line_number=None):
         """
@@ -380,8 +400,7 @@ class ExpressionEvaluator:
         full_scope = {**scope, **cell_vars}
 
         # Final safety net for member calls on arrays before eval()
-        m_member_array_fallback = re.match(
-            r'^([\w_]+)\.([\w_]+)\((.*)\)$', expr)
+        m_member_array_fallback = re.match(r'^([\w_]+)\.([\w_]+)\((.*)\)$', expr)
         if m_member_array_fallback:
             obj_name, method_name, args_part = m_member_array_fallback.groups()
             obj_value = full_scope.get(obj_name)
@@ -397,8 +416,7 @@ class ExpressionEvaluator:
                         if element_type:
                             break
                 if element_type:
-                    func_key = self.compiler._resolve_member_function(
-                        element_type, method_name)
+                    func_key = self.compiler._resolve_member_function(element_type, method_name)
                     if func_key and func_key in getattr(self.compiler, 'functions', {}):
                         args_list = []
                         if args_part.strip():
@@ -650,6 +668,1118 @@ class ExpressionEvaluator:
             return None
         return base_name, index_expr, method_name, args_part
 
+    def _replace_grid_indexing(self, expr, scope, line_number):
+        # Handle grid indexing without variable prefix (e.g., grid{a, b}) first
+        # This must happen before array access processing to avoid confusion
+        if 'grid{' not in expr:
+            return expr
+        grid_pattern = re.compile(r'grid\{([^}]+)\}')
+        grid_matches = grid_pattern.findall(expr)
+        for indices_str in grid_matches:
+            try:
+                # Parse indices (e.g., "a-1, b-1" -> [a-1, b-1])
+                indices = []
+                for index_expr in indices_str.split(','):
+                    index_expr = index_expr.strip()
+                    try:
+                        # Evaluate the index expression (e.g., "a-1")
+                        index_value = self.eval_expr(
+                            index_expr, scope, line_number)
+                        indices.append(index_value)
+                    except Exception as e:
+                        raise SyntaxError(
+                            f"Invalid index expression '{index_expr}' in grid{{...}}: {e} at line {line_number}")
+
+                # Look for grid in the scope
+                if 'grid' in scope:
+                    grid = scope['grid']
+                    if isinstance(grid, dict):
+                        # Convert tuple indices to the format used in the grid
+                        if len(indices) == 2:
+                            key = (int(indices[0]), int(indices[1]))
+                            if key in grid:
+                                value = grid[key]
+                            else:
+                                # Return 0 for undefined grid positions
+                                value = 0
+                        else:
+                            raise SyntaxError(
+                                f"Grid indexing expects 2 indices, got {len(indices)} at line {line_number}")
+                    else:
+                        raise ValueError(
+                            f"Expected grid to be a dictionary, got {type(grid)} at line {line_number}")
+                else:
+                    # Return 0 if grid is not defined
+                    value = 0
+
+                # Replace the grid expression with the value
+                expr = expr.replace(f'grid{{{indices_str}}}', str(value))
+
+            except Exception as e:
+                raise RuntimeError(
+                    f"Invalid grid reference 'grid{{{indices_str}}}': {e} at line {line_number}")
+        return expr
+
+    def _try_eval_dimension_selector(self, expr, scope, line_number=None):
+        if '!' not in expr or '(' not in expr or ')' not in expr:
+            return False, None
+        m = re.match(r'^([\w_]+)!(\w+)\(([^)]+)\)$', expr)
+        if not m:
+            return False, None
+
+        var_name, dim_name, index_str = m.groups()
+        if hasattr(scope, 'get_evaluation_scope'):
+            full_scope = scope.get_evaluation_scope()
+        else:
+            full_scope = scope
+
+        resolved_key = None
+        if isinstance(full_scope, dict):
+            for key in full_scope:
+                if str(key).lower() == var_name.lower():
+                    resolved_key = key
+                    break
+        if resolved_key is None:
+            for key in self.compiler.variables:
+                if str(key).lower() == var_name.lower():
+                    resolved_key = key
+                    break
+        if resolved_key is None:
+            raise NameError(
+                f"Variable '{var_name}' not defined at line {line_number}")
+
+        array = full_scope.get(
+            resolved_key, self.compiler.variables.get(resolved_key))
+        shape = self.compiler.array_handler.get_array_shape(array, line_number)
+
+        dim_var_key = None
+        for key in self.compiler.dim_names:
+            if str(key).lower() == var_name.lower():
+                dim_var_key = key
+                break
+
+        labels = {}
+        dim_idx = None
+        if dim_var_key:
+            dim_idx = self.compiler.dim_names[dim_var_key].get(dim_name)
+            if dim_idx is None:
+                raise SyntaxError(
+                    f"Dimension '{dim_name}' not found for '{var_name}' at line {line_number}")
+            labels = self.compiler.dim_labels.get(dim_var_key, {}).get(dim_name, {})
+        else:
+            label_candidates = []
+            for dim_map in self.compiler.dim_labels.values():
+                if dim_name not in dim_map:
+                    continue
+                label_map = dim_map[dim_name]
+                label_len = len(label_map)
+                if len(shape) == 1 and label_len == shape[0]:
+                    label_candidates.append((label_map, 0))
+                elif len(shape) > 1:
+                    if label_len == shape[0]:
+                        label_candidates.append((label_map, 0))
+                    if label_len == shape[1]:
+                        label_candidates.append((label_map, 1))
+            if len(label_candidates) == 1:
+                labels, dim_idx = label_candidates[0]
+            else:
+                raise SyntaxError(
+                    f"Variable '{var_name}' has no named dimensions at line {line_number}")
+
+        index_str_clean = index_str.strip('"')
+        dim_index = None
+        if index_str_clean in labels:
+            dim_index = labels[index_str_clean]
+        else:
+            for k, v in labels.items():
+                if str(v) == index_str_clean:
+                    dim_index = k
+                    break
+        if dim_index is None:
+            try:
+                dim_index = int(index_str_clean) - 1
+            except ValueError:
+                try:
+                    evaluated_index = self.eval_expr(index_str, scope, line_number)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Invalid index '{index_str_clean}' for dimension '{dim_name}' at line {line_number}") from exc
+                if isinstance(evaluated_index, str):
+                    if evaluated_index in labels:
+                        dim_index = labels[evaluated_index]
+                    elif evaluated_index.isdigit():
+                        dim_index = int(evaluated_index) - 1
+                    else:
+                        raise ValueError(
+                            f"Invalid index '{evaluated_index}' for dimension '{dim_name}' at line {line_number}")
+                elif isinstance(evaluated_index, (int, float)):
+                    dim_index = int(evaluated_index) - 1
+                else:
+                    raise ValueError(
+                        f"Invalid index '{evaluated_index}' for dimension '{dim_name}' at line {line_number}")
+        try:
+            dim_index = int(dim_index)
+        except Exception:
+            raise ValueError(
+                f"Invalid resolved index '{dim_index}' for dimension '{dim_name}' at line {line_number}")
+        if dim_index < 0 or dim_index >= shape[dim_idx]:
+            raise ValueError(
+                f"Index {dim_index + 1} out of bounds for dimension '{dim_name}' at line {line_number}")
+
+        flat_arr = self.compiler.array_handler.flatten_array(array, line_number)
+        if len(shape) == 1:
+            result = flat_arr[dim_index]
+        else:
+            inner_size = shape[1] if len(shape) > 1 else 1
+            outer_size = shape[0]
+            result = []
+            if dim_idx == 0:
+                start_idx = dim_index * inner_size
+                result = flat_arr[start_idx:start_idx + inner_size]
+            else:
+                for i in range(outer_size):
+                    result.append(flat_arr[i * inner_size + dim_index])
+        if len(result) == 1 and isinstance(result, list):
+            result = result[0]
+        return True, result
+
+    def _try_eval_array_member_call(self, obj_value, obj_type, method_name, args_part, scope, line_number):
+        if not isinstance(obj_value, (list, tuple, pa.Array)):
+            return False, None
+        if isinstance(obj_value, pa.Array):
+            obj_list = obj_value.to_pylist()
+        else:
+            obj_list = list(obj_value)
+
+        element_type = obj_type
+        func_key = None
+        if element_type:
+            func_key = self.compiler._resolve_member_function(
+                element_type, method_name)
+        if not func_key:
+            for elem in obj_list:
+                if not isinstance(elem, dict):
+                    continue
+                candidate = elem.get('_type_name')
+                if not candidate:
+                    for t_name, t_def in getattr(self.compiler, 'types_defined', {}).items():
+                        public_fields = self.compiler._get_public_type_fields(t_def)
+                        if public_fields and object_public_keys(elem) == set(public_fields.keys()):
+                            candidate = t_name
+                            break
+                if not candidate:
+                    continue
+                func_key = self.compiler._resolve_member_function(
+                    candidate, method_name)
+                if func_key:
+                    element_type = candidate
+                    break
+        if not (func_key and func_key in getattr(self.compiler, 'functions', {})):
+            return False, None
+
+        arg_text = args_part if args_part is not None else ""
+        args_list = []
+        if arg_text.strip():
+            args_list = [a.strip()
+                         for a in re.split(r',(?![^{]*})', arg_text) if a.strip()]
+        evaluated_args = [self.eval_or_eval_array(
+            a, scope, line_number) for a in args_list]
+        results = []
+        for elem in obj_list:
+            if isinstance(elem, dict):
+                results.append(self.compiler.call_function(
+                    func_key, [elem] + evaluated_args, instance_type=element_type))
+        return True, results
+
+    def _try_eval_object_creation(self, expr, scope, line_number):
+        if expr.lower().startswith('new ') and 'with' in expr.lower():
+            in_quote = None
+            paren_level = 0
+            brace_level = 0
+            split_pos = None
+            lower_expr = expr.lower()
+            for idx, ch in enumerate(expr):
+                if in_quote:
+                    if ch == in_quote and (idx == 0 or expr[idx - 1] != '\\'):
+                        in_quote = None
+                    continue
+                if ch in ('"', "'"):
+                    in_quote = ch
+                    continue
+                if ch == '(':
+                    paren_level += 1
+                elif ch == ')':
+                    paren_level = max(paren_level - 1, 0)
+                elif ch == '{':
+                    brace_level += 1
+                elif ch == '}':
+                    brace_level = max(brace_level - 1, 0)
+                if paren_level == 0 and brace_level == 0 and lower_expr.startswith('with', idx):
+                    before = expr[idx - 1] if idx > 0 else ' '
+                    after = expr[idx + 4] if idx + 4 < len(expr) else ''
+                    if (before.isspace() or before in '})') and (after.isspace() or after == '('):
+                        split_pos = idx
+                        break
+            if split_pos is not None:
+                base_expr = expr[:split_pos].strip()
+                with_text = expr[split_pos:].strip()
+                bare_new_match = re.match(r'^new\s+(\w+)\s*$', base_expr, re.I)
+                if bare_new_match:
+                    type_name = bare_new_match.group(1)
+                    base_value = self.compiler._instantiate_type(
+                        type_name, [], line_number,
+                        allow_default_if_empty=True, execute_code=False)
+                else:
+                    base_value = self.eval_expr(base_expr, scope, line_number)
+                if not isinstance(base_value, dict):
+                    raise TypeError(
+                        f"WITH can only be applied to object instances at line {line_number}")
+                type_match = re.match(r'^new\s+(\w+)', base_expr, re.I)
+                type_name = type_match.group(1) if type_match else None
+                with_assignments = self.compiler._parse_with_clause(
+                    with_text, line_number)
+                return True, self.compiler._apply_with_constraints(
+                    base_value, with_assignments, scope, line_number,
+                    type_name=type_name)
+
+        bare_new_match = re.match(r'^new\s+(\w+)\s*$', expr)
+        if bare_new_match:
+            type_name = bare_new_match.group(1)
+            if type_name.lower() in self.compiler.types_defined:
+                return True, self.compiler._instantiate_type(
+                    type_name, [], line_number, allow_default_if_empty=True)
+            raise ValueError(
+                f"Type '{type_name}' not defined at line {line_number}")
+
+        obj_match = re.match(r'^new\s+(\w+)\s*(\{|\()', expr)
+        if not obj_match:
+            return False, None
+
+        type_name, opener = obj_match.groups()
+        pairs = {'{': '}', '(': ')'}
+        closer = pairs[opener]
+
+        start_pos = expr.find(opener, obj_match.start(2))
+        stack = [closer]
+        args_str = None
+        for i, char in enumerate(expr[start_pos + 1:], start_pos + 1):
+            if char in pairs:
+                stack.append(pairs[char])
+            elif stack and char == stack[-1]:
+                stack.pop()
+                if not stack:
+                    args_str = expr[start_pos + 1:i]
+                    break
+            elif char in pairs.values():
+                raise SyntaxError(
+                    f"Mismatched delimiter in object creation: {expr} at line {line_number}")
+
+        if args_str is None:
+            raise SyntaxError(
+                f"Unclosed delimiters in object creation: {expr} at line {line_number}")
+
+        args_list = []
+        current_arg = ""
+        nest_stack = []
+        for char in args_str + ',':
+            if char == ',' and not nest_stack:
+                if current_arg.strip():
+                    args_list.append(current_arg.strip())
+                current_arg = ""
+                continue
+
+            current_arg += char
+            if char in pairs:
+                nest_stack.append(pairs[char])
+            elif nest_stack and char == nest_stack[-1]:
+                nest_stack.pop()
+            elif char in pairs.values():
+                raise SyntaxError(
+                    f"Mismatched delimiter in arguments: {expr} at line {line_number}")
+
+        if nest_stack:
+            raise SyntaxError(
+                f"Unbalanced delimiters in arguments: {expr} at line {line_number}")
+
+        args_list = [a for a in args_list if a.strip()]
+        evaluated_args = [self.eval_or_eval_array(
+            a, scope, line_number) for a in args_list]
+
+        if type_name.lower() in self.compiler.types_defined:
+            allow_defaults = len(args_list) == 0 and args_str.strip() == ''
+            return True, self.compiler._instantiate_type(
+                type_name, evaluated_args, line_number, allow_default_if_empty=allow_defaults)
+        raise ValueError(
+            f"Type '{type_name}' not defined at line {line_number}")
+
+    def _try_eval_user_function_call(self, expr, scope, line_number):
+        m_plain_func = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)$', expr)
+        if m_plain_func:
+            func_name, arg_text = m_plain_func.groups()
+            func_defs = getattr(self.compiler, 'functions', {}) or {}
+            if func_name.lower() in func_defs:
+                splitter = getattr(self.compiler, '_split_call_arguments', None)
+                if splitter:
+                    args_list = splitter(arg_text)
+                else:
+                    args_list = [a.strip()
+                                 for a in re.split(r',(?![^{]*})', arg_text) if a.strip()] if arg_text.strip() else []
+                evaluated_args = [self.eval_or_eval_array(
+                    a, scope, line_number) for a in args_list] if args_list else []
+                return True, self.compiler.call_function(func_name, evaluated_args)
+
+        m_dotted_func = re.match(r'^([A-Za-z_][A-Za-z0-9_.]*)\s*\((.*)\)$', expr)
+        if m_dotted_func:
+            func_name, arg_text = m_dotted_func.groups()
+            func_defs = getattr(self.compiler, 'functions', {}) or {}
+            base_name = func_name.split('.')[0]
+            is_scope_var = False
+            try:
+                if hasattr(self.compiler, 'current_scope'):
+                    self.compiler.current_scope().get(base_name)
+                    is_scope_var = True
+            except Exception:
+                is_scope_var = False
+            if func_name.lower() in func_defs and not is_scope_var:
+                args_list = []
+                if arg_text.strip():
+                    args_list = [a.strip()
+                                 for a in re.split(r',(?![^{]*})', arg_text) if a.strip()]
+                evaluated_args = [self.eval_or_eval_array(
+                    a, scope, line_number) for a in args_list]
+                return True, self.compiler.call_function(func_name, evaluated_args)
+
+        return False, None
+
+    def _try_eval_member_function_call(self, expr, scope, line_number):
+        m_member = re.match(r'^([\w_]+)\.([\w_]+)(?:\((.*)\))?$', expr)
+        if not m_member:
+            return False, None
+
+        obj_name, method_name, args_part = m_member.groups()
+        obj_value = None
+        obj_type = None
+        try:
+            obj_value = scope.get(obj_name)
+        except Exception:
+            try:
+                obj_value = self.compiler.current_scope().get(obj_name)
+            except Exception:
+                obj_value = None
+        if obj_value is None and hasattr(self.compiler, '_materialize_inits'):
+            try:
+                self.compiler._materialize_inits()
+                try:
+                    obj_value = scope.get(obj_name)
+                except Exception:
+                    obj_value = self.compiler.current_scope().get(obj_name)
+            except Exception:
+                pass
+        try:
+            defining_scope = self.compiler.current_scope(
+            ).get_defining_scope(obj_name)
+            if defining_scope:
+                actual_key = defining_scope._get_case_insensitive_key(
+                    obj_name, defining_scope.types)
+                if actual_key:
+                    obj_type = defining_scope.types.get(actual_key)
+        except Exception:
+            pass
+        if obj_type is None and isinstance(obj_value, dict):
+            obj_type = obj_value.get('_type_name')
+        if obj_type is None and isinstance(obj_value, dict):
+            for t_name, t_def in getattr(self.compiler, 'types_defined', {}).items():
+                public_fields = self.compiler._get_public_type_fields(t_def)
+                if public_fields and object_public_keys(obj_value) == set(public_fields.keys()):
+                    obj_type = t_name
+                    break
+
+        handled, array_member_result = self._try_eval_array_member_call(
+            obj_value, obj_type, method_name, args_part, scope, line_number)
+        if handled:
+            return True, array_member_result
+
+        func_key = self.compiler._resolve_member_function(
+            obj_type, method_name) if obj_type else None
+        if func_key and func_key in getattr(self.compiler, 'functions', {}):
+            arg_text = args_part if args_part is not None else ""
+            args_list = []
+            if arg_text.strip():
+                args_list = [a.strip()
+                             for a in re.split(r',(?![^{]*})', arg_text) if a.strip()]
+            evaluated_args = [self.eval_or_eval_array(
+                a, scope, line_number) for a in args_list]
+            return True, self.compiler.call_function(func_key, [obj_value] + evaluated_args, instance_type=obj_type)
+
+        if obj_type:
+            type_def = getattr(self.compiler, 'types_defined', {}).get(obj_type.lower(), {})
+            helper_defs = type_def.get('_private_helpers', {}) if isinstance(type_def, dict) else {}
+            if method_name.lower() in helper_defs:
+                if not getattr(self.compiler, '_allow_hidden_member_calls', False):
+                    raise PermissionError(
+                        f"Private helper '{method_name}' cannot be called here at line {line_number}")
+                arg_text = args_part if args_part is not None else ""
+                args_list = []
+                if arg_text.strip():
+                    args_list = [a.strip()
+                                 for a in re.split(r',(?![^{]*})', arg_text) if a.strip()]
+                evaluated_args = [self.eval_or_eval_array(
+                    a, scope, line_number) for a in args_list]
+                self.compiler.type_processor._execute_private_helper(
+                    obj_type, method_name, obj_value, line_number, evaluated_args)
+                return True, obj_value
+
+        return False, None
+
+    def _try_eval_field_access(self, expr, scope, line_number):
+        if not re.match(r'^[\w_]+\.\w+$', expr):
+            return False, None
+        var, field = expr.split('.')
+        if isinstance(scope, dict):
+            scope_var_key = get_case_insensitive_key(scope, var)
+            scope_var = scope.get(scope_var_key) if scope_var_key else None
+        else:
+            scope_var = None
+        if isinstance(scope_var, dict):
+            actual_field = get_case_insensitive_key(scope_var, field) or field
+            if self.compiler._is_hidden_field(scope_var, actual_field) and not getattr(self.compiler, '_allow_hidden_field_access', False):
+                raise PermissionError(
+                    f"Hidden field '{field}' is not accessible at line {line_number}")
+            return True, scope_var.get(actual_field)
+        try:
+            var_value = self.compiler.current_scope().get(var)
+            if isinstance(var_value, dict):
+                actual_field = get_case_insensitive_key(var_value, field) or field
+                if self.compiler._is_hidden_field(var_value, actual_field) and not getattr(self.compiler, '_allow_hidden_field_access', False):
+                    raise PermissionError(
+                        f"Hidden field '{field}' is not accessible at line {line_number}")
+                return True, var_value.get(actual_field)
+        except NameError:
+            pass
+        return False, None
+
+    def _try_eval_single_cell_reference(self, expr, line_number):
+        if not (expr.startswith('[') and expr.endswith(']') and ':' not in expr):
+            return False, None
+        cell_ref = expr[1:-1].strip()
+        if cell_ref.startswith('^'):
+            cell_ref = cell_ref[1:].strip()
+        if not re.match(r'^[A-Za-z]+\d+$', cell_ref):
+            return False, None
+        try:
+            validate_cell_ref(cell_ref)
+            value = self.compiler.array_handler.lookup_cell(cell_ref, line_number)
+            return True, value
+        except ValueError as e:
+            raise RuntimeError(
+                f"Invalid cell reference '{cell_ref}': {e} at line {line_number}")
+
+    def _try_eval_indexed_member_call(self, expr, scope, line_number, depth):
+        parsed_member = self._parse_indexed_member_call(expr)
+        if not parsed_member:
+            return False, None
+
+        array_name, index_expr, method_name, args_part = parsed_member
+        array_value = None
+        try:
+            array_value = scope.get(array_name)
+        except Exception:
+            try:
+                array_value = self.compiler.current_scope().get(array_name)
+            except Exception:
+                array_value = None
+        if array_value is None:
+            return False, None
+
+        splitter = getattr(self.compiler, '_split_call_arguments', None)
+        if splitter:
+            index_parts = splitter(index_expr)
+        else:
+            index_parts = [p.strip()
+                           for p in re.split(r',(?![^{]*})', index_expr) if p.strip()]
+        indices = []
+        for part in index_parts:
+            idx_value = self.eval_expr(part, scope, line_number, depth + 1)
+            if isinstance(idx_value, float) and idx_value.is_integer():
+                idx_value = int(idx_value)
+            if isinstance(idx_value, int):
+                idx_value -= 1
+            indices.append(idx_value)
+
+        element = self.compiler.array_handler.get_array_element(
+            array_value, indices, line_number)
+        element_type = None
+        if isinstance(element, dict):
+            element_type = element.get('_type_name')
+            if not element_type:
+                for t_name, t_def in getattr(self.compiler, 'types_defined', {}).items():
+                    public_fields = self.compiler._get_public_type_fields(t_def)
+                    if public_fields and object_public_keys(element) == set(public_fields.keys()):
+                        element_type = t_name
+                        break
+        func_key = self.compiler._resolve_member_function(
+            element_type, method_name) if element_type else None
+        if func_key and func_key in getattr(self.compiler, 'functions', {}):
+            args_list = []
+            if args_part and args_part.strip():
+                if splitter:
+                    args_list = splitter(args_part)
+                else:
+                    args_list = [a.strip()
+                                 for a in re.split(r',(?![^{]*})', args_part) if a.strip()]
+            evaluated_args = [self.eval_or_eval_array(
+                a, scope, line_number) for a in args_list]
+            return True, self.compiler.call_function(
+                func_key, [element] + evaluated_args, instance_type=element_type)
+        if (not args_part or not args_part.strip()) and isinstance(element, dict):
+            actual_field = get_case_insensitive_key(
+                element, method_name) or method_name
+            if self.compiler._is_hidden_field(element, actual_field) and not getattr(self.compiler, '_allow_hidden_field_access', False):
+                raise PermissionError(
+                    f"Hidden field '{method_name}' is not accessible at line {line_number}")
+            return True, element.get(actual_field)
+
+        return False, None
+
+    def _preprocess_interpolated_cell_refs(self, expr, scope, line_number, depth):
+        # Handle interpolated cell references (e.g., [B{I}], [{i :A}5]) first
+        # This must happen before array access processing to avoid confusion
+        col_interp_pattern = re.compile(
+            r'\[\{\s*([^}:]+?)\s*:\s*([A-Za-z]+)\s*\}\s*(\d+|\{[^}]+\})\s*\]')
+
+        def col_interp_replacer(match):
+            inside = match.group(0)[1:-1].strip()
+            cell_ref = self._resolve_column_interpolated_cell(
+                inside, scope, line_number)
+            value = self.compiler.array_handler.lookup_cell(
+                cell_ref, line_number)
+            if isinstance(value, (int, float)):
+                return str(value)
+            return f'"{value}"'
+
+        expr = col_interp_pattern.sub(col_interp_replacer, expr)
+
+        interpolated_cell_pattern = re.compile(r'\[([A-Za-z]+)\{([^}]+)\}\]')
+        interpolated_matches = interpolated_cell_pattern.findall(expr)
+        for col, index_expr in interpolated_matches:
+            try:
+                index_value = self.eval_expr(
+                    index_expr, scope, line_number, depth + 1)
+                if isinstance(index_value, float) and index_value.is_integer():
+                    index_value = int(index_value)
+                if not isinstance(index_value, int) or index_value < 1:
+                    raise ValueError(
+                        f"Invalid cell reference index '{index_value}' must be a positive integer at line {line_number}")
+
+                cell_ref = f"{col}{index_value}"
+                validate_cell_ref(cell_ref)
+                value = self.compiler.array_handler.lookup_cell(
+                    cell_ref, line_number)
+                if isinstance(value, (int, float)):
+                    expr = expr.replace(f'[{col}{{{index_expr}}}]', str(value))
+                else:
+                    expr = expr.replace(
+                        f'[{col}{{{index_expr}}}]', f'"{value}"')
+            except Exception as e:
+                raise RuntimeError(
+                    f"Invalid interpolated cell reference '[{col}{{{index_expr}}}]': {e} at line {line_number}")
+        return expr
+
+    def _array_access_replacer(self, match, scope, line_number):
+        array_expr = match.group(0)
+        # Parse the array access directly to avoid recursion
+        var_name, indices_str = array_expr.split('{', 1)
+        var_name = var_name.strip()
+        indices_str = indices_str[:-1]  # Remove closing brace
+
+        # Parse indices
+        indices = []
+        for index_expr in indices_str.split(','):
+            index_expr = index_expr.strip()
+            try:
+                # Try to evaluate as a number first
+                indices.append(int(index_expr))
+            except ValueError:
+                # If not a number, evaluate as an expression
+                index_value = self.eval_expr(index_expr, scope, line_number)
+                indices.append(int(index_value))
+
+        # Get the array and evaluate the access
+        if hasattr(scope, 'get_evaluation_scope'):
+            full_scope = scope.get_evaluation_scope()
+        else:
+            full_scope = scope
+
+        if var_name in full_scope:
+            arr = full_scope[var_name]
+        else:
+            try:
+                arr = self.compiler.current_scope().get(var_name)
+            except NameError:
+                # Not an array access; leave the original expression intact
+                return match.group(0)
+
+        # Adjust indices based on dimension metadata
+        dims = self.compiler.dimensions.get(var_name, [])
+        # Also check constraints in scope for dimension-constrained arrays
+        scope_constraints = None
+        current_scope = self.compiler.current_scope()
+        if hasattr(current_scope, 'constraints') and var_name in current_scope.constraints:
+            scope_constraints = current_scope.constraints[var_name].get('dim', [])
+
+        adjusted_indices = []
+        for i, idx in enumerate(indices):
+            # Prefer scope constraints (dimension-constrained arrays)
+            if scope_constraints and i < len(scope_constraints):
+                constraint = scope_constraints[i]
+                if isinstance(constraint, tuple) and len(constraint) == 2 and isinstance(constraint[1], tuple):
+                    base = constraint[1][0]
+                    adjusted_idx = idx - base
+                    adjusted_indices.append(adjusted_idx)
+                else:
+                    adjusted_idx = idx - 1
+                    adjusted_indices.append(adjusted_idx)
+            # range, e.g., (0, 10)
+            elif i < len(dims) and isinstance(dims[i][1], tuple):
+                base = dims[i][1][0]
+                adjusted_idx = idx - base
+                adjusted_indices.append(adjusted_idx)
+            else:  # just a size, treat as 1-based
+                adjusted_idx = idx - 1
+                adjusted_indices.append(adjusted_idx)
+
+
+        # Get the array element
+        try:
+            result = self.compiler.array_handler.get_array_element(
+                arr, adjusted_indices, line_number)
+            return str(result)
+        except (IndexError, ValueError) as e:
+            raise IndexError(
+                f"Invalid indices {indices_str} for '{var_name}': {e} at line {line_number}")
+
+    def _member_paren_access_replacer(self, match, scope, line_number):
+        obj_name, field_name, index_expr = match.groups()
+        try:
+            obj_value = self.compiler.current_scope().get(obj_name)
+        except Exception:
+            obj_value = None
+        if not isinstance(obj_value, dict):
+            return match.group(0)
+        obj_type = obj_value.get('_type_name')
+        if obj_type:
+            func_key = self.compiler._resolve_member_function(obj_type, field_name)
+            if func_key and func_key in getattr(self.compiler, 'functions', {}):
+                return match.group(0)
+            type_def = getattr(self.compiler, 'types_defined', {}).get(obj_type.lower(), {})
+            helper_defs = type_def.get('_private_helpers', {}) if isinstance(type_def, dict) else {}
+            if field_name.lower() in helper_defs:
+                return match.group(0)
+        actual_field = get_case_insensitive_key(obj_value, field_name) or field_name
+        field_val = obj_value.get(actual_field)
+        import pyarrow as pa
+        if not isinstance(field_val, (list, tuple, pa.Array)):
+            return match.group(0)
+        range_match = re.match(r'^\s*(.+)\s+to\s+(.+?)\s*$', index_expr, re.I)
+        if range_match:
+            start_expr, end_expr = range_match.groups()
+            try:
+                start_value = self.eval_expr(start_expr, scope, line_number)
+                end_value = self.eval_expr(end_expr, scope, line_number)
+                if isinstance(start_value, float) and start_value.is_integer():
+                    start_value = int(start_value)
+                if isinstance(end_value, float) and end_value.is_integer():
+                    end_value = int(end_value)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Error evaluating index expression '{index_expr}': {e} at line {line_number}")
+            start_idx = start_value - 1
+            end_idx = end_value - 1
+            if isinstance(field_val, pa.Array):
+                return repr(field_val.to_pylist()[start_idx:end_idx + 1])
+            if isinstance(field_val, list):
+                return repr(field_val[start_idx:end_idx + 1])
+            if isinstance(field_val, tuple):
+                return repr(list(field_val[start_idx:end_idx + 1]))
+        try:
+            index_value = self.eval_expr(index_expr, scope, line_number)
+            if isinstance(index_value, float) and index_value.is_integer():
+                index_value = int(index_value)
+        except Exception:
+            return match.group(0)
+        idx = index_value - 1
+        try:
+            if isinstance(field_val, pa.Array):
+                result = field_val.to_pylist()[idx]
+            else:
+                result = field_val[idx]
+        except Exception:
+            return match.group(0)
+        if isinstance(result, str):
+            return f'"{result}"'
+        if isinstance(result, (list, dict)):
+            return repr(result)
+        return str(result)
+
+    def _paren_access_replacer(self, match, scope, line_number):
+        var_name, index_expr = match.groups()
+        # Skip user-defined functions/subprocesses
+        known_funcs = {}
+        if hasattr(self, 'functions'):
+            known_funcs.update(getattr(self, 'functions') or {})
+        if hasattr(self.compiler, 'functions'):
+            known_funcs.update(getattr(self.compiler, 'functions', {}) or {})
+        known_subprocesses = {}
+        if hasattr(self, 'subprocesses'):
+            known_subprocesses.update(getattr(self, 'subprocesses') or {})
+        if hasattr(self.compiler, 'subprocesses'):
+            known_subprocesses.update(
+                getattr(self.compiler, 'subprocesses', {}) or {})
+        builtin_callables = {
+            'len', 'mid', 'textsplit', 'counta', 'randarray', 'sortby',
+            'sqrt', 'rows'
+        }
+        if var_name.lower() in known_funcs:
+            return match.group(0)
+        if var_name.lower() in known_subprocesses:
+            return match.group(0)
+        if var_name.lower() in builtin_callables:
+            return match.group(0)
+
+        if hasattr(scope, 'get_evaluation_scope'):
+            full_scope = scope.get_evaluation_scope()
+        else:
+            full_scope = scope
+
+        if var_name in full_scope:
+            arr = full_scope[var_name]
+        else:
+            try:
+                arr = self.compiler.current_scope().get(var_name)
+            except NameError:
+                return match.group(0)
+
+        import pyarrow as pa
+        if not isinstance(arr, (list, tuple, dict, pa.Array)):
+            return match.group(0)
+
+        # Check if this array is 0-based or 1-based based on dimension constraints
+        is_zero_based = False
+
+        # Try to find constraints in the actual scope object
+        actual_scope = None
+        if hasattr(scope, 'constraints'):
+            actual_scope = scope
+        elif hasattr(scope, 'get_defining_scope'):
+            actual_scope = scope
+        else:
+            for scope_obj in self.compiler.scopes:
+                if var_name in scope_obj.constraints:
+                    actual_scope = scope_obj
+                    break
+
+        if actual_scope and hasattr(actual_scope, 'constraints') and var_name in actual_scope.constraints:
+            dim_constraints = actual_scope.constraints[var_name].get('dim', [])
+            for _, size_spec in dim_constraints:
+                if isinstance(size_spec, tuple):
+                    start, end = size_spec
+                    if start == 0:
+                        is_zero_based = True
+                        break
+
+        # Handle range access like var(1 to n)
+        range_match = re.match(r'^\s*(.+)\s+to\s+(.+?)\s*$', index_expr, re.I)
+        if range_match:
+            start_expr, end_expr = range_match.groups()
+            try:
+                start_value = self.eval_expr(start_expr, scope, line_number)
+                end_value = self.eval_expr(end_expr, scope, line_number)
+                if isinstance(start_value, float) and start_value.is_integer():
+                    start_value = int(start_value)
+                if isinstance(end_value, float) and end_value.is_integer():
+                    end_value = int(end_value)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Error evaluating index expression '{index_expr}': {e} at line {line_number}")
+            if is_zero_based:
+                start_idx = start_value
+                end_idx = end_value
+            else:
+                start_idx = start_value - 1
+                end_idx = end_value - 1
+            if isinstance(arr, pa.Array):
+                arr_list = arr.to_pylist()
+                return repr(arr_list[start_idx:end_idx + 1])
+            if isinstance(arr, list):
+                return repr(arr[start_idx:end_idx + 1])
+            if isinstance(arr, tuple):
+                return repr(list(arr[start_idx:end_idx + 1]))
+            return match.group(0)
+
+        try:
+            index_value = self.eval_expr(index_expr, scope, line_number)
+            if isinstance(index_value, float) and index_value.is_integer():
+                index_value = int(index_value)
+        except Exception as e:
+            raise RuntimeError(
+                f"Error evaluating index expression '{index_expr}': {e} at line {line_number}")
+
+        if is_zero_based:
+            adjusted_index = index_value
+        else:
+            adjusted_index = index_value - 1
+
+        try:
+            result = self.compiler.array_handler.get_array_element(
+                arr, [adjusted_index], line_number)
+            if isinstance(result, str):
+                return f'"{result}"'
+            return str(result)
+        except (IndexError, ValueError) as e:
+            raise IndexError(
+                f"Invalid index {index_expr} for '{var_name}': {e} at line {line_number}")
+
+    def _paren_access_replacer_with_check(self, match, scope, line_number):
+        var_name, index_expr = match.groups()
+        callable_names = {'SQRT', 'ABS', 'SIN', 'COS',
+                          'TAN', 'LOG', 'EXP', 'LEN', 'MID', 'TEXTSPLIT'}
+        if hasattr(self.compiler, 'functions'):
+            callable_names.update({n.upper() for n in self.compiler.functions.keys()})
+        if hasattr(self.compiler, 'subprocesses'):
+            callable_names.update({n.upper() for n in self.compiler.subprocesses.keys()})
+        if var_name.upper() in callable_names:
+            return match.group(0)
+        if '!' in var_name:
+            return match.group(0)
+        return self._paren_access_replacer(match, scope, line_number)
+
+    def _replace_paren_access_balanced(self, text, scope, line_number):
+        out = []
+        i = 0
+        length = len(text)
+
+        class _FakeMatch:
+            def __init__(self, name, idx_expr):
+                self._name = name
+                self._idx_expr = idx_expr
+                self._full = f"{name}({idx_expr})"
+
+            def groups(self):
+                return (self._name, self._idx_expr)
+
+            def group(self, idx):
+                if idx == 0:
+                    return self._full
+                raise IndexError("Only group(0) supported")
+
+        while i < length:
+            ch = text[i]
+            if ch in ('"', "'"):
+                quote = ch
+                out.append(ch)
+                i += 1
+                while i < length:
+                    out.append(text[i])
+                    if text[i] == quote and text[i - 1] != '\\':
+                        i += 1
+                        break
+                    i += 1
+                continue
+
+            if ch.isalpha() or ch == '_':
+                start = i
+                i += 1
+                while i < length and (text[i].isalnum() or text[i] == '_'):
+                    i += 1
+                name = text[start:i]
+                prev = start - 1
+                while prev >= 0 and text[prev].isspace():
+                    prev -= 1
+                if prev >= 0 and text[prev] == '.':
+                    out.append(name)
+                    continue
+
+                j = i
+                while j < length and text[j].isspace():
+                    j += 1
+                if j < length and text[j] == '(':
+                    depth = 1
+                    k = j + 1
+                    while k < length and depth > 0:
+                        if text[k] in ('"', "'"):
+                            quote = text[k]
+                            k += 1
+                            while k < length:
+                                if text[k] == quote and text[k - 1] != '\\':
+                                    k += 1
+                                    break
+                                k += 1
+                            continue
+                        if text[k] == '(':
+                            depth += 1
+                        elif text[k] == ')':
+                            depth -= 1
+                        k += 1
+                    if depth == 0:
+                        index_expr = text[j + 1:k - 1]
+                        fake = _FakeMatch(name, index_expr)
+                        out.append(self._paren_access_replacer_with_check(
+                            fake, scope, line_number))
+                        i = k
+                        continue
+                out.append(name)
+                continue
+
+            out.append(ch)
+            i += 1
+        return ''.join(out)
+
+    def _try_eval_scalar_constructs(self, expr, scope, line_number):
+        # Handle text concatenation with & operator
+        if '&' in expr:
+            parts = expr.split('&')
+            result = ''
+            for part in parts:
+                part = part.strip()
+                if part.startswith('$"') and part.endswith('"'):
+                    result += self._process_interpolation(
+                        part, scope, line_number)
+                elif part.startswith('"') and part.endswith('"'):
+                    result += part[1:-1].replace('""', '"')
+                else:
+                    val = self.eval_expr(part, scope, line_number)
+                    result += str(val)
+            return True, result
+
+        # Handle interpolated strings ($"...")
+        if expr.startswith('$"') and expr.endswith('"'):
+            return True, self._process_interpolation(expr, scope, line_number)
+
+        # Handle literal strings
+        if expr.startswith('"') and expr.endswith('"'):
+            return True, expr[1:-1].replace('""', '"')
+
+        # Handle special values (#INF, -#INF, #N/A)
+        uexpr = expr.upper()
+        if uexpr == '#INF':
+            return True, float('inf')
+        if uexpr == '-#INF':
+            return True, float('-inf')
+        if uexpr == '#N/A':
+            return True, float('nan')
+
+        # Handle numeric literals (integers, floats, scientific notation)
+        try:
+            nm = re.match(r'^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$', expr)
+            if nm:
+                parsed = float(expr) if '.' in expr or 'e' in expr.lower() else int(expr)
+                return True, parsed
+        except ValueError:
+            pass
+
+        # Handle number sequences (e.g., 1 to 10 step 2)
+        sm = re.match(
+            r'^(-?\d+(?:\.\d+)?)\s+to\s+(-?\d+(?:\.\d+)?)(?:\s+step\s+(-?\d+(?:\.\d+)?))?$', expr, re.I)
+        if sm:
+            return True, self._build_sequence(expr, line_number)
+
+        # Handle object creation (e.g., new Type{val1, val2} or new Type(val1, val2))
+        handled, object_result = self._try_eval_object_creation(
+            expr, scope, line_number)
+        if handled:
+            return True, object_result
+
+        return False, None
+
+    def _try_eval_simple_variable(self, expr, scope, line_number):
+        if expr in scope:
+            value = scope[expr]
+            if value is None and hasattr(self.compiler, 'pending_assignments'):
+                pending = getattr(self.compiler, 'pending_assignments', {})
+                if expr in pending and hasattr(self.compiler, '_resolve_global_dependency'):
+                    target_scope = None
+                    if hasattr(scope, 'get_full_scope'):
+                        target_scope = scope
+                    elif hasattr(self.compiler, 'current_scope'):
+                        target_scope = self.compiler.current_scope()
+                    if target_scope is not None:
+                        try:
+                            self.compiler._resolve_global_dependency(
+                                expr, line_number, target_scope=target_scope)
+                            if hasattr(target_scope, 'get_full_scope'):
+                                value = target_scope.get_full_scope().get(expr, value)
+                        except Exception:
+                            pass
+            return True, value
+        if isinstance(scope, dict):
+            expr_lower = expr.lower()
+            for key, value in scope.items():
+                if str(key).lower() == expr_lower:
+                    return True, value
+        return False, None
+
+    def _preprocess_expr_before_range_handling(self, expr, scope, line_number, depth):
+        expr = self._replace_grid_indexing(expr, scope, line_number)
+        expr = self._preprocess_interpolated_cell_refs(
+            expr, scope, line_number, depth)
+
+        handled, indexed_member_result = self._try_eval_indexed_member_call(
+            expr, scope, line_number, depth)
+        if handled:
+            return True, indexed_member_result, expr
+
+        # Preprocess: evaluate all array accesses D{...} in the expression
+        # But skip if this looks like object creation
+        if not expr.strip().startswith('new '):
+            expr = re.sub(
+                r'[\w_]+\{[^}]+\}',
+                lambda m: self._array_access_replacer(m, scope, line_number),
+                expr)
+
+            expr = re.sub(
+                r'([A-Za-z_][\w_]*)\.(\w+)\(([^)]+)\)',
+                lambda m: self._member_paren_access_replacer(m, scope, line_number),
+                expr)
+
+            handled, dim_result = self._try_eval_dimension_selector(
+                expr, scope, line_number)
+            if handled:
+                return True, dim_result, expr
+
+            expr = self._replace_paren_access_balanced(expr, scope, line_number)
+
+        return False, None, expr
+
+    def _try_eval_member_array_call(self, expr, scope, line_number):
+        m_member_array = re.match(r'^([\w_]+)\.([\w_]+)\((.*)\)$', expr)
+        if not m_member_array:
+            return False, None
+        obj_name, method_name, args_part = m_member_array.groups()
+        obj_value = None
+        obj_type = None
+        try:
+            obj_value = scope.get(obj_name)
+        except Exception:
+            try:
+                obj_value = self.compiler.current_scope().get(obj_name)
+            except Exception:
+                obj_value = None
+        try:
+            defining_scope = self.compiler.current_scope().get_defining_scope(obj_name)
+            if defining_scope:
+                actual_key = defining_scope._get_case_insensitive_key(
+                    obj_name, defining_scope.types)
+                if actual_key:
+                    obj_type = defining_scope.types.get(actual_key)
+        except Exception:
+            pass
+        if isinstance(obj_value, (list, tuple, pa.Array)):
+            handled, array_member_result = self._try_eval_array_member_call(
+                obj_value, obj_type, method_name, args_part, scope, line_number)
+            if handled:
+                return True, array_member_result
+        return False, None
+
     def eval_expr(self, expr, scope, line_number=None, depth=0):
         """
         Evaluate a general expression, handling ranges, sums, grid indexing, interpolations,
@@ -672,639 +1802,15 @@ class ExpressionEvaluator:
                     f"Invalid boolean expression '?' at line {line_number}")
             expr = f"(1 if ({expr}) else 0)"
 
-        # Handle simple variable lookup first
-        if expr in scope:
-            value = scope[expr]
-            if value is None and hasattr(self.compiler, 'pending_assignments'):
-                pending = getattr(self.compiler, 'pending_assignments', {})
-                if expr in pending and hasattr(self.compiler, '_resolve_global_dependency'):
-                    target_scope = None
-                    if hasattr(scope, 'get_full_scope'):
-                        target_scope = scope
-                    elif hasattr(self.compiler, 'current_scope'):
-                        target_scope = self.compiler.current_scope()
-                    if target_scope is not None:
-                        try:
-                            self.compiler._resolve_global_dependency(
-                                expr, line_number, target_scope=target_scope)
-                            if hasattr(target_scope, 'get_full_scope'):
-                                value = target_scope.get_full_scope().get(expr, value)
-                        except Exception:
-                            pass
-            return value
+        handled, simple_value = self._try_eval_simple_variable(
+            expr, scope, line_number)
+        if handled:
+            return simple_value
 
-        # Handle grid indexing without variable prefix (e.g., grid{a, b}) first
-        # This must happen before array access processing to avoid confusion
-        if 'grid{' in expr:
-            grid_pattern = re.compile(r'grid\{([^}]+)\}')
-            grid_matches = grid_pattern.findall(expr)
-            for indices_str in grid_matches:
-                try:
-                    # Parse indices (e.g., "a-1, b-1" -> [a-1, b-1])
-                    indices = []
-                    for index_expr in indices_str.split(','):
-                        index_expr = index_expr.strip()
-                        try:
-                            # Evaluate the index expression (e.g., "a-1")
-                            index_value = self.eval_expr(
-                                index_expr, scope, line_number)
-                            indices.append(index_value)
-                        except Exception as e:
-                            raise SyntaxError(
-                                f"Invalid index expression '{index_expr}' in grid{{...}}: {e} at line {line_number}")
-
-                    # Look for grid in the scope
-                    if 'grid' in scope:
-                        grid = scope['grid']
-                        if isinstance(grid, dict):
-                            # Convert tuple indices to the format used in the grid
-                            if len(indices) == 2:
-                                key = (int(indices[0]), int(indices[1]))
-                                if key in grid:
-                                    value = grid[key]
-                                else:
-                                    # Return 0 for undefined grid positions
-                                    value = 0
-                            else:
-                                raise SyntaxError(
-                                    f"Grid indexing expects 2 indices, got {len(indices)} at line {line_number}")
-                        else:
-                            raise ValueError(
-                                f"Expected grid to be a dictionary, got {type(grid)} at line {line_number}")
-                    else:
-                        # Return 0 if grid is not defined
-                        value = 0
-
-                    # Replace the grid expression with the value
-                    expr = expr.replace(f'grid{{{indices_str}}}', str(value))
-
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Invalid grid reference 'grid{{{indices_str}}}': {e} at line {line_number}")
-
-        # Handle interpolated cell references (e.g., [B{I}], [{i :A}5]) first
-        # This must happen before array access processing to avoid confusion
-        col_interp_pattern = re.compile(
-            r'\[\{\s*([^}:]+?)\s*:\s*([A-Za-z]+)\s*\}\s*(\d+|\{[^}]+\})\s*\]')
-
-        def col_interp_replacer(match):
-            inside = match.group(0)[1:-1].strip()
-            cell_ref = self._resolve_column_interpolated_cell(
-                inside, scope, line_number)
-            value = self.compiler.array_handler.lookup_cell(
-                cell_ref, line_number)
-            if isinstance(value, (int, float)):
-                return str(value)
-            return f'"{value}"'
-
-        expr = col_interp_pattern.sub(col_interp_replacer, expr)
-
-        interpolated_cell_pattern = re.compile(r'\[([A-Za-z]+)\{([^}]+)\}\]')
-        interpolated_matches = interpolated_cell_pattern.findall(expr)
-        for col, index_expr in interpolated_matches:
-            try:
-                # Evaluate the index expression
-                index_value = self.eval_expr(
-                    index_expr, scope, line_number, depth + 1)
-                if isinstance(index_value, float) and index_value.is_integer():
-                    index_value = int(index_value)
-                if not isinstance(index_value, int) or index_value < 1:
-                    raise ValueError(
-                        f"Invalid cell reference index '{index_value}' must be a positive integer at line {line_number}")
-
-                # Construct the cell reference
-                cell_ref = f"{col}{index_value}"
-                validate_cell_ref(cell_ref)
-                value = self.compiler.array_handler.lookup_cell(
-                    cell_ref, line_number)
-                if isinstance(value, (int, float)):
-                    expr = expr.replace(f'[{col}{{{index_expr}}}]', str(value))
-                else:
-                    expr = expr.replace(
-                        f'[{col}{{{index_expr}}}]', f'"{value}"')
-            except Exception as e:
-                raise RuntimeError(
-                    f"Invalid interpolated cell reference '[{col}{{{index_expr}}}]': {e} at line {line_number}")
-
-        # Handle member calls on array elements (e.g., hand1(i).Name())
-        parsed_member = self._parse_indexed_member_call(expr)
-        if parsed_member:
-            array_name, index_expr, method_name, args_part = parsed_member
-            array_value = None
-            try:
-                array_value = scope.get(array_name)
-            except Exception:
-                try:
-                    array_value = self.compiler.current_scope().get(array_name)
-                except Exception:
-                    array_value = None
-            if array_value is None:
-                parsed_member = None
-        if parsed_member:
-
-            splitter = getattr(self.compiler, '_split_call_arguments', None)
-            if splitter:
-                index_parts = splitter(index_expr)
-            else:
-                index_parts = [p.strip()
-                               for p in re.split(r',(?![^{]*})', index_expr) if p.strip()]
-            indices = []
-            for part in index_parts:
-                idx_value = self.eval_expr(part, scope, line_number, depth + 1)
-                if isinstance(idx_value, float) and idx_value.is_integer():
-                    idx_value = int(idx_value)
-                if isinstance(idx_value, int):
-                    idx_value -= 1
-                indices.append(idx_value)
-
-            element = self.compiler.array_handler.get_array_element(
-                array_value, indices, line_number)
-            element_type = None
-            if isinstance(element, dict):
-                element_type = element.get('_type_name')
-                if not element_type:
-                    for t_name, t_def in getattr(self.compiler, 'types_defined', {}).items():
-                        public_fields = self.compiler._get_public_type_fields(
-                            t_def)
-                        if public_fields and object_public_keys(element) == set(public_fields.keys()):
-                            element_type = t_name
-                            break
-            func_key = self.compiler._resolve_member_function(
-                element_type, method_name) if element_type else None
-            if func_key and func_key in getattr(self.compiler, 'functions', {}):
-                args_list = []
-                if args_part and args_part.strip():
-                    if splitter:
-                        args_list = splitter(args_part)
-                    else:
-                        args_list = [a.strip()
-                                     for a in re.split(r',(?![^{]*})', args_part) if a.strip()]
-                evaluated_args = [self.eval_or_eval_array(
-                    a, scope, line_number) for a in args_list]
-                return self.compiler.call_function(
-                    func_key, [element] + evaluated_args, instance_type=element_type)
-
-        # Preprocess: evaluate all array accesses D{...} in the expression
-        # But skip if this looks like object creation
-        if not expr.strip().startswith('new '):
-            def array_access_replacer(match):
-                array_expr = match.group(0)
-                # Parse the array access directly to avoid recursion
-                var_name, indices_str = array_expr.split('{', 1)
-                var_name = var_name.strip()
-                indices_str = indices_str[:-1]  # Remove closing brace
-
-                # Parse indices
-                indices = []
-                for index_expr in indices_str.split(','):
-                    index_expr = index_expr.strip()
-                    try:
-                        # Try to evaluate as a number first
-                        indices.append(int(index_expr))
-                    except ValueError:
-                        # If not a number, evaluate as an expression
-                        index_value = self.eval_expr(
-                            index_expr, scope, line_number)
-                        indices.append(int(index_value))
-
-                # Get the array and evaluate the access
-                if hasattr(scope, 'get_evaluation_scope'):
-                    full_scope = scope.get_evaluation_scope()
-                else:
-                    full_scope = scope
-
-                if var_name in full_scope:
-                    arr = full_scope[var_name]
-                else:
-                    try:
-                        arr = self.compiler.current_scope().get(var_name)
-                    except NameError:
-                        # Not an array access; leave the original expression intact
-                        return match.group(0)
-
-                # Adjust indices based on dimension metadata
-                dims = self.compiler.dimensions.get(var_name, [])
-                # Also check constraints in scope for dimension-constrained arrays
-                scope_constraints = None
-                current_scope = self.compiler.current_scope()
-                if hasattr(current_scope, 'constraints') and var_name in current_scope.constraints:
-                    scope_constraints = current_scope.constraints[var_name].get(
-                        'dim', [])
-                else:
-                    pass
-
-                adjusted_indices = []
-                for i, idx in enumerate(indices):
-                    # Prefer scope constraints (dimension-constrained arrays)
-                    if scope_constraints and i < len(scope_constraints):
-                        constraint = scope_constraints[i]
-                        if isinstance(constraint, tuple) and len(constraint) == 2 and isinstance(constraint[1], tuple):
-                            base = constraint[1][0]
-                            adjusted_idx = idx - base
-                            adjusted_indices.append(adjusted_idx)
-                        else:
-                            adjusted_idx = idx - 1
-                            adjusted_indices.append(adjusted_idx)
-                    # range, e.g., (0, 10)
-                    elif i < len(dims) and isinstance(dims[i][1], tuple):
-                        base = dims[i][1][0]
-                        adjusted_idx = idx - base
-                        adjusted_indices.append(adjusted_idx)
-                    else:  # just a size, treat as 1-based
-                        adjusted_idx = idx - 1
-                        adjusted_indices.append(adjusted_idx)
-
-                # Get the array element
-                try:
-                    result = self.compiler.array_handler.get_array_element(
-                        arr, adjusted_indices, line_number)
-                    return str(result)
-                except (IndexError, ValueError) as e:
-                    raise IndexError(
-                        f"Invalid indices {indices_str} for '{var_name}': {e} at line {line_number}")
-
-            expr = re.sub(r'[\w_]+\{[^}]+\}', array_access_replacer, expr)
-
-            # Handle member field indexing (e.g., obj.field(1 to n))
-            def member_paren_access_replacer(match):
-                obj_name, field_name, index_expr = match.groups()
-                try:
-                    obj_value = self.compiler.current_scope().get(obj_name)
-                except Exception:
-                    obj_value = None
-                if not isinstance(obj_value, dict):
-                    return match.group(0)
-                obj_type = obj_value.get('_type_name')
-                if obj_type:
-                    func_key = self.compiler._resolve_member_function(
-                        obj_type, field_name)
-                    if func_key and func_key in getattr(self.compiler, 'functions', {}):
-                        return match.group(0)
-                    type_def = getattr(self.compiler, 'types_defined', {}).get(
-                        obj_type.lower(), {})
-                    helper_defs = type_def.get(
-                        '_private_helpers', {}) if isinstance(type_def, dict) else {}
-                    if field_name.lower() in helper_defs:
-                        return match.group(0)
-                field_val = obj_value.get(field_name)
-                import pyarrow as pa
-                if not isinstance(field_val, (list, tuple, pa.Array)):
-                    return match.group(0)
-                range_match = re.match(
-                    r'^\s*(.+)\s+to\s+(.+?)\s*$', index_expr, re.I)
-                if range_match:
-                    start_expr, end_expr = range_match.groups()
-                    try:
-                        start_value = self.eval_expr(
-                            start_expr, scope, line_number)
-                        end_value = self.eval_expr(
-                            end_expr, scope, line_number)
-                        if isinstance(start_value, float) and start_value.is_integer():
-                            start_value = int(start_value)
-                        if isinstance(end_value, float) and end_value.is_integer():
-                            end_value = int(end_value)
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"Error evaluating index expression '{index_expr}': {e} at line {line_number}")
-                    start_idx = start_value - 1
-                    end_idx = end_value - 1
-                    if isinstance(field_val, pa.Array):
-                        return repr(field_val.to_pylist()[start_idx:end_idx + 1])
-                    if isinstance(field_val, list):
-                        return repr(field_val[start_idx:end_idx + 1])
-                    if isinstance(field_val, tuple):
-                        return repr(list(field_val[start_idx:end_idx + 1]))
-                try:
-                    index_value = self.eval_expr(
-                        index_expr, scope, line_number)
-                    if isinstance(index_value, float) and index_value.is_integer():
-                        index_value = int(index_value)
-                except Exception:
-                    return match.group(0)
-                idx = index_value - 1
-                try:
-                    if isinstance(field_val, pa.Array):
-                        result = field_val.to_pylist()[idx]
-                    else:
-                        result = field_val[idx]
-                except Exception:
-                    return match.group(0)
-                if isinstance(result, str):
-                    return f'"{result}"'
-                if isinstance(result, (list, dict)):
-                    return repr(result)
-                return str(result)
-
-            expr = re.sub(r'([A-Za-z_][\w_]*)\.(\w+)\(([^)]+)\)',
-                          member_paren_access_replacer, expr)
-
-            # Handle parentheses array indexing (e.g., D(k))
-            def paren_access_replacer(match):
-                var_name, index_expr = match.groups()
-                # Skip user-defined functions/subprocesses
-                known_funcs = {}
-                if hasattr(self, 'functions'):
-                    known_funcs.update(getattr(self, 'functions') or {})
-                if hasattr(self.compiler, 'functions'):
-                    known_funcs.update(
-                        getattr(self.compiler, 'functions', {}) or {})
-                known_subprocesses = {}
-                if hasattr(self, 'subprocesses'):
-                    known_subprocesses.update(
-                        getattr(self, 'subprocesses') or {})
-                if hasattr(self.compiler, 'subprocesses'):
-                    known_subprocesses.update(
-                        getattr(self.compiler, 'subprocesses', {}) or {})
-                builtin_callables = {
-                    'len', 'mid', 'textsplit', 'counta', 'randarray', 'sortby',
-                    'sqrt', 'rows'
-                }
-                if var_name.lower() in known_funcs:
-                    return match.group(0)
-                if var_name.lower() in known_subprocesses:
-                    return match.group(0)
-                if var_name.lower() in builtin_callables:
-                    return match.group(0)
-                # Get the array and evaluate the access
-                if hasattr(scope, 'get_evaluation_scope'):
-                    full_scope = scope.get_evaluation_scope()
-                else:
-                    full_scope = scope
-
-                if var_name in full_scope:
-                    arr = full_scope[var_name]
-                else:
-                    try:
-                        arr = self.compiler.current_scope().get(var_name)
-                    except NameError:
-                        return match.group(0)
-                # If the target is not an indexable array/list/object, leave the call unchanged
-                import pyarrow as pa
-                if not isinstance(arr, (list, tuple, dict, pa.Array)):
-                    return match.group(0)
-
-                # Check if this array is 0-based or 1-based based on dimension constraints
-                is_zero_based = False
-
-                # Try to find constraints in the actual scope object
-                actual_scope = None
-                if hasattr(scope, 'constraints'):
-                    actual_scope = scope
-                elif hasattr(scope, 'get_defining_scope'):
-                    # This is a Scope object, use it directly
-                    actual_scope = scope
-                else:
-                    # This is an evaluation scope dictionary, try to find the actual scope
-                    # Look for the variable in the compiler's scopes
-                    for scope_obj in self.compiler.scopes:
-                        if var_name in scope_obj.constraints:
-                            actual_scope = scope_obj
-                            break
-
-                if actual_scope and hasattr(actual_scope, 'constraints') and var_name in actual_scope.constraints:
-                    dim_constraints = actual_scope.constraints[var_name].get(
-                        'dim', [])
-                    for _, size_spec in dim_constraints:
-                        if isinstance(size_spec, tuple):
-                            start, end = size_spec
-                            if start == 0:
-                                is_zero_based = True
-                                break
-
-                # Handle range access like var(1 to n)
-                range_match = re.match(
-                    r'^\s*(.+)\s+to\s+(.+?)\s*$', index_expr, re.I)
-                if range_match:
-                    start_expr, end_expr = range_match.groups()
-                    try:
-                        start_value = self.eval_expr(
-                            start_expr, scope, line_number)
-                        end_value = self.eval_expr(
-                            end_expr, scope, line_number)
-                        if isinstance(start_value, float) and start_value.is_integer():
-                            start_value = int(start_value)
-                        if isinstance(end_value, float) and end_value.is_integer():
-                            end_value = int(end_value)
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"Error evaluating index expression '{index_expr}': {e} at line {line_number}")
-                    if is_zero_based:
-                        start_idx = start_value
-                        end_idx = end_value
-                    else:
-                        start_idx = start_value - 1
-                        end_idx = end_value - 1
-                    if isinstance(arr, pa.Array):
-                        arr_list = arr.to_pylist()
-                        return repr(arr_list[start_idx:end_idx + 1])
-                    if isinstance(arr, list):
-                        return repr(arr[start_idx:end_idx + 1])
-                    if isinstance(arr, tuple):
-                        return repr(list(arr[start_idx:end_idx + 1]))
-                    return match.group(0)
-
-                # Evaluate the index expression
-                try:
-                    index_value = self.eval_expr(
-                        index_expr, scope, line_number)
-                    if isinstance(index_value, float) and index_value.is_integer():
-                        index_value = int(index_value)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Error evaluating index expression '{index_expr}': {e} at line {line_number}")
-
-                # Convert to 0-based indexing
-                if is_zero_based:
-                    adjusted_index = index_value  # Already 0-based
-                else:
-                    adjusted_index = index_value - 1  # Convert from 1-based to 0-based
-
-                try:
-                    result = self.compiler.array_handler.get_array_element(
-                        arr, [adjusted_index], line_number)
-                    # If the result is a string, quote it to prevent it from being treated as a variable name
-                    if isinstance(result, str):
-                        return f'"{result}"'
-                    # If the result is a number, convert it to string to prevent regex substitution issues
-                    return str(result)
-                except (IndexError, ValueError) as e:
-                    raise IndexError(
-                        f"Invalid index {index_expr} for '{var_name}': {e} at line {line_number}")
-
-            # Don't match function calls like SQRT(100), only array access like D(k)
-            def paren_access_replacer_with_check(match):
-                var_name, index_expr = match.groups()
-                # Check if this is a function call by looking for common function names
-                callable_names = {'SQRT', 'ABS', 'SIN', 'COS',
-                                  'TAN', 'LOG', 'EXP', 'LEN', 'MID', 'TEXTSPLIT'}
-                if hasattr(self.compiler, 'functions'):
-                    callable_names.update(
-                        {n.upper() for n in self.compiler.functions.keys()})
-                if hasattr(self.compiler, 'subprocesses'):
-                    callable_names.update(
-                        {n.upper() for n in self.compiler.subprocesses.keys()})
-                if var_name.upper() in callable_names:
-                    return match.group(0)  # Don't process function calls
-                # Check if this contains a dimension selector (e.g., Results!Quarter)
-                if '!' in var_name:
-                    return match.group(0)  # Don't process dimension selectors
-                return paren_access_replacer(match)
-
-            # Use a more specific pattern that doesn't match function calls within dimension selectors
-            # First, let's handle dimension selectors before processing parentheses
-            if '!' in expr and '(' in expr and ')' in expr:
-                m = re.match(r'^([\w_]+)!(\w+)\(([^)]+)\)$', expr)
-                if m:
-                    var_name, dim_name, index_str = m.groups()
-                    # Check if variable exists in scope or compiler variables
-                    if hasattr(scope, 'get_evaluation_scope'):
-                        full_scope = scope.get_evaluation_scope()
-                    else:
-                        full_scope = scope
-
-                    if var_name not in full_scope and var_name not in self.compiler.variables:
-                        raise NameError(
-                            f"Variable '{var_name}' not defined at line {line_number}")
-                    if var_name not in self.compiler.dim_names:
-                        raise SyntaxError(
-                            f"Variable '{var_name}' has no named dimensions at line {line_number}")
-                    dim_idx = self.compiler.dim_names[var_name].get(dim_name)
-                    if dim_idx is None:
-                        raise SyntaxError(
-                            f"Dimension '{dim_name}' not found for '{var_name}' at line {line_number}")
-                    labels = self.compiler.dim_labels.get(
-                        var_name, {}).get(dim_name, {})
-                    array = full_scope.get(
-                        var_name, self.compiler.variables.get(var_name))
-                    shape = self.compiler.array_handler.get_array_shape(
-                        array, line_number)
-                    index_str_clean = index_str.strip('"')
-                    dim_index = None
-                    if index_str_clean in labels:
-                        dim_index = labels[index_str_clean]
-                    else:
-                        for k, v in labels.items():
-                            if str(v) == index_str_clean:
-                                dim_index = k
-                                break
-                    if dim_index is None:
-                        try:
-                            dim_index = int(index_str_clean) - 1
-                        except ValueError:
-                            raise ValueError(
-                                f"Invalid index '{index_str_clean}' for dimension '{dim_name}' at line {line_number}")
-                    try:
-                        dim_index = int(dim_index)
-                    except Exception:
-                        raise ValueError(
-                            f"Invalid resolved index '{dim_index}' for dimension '{dim_name}' at line {line_number}")
-                    if dim_index < 0 or dim_index >= shape[dim_idx]:
-                        raise ValueError(
-                            f"Index {dim_index + 1} out of bounds for dimension '{dim_name}' at line {line_number}")
-                    flat_arr = self.compiler.array_handler.flatten_array(
-                        array, line_number)
-                    if len(shape) == 1:
-                        result = flat_arr[dim_index]
-                    else:
-                        inner_size = shape[1] if len(shape) > 1 else 1
-                        outer_size = shape[0]
-                        result = []
-                        if dim_idx == 0:
-                            start_idx = dim_index * inner_size
-                            result = flat_arr[start_idx:start_idx + inner_size]
-                        else:
-                            for i in range(outer_size):
-                                result.append(
-                                    flat_arr[i * inner_size + dim_index])
-                    if len(result) == 1 and isinstance(result, list):
-                        result = result[0]
-                    return result
-
-            # Now handle regular parentheses access (but not dimension selectors)
-            # Use a balanced parser to support nested parentheses.
-            def _replace_paren_access_balanced(text):
-                out = []
-                i = 0
-                length = len(text)
-
-                class _FakeMatch:
-                    def __init__(self, name, idx_expr):
-                        self._name = name
-                        self._idx_expr = idx_expr
-                        self._full = f"{name}({idx_expr})"
-
-                    def groups(self):
-                        return (self._name, self._idx_expr)
-
-                    def group(self, idx):
-                        if idx == 0:
-                            return self._full
-                        raise IndexError("Only group(0) supported")
-
-                while i < length:
-                    ch = text[i]
-                    if ch in ('"', "'"):
-                        quote = ch
-                        out.append(ch)
-                        i += 1
-                        while i < length:
-                            out.append(text[i])
-                            if text[i] == quote and text[i - 1] != '\\':
-                                i += 1
-                                break
-                            i += 1
-                        continue
-
-                    if ch.isalpha() or ch == '_':
-                        start = i
-                        i += 1
-                        while i < length and (text[i].isalnum() or text[i] == '_'):
-                            i += 1
-                        name = text[start:i]
-                        # Skip member calls like obj.method(...)
-                        prev = start - 1
-                        while prev >= 0 and text[prev].isspace():
-                            prev -= 1
-                        if prev >= 0 and text[prev] == '.':
-                            out.append(name)
-                            continue
-
-                        j = i
-                        while j < length and text[j].isspace():
-                            j += 1
-                        if j < length and text[j] == '(':
-                            depth = 1
-                            k = j + 1
-                            while k < length and depth > 0:
-                                if text[k] in ('"', "'"):
-                                    quote = text[k]
-                                    k += 1
-                                    while k < length:
-                                        if text[k] == quote and text[k - 1] != '\\':
-                                            k += 1
-                                            break
-                                        k += 1
-                                    continue
-                                if text[k] == '(':
-                                    depth += 1
-                                elif text[k] == ')':
-                                    depth -= 1
-                                k += 1
-                            if depth == 0:
-                                index_expr = text[j + 1:k - 1]
-                                fake = _FakeMatch(name, index_expr)
-                                out.append(
-                                    paren_access_replacer_with_check(fake))
-                                i = k
-                                continue
-                        out.append(name)
-                        continue
-
-                    out.append(ch)
-                    i += 1
-                return ''.join(out)
-
-            expr = _replace_paren_access_balanced(expr)
+        handled, preprocessed_result, expr = self._preprocess_expr_before_range_handling(
+            expr, scope, line_number, depth)
+        if handled:
+            return preprocessed_result
 
         # Handle ranges in expressions
         range_match = re.match(
@@ -1420,17 +1926,58 @@ class ExpressionEvaluator:
             if var_name in scope or var_name in self.compiler.variables:
                 return self.compiler.array_handler.resolve_cell_index(var_name, cell_ref, line_number)
 
-        # Handle curly brace indexing (e.g., D{i, 2})
+        handled, curly_result = self._try_eval_curly_indexing_variants(
+            expr, scope, line_number)
+        if handled:
+            return curly_result
+
+        # Handle dimension selector (e.g., var!dim("label"))
+        handled, dim_result = self._try_eval_dimension_selector(
+            expr, scope, line_number)
+        if handled:
+            return dim_result
+
+        handled, scalar_result = self._try_eval_scalar_constructs(
+            expr, scope, line_number)
+        if handled:
+            return scalar_result
+
+        handled, array_member_result = self._try_eval_member_array_call(
+            expr, scope, line_number)
+        if handled:
+            return array_member_result
+
+        handled, func_result = self._try_eval_user_function_call(
+            expr, scope, line_number)
+        if handled:
+            return func_result
+
+        handled, member_result = self._try_eval_member_function_call(
+            expr, scope, line_number)
+        if handled:
+            return member_result
+
+        handled, field_result = self._try_eval_field_access(
+            expr, scope, line_number)
+        if handled:
+            return field_result
+
+        handled, cell_result = self._try_eval_single_cell_reference(
+            expr, line_number)
+        if handled:
+            return cell_result
+
+        return self._evaluate_with_python_fallback(expr, scope, line_number)
+
+    def _try_eval_curly_indexing_variants(self, expr, scope, line_number):
         curly_brace_match = re.match(r'^([\w_]+)\{([^}]+)\}$', expr)
         if curly_brace_match:
             var_name, indices_str = curly_brace_match.groups()
             if var_name in scope or var_name in self.compiler.variables:
-                # Parse indices (e.g., "i+1, 1" -> [i+1, 1])
                 indices = []
                 for index_expr in indices_str.split(','):
                     index_expr = index_expr.strip()
                     try:
-                        # Evaluate the index expression (e.g., "i+1")
                         index_value = self.eval_expr(
                             index_expr, scope, line_number)
                         indices.append(index_value)
@@ -1438,27 +1985,21 @@ class ExpressionEvaluator:
                         raise SyntaxError(
                             f"Invalid index expression '{index_expr}' in '{expr}': {e} at line {line_number}")
 
-                # Get the array
                 array = scope.get(
                     var_name, self.compiler.variables.get(var_name))
                 if array is None:
                     raise ValueError(
                         f"Variable '{var_name}' is uninitialized at line {line_number}")
 
-                # Adjust indices based on dimension metadata
                 dims = self.compiler.dimensions.get(var_name, [])
-                # Also check constraints in scope for dimension-constrained arrays
                 scope_constraints = None
                 current_scope = self.compiler.current_scope()
                 if hasattr(current_scope, 'constraints') and var_name in current_scope.constraints:
                     scope_constraints = current_scope.constraints[var_name].get(
                         'dim', [])
-                else:
-                    pass
 
                 adjusted_indices = []
                 for i, idx in enumerate(indices):
-                    # Prefer scope constraints (dimension-constrained arrays)
                     if scope_constraints and i < len(scope_constraints):
                         constraint = scope_constraints[i]
                         if isinstance(constraint, tuple) and len(constraint) == 2 and isinstance(constraint[1], tuple):
@@ -1468,16 +2009,15 @@ class ExpressionEvaluator:
                         else:
                             adjusted_idx = idx - 1
                             adjusted_indices.append(adjusted_idx)
-                    # range, e.g., (0, 10)
                     elif i < len(dims) and isinstance(dims[i][1], tuple):
                         base = dims[i][1][0]
                         adjusted_idx = idx - base
                         adjusted_indices.append(adjusted_idx)
-                    else:  # just a size, treat as 1-based
+                    else:
                         adjusted_idx = idx - 1
                         adjusted_indices.append(adjusted_idx)
 
-                # Special case: if all indices are 0 and we have dimension constraints, use indices as-is
+
                 current_scope = self.compiler.current_scope()
                 if all(idx == 0 for idx in indices) and var_name in current_scope.constraints:
                     scope_constraints = current_scope.constraints[var_name].get(
@@ -1488,94 +2028,22 @@ class ExpressionEvaluator:
                 try:
                     result = self.compiler.array_handler.get_array_element(
                         array, adjusted_indices, line_number)
-                    return result
+                    return True, result
                 except (IndexError, ValueError) as e:
                     raise IndexError(
                         f"Invalid indices {indices_str} for '{var_name}': {e} at line {line_number}")
 
-        # Handle dimension selector (e.g., var!dim("label"))
-        if '!' in expr and '(' in expr and ')' in expr:
-            m = re.match(r'^([\w_]+)!(\w+)\(([^)]+)\)$', expr)
-            if m:
-                var_name, dim_name, index_str = m.groups()
-                # Check if variable exists in scope or compiler variables
-                if hasattr(scope, 'get_evaluation_scope'):
-                    full_scope = scope.get_evaluation_scope()
-                else:
-                    full_scope = scope
-
-                if var_name not in full_scope and var_name not in self.compiler.variables:
-                    raise NameError(
-                        f"Variable '{var_name}' not defined at line {line_number}")
-                if var_name not in self.compiler.dim_names:
-                    raise SyntaxError(
-                        f"Variable '{var_name}' has no named dimensions at line {line_number}")
-                dim_idx = self.compiler.dim_names[var_name].get(dim_name)
-                if dim_idx is None:
-                    raise SyntaxError(
-                        f"Dimension '{dim_name}' not found for '{var_name}' at line {line_number}")
-                labels = self.compiler.dim_labels.get(
-                    var_name, {}).get(dim_name, {})
-                array = full_scope.get(
-                    var_name, self.compiler.variables.get(var_name))
-                shape = self.compiler.array_handler.get_array_shape(
-                    array, line_number)
-                index_str_clean = index_str.strip('"')
-                dim_index = None
-                if index_str_clean in labels:
-                    dim_index = labels[index_str_clean]
-                else:
-                    for k, v in labels.items():
-                        if str(v) == index_str_clean:
-                            dim_index = k
-                            break
-                if dim_index is None:
-                    try:
-                        dim_index = int(index_str_clean) - 1
-                    except ValueError:
-                        raise ValueError(
-                            f"Invalid index '{index_str_clean}' for dimension '{dim_name}' at line {line_number}")
-                try:
-                    dim_index = int(dim_index)
-                except Exception:
-                    raise ValueError(
-                        f"Invalid resolved index '{dim_index}' for dimension '{dim_name}' at line {line_number}")
-                if dim_index < 0 or dim_index >= shape[dim_idx]:
-                    raise ValueError(
-                        f"Index {dim_index + 1} out of bounds for dimension '{dim_name}' at line {line_number}")
-                flat_arr = self.compiler.array_handler.flatten_array(
-                    array, line_number)
-                if len(shape) == 1:
-                    result = flat_arr[dim_index]
-                else:
-                    inner_size = shape[1] if len(shape) > 1 else 1
-                    outer_size = shape[0]
-                    result = []
-                    if dim_idx == 0:
-                        start_idx = dim_index * inner_size
-                        result = flat_arr[start_idx:start_idx + inner_size]
-                    else:
-                        for i in range(outer_size):
-                            result.append(flat_arr[i * inner_size + dim_index])
-                if len(result) == 1 and isinstance(result, list):
-                    result = result[0]
-                return result
-
-        # Handle array indexing (e.g., var{1,2} or var{i,2})
         match = re.match(r'^[\w_]+\{[^}]+\}$', expr)
         if match:
             var_name, indices_str = expr.split('{', 1)
             var_name = var_name.strip()
-            indices_str = indices_str[:-1]  # Remove closing brace
-            # Parse indices - can be numbers or variables
+            indices_str = indices_str[:-1]
             indices = []
             for index_expr in indices_str.split(','):
                 index_expr = index_expr.strip()
                 try:
-                    # Try to evaluate as a number first
                     indices.append(int(index_expr))
                 except ValueError:
-                    # If not a number, evaluate as an expression
                     try:
                         index_value = self.eval_expr(
                             index_expr, scope, line_number)
@@ -1584,12 +2052,10 @@ class ExpressionEvaluator:
                         raise ValueError(
                             f"Invalid index expression '{index_expr}' in '{expr}': {e} at line {line_number}")
 
-            # Get the full scope to find variables in parent scopes
             if hasattr(scope, 'get_evaluation_scope'):
                 full_scope = scope.get_evaluation_scope()
             else:
                 full_scope = scope
-
             if var_name in full_scope:
                 arr = full_scope[var_name]
             else:
@@ -1632,449 +2098,36 @@ class ExpressionEvaluator:
                     raise ValueError(
                         f"Cannot index into non-list at dimension {dim} of '{var_name}' at line {line_number}")
                 result = result[idx]
-            return result
+            return True, result
 
-        # Handle text concatenation with & operator
-        if '&' in expr:
-            parts = expr.split('&')
-            result = ''
-            for part in parts:
-                part = part.strip()
-                if part.startswith('$"') and part.endswith('"'):
-                    result += self._process_interpolation(
-                        part, scope, line_number)
-                elif part.startswith('"') and part.endswith('"'):
-                    result += part[1:-1].replace('""', '"')
-                else:
-                    val = self.eval_expr(part, scope, line_number)
-                    result += str(val)
-            return result
+        return False, None
 
-        # Handle interpolated strings ($"...")
-        if expr.startswith('$"') and expr.endswith('"'):
-            return self._process_interpolation(expr, scope, line_number)
 
-        # Handle literal strings
-        if expr.startswith('"') and expr.endswith('"'):
-            return expr[1:-1].replace('""', '"')
-
-        # Handle special values (#INF, -#INF, #N/A)
-        uexpr = expr.upper()
-        if uexpr == '#INF':
-            return float('inf')
-        if uexpr == '-#INF':
-            return float('-inf')
-        if uexpr == '#N/A':
-            return float('nan')
-
-        # Handle numeric literals (integers, floats, scientific notation)
-        try:
-            nm = re.match(r'^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$', expr)
-            if nm:
-                return float(expr) if '.' in expr or 'e' in expr.lower() else int(expr)
-        except ValueError:
-            pass
-
-        # Handle number sequences (e.g., 1 to 10 step 2)
-        sm = re.match(
-            r'^(-?\d+(?:\.\d+)?)\s+to\s+(-?\d+(?:\.\d+)?)(?:\s+step\s+(-?\d+(?:\.\d+)?))?$', expr, re.I)
-        if sm:
-            return self._build_sequence(expr, line_number)
-
-        # Handle object creation (e.g., new Type{val1, val2} or new Type(val1, val2))
-        if expr.lower().startswith('new ') and 'with' in expr.lower():
-            in_quote = None
-            paren_level = 0
-            brace_level = 0
-            split_pos = None
-            lower_expr = expr.lower()
-            for idx, ch in enumerate(expr):
-                if in_quote:
-                    if ch == in_quote and (idx == 0 or expr[idx - 1] != '\\'):
-                        in_quote = None
-                    continue
-                if ch in ('"', "'"):
-                    in_quote = ch
-                    continue
-                if ch == '(':
-                    paren_level += 1
-                elif ch == ')':
-                    paren_level = max(paren_level - 1, 0)
-                elif ch == '{':
-                    brace_level += 1
-                elif ch == '}':
-                    brace_level = max(brace_level - 1, 0)
-                if paren_level == 0 and brace_level == 0 and lower_expr.startswith('with', idx):
-                    before = expr[idx - 1] if idx > 0 else ' '
-                    after = expr[idx + 4] if idx + 4 < len(expr) else ''
-                    if (before.isspace() or before in '})') and (after.isspace() or after == '('):
-                        split_pos = idx
-                        break
-            if split_pos is not None:
-                base_expr = expr[:split_pos].strip()
-                with_text = expr[split_pos:].strip()
-                bare_new_match = re.match(r'^new\s+(\w+)\s*$', base_expr, re.I)
-                if bare_new_match:
-                    type_name = bare_new_match.group(1)
-                    base_value = self.compiler._instantiate_type(
-                        type_name, [], line_number,
-                        allow_default_if_empty=True, execute_code=False)
-                else:
-                    base_value = self.eval_expr(base_expr, scope, line_number)
-                if not isinstance(base_value, dict):
-                    raise TypeError(
-                        f"WITH can only be applied to object instances at line {line_number}")
-                type_match = re.match(r'^new\s+(\w+)', base_expr, re.I)
-                type_name = type_match.group(1) if type_match else None
-                with_assignments = self.compiler._parse_with_clause(
-                    with_text, line_number)
-                return self.compiler._apply_with_constraints(
-                    base_value, with_assignments, scope, line_number,
-                    type_name=type_name)
-        bare_new_match = re.match(r'^new\s+(\w+)\s*$', expr)
-        if bare_new_match:
-            type_name = bare_new_match.group(1)
-            if type_name.lower() in self.compiler.types_defined:
-                return self.compiler._instantiate_type(
-                    type_name, [], line_number, allow_default_if_empty=True)
-            raise ValueError(
-                f"Type '{type_name}' not defined at line {line_number}")
-        obj_match = re.match(r'^new\s+(\w+)\s*(\{|\()',
-                             expr)
-        if obj_match:
-            type_name, opener = obj_match.groups()
-            pairs = {'{': '}', '(': ')'}
-            closer = pairs[opener]
-
-            # Locate the full argument segment, supporting nested delimiters
-            start_pos = expr.find(opener, obj_match.start(2))
-            stack = [closer]
-            args_str = None
-            for i, char in enumerate(expr[start_pos + 1:], start_pos + 1):
-                if char in pairs:
-                    stack.append(pairs[char])
-                elif stack and char == stack[-1]:
-                    stack.pop()
-                    if not stack:
-                        args_str = expr[start_pos + 1:i]
-                        break
-                elif char in pairs.values():
-                    raise SyntaxError(
-                        f"Mismatched delimiter in object creation: {expr} at line {line_number}")
-
-            if args_str is None:
-                raise SyntaxError(
-                    f"Unclosed delimiters in object creation: {expr} at line {line_number}")
-
-            # Parse arguments, handling nested objects with braces or parentheses
-            args_list = []
-            current_arg = ""
-            nest_stack = []
-            for char in args_str + ',':
-                if char == ',' and not nest_stack:
-                    if current_arg.strip():
-                        args_list.append(current_arg.strip())
-                    current_arg = ""
-                    continue
-
-                current_arg += char
-                if char in pairs:
-                    nest_stack.append(pairs[char])
-                elif nest_stack and char == nest_stack[-1]:
-                    nest_stack.pop()
-                elif char in pairs.values():
-                    raise SyntaxError(
-                        f"Mismatched delimiter in arguments: {expr} at line {line_number}")
-
-            if nest_stack:
-                raise SyntaxError(
-                    f"Unbalanced delimiters in arguments: {expr} at line {line_number}")
-
-            args_list = [a for a in args_list if a.strip()]
-
-            evaluated_args = [self.eval_or_eval_array(
-                a, scope, line_number) for a in args_list]
-
-            if type_name.lower() in self.compiler.types_defined:
-                allow_defaults = len(args_list) == 0 and args_str.strip() == ''
-                return self.compiler._instantiate_type(
-                    type_name, evaluated_args, line_number, allow_default_if_empty=allow_defaults)
-            else:
-                raise ValueError(
-                    f"Type '{type_name}' not defined at line {line_number}")
-
-        # Handle member calls on arrays before falling back to eval
-        m_member_array = re.match(r'^([\w_]+)\.([\w_]+)\((.*)\)$', expr)
-        if m_member_array:
-            obj_name, method_name, args_part = m_member_array.groups()
-            obj_value = None
-            obj_type = None
-            try:
-                obj_value = scope.get(obj_name)
-            except Exception:
-                try:
-                    obj_value = self.compiler.current_scope().get(obj_name)
-                except Exception:
-                    obj_value = None
-            try:
-                defining_scope = self.compiler.current_scope().get_defining_scope(obj_name)
-                if defining_scope:
-                    actual_key = defining_scope._get_case_insensitive_key(
-                        obj_name, defining_scope.types)
-                    if actual_key:
-                        obj_type = defining_scope.types.get(actual_key)
-            except Exception:
-                pass
-            if isinstance(obj_value, (list, tuple, pa.Array)):
-                if isinstance(obj_value, pa.Array):
-                    obj_list = obj_value.to_pylist()
-                else:
-                    obj_list = list(obj_value)
-                element_type = obj_type
-                func_key = None
-                if element_type:
-                    func_key = self.compiler._resolve_member_function(
-                        element_type, method_name)
-                if not func_key:
-                    for elem in obj_list:
-                        if not isinstance(elem, dict):
-                            continue
-                        candidate = elem.get('_type_name')
-                        if not candidate:
-                            for t_name, t_def in getattr(self.compiler, 'types_defined', {}).items():
-                                public_fields = self.compiler._get_public_type_fields(
-                                    t_def)
-                                if public_fields and object_public_keys(elem) == set(public_fields.keys()):
-                                    candidate = t_name
-                                    break
-                        if not candidate:
-                            continue
-                        func_key = self.compiler._resolve_member_function(
-                            candidate, method_name)
-                        if func_key:
-                            element_type = candidate
-                            break
-                if func_key and func_key in getattr(self.compiler, 'functions', {}):
-                    args_list = []
-                    if args_part.strip():
-                        args_list = [a.strip()
-                                     for a in re.split(r',(?![^{]*})', args_part) if a.strip()]
-                    evaluated_args = [self.eval_or_eval_array(
-                        a, scope, line_number) for a in args_list]
-                    results = []
-                    for elem in obj_list:
-                        if isinstance(elem, dict):
-                            results.append(self.compiler.call_function(
-                                func_key, [elem] + evaluated_args, instance_type=element_type))
-                    return results
-
-        # Handle plain user-defined function calls (Func(arg1, arg2))
-        m_plain_func = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)$', expr)
-        if m_plain_func:
-            func_name, arg_text = m_plain_func.groups()
-            func_defs = getattr(self.compiler, 'functions', {}) or {}
-            if func_name.lower() in func_defs:
-                splitter = getattr(
-                    self.compiler, '_split_call_arguments', None)
-                if splitter:
-                    args_list = splitter(arg_text)
-                else:
-                    args_list = [a.strip()
-                                 for a in re.split(r',(?![^{]*})', arg_text) if a.strip()] if arg_text.strip() else []
-                evaluated_args = [self.eval_or_eval_array(
-                    a, scope, line_number) for a in args_list] if args_list else []
-                return self.compiler.call_function(func_name, evaluated_args)
-
-        # Handle function names that include dots (e.g., Point1.DistanceToOrigin(...))
-        m_dotted_func = re.match(
-            r'^([A-Za-z_][A-Za-z0-9_.]*)\s*\((.*)\)$', expr)
-        if m_dotted_func:
-            func_name, arg_text = m_dotted_func.groups()
-            func_defs = getattr(self.compiler, 'functions', {}) or {}
-            # Skip friendly member syntax (handled below) where the prefix is an object variable
-            base_name = func_name.split('.')[0]
-            is_scope_var = False
-            try:
-                if hasattr(self.compiler, 'current_scope'):
-                    self.compiler.current_scope().get(base_name)
-                    is_scope_var = True
-            except Exception:
-                is_scope_var = False
-            if func_name.lower() in func_defs and not is_scope_var:
-                args_list = []
-                if arg_text.strip():
-                    args_list = [a.strip()
-                                 for a in re.split(r',(?![^{]*})', arg_text) if a.strip()]
-                evaluated_args = [self.eval_or_eval_array(
-                    a, scope, line_number) for a in args_list]
-                return self.compiler.call_function(func_name, evaluated_args)
-
-        # Handle member function calls (object.method(...) or object.method)
-        m_member = re.match(r'^([\w_]+)\.([\w_]+)(?:\((.*)\))?$', expr)
-        if m_member:
-            obj_name, method_name, args_part = m_member.groups()
-            # Retrieve the object value and type (if known)
-            obj_value = None
-            obj_type = None
-            try:
-                obj_value = scope.get(obj_name)
-            except Exception:
-                try:
-                    obj_value = self.compiler.current_scope().get(obj_name)
-                except Exception:
-                    obj_value = None
-            if obj_value is None and hasattr(self.compiler, '_materialize_inits'):
-                try:
-                    self.compiler._materialize_inits()
-                    try:
-                        obj_value = scope.get(obj_name)
-                    except Exception:
-                        obj_value = self.compiler.current_scope().get(obj_name)
-                except Exception:
-                    pass
-            try:
-                defining_scope = self.compiler.current_scope(
-                ).get_defining_scope(obj_name)
-                if defining_scope:
-                    actual_key = defining_scope._get_case_insensitive_key(
-                        obj_name, defining_scope.types)
-                    if actual_key:
-                        obj_type = defining_scope.types.get(actual_key)
-            except Exception:
-                pass
-            if obj_type is None and isinstance(obj_value, dict):
-                obj_type = obj_value.get('_type_name')
-            if obj_type is None and isinstance(obj_value, dict):
-                for t_name, t_def in getattr(self.compiler, 'types_defined', {}).items():
-                    public_fields = self.compiler._get_public_type_fields(
-                        t_def)
-                    if public_fields and object_public_keys(obj_value) == set(public_fields.keys()):
-                        obj_type = t_name
-                        break
-
-            # Handle member calls on arrays of objects (e.g., hand1.Name())
-            if isinstance(obj_value, (list, tuple, pa.Array)):
-                if isinstance(obj_value, pa.Array):
-                    obj_list = obj_value.to_pylist()
-                else:
-                    obj_list = list(obj_value)
-                element_type = obj_type
-                func_key = None
-                if element_type:
-                    func_key = self.compiler._resolve_member_function(
-                        element_type, method_name)
-                if not func_key:
-                    for elem in obj_list:
-                        if not isinstance(elem, dict):
-                            continue
-                        candidate = elem.get('_type_name')
-                        if not candidate:
-                            for t_name, t_def in getattr(self.compiler, 'types_defined', {}).items():
-                                public_fields = self.compiler._get_public_type_fields(
-                                    t_def)
-                                if public_fields and object_public_keys(elem) == set(public_fields.keys()):
-                                    candidate = t_name
-                                    break
-                        if not candidate:
-                            continue
-                        func_key = self.compiler._resolve_member_function(
-                            candidate, method_name)
-                        if func_key:
-                            element_type = candidate
-                            break
-                if func_key and func_key in getattr(self.compiler, 'functions', {}):
-                    arg_text = args_part if args_part is not None else ""
-                    args_list = []
-                    if arg_text.strip():
-                        args_list = [a.strip()
-                                     for a in re.split(r',(?![^{]*})', arg_text) if a.strip()]
-                    evaluated_args = [self.eval_or_eval_array(
-                        a, scope, line_number) for a in args_list]
-                    results = []
-                    for elem in obj_list:
-                        if isinstance(elem, dict):
-                            results.append(self.compiler.call_function(
-                                func_key, [elem] + evaluated_args, instance_type=element_type))
-                    return results
-
-            func_key = self.compiler._resolve_member_function(
-                obj_type, method_name) if obj_type else None
-            if func_key and func_key in getattr(self.compiler, 'functions', {}):
-                arg_text = args_part if args_part is not None else ""
-                args_list = []
-                if arg_text.strip():
-                    args_list = [a.strip()
-                                 for a in re.split(r',(?![^{]*})', arg_text) if a.strip()]
-                evaluated_args = [self.eval_or_eval_array(
-                    a, scope, line_number) for a in args_list]
-                return self.compiler.call_function(func_key, [obj_value] + evaluated_args, instance_type=obj_type)
-
-            if obj_type:
-                type_def = getattr(self.compiler, 'types_defined', {}).get(
-                    obj_type.lower(), {})
-                helper_defs = type_def.get(
-                    '_private_helpers', {}) if isinstance(type_def, dict) else {}
-                if method_name.lower() in helper_defs:
-                    if not getattr(self.compiler, '_allow_hidden_member_calls', False):
-                        raise PermissionError(
-                            f"Private helper '{method_name}' cannot be called here at line {line_number}")
-                    arg_text = args_part if args_part is not None else ""
-                    args_list = []
-                    if arg_text.strip():
-                        args_list = [a.strip()
-                                     for a in re.split(r',(?![^{]*})', arg_text) if a.strip()]
-                    evaluated_args = [self.eval_or_eval_array(
-                        a, scope, line_number) for a in args_list]
-                    self.compiler.type_processor._execute_private_helper(
-                        obj_type, method_name, obj_value, line_number, evaluated_args)
-                    return obj_value
-
-        # Handle field access (e.g., var.field)
-        if re.match(r'^[\w_]+\.\w+$', expr):
-            var, field = expr.split('.')
-            if var in scope and isinstance(scope[var], dict):
-                if self.compiler._is_hidden_field(scope[var], field) and not getattr(self.compiler, '_allow_hidden_field_access', False):
-                    raise PermissionError(
-                        f"Hidden field '{field}' is not accessible at line {line_number}")
-                return scope[var].get(field)
-            try:
-                var_value = self.compiler.current_scope().get(var)
-                if isinstance(var_value, dict):
-                    if self.compiler._is_hidden_field(var_value, field) and not getattr(self.compiler, '_allow_hidden_field_access', False):
-                        raise PermissionError(
-                            f"Hidden field '{field}' is not accessible at line {line_number}")
-                    return var_value.get(field)
-            except NameError:
-                pass
-
-        # Handle single cell reference (e.g., [A1])
-        if expr.startswith('[') and expr.endswith(']') and not ':' in expr:
-            cell_ref = expr[1:-1].strip()
-            if cell_ref.startswith('^'):
-                cell_ref = cell_ref[1:].strip()
-            if re.match(r'^[A-Za-z]+\d+$', cell_ref):
-                try:
-                    validate_cell_ref(cell_ref)
-                    value = self.compiler.array_handler.lookup_cell(
-                        cell_ref, line_number)
-                    return value
-                except ValueError as e:
-                    raise RuntimeError(
-                        f"Invalid cell reference '{cell_ref}': {e} at line {line_number}")
-
-        # Prepare expression for eval, replacing cell refs
+    def _evaluate_with_python_fallback(self, expr, scope, line_number):
         eval_expr = expr
-        # Use case-insensitive scope access for cell variables
-        cell_vars = {}
-        for c, v in self.compiler._cell_var_map.items():
-            try:
-                cell_vars[v] = self.compiler.current_scope().get(v)
-            except NameError:
-                # Variable not found, skip it
-                pass
-        full_scope = {**scope, **cell_vars}
+        full_scope = self._build_fallback_cell_scope(scope)
+        eval_expr = self._replace_fallback_cell_refs(eval_expr, line_number)
+        handled, result = self._try_eval_fallback_array_operation(
+            eval_expr, full_scope, line_number)
+        if handled:
+            return result
+        eval_expr = self._replace_fallback_curly_accesses(
+            eval_expr, scope, line_number)
+        eval_expr = self._replace_operators(eval_expr, line_number)
+        python_scope = self._build_python_fallback_scope(scope, line_number)
+        return self._eval_python_fallback_result(
+            expr, eval_expr, python_scope, line_number)
 
-        # Handle regular cell references (e.g., [A1], [B2])
+    def _build_fallback_cell_scope(self, scope):
+        cell_vars = {}
+        for _, var_name in self.compiler._cell_var_map.items():
+            try:
+                cell_vars[var_name] = self.compiler.current_scope().get(var_name)
+            except NameError:
+                pass
+        return {**scope, **cell_vars}
+
+    def _replace_fallback_cell_refs(self, eval_expr, line_number):
         cell_ref_pattern = re.compile(r'\[\^?([A-Za-z]+\d+)\]')
         cell_refs = cell_ref_pattern.findall(eval_expr)
         for cell_ref in cell_refs:
@@ -2083,208 +2136,182 @@ class ExpressionEvaluator:
                 value = self.compiler.array_handler.lookup_cell(
                     cell_ref, line_number)
                 if isinstance(value, (int, float)):
-                    eval_expr = eval_expr.replace(f'[{cell_ref}]', str(value))
-                    eval_expr = eval_expr.replace(f'[^{cell_ref}]', str(value))
+                    replacement = str(value)
                 else:
-                    eval_expr = eval_expr.replace(
-                        f'[{cell_ref}]', f'"{value}"')
-                    eval_expr = eval_expr.replace(
-                        f'[^{cell_ref}]', f'"{value}"')
+                    replacement = f'"{value}"'
+                eval_expr = eval_expr.replace(f'[{cell_ref}]', replacement)
+                eval_expr = eval_expr.replace(f'[^{cell_ref}]', replacement)
             except ValueError as e:
                 raise RuntimeError(
                     f"Invalid cell reference '{cell_ref}': {e} at line {line_number}")
+        return eval_expr
 
-        # Handle array operations (e.g., {1,2} + {3,4})
+    def _try_eval_fallback_array_operation(self, eval_expr, full_scope, line_number):
         array_op_match = re.match(
             r'^\s*(\{[^}]*\})\s*([+\-*/^\\]|mod)\s*(\{[^}]*\})\s*$', eval_expr, re.I)
-        if array_op_match:
-            left_array, op, right_array = array_op_match.groups()
-            arr1 = self._evaluate_array(left_array, full_scope, line_number)
-            arr2 = self._evaluate_array(right_array, full_scope, line_number)
-            shapes = [self.compiler.array_handler.get_array_shape(
-                arr, line_number) for arr in [arr1, arr2]]
-            if shapes[0] != shapes[1]:
-                raise ValueError(
-                    f"Arrays must have the same shape for operation {op}: {shapes} at line {line_number}")
-            rows, cols = shapes[0]
-            arr1_vals = arr1 if isinstance(arr1, list) else arr1.to_pylist()
-            arr2_vals = arr2 if isinstance(arr2, list) else arr2.to_pylist()
-            result = []
-            for i in range(rows):
-                row = []
-                for j in range(cols):
-                    val1 = arr1_vals[i][j]
-                    val2 = arr2_vals[i][j]
-                    if not (isinstance(val1, (int, float)) and isinstance(val2, (int, float))):
-                        raise TypeError(
-                            f"Non-numeric values at position [{i}][{j}]: {val1}, {val2} at line {line_number}")
-                    try:
-                        if op == '+':
-                            result_val = float(val1 + val2)
-                        elif op == '-':
-                            result_val = float(val1 - val2)
-                        elif op == '*':
-                            result_val = float(val1 * val2)
-                        elif op == '/':
-                            result_val = float(
-                                val1 / val2) if val2 != 0 else float('nan')
-                        elif op == '^':
-                            result_val = float(val1 ** val2)
-                        elif op.lower() == 'mod':
-                            result_val = float(
-                                val1 % val2) if val2 != 0 else float('nan')
-                        elif op == '\\':
-                            result_val = float(
-                                val1 // val2) if val2 != 0 else float('nan')
-                        else:
-                            raise SyntaxError(
-                                f"Unsupported array operator: {op} at line {line_number}")
-                        row.append(result_val)
-                    except ZeroDivisionError:
-                        row.append(float('nan'))
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"Error computing {val1} {op} {val2} at position [{i}][{j}]: {e} at line {line_number}")
-                result.append(row)
-            return result
+        if not array_op_match:
+            return False, None
+        left_array, op, right_array = array_op_match.groups()
+        arr1 = self._evaluate_array(left_array, full_scope, line_number)
+        arr2 = self._evaluate_array(right_array, full_scope, line_number)
+        shapes = [self.compiler.array_handler.get_array_shape(
+            arr, line_number) for arr in [arr1, arr2]]
+        if shapes[0] != shapes[1]:
+            raise ValueError(
+                f"Arrays must have the same shape for operation {op}: {shapes} at line {line_number}")
+        rows, cols = shapes[0]
+        arr1_vals = arr1 if isinstance(arr1, list) else arr1.to_pylist()
+        arr2_vals = arr2 if isinstance(arr2, list) else arr2.to_pylist()
+        result = []
+        for row_i in range(rows):
+            row = []
+            for col_i in range(cols):
+                val1 = arr1_vals[row_i][col_i]
+                val2 = arr2_vals[row_i][col_i]
+                if not (isinstance(val1, (int, float)) and isinstance(val2, (int, float))):
+                    raise TypeError(
+                        f"Non-numeric values at position [{row_i}][{col_i}]: {val1}, {val2} at line {line_number}")
+                try:
+                    if op == '+':
+                        result_val = float(val1 + val2)
+                    elif op == '-':
+                        result_val = float(val1 - val2)
+                    elif op == '*':
+                        result_val = float(val1 * val2)
+                    elif op == '/':
+                        result_val = float(val1 / val2) if val2 != 0 else float('nan')
+                    elif op == '^':
+                        result_val = float(val1 ** val2)
+                    elif op.lower() == 'mod':
+                        result_val = float(val1 % val2) if val2 != 0 else float('nan')
+                    elif op == '\\':
+                        result_val = float(val1 // val2) if val2 != 0 else float('nan')
+                    else:
+                        raise SyntaxError(
+                            f"Unsupported array operator: {op} at line {line_number}")
+                    row.append(result_val)
+                except ZeroDivisionError:
+                    row.append(float('nan'))
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Error computing {val1} {op} {val2} at position [{row_i}][{col_i}]: {e} at line {line_number}")
+            result.append(row)
+        return True, result
 
-        # Pre-process curly brace expressions (e.g., D{i, 1} → evaluated_value)
+    def _replace_fallback_curly_accesses(self, eval_expr, scope, line_number):
         curly_brace_pattern = re.compile(r'([\w_]+)\{([^}]+)\}')
         curly_matches = curly_brace_pattern.findall(eval_expr)
         for var_name, indices_str in curly_matches:
-            if var_name in scope or var_name in self.compiler.variables:
-                # Parse indices (e.g., "i+1, 1" -> [i+1, 1])
-                indices = []
-                for index_expr in indices_str.split(','):
-                    index_expr = index_expr.strip()
-                    try:
-                        # Evaluate the index expression (e.g., "i+1")
-                        index_value = self.eval_expr(
-                            index_expr, scope, line_number)
-                        indices.append(index_value)
-                    except Exception as e:
-                        raise SyntaxError(
-                            f"Invalid index expression '{index_expr}' in '{var_name}{{{indices_str}}}': {e} at line {line_number}")
-
-                # Get the array
-                array = scope.get(
-                    var_name, self.compiler.variables.get(var_name))
-                if array is None:
-                    raise ValueError(
-                        f"Variable '{var_name}' is uninitialized at line {line_number}")
-
-                # Adjust indices based on dimension metadata
-                dims = self.compiler.dimensions.get(var_name, [])
-                # Also check constraints in scope for dimension-constrained arrays
-                scope_constraints = None
-                current_scope = self.compiler.current_scope()
-                if hasattr(current_scope, 'constraints') and var_name in current_scope.constraints:
-                    scope_constraints = current_scope.constraints[var_name].get(
-                        'dim', [])
-                else:
-                    pass
-
-                adjusted_indices = []
-                for i, idx in enumerate(indices):
-                    # Prefer scope constraints (dimension-constrained arrays)
-                    if scope_constraints and i < len(scope_constraints):
-                        constraint = scope_constraints[i]
-                        if isinstance(constraint, tuple) and len(constraint) == 2 and isinstance(constraint[1], tuple):
-                            base = constraint[1][0]
-                            adjusted_idx = idx - base
-                            adjusted_indices.append(adjusted_idx)
-                        else:
-                            adjusted_idx = idx - 1
-                            adjusted_indices.append(adjusted_idx)
-                    # range, e.g., (0, 10)
-                    elif i < len(dims) and isinstance(dims[i][1], tuple):
-                        base = dims[i][1][0]
+            if var_name not in scope and var_name not in self.compiler.variables:
+                continue
+            indices = []
+            for index_expr in indices_str.split(','):
+                index_expr = index_expr.strip()
+                try:
+                    index_value = self.eval_expr(
+                        index_expr, scope, line_number)
+                    indices.append(index_value)
+                except Exception as e:
+                    raise SyntaxError(
+                        f"Invalid index expression '{index_expr}' in '{var_name}{{{indices_str}}}': {e} at line {line_number}")
+            array = scope.get(var_name, self.compiler.variables.get(var_name))
+            if array is None:
+                raise ValueError(
+                    f"Variable '{var_name}' is uninitialized at line {line_number}")
+            dims = self.compiler.dimensions.get(var_name, [])
+            scope_constraints = None
+            current_scope = self.compiler.current_scope()
+            if hasattr(current_scope, 'constraints') and var_name in current_scope.constraints:
+                scope_constraints = current_scope.constraints[var_name].get(
+                    'dim', [])
+            adjusted_indices = []
+            for idx_i, idx in enumerate(indices):
+                if scope_constraints and idx_i < len(scope_constraints):
+                    constraint = scope_constraints[idx_i]
+                    if isinstance(constraint, tuple) and len(constraint) == 2 and isinstance(constraint[1], tuple):
+                        base = constraint[1][0]
                         adjusted_idx = idx - base
                         adjusted_indices.append(adjusted_idx)
-                    else:  # just a size, treat as 1-based
+                    else:
                         adjusted_idx = idx - 1
                         adjusted_indices.append(adjusted_idx)
+                elif idx_i < len(dims) and isinstance(dims[idx_i][1], tuple):
+                    base = dims[idx_i][1][0]
+                    adjusted_idx = idx - base
+                    adjusted_indices.append(adjusted_idx)
+                else:
+                    adjusted_idx = idx - 1
+                    adjusted_indices.append(adjusted_idx)
+            try:
+                result = self.compiler.array_handler.get_array_element(
+                    array, adjusted_indices, line_number)
+                curly_expr = f"{var_name}{{{indices_str}}}"
+                eval_expr = eval_expr.replace(curly_expr, str(result))
+            except (IndexError, ValueError) as e:
+                raise IndexError(
+                    f"Invalid indices {indices_str} for '{var_name}': {e} at line {line_number}")
+        return eval_expr
 
-                try:
-                    result = self.compiler.array_handler.get_array_element(
-                        array, adjusted_indices, line_number)
-                    # Replace the curly brace expression with the evaluated result
-                    curly_expr = f"{var_name}{{{indices_str}}}"
-                    eval_expr = eval_expr.replace(curly_expr, str(result))
-                except (IndexError, ValueError) as e:
-                    raise IndexError(
-                        f"Invalid indices {indices_str} for '{var_name}': {e} at line {line_number}")
-
-        # Replace operators for Python eval (mod → %, ^ → **, \ → //)
-        eval_expr = self._replace_operators(eval_expr, line_number)
-
-        # Get the full scope for evaluation
+    def _build_python_fallback_scope(self, scope, line_number):
         if hasattr(scope, 'get_evaluation_scope'):
             full_scope = scope.get_evaluation_scope()
         else:
             full_scope = scope
-
-        # Allow attribute-style access on dictionaries (e.g., p.x)
-        def _wrap_value(val):
-            if isinstance(val, dict):
-                evaluator = self
-
-                class DotDict(dict):
-                    def __getattr__(self, item):
-                        hidden = self.get('_hidden_fields', set())
-                        if isinstance(hidden, (set, list, tuple)):
-                            hidden_set = {str(h).lower() for h in hidden}
-                        else:
-                            hidden_set = set()
-                        if str(item).lower() in hidden_set and not getattr(evaluator.compiler, '_allow_hidden_field_access', False):
-                            raise PermissionError(
-                                f"Hidden field '{item}' is not accessible at line {line_number}")
-                        return self.get(item)
-                wrapped = DotDict()
-                for k, v in val.items():
-                    wrapped[k] = _wrap_value(v)
-                return wrapped
-            if isinstance(val, list):
-                return [_wrap_value(v) for v in val]
-            return val
-
-        full_scope = {k: _wrap_value(v) for k, v in full_scope.items()} if isinstance(
+        full_scope = {k: self._wrap_eval_scope_value(v, line_number) for k, v in full_scope.items()} if isinstance(
             full_scope, dict) else full_scope
         if isinstance(full_scope, dict):
             full_scope = CaseInsensitiveDict(full_scope)
 
-        # Add built-in functions to the scope
         def rows(arr):
-            """Return the length of an array or list."""
             if hasattr(arr, '__len__'):
                 return len(arr)
-            elif isinstance(arr, (list, tuple)):
+            if isinstance(arr, (list, tuple)):
                 return len(arr)
-            else:
-                return 0
+            return 0
 
         def sum_func(*args):
-            """Sum function that handles sum{a, b} syntax."""
             if len(args) == 1 and isinstance(args[0], str):
-                # Handle sum{a, b} syntax
                 if args[0].startswith('{') and args[0].endswith('}'):
                     return self._evaluate_sum_vars(f"sum{args[0]}", scope, line_number)
-                # Handle sum[A1:B2] syntax
-                elif args[0].startswith('[') and args[0].endswith(']'):
+                if args[0].startswith('[') and args[0].endswith(']'):
                     return self._evaluate_sum_range(f"sum{args[0]}", scope, line_number)
-            # Handle regular sum of arguments
             return sum(args)
 
         full_scope['rows'] = rows
         full_scope['sum'] = sum_func
+        return full_scope
 
-        # Evaluate the prepared expression using Python's eval
+    def _wrap_eval_scope_value(self, value, line_number):
+        if isinstance(value, dict):
+            evaluator = self
+
+            class DotDict(dict):
+                def __getattr__(self, item):
+                    hidden = self.get('_hidden_fields', set())
+                    if isinstance(hidden, (set, list, tuple)):
+                        hidden_set = {str(h).lower() for h in hidden}
+                    else:
+                        hidden_set = set()
+                    if str(item).lower() in hidden_set and not getattr(evaluator.compiler, '_allow_hidden_field_access', False):
+                        raise PermissionError(
+                            f"Hidden field '{item}' is not accessible at line {line_number}")
+                    return self.get(item)
+
+            wrapped = DotDict()
+            for key, item_value in value.items():
+                wrapped[key] = self._wrap_eval_scope_value(
+                    item_value, line_number)
+            return wrapped
+        if isinstance(value, list):
+            return [self._wrap_eval_scope_value(v, line_number) for v in value]
+        return value
+
+    def _eval_python_fallback_result(self, original_expr, eval_expr, full_scope, line_number):
         try:
             globals_dict = self._get_eval_globals()
             result = eval(eval_expr, globals_dict, full_scope)
             if isinstance(result, (int, float)) and math.isnan(result):
                 return float('nan')
-            # Ensure array literals are returned as lists, not sets
             if isinstance(result, set):
                 result = sorted(list(result))
             return float(result) if isinstance(result, (int, float)) else result
@@ -2294,7 +2321,7 @@ class ExpressionEvaluator:
             raise NameError(f"{e} at line {line_number}")
         except Exception as e:
             raise RuntimeError(
-                f"Error evaluating '{expr}': {e} at line {line_number}")
+                f"Error evaluating '{original_expr}': {e} at line {line_number}")
 
     def get_full_scope(self):
         """Get the full evaluation scope (alias to get_evaluation_scope)."""
@@ -2476,8 +2503,7 @@ class ExpressionEvaluator:
                 elif isinstance(item, str):
                     lengths.append(len(item))
                 else:
-                    raise TypeError(
-                        "Len expects text or an array of text values")
+                    raise TypeError("Len expects text or an array of text values")
             return lengths
 
         def Mid(text, start, length=1):
@@ -2540,6 +2566,8 @@ class ExpressionEvaluator:
             'RandArray': RandArray,
             'SortBy': SortBy,
             'SQRT': math.sqrt,
+            'sqrt': math.sqrt,
+            'Sqrt': math.sqrt,
             '_lookup_cell': self.compiler.array_handler.lookup_cell,
             'rows': rows
         }

@@ -23,33 +23,13 @@ class GridLangParser:
         dims = None
         type_union = []
 
-        # Handle field assignments (e.g., p.x = value)
-        field_match = re.match(r'^([\w_]+)\.(\w+)\s*=\s*(.+)$', def_str)
-        if field_match:
-            var, field, expr_str = field_match.groups()
-            expr = expr_str
-            constraints['constant'] = expr
-            return f"{var}.{field}", None, constraints, expr
-
-        # Handle array indexing assignments (e.g., D{i+1, 1} = value)
-        array_index_match = re.match(
-            r'^([\w_]+)\{([^}]+)\}\s*=\s*(.+)$', def_str)
-        if array_index_match:
-            var_name, indices_str, expr_str = array_index_match.groups()
-            expr = expr_str
-            # Create a special variable name that includes the indices
-            var = f"{var_name}{{{indices_str}}}"
-            return var, None, constraints, expr
-
-        # Handle parentheses indexing assignments (e.g., D(1) = value)
-        paren_index_match = re.match(
-            r'^([\w_]+)\(([^)]+)\)\s*=\s*(.+)$', def_str)
-        if paren_index_match:
-            var_name, index_expr, expr_str = paren_index_match.groups()
-            expr = expr_str
-            # Create a special variable name that includes the parentheses indices
-            var = f"{var_name}({index_expr})"
-            return var, None, constraints, expr
+        direct_match = self._match_direct_assignment_patterns(
+            def_str,
+            line_number,
+            constraints,
+        )
+        if direct_match is not None:
+            return direct_match
 
         # Extract 'with' clause early to preserve parentheses
         with_content_str = None
@@ -139,7 +119,10 @@ class GridLangParser:
                         range_constraint['step'] = step_expr
                     constraints['range'] = range_constraint
                 else:
-                    raise SyntaxError(f"Invalid 'in' constraint syntax: '{next_part}' at line {line_number}")
+                    # Allow variable/expression-based in constraints (e.g., "in Options")
+                    if not next_part:
+                        raise SyntaxError(f"Invalid 'in' constraint syntax: '{next_part}' at line {line_number}")
+                    constraints['in'] = next_part
             elif keyword in ('<=', '>=', '<', '>', '<>'):
                 if negated:
                     constraints[f'not_{keyword}'] = next_part
@@ -157,7 +140,21 @@ class GridLangParser:
                         matrix_data = []
                         for matrix in matrices:
                             rows = [r.strip().split(',') for r in matrix.split(';')]
-                            matrix_data.append([[float(v.strip()) for v in row] for row in rows])
+                            parsed_rows = []
+                            for row in rows:
+                                parsed_row = []
+                                for v in row:
+                                    v_clean = v.strip()
+                                    if (v_clean.startswith('"') and v_clean.endswith('"')) or (
+                                            v_clean.startswith("'") and v_clean.endswith("'")):
+                                        parsed_row.append(v_clean[1:-1])
+                                    else:
+                                        try:
+                                            parsed_row.append(float(v_clean))
+                                        except ValueError:
+                                            parsed_row.append(v_clean)
+                                parsed_rows.append(parsed_row)
+                            matrix_data.append(parsed_rows)
                         expr = matrix_data
                     else:
                         values_str = next_part[1:-1].split(',')
@@ -177,113 +174,168 @@ class GridLangParser:
                     expr = next_part
             i += 2
 
-        # Process 'with' clause
-        if with_content_str:
-            with_inner_content = with_content_str[1:-1].strip()
-            with_constraints = {}
-            dim_constraint = None
-            wc_parts = []
-            current = ""
-            in_quotes = False
-            paren_level, brace_level = 0, 0
-            for char in with_inner_content + ',':
-                if char == '"' and (len(current) == 0 or current[-1] != '\\'):
-                    in_quotes = not in_quotes
-                elif not in_quotes:
-                    if char == '(':
-                        paren_level += 1
-                    elif char == ')':
-                        paren_level -= 1
-                    elif char == '{':
-                        brace_level += 1
-                    elif char == '}':
-                        brace_level -= 1
-                if char == ',' and not in_quotes and paren_level == 0 and brace_level == 0:
-                    if current.strip():
-                        wc_parts.append(current.strip())
-                    current = ""
-                else:
-                    current += char
-            for wc in wc_parts:
-                wc = wc.strip()
-                if wc.lower().startswith('grid dim'):
-                    if dim_constraint is not None:
-                        raise SyntaxError(
-                            f"Multiple grid DIM statements not allowed in with clause at line {line_number}")
-                    dim_match = re.match(
-                        r'grid\s+dim\s*\{([^}]+)\}\s*(?:=\s*({.+?}(?:\s*\|\s*{.+?})*|[\d.]+|\w+))?', wc, re.I)
-                    if not dim_match:
-                        raise SyntaxError(
-                            f"Invalid dimension syntax: '{wc}' at line {line_number}")
-                    dim_str = dim_match.group(1)
-                    grid_data = dim_match.group(2)
-                    dim_parts = [p.strip() for p in dim_str.split(',')]
-                    dim_constraint = {
-                        'dims': [(1, int(p.strip())) for p in dim_parts]}
-                    if grid_data:
-                        if re.match(r'^{.+?}(?:\s*\|\s*{.+?})*$', grid_data):
-                            matrices = [m.strip()[1:-1]
-                                        for m in grid_data.split('|')]
-                            matrix_data = []
-                            for matrix in matrices:
-                                rows = [r.strip().split(',')
-                                        for r in matrix.split(';')]
-                                matrix_data.append(
-                                    [[float(v.strip()) for v in row] for row in rows])
-                            # Normalize single-matrix to 2D list instead of [[[...]]]
-                            dim_constraint['matrix_data'] = matrix_data if len(
-                                matrix_data) > 1 else matrix_data
-                        elif re.match(r'^[\d.]+$', grid_data):
-                            dim_constraint['value'] = float(grid_data)
-                        elif re.match(r'^\w+$', grid_data):
-                            dim_constraint['data_var'] = grid_data
-                        else:
-                            raise SyntaxError(
-                                f"Invalid grid data: '{grid_data}' at line {line_number}")
-                elif '=' in wc:
-                    k, v = [s.strip() for s in wc.split('=', 1)]
-                    if v.startswith('"') and v.endswith('"'):
-                        with_constraints[k] = v[1:-1]
-                    else:
-                        try:
-                            with_constraints[k] = self.compiler.expr_evaluator.eval_expr(
-                                v, self.compiler.current_scope().get_full_scope(), line_number)
-                        except Exception:
-                            v = v.strip('"')
-                            with_constraints[k] = v
-                else:
-                    name = wc.strip()
-                    if name:
-                        with_constraints[name] = name
-            if with_constraints:
-                constraints['with'] = with_constraints
-            if dim_constraint:
-                constraints['dim'] = dim_constraint
+        self._apply_with_clause(
+            with_content_str,
+            constraints,
+            line_number,
+        )
 
-        # Process dimensions
+        self._apply_dimension_constraints(
+            dims,
+            constraints,
+            line_number,
+        )
+        if type_union:
+            unique_types = list(dict.fromkeys(type_union))
+            if len(unique_types) == 1:
+                type_name = unique_types[0]
+            else:
+                constraints['type_union'] = unique_types
+                type_name = None
+
+        self._merge_custom_type_constraints(type_name, constraints)
+
+        return var, type_name, constraints, expr
+
+    def _match_direct_assignment_patterns(self, def_str, line_number, constraints):
+        field_match = re.match(r'^([\w_]+)\.(\w+)\s*=\s*(.+)$', def_str)
+        if field_match:
+            var, field, expr = field_match.groups()
+            constraints['constant'] = expr
+            return f"{var}.{field}", None, constraints, expr
+
+        array_index_match = re.match(
+            r'^([\w_]+)\{([^}]+)\}\s*=\s*(.+)$', def_str)
+        if array_index_match:
+            var_name, indices_str, expr = array_index_match.groups()
+            var = f"{var_name}{{{indices_str}}}"
+            return var, None, constraints, expr
+
+        paren_index_match = re.match(
+            r'^([\w_]+)\(([^)]+)\)\s*=\s*(.+)$', def_str)
+        if paren_index_match:
+            var_name, index_expr, expr = paren_index_match.groups()
+            var = f"{var_name}({index_expr})"
+            return var, None, constraints, expr
+
+        return None
+
+    def _apply_with_clause(self, with_content_str, constraints, line_number):
+        if not with_content_str:
+            return
+
+        with_inner_content = with_content_str[1:-1].strip()
+        with_constraints = {}
+        dim_constraint = None
+        wc_parts = []
+        current = ""
+        in_quotes = False
+        paren_level, brace_level = 0, 0
+        for char in with_inner_content + ',':
+            if char == '"' and (len(current) == 0 or current[-1] != '\\'):
+                in_quotes = not in_quotes
+            elif not in_quotes:
+                if char == '(':
+                    paren_level += 1
+                elif char == ')':
+                    paren_level -= 1
+                elif char == '{':
+                    brace_level += 1
+                elif char == '}':
+                    brace_level -= 1
+            if char == ',' and not in_quotes and paren_level == 0 and brace_level == 0:
+                if current.strip():
+                    wc_parts.append(current.strip())
+                current = ""
+            else:
+                current += char
+
+        for wc in wc_parts:
+            wc = wc.strip()
+            if wc.lower().startswith('grid dim'):
+                if dim_constraint is not None:
+                    raise SyntaxError(
+                        f"Multiple grid DIM statements not allowed in with clause at line {line_number}")
+                dim_match = re.match(
+                    r'grid\s+dim\s*\{([^}]+)\}\s*(?:=\s*({.+?}(?:\s*\|\s*{.+?})*|[\d.]+|\w+))?',
+                    wc,
+                    re.I,
+                )
+                if not dim_match:
+                    raise SyntaxError(
+                        f"Invalid dimension syntax: '{wc}' at line {line_number}")
+                dim_str = dim_match.group(1)
+                grid_data = dim_match.group(2)
+                dim_parts = [p.strip() for p in dim_str.split(',')]
+                dim_constraint = {
+                    'dims': [(1, int(p.strip())) for p in dim_parts]}
+                if grid_data:
+                    if re.match(r'^{.+?}(?:\s*\|\s*{.+?})*$', grid_data):
+                        matrices = [m.strip()[1:-1] for m in grid_data.split('|')]
+                        matrix_data = []
+                        for matrix in matrices:
+                            rows = [r.strip().split(',') for r in matrix.split(';')]
+                            matrix_data.append(
+                                [[float(v.strip()) for v in row] for row in rows])
+                        dim_constraint['matrix_data'] = matrix_data if len(
+                            matrix_data) > 1 else matrix_data
+                    elif re.match(r'^[\d.]+$', grid_data):
+                        dim_constraint['value'] = float(grid_data)
+                    elif re.match(r'^\w+$', grid_data):
+                        dim_constraint['data_var'] = grid_data
+                    else:
+                        raise SyntaxError(
+                            f"Invalid grid data: '{grid_data}' at line {line_number}")
+            elif '=' in wc:
+                key, value = [s.strip() for s in wc.split('=', 1)]
+                if value.startswith('"') and value.endswith('"'):
+                    with_constraints[key] = value[1:-1]
+                else:
+                    try:
+                        with_constraints[key] = self.compiler.expr_evaluator.eval_expr(
+                            value, self.compiler.current_scope().get_full_scope(), line_number)
+                    except Exception:
+                        with_constraints[key] = value.strip('"')
+            else:
+                name = wc.strip()
+                if name:
+                    with_constraints[name] = name
+
+        if with_constraints:
+            constraints['with'] = with_constraints
+        if dim_constraint:
+            constraints['dim'] = dim_constraint
+
+    def _apply_dimension_constraints(self, dims, constraints, line_number):
         if dims:
             dim_expr = dims.strip()
-            # Allow "dim {} or dim 1" style declarations by taking the first clause.
-            dim_expr = re.split(r'\s+or\s+', dim_expr, maxsplit=1, flags=re.I)[0].strip()
+            dim_expr = re.split(
+                r'\s+or\s+',
+                dim_expr,
+                maxsplit=1,
+                flags=re.I,
+            )[0].strip()
             if dim_expr == '{}':
                 constraints['dim'] = '{}'
-            else:
-                dim_parts = dim_expr[1:-
-                                     1].split(',') if dim_expr.startswith('{') else [dim_expr]
-                dims_list = []
-                for part in dim_parts:
-                    part = part.strip()
-                    if not part:
-                        continue
-                    if ':' in part:
-                        name, size = map(str.strip, part.split(':'))
-                        size_spec = self._parse_dim_size(size, line_number)
-                        dims_list.append((name, size_spec))
-                    else:
-                        size_spec = self._parse_dim_size(part, line_number)
-                        dims_list.append((None, size_spec))
-                constraints['dim'] = dims_list
-        elif constraints.get('with', {}).get('dim'):
+                return
+
+            dim_parts = dim_expr[1:-1].split(',') if dim_expr.startswith('{') else [dim_expr]
+            dims_list = []
+            for part in dim_parts:
+                part = part.strip()
+                if not part:
+                    continue
+                if ':' in part:
+                    name, size = map(str.strip, part.split(':'))
+                    size_spec = self._parse_dim_size(size, line_number)
+                    dims_list.append((name, size_spec))
+                else:
+                    size_spec = self._parse_dim_size(part, line_number)
+                    dims_list.append((None, size_spec))
+            constraints['dim'] = dims_list
+            return
+
+        if constraints.get('with', {}).get('dim'):
             dim_str = constraints['with']['dim']
             m = re.match(r'^\s*grid\s+dim\s*\{([^}]+)\}\s*$', dim_str, re.I)
             if not m:
@@ -297,26 +349,18 @@ class GridLangParser:
                 size_spec = self._parse_dim_size(part, line_number)
                 dims_list.append((None, size_spec))
             constraints['dim'] = dims_list
-        if type_union:
-            unique_types = list(dict.fromkeys(type_union))
-            if len(unique_types) == 1:
-                type_name = unique_types[0]
-            else:
-                constraints['type_union'] = unique_types
-                type_name = None
 
-        # Merge in custom type constraints when available
-        if type_name and self.compiler and hasattr(self.compiler, 'types_defined'):
-            type_def = self.compiler.types_defined.get(type_name.lower())
-            if isinstance(type_def, dict):
-                type_constraints = type_def.get('_constraints', {}) or {}
-                for key, val in type_constraints.items():
-                    constraints.setdefault(key, val)
-                base_type = type_def.get('_base_type')
-                if base_type and 'type' not in constraints:
-                    constraints['type'] = base_type
-
-        return var, type_name, constraints, expr
+    def _merge_custom_type_constraints(self, type_name, constraints):
+        if not (type_name and self.compiler and hasattr(self.compiler, 'types_defined')):
+            return
+        type_def = self.compiler.types_defined.get(type_name.lower())
+        if isinstance(type_def, dict):
+            type_constraints = type_def.get('_constraints', {}) or {}
+            for key, val in type_constraints.items():
+                constraints.setdefault(key, val)
+            base_type = type_def.get('_base_type')
+            if base_type and 'type' not in constraints:
+                constraints['type'] = base_type
 
     def _split_on_keywords(self, text):
         """Split a variable definition on keywords, skipping quoted sections."""

@@ -3,6 +3,10 @@ Scope management for GridLang compiler.
 Handles variable scoping, constraints, and pipe connections.
 """
 
+import copy
+
+import pyarrow as pa
+
 
 class Scope:
     def __init__(self, compiler, parent=None, is_private=False):
@@ -16,8 +20,7 @@ class Scope:
         self.pending_assignments = {}
         # New Grid language features
         # Maintain definition order for inputs/outputs (args rely on this)
-        # Variables that can only receive values (case-insensitive, ordered)
-        self.input_variables = []
+        self.input_variables = []  # Variables that can only receive values (case-insensitive, ordered)
         self.output_variables = set()  # Variables that can only push values
         self.pipe_connections = {}  # Maps outputs to connected inputs
         self.implicit_let = set()
@@ -30,24 +33,97 @@ class Scope:
                 return key
         return None
 
+    def _coerce_custom_type_value(self, type_name, value, constraints=None, line_number=None):
+        adjusted_value = value
+        adjusted_constraints = constraints or {}
+        if (
+            adjusted_value is None
+            or not type_name
+            or not hasattr(self, 'compiler')
+            or not hasattr(self.compiler, 'types_defined')
+            or type_name.lower() not in self.compiler.types_defined
+        ):
+            return adjusted_value, adjusted_constraints
+
+        if isinstance(adjusted_value, pa.Array) and not adjusted_constraints.get('dim'):
+            adjusted_value = adjusted_value.to_pylist()
+        if isinstance(adjusted_value, list) and not adjusted_constraints.get('dim'):
+            adjusted_value = self.compiler._convert_array_to_object(
+                type_name, adjusted_value, line_number)
+
+        constant_expr = adjusted_constraints.get('constant')
+        raw_is_typed_literal = isinstance(constant_expr, (list, tuple, pa.Array))
+        if isinstance(constant_expr, str):
+            constant_text = constant_expr.strip()
+            raw_is_typed_literal = constant_text.startswith('{') and constant_text.endswith('}')
+        if raw_is_typed_literal and isinstance(adjusted_value, dict):
+            adjusted_constraints = dict(adjusted_constraints)
+            adjusted_constraints['constant'] = adjusted_value
+
+        return adjusted_value, adjusted_constraints
+
+    def _strip_init_copy_immutability(self, value):
+        if isinstance(value, dict):
+            cleaned = {}
+            for key, item in value.items():
+                if key == '_immutable_fields':
+                    continue
+                cleaned[key] = self._strip_init_copy_immutability(item)
+            return cleaned
+        if isinstance(value, list):
+            return [self._strip_init_copy_immutability(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._strip_init_copy_immutability(item) for item in value)
+        return value
+
+    def _materialize_lazy_init_value(self, name, value, line_number=None):
+        actual_key = self._get_case_insensitive_key(name, self.variables) or name
+        try:
+            materialized = copy.deepcopy(value)
+        except Exception:
+            materialized = value
+        materialized = self._strip_init_copy_immutability(materialized)
+
+        constraints_key = self._get_case_insensitive_key(
+            actual_key, self.constraints) or actual_key
+        constraints = self.constraints.get(constraints_key, {})
+        type_key = self._get_case_insensitive_key(actual_key, self.types) or actual_key
+        var_type = self.types.get(type_key)
+
+        if materialized is not None and var_type and hasattr(self, 'compiler'):
+            materialized, constraints = self._coerce_custom_type_value(
+                var_type, materialized, constraints, line_number)
+            self.constraints[constraints_key] = constraints
+        if materialized is not None and constraints and constraints.get('dim') and hasattr(self, 'compiler'):
+            materialized = self.compiler.array_handler.check_dimension_constraints(
+                actual_key, materialized, line_number)
+        if materialized is not None:
+            self._check_constraints(actual_key, materialized, line_number)
+
+        self.variables[actual_key] = materialized
+        self.uninitialized.discard(actual_key)
+        if hasattr(self.compiler, 'mark_dependency_resolved'):
+            self.compiler.mark_dependency_resolved(actual_key)
+        return materialized
+
     def define(self, name, value=None, type=None, constraints=None, is_uninitialized=False, line_number=None):
+        effective_constraints = constraints or {}
         # Check for case-insensitive conflicts
         existing_key = self._get_case_insensitive_key(name, self.variables)
         if existing_key and not is_uninitialized:
             raise ValueError(
                 f"Variable '{name}' conflicts with existing variable '{existing_key}' in this scope")
         if value is not None and type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
-            if isinstance(value, list) and type.lower() in self.compiler.types_defined:
-                value = self.compiler._convert_array_to_object(
-                    type, value, line_number)
+            value, effective_constraints = self._coerce_custom_type_value(
+                type, value, effective_constraints, line_number)
         if value is not None and not is_uninitialized:
-            if constraints and constraints.get('dim') and hasattr(self, 'compiler'):
+            if effective_constraints and effective_constraints.get('dim') and hasattr(self, 'compiler'):
                 value = self.compiler.array_handler.check_dimension_constraints(
                     name, value, line_number)
             self._check_constraints(name, value, line_number)
         self.variables[name] = value
         self.types[name] = type
-        self.constraints[name] = constraints or {}
+        self.constraints[name] = effective_constraints
         if is_uninitialized:
             self.uninitialized.add(name)
         else:
@@ -63,12 +139,11 @@ class Scope:
                 name, defining_scope.variables)
             if actual_key:
                 var_type = defining_scope.types.get(actual_key)
+                constraints = defining_scope.constraints.get(actual_key, {})
                 if value is not None and var_type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
-                    if isinstance(value, list) and var_type.lower() in self.compiler.types_defined:
-                        # If this variable is an array of custom types, keep the list.
-                        if not defining_scope.constraints.get(actual_key, {}).get('dim'):
-                            value = self.compiler._convert_array_to_object(
-                                var_type, value, line_number)
+                    value, constraints = defining_scope._coerce_custom_type_value(
+                        var_type, value, constraints, line_number)
+                    defining_scope.constraints[actual_key] = constraints
                 # Prevent updating input variables once initialized
                 if defining_scope.constraints.get(actual_key, {}).get('input') and actual_key not in defining_scope.uninitialized:
                     raise ValueError(
@@ -76,8 +151,7 @@ class Scope:
                 if defining_scope.constraints.get(actual_key, {}).get('dim'):
                     value = self.compiler.array_handler.check_dimension_constraints(
                         actual_key, value, line_number)
-                defining_scope._check_constraints(
-                    actual_key, value, line_number)
+                defining_scope._check_constraints(actual_key, value, line_number)
                 defining_scope.variables[actual_key] = value
                 defining_scope.uninitialized.discard(actual_key)
 
@@ -121,8 +195,8 @@ class Scope:
                     try:
                         value = self.compiler.expr_evaluator.eval_or_eval_array(
                             str(init_expr), self.get_full_scope())
-                        self.variables[actual_key] = value
-                        self.uninitialized.discard(actual_key)
+                        value = self._materialize_lazy_init_value(
+                            actual_key, value)
                     except Exception:
                         pass
             return value
@@ -328,8 +402,7 @@ class Scope:
             expr_text = ' '.join(brace_parts)
         else:
             # Strip quoted strings to avoid false positives from literals.
-            expr_text = re.sub(
-                r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', ' ', expr)
+            expr_text = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', ' ', expr)
         # Create a pattern that matches the variable name as a whole word
         pattern = r'\b' + re.escape(var_name) + r'\b'
         return bool(re.search(pattern, expr_text))
@@ -350,6 +423,25 @@ class Scope:
                         continue
                 else:
                     constraint_val = constraint_expr
+                # WITH constraints are stored separately from '=' parsing.
+                # Apply them before constant comparison so
+                # "new Type with (...)" compares against the constrained value.
+                if constraints.get('with'):
+                    try:
+                        type_name = None
+                        actual_type_key = self._get_case_insensitive_key(
+                            key_for_constraints, self.types)
+                        if actual_type_key:
+                            type_name = self.types.get(actual_type_key)
+                        constraint_val = self.compiler._apply_with_constraints(
+                            constraint_val,
+                            constraints.get('with', {}),
+                            self.get_full_scope(),
+                            line_number,
+                            type_name=type_name,
+                        )
+                    except Exception:
+                        pass
                 if constraints.get('dim'):
                     try:
                         constraint_val = self.compiler.array_handler.check_dimension_constraints(
@@ -401,13 +493,24 @@ class Scope:
                     raise ValueError(
                         f"'{key_for_constraints}' must be less than {constraint_val} at line {line_number}")
             elif constraint_type == 'in':
+                allowed_values = constraint_expr
+                if isinstance(constraint_expr, str):
+                    try:
+                        allowed_values = self.compiler.expr_evaluator.eval_or_eval_array(
+                            constraint_expr, self.get_full_scope(), line_number)
+                    except Exception:
+                        allowed_values = constraint_expr
+                if isinstance(allowed_values, pa.Array):
+                    allowed_values = allowed_values.to_pylist()
+                if isinstance(allowed_values, str):
+                    allowed_values = [allowed_values]
                 if isinstance(value, (list, tuple, set)):
-                    if not all(item in constraint_expr for item in value):
+                    if not all(item in allowed_values for item in value):
                         raise ValueError(
-                            f"'{key_for_constraints}' values {value} not in allowed values {constraint_expr} at line {line_number}")
-                elif value not in constraint_expr:
+                            f"'{key_for_constraints}' values {value} not in allowed values {allowed_values} at line {line_number}")
+                elif value not in allowed_values:
                     raise ValueError(
-                        f"'{key_for_constraints}' value {value} not in allowed values {constraint_expr} at line {line_number}")
+                        f"'{key_for_constraints}' value {value} not in allowed values {allowed_values} at line {line_number}")
             elif constraint_type == 'range':
                 start_expr = constraint_expr.get('start')
                 end_expr = constraint_expr.get('end')
@@ -474,8 +577,6 @@ class Scope:
                 elif expected_type == 'text' and actual_type in ('string', 'text'):
                     raise ValueError(
                         f"'{key_for_constraints}' must not be text at line {line_number}")
-            elif constraint_type == 'unit':
-                pass
             elif constraint_type == 'not_unit':
                 if isinstance(value, str) and value == constraint_expr:
                     raise ValueError(

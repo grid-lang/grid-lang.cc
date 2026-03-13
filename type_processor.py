@@ -3,8 +3,10 @@ Type processing functionality for GridLang compiler.
 Handles type definitions, type code execution, and type-related operations.
 """
 
+import copy
 import re
 import numbers
+from utils import get_case_insensitive_key
 
 
 class GridLangTypeProcessor:
@@ -13,120 +15,192 @@ class GridLangTypeProcessor:
     def __init__(self, compiler=None):
         self.compiler = compiler
 
+    def _new_type_def_state(self):
+        """Create the accumulator used while parsing a type definition."""
+        return {
+            'fields': {},
+            'executable_code': [],
+            'inputs': [],
+            'hidden_fields': set(),
+            'field_constraints': {},
+            'computed_fields': {},
+            'init_fields': set(),
+        }
+
     def _parse_type_def(self, lines, line_number=None):
         """Parse type definition lines and extract fields and executable code."""
-        fields = {}
-        executable_code = []
-        inputs = []
-        hidden_fields = set()
-        field_constraints = {}
-
+        state = self._new_type_def_state()
         for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            lowered = stripped.lower()
-            if lowered.startswith('input '):
-                input_body = stripped[5:].strip()
-                input_type = None
-                input_default = None
-                names_part = input_body
-                m_as = re.search(r'\s+as\s+', input_body, re.I)
-                if m_as:
-                    names_part = input_body[:m_as.start()].strip()
-                    remainder = input_body[m_as.end():].strip()
-                    m_default = re.search(r'\bor\s*=\s*(.+)$', remainder, re.I)
-                    if m_default:
-                        input_type = remainder[:m_default.start()].strip() or None
-                        input_default = m_default.group(1).strip()
-                    else:
-                        input_type = remainder.strip() or None
-                else:
-                    m_default = re.search(r'\bor\s*=\s*(.+)$', input_body, re.I)
-                    if m_default:
-                        names_part = input_body[:m_default.start()].strip()
-                        input_default = m_default.group(1).strip()
-                name_list = [n.strip() for n in names_part.split(',') if n.strip()]
-                if not name_list:
-                    raise SyntaxError(
-                        f"Invalid input definition: '{line}' at line {line_number}")
-                for in_name in name_list:
-                    inputs.append({
-                        'name': in_name.strip(),
-                        'type': input_type.lower() if input_type else None,
-                        'default': input_default
-                    })
-                continue
+            self._parse_type_def_line(line, line_number, state)
+        self._collect_type_computed_fields(state)
+        return self._finalize_type_def_state(state)
 
-            field_line = None
-            if stripped.startswith(':'):
-                field_line = stripped[1:].strip()
-            elif lowered.startswith('for ') and ' do' not in lowered:
-                field_line = stripped[4:].strip()
-            elif lowered.startswith('let ') and '=' not in stripped:
-                field_line = stripped[4:].strip()
+    def _parse_type_def_line(self, line, line_number, state):
+        """Route one type-definition line into inputs, fields, or executable code."""
+        stripped = line.strip()
+        if not stripped:
+            return
+        lowered = stripped.lower()
+        if lowered.startswith('input '):
+            state['inputs'].extend(
+                self._parse_type_input_definition(line, stripped, line_number)
+            )
+            return
 
-            if field_line:
-                init_expr = None
-                default_match = re.search(r'\bor\s*=\s*(.+)$', field_line, re.I)
-                if default_match:
-                    init_expr = default_match.group(1).strip()
-                    field_line = field_line[:default_match.start()].strip()
-                init_match = re.search(r'\binit\b', field_line, re.I)
-                if init_match:
-                    init_expr = field_line[init_match.end():].strip()
-                    field_line = field_line[:init_match.start()].strip()
+        field_line = self._extract_type_field_line(stripped, lowered)
+        if field_line:
+            self._record_type_field_definition(
+                state, line, field_line, lowered, line_number
+            )
+            return
 
-                m = re.match(
-                    r'^(\$?[A-Za-z_][\w_]*(?:\s*,\s*\$?[A-Za-z_][\w_]*)*)', field_line)
-                if not m:
-                    raise SyntaxError(
-                        f"Invalid field definition: '{line}' at line {line_number}")
-                var_names = [v.strip() for v in m.group(1).split(',') if v.strip()]
-                type_candidates = re.findall(
-                    r'\bas\s+([A-Za-z_][\w_]*)', field_line, re.I)
-                type_name = type_candidates[-1].lower(
-                ) if type_candidates else None
-                has_dim = re.search(r'\bdim\b', field_line, re.I)
-                effective_type = 'array' if has_dim and not type_name else (type_name or 'unknown')
+        # Executable code inside type definition (strip leading colon if present)
+        state['executable_code'].append(line.lstrip(':').strip())
+
+    def _parse_type_input_definition(self, line, stripped, line_number):
+        """Parse a type constructor input declaration."""
+        input_body = stripped[5:].strip()
+        input_type = None
+        input_default = None
+        names_part = input_body
+        m_as = re.search(r'\s+as\s+', input_body, re.I)
+        if m_as:
+            names_part = input_body[:m_as.start()].strip()
+            remainder = input_body[m_as.end():].strip()
+            m_default = re.search(r'\bor\s*=\s*(.+)$', remainder, re.I)
+            if m_default:
+                input_type = remainder[:m_default.start()].strip() or None
+                input_default = m_default.group(1).strip()
+            else:
+                input_type = remainder.strip() or None
+        else:
+            m_default = re.search(r'\bor\s*=\s*(.+)$', input_body, re.I)
+            if m_default:
+                names_part = input_body[:m_default.start()].strip()
+                input_default = m_default.group(1).strip()
+
+        name_list = [n.strip() for n in names_part.split(',') if n.strip()]
+        if not name_list:
+            raise SyntaxError(
+                f"Invalid input definition: '{line}' at line {line_number}")
+        return [
+            {
+                'name': in_name,
+                'type': input_type.lower() if input_type else None,
+                'default': input_default
+            }
+            for in_name in name_list
+        ]
+
+    def _extract_type_field_line(self, stripped, lowered):
+        """Return the declaration body for a type field line, if any."""
+        if stripped.startswith(':'):
+            return stripped[1:].strip()
+        if lowered.startswith('for ') and ' do' not in lowered:
+            return stripped[4:].strip()
+        if lowered.startswith('let ') and '=' not in stripped:
+            return stripped[4:].strip()
+        return None
+
+    def _split_type_field_initializer(self, field_line):
+        """Separate a field declaration from its init/default expression."""
+        init_expr = None
+        default_match = re.search(r'\bor\s*=\s*(.+)$', field_line, re.I)
+        if default_match:
+            init_expr = default_match.group(1).strip()
+            field_line = field_line[:default_match.start()].strip()
+        init_match = re.search(r'\binit\b', field_line, re.I)
+        if init_match:
+            init_expr = field_line[init_match.end():].strip()
+            field_line = field_line[:init_match.start()].strip()
+        return field_line, init_expr
+
+    def _parse_type_field_constraints(self, field_line, line_number, type_name):
+        """Parse field constraints with the compiler parser when available."""
+        parsed_constraints = {}
+        parsed_type = type_name
+        if self.compiler and hasattr(self.compiler, '_parse_variable_def'):
+            try:
+                _, parsed_type, parsed_constraints, _ = self.compiler._parse_variable_def(
+                    field_line, line_number)
+                parsed_constraints = parsed_constraints or {}
+            except Exception:
                 parsed_constraints = {}
-                parsed_type = type_name
-                if self.compiler and hasattr(self.compiler, '_parse_variable_def'):
-                    try:
-                        parsed_var, parsed_type, parsed_constraints, _ = self.compiler._parse_variable_def(
-                            field_line, line_number)
-                        parsed_constraints = parsed_constraints or {}
-                    except Exception:
-                        parsed_constraints = {}
-                if parsed_type and 'type' not in parsed_constraints and 'type_union' not in parsed_constraints:
-                    parsed_constraints['type'] = parsed_type.lower()
-                parsed_constraints.pop('var_list', None)
-                for name in var_names:
-                    clean_name = name[1:] if name.startswith('$') else name
-                    if name.startswith('$'):
-                        hidden_fields.add(clean_name.lower())
-                    fields[clean_name] = effective_type
-                    if parsed_constraints:
-                        field_constraints[clean_name] = dict(parsed_constraints)
-                    if init_expr:
-                        executable_code.append(f"{clean_name} = {init_expr}")
-                # Allow constructor-style assignments (e.g., ": x = in_x") to execute.
-                if re.search(r'^\$?[A-Za-z_][\w_]*\s*=', field_line) and 'or =' not in lowered:
-                    executable_code.append(field_line)
+        if parsed_type and 'type' not in parsed_constraints and 'type_union' not in parsed_constraints:
+            parsed_constraints['type'] = parsed_type.lower()
+        parsed_constraints.pop('var_list', None)
+        return parsed_constraints
+
+    def _parse_type_field_definition(self, line, field_line, line_number):
+        """Parse one field declaration line into normalized metadata."""
+        field_line, init_expr = self._split_type_field_initializer(field_line)
+        match = re.match(
+            r'^(\$?[A-Za-z_][\w_]*(?:\s*,\s*\$?[A-Za-z_][\w_]*)*)', field_line)
+        if not match:
+            raise SyntaxError(
+                f"Invalid field definition: '{line}' at line {line_number}")
+        var_names = [v.strip() for v in match.group(1).split(',') if v.strip()]
+        type_candidates = re.findall(r'\bas\s+([A-Za-z_][\w_]*)', field_line, re.I)
+        type_name = type_candidates[-1].lower() if type_candidates else None
+        has_dim = re.search(r'\bdim\b', field_line, re.I)
+        effective_type = 'array' if has_dim and not type_name else (type_name or 'unknown')
+        return {
+            'field_line': field_line,
+            'init_expr': init_expr,
+            'var_names': var_names,
+            'effective_type': effective_type,
+            'parsed_constraints': self._parse_type_field_constraints(
+                field_line, line_number, type_name),
+        }
+
+    def _record_type_field_definition(self, state, line, field_line, lowered, line_number):
+        """Apply one parsed field declaration to the type-definition state."""
+        parsed_field = self._parse_type_field_definition(
+            line, field_line, line_number)
+        for name in parsed_field['var_names']:
+            clean_name = name[1:] if name.startswith('$') else name
+            if name.startswith('$'):
+                state['hidden_fields'].add(clean_name.lower())
+            state['fields'][clean_name] = parsed_field['effective_type']
+            if parsed_field['parsed_constraints']:
+                state['field_constraints'][clean_name] = dict(
+                    parsed_field['parsed_constraints'])
+            if parsed_field['init_expr']:
+                state['executable_code'].append(
+                    f"{clean_name} = {parsed_field['init_expr']}")
+                state['init_fields'].add(clean_name.lower())
+        # Allow constructor-style assignments (e.g., ": x = in_x") to execute.
+        if (re.search(r'^\$?[A-Za-z_][\w_]*\s*=', parsed_field['field_line']) and
+                'or =' not in lowered):
+            state['executable_code'].append(parsed_field['field_line'])
+
+    def _collect_type_computed_fields(self, state):
+        """Capture computed fields for reactive recomputation."""
+        for code_line in state['executable_code']:
+            match = re.match(r'^\s*(\$?[A-Za-z_][\w_]*)\s*=\s*(.+)$', code_line)
+            if not match:
                 continue
+            lhs = match.group(1).strip()
+            rhs = match.group(2).strip()
+            clean_lhs = lhs[1:] if lhs.startswith('$') else lhs
+            if clean_lhs in state['fields']:
+                state['computed_fields'][clean_lhs] = rhs
 
-            # Executable code inside type definition (strip leading colon if present)
-            executable_code.append(line.lstrip(':').strip())
-
-        if executable_code:
-            fields['_executable_code'] = executable_code
-        if inputs:
-            fields['_inputs'] = inputs
-        if field_constraints:
-            fields['_field_constraints'] = field_constraints
-        if hidden_fields:
-            fields['_hidden_fields'] = hidden_fields
-
+    def _finalize_type_def_state(self, state):
+        """Build the public type-definition structure from parse state."""
+        fields = state['fields']
+        if state['executable_code']:
+            fields['_executable_code'] = state['executable_code']
+        if state['inputs']:
+            fields['_inputs'] = state['inputs']
+        if state['field_constraints']:
+            fields['_field_constraints'] = state['field_constraints']
+        if state['hidden_fields']:
+            fields['_hidden_fields'] = state['hidden_fields']
+        if state['computed_fields']:
+            fields['_computed_fields'] = state['computed_fields']
+        if state['init_fields']:
+            fields['_init_fields'] = state['init_fields']
         return fields
 
     def _execute_type_code(self, code_lines, var_name, value_dict, line_number, input_values=None):
@@ -160,8 +234,13 @@ class GridLangTypeProcessor:
             value_dict['grid'] = {}
 
         try:
+            type_def = {}
+            if inferred_type:
+                type_def = self.compiler.types_defined.get(
+                    str(inferred_type).lower(), {}) or {}
+            init_fields = set(type_def.get('_init_fields', set()))
             self._execute_type_block(
-                code_lines, value_dict, input_values, line_number)
+                code_lines, value_dict, input_values, line_number, init_fields)
         except Exception as e:
             raise
         finally:
@@ -169,8 +248,9 @@ class GridLangTypeProcessor:
             self.compiler._allow_hidden_member_calls = prev_hidden_member_calls
             self.compiler.pop_scope()
 
-    def _execute_type_block(self, code_lines, value_dict, input_values, line_number):
+    def _execute_type_block(self, code_lines, value_dict, input_values, line_number, init_fields=None):
         """Execute a list of type code lines within the current scope."""
+        init_fields = init_fields or set()
         i = 0
         while i < len(code_lines):
             code_line = code_lines[i]
@@ -187,9 +267,20 @@ class GridLangTypeProcessor:
                 continue
 
             if stripped_line.lower().startswith('push '):
-                assign_line = stripped_line[5:].strip()
+                push_match = re.match(
+                    r'^\s*push\s+(\$?[\w_]+(?:\([^)]+\)|\{[^}]+\})?)(?:\s*=\s*(.+))?\s*$',
+                    stripped_line,
+                    re.I,
+                )
+                if not push_match:
+                    raise SyntaxError(
+                        f"Invalid PUSH syntax at line {line_number}")
+                target, value_expr = push_match.groups()
+                if value_expr is None:
+                    value_expr = target
+                assign_line = f"{target} = {value_expr}"
                 self._process_type_assignment(
-                    assign_line, value_dict, input_values, line_number)
+                    assign_line, value_dict, input_values, line_number, init_fields)
                 i += 1
                 continue
             if (re.match(r'^for\b', stripped_line, re.I) and
@@ -260,7 +351,7 @@ class GridLangTypeProcessor:
             if '=' in stripped_line:
                 # Simple assignment inside constructor (e.g., x = in_x)
                 self._process_type_assignment(
-                    stripped_line, value_dict, input_values, line_number)
+                    stripped_line, value_dict, input_values, line_number, init_fields)
                 i += 1
                 continue
             if stripped_line.lower().startswith('end'):
@@ -509,13 +600,17 @@ class GridLangTypeProcessor:
             field_name, value_expr = match.groups()
             if field_name.startswith('$'):
                 field_name = field_name[1:]
+            actual_field = get_case_insensitive_key(
+                value_dict, field_name) or field_name
             scope = self._build_type_eval_scope(value_dict, {})
             value = self.compiler.expr_evaluator.eval_expr(
                 value_expr.strip(), scope, line_number)
-            value_dict[field_name] = value
+            value_dict[actual_field] = value
 
-    def _process_type_assignment(self, line, value_dict, input_values, line_number):
+    def _process_type_assignment(self, line, value_dict, input_values, line_number, init_fields=None):
         """Handle assignments inside type definitions (e.g., x = in_x)."""
+        init_fields = init_fields or set()
+
         def _coerce_field_value(field_name, raw_value):
             if not isinstance(value_dict, dict):
                 return raw_value
@@ -541,11 +636,27 @@ class GridLangTypeProcessor:
                     field_type, list(raw_value), line_number, allow_default_if_empty=True)
             return raw_value
 
+        def _strip_init_copy_immutability(raw_value):
+            if isinstance(raw_value, dict):
+                cleaned = {}
+                for key, item in raw_value.items():
+                    if key == '_immutable_fields':
+                        continue
+                    cleaned[key] = _strip_init_copy_immutability(item)
+                return cleaned
+            if isinstance(raw_value, list):
+                return [_strip_init_copy_immutability(item) for item in raw_value]
+            if isinstance(raw_value, tuple):
+                return tuple(_strip_init_copy_immutability(item) for item in raw_value)
+            return raw_value
+
         paren_match = re.match(r'^\s*(\$?[\w_]+)\s*\(([^)]+)\)\s*=\s*(.+)$', line)
         if paren_match:
             field_name, index_expr, value_expr = paren_match.groups()
             if field_name.startswith('$'):
                 field_name = field_name[1:]
+            actual_field = get_case_insensitive_key(
+                value_dict, field_name) or field_name
             scope = self._build_type_eval_scope(value_dict, input_values)
             index_val = self.compiler.expr_evaluator.eval_expr(
                 index_expr.strip(), scope, line_number)
@@ -553,8 +664,8 @@ class GridLangTypeProcessor:
                 index_val = int(round(index_val))
             value = self.compiler.expr_evaluator.eval_or_eval_array(
                 value_expr.strip(), scope, line_number)
-            value = _coerce_field_value(field_name, value)
-            arr = value_dict.get(field_name)
+            value = _coerce_field_value(actual_field, value)
+            arr = value_dict.get(actual_field)
             if arr is None or not isinstance(arr, list):
                 arr = []
             if index_val is None or index_val < 1:
@@ -563,7 +674,7 @@ class GridLangTypeProcessor:
             while len(arr) < index_val:
                 arr.append(None)
             arr[index_val - 1] = value
-            value_dict[field_name] = arr
+            value_dict[actual_field] = arr
             return
 
         brace_match = re.match(r'^\s*(\$?[\w_]+)\s*\{([^}]+)\}\s*=\s*(.+)$', line)
@@ -571,6 +682,8 @@ class GridLangTypeProcessor:
             field_name, indices_str, value_expr = brace_match.groups()
             if field_name.startswith('$'):
                 field_name = field_name[1:]
+            actual_field = get_case_insensitive_key(
+                value_dict, field_name) or field_name
             scope = self._build_type_eval_scope(value_dict, input_values)
             indices = [idx.strip() for idx in indices_str.split(',') if idx.strip()]
             if len(indices) != 1:
@@ -582,8 +695,8 @@ class GridLangTypeProcessor:
                 index_val = int(round(index_val))
             value = self.compiler.expr_evaluator.eval_or_eval_array(
                 value_expr.strip(), scope, line_number)
-            value = _coerce_field_value(field_name, value)
-            arr = value_dict.get(field_name)
+            value = _coerce_field_value(actual_field, value)
+            arr = value_dict.get(actual_field)
             if arr is None or not isinstance(arr, list):
                 arr = []
             if index_val is None or index_val < 1:
@@ -592,7 +705,7 @@ class GridLangTypeProcessor:
             while len(arr) < index_val:
                 arr.append(None)
             arr[index_val - 1] = value
-            value_dict[field_name] = arr
+            value_dict[actual_field] = arr
             return
 
         match = re.match(r'^\s*(\$?[\w_]+)\s*=\s*(.+)$', line)
@@ -601,17 +714,25 @@ class GridLangTypeProcessor:
         field_name, value_expr = match.groups()
         if field_name.startswith('$'):
             field_name = field_name[1:]
+        actual_field = get_case_insensitive_key(
+            value_dict, field_name) or field_name
         scope = self._build_type_eval_scope(value_dict, input_values)
         value = self.compiler.expr_evaluator.eval_expr(
             value_expr.strip(), scope, line_number)
-        value_dict[field_name] = value
+        if actual_field.lower() in init_fields:
+            try:
+                value = copy.deepcopy(value)
+            except Exception:
+                pass
+            value = _strip_init_copy_immutability(value)
+        value_dict[actual_field] = value
         if input_values:
             tokens = re.findall(r'\b[\w_]+\b', value_expr)
             input_names = {name.lower() for name in input_values.keys()}
             if any(tok.lower() in input_names for tok in tokens):
                 immutable_fields = value_dict.setdefault(
                     '_immutable_fields', set())
-                immutable_fields.add(field_name.lower())
+                immutable_fields.add(actual_field.lower())
 
     def _build_type_eval_scope(self, value_dict, input_values):
         scope = self.compiler.current_scope().get_full_scope()

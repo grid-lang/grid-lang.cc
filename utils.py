@@ -82,6 +82,25 @@ def object_public_keys(obj: dict):
     }
 
 
+def get_case_insensitive_key(mapping, name):
+    """Return the actual key in mapping matching name case-insensitively, or None."""
+    if not isinstance(mapping, dict):
+        return None
+    name_lower = str(name).lower()
+    for key in mapping.keys():
+        if str(key).lower() == name_lower:
+            return key
+    return None
+
+
+def get_case_insensitive_value(mapping, name, default=None):
+    """Return the value for name in mapping using case-insensitive key lookup."""
+    key = get_case_insensitive_key(mapping, name)
+    if key is None:
+        return default
+    return mapping.get(key, default)
+
+
 def public_object_view(obj):
     """Return a view of an object containing only public fields (recursively)."""
     if not isinstance(obj, dict):
@@ -96,3 +115,38 @@ def public_object_view(obj):
         else:
             result[key] = val
     return result
+
+
+def format_display_value(value, sig_digits=15):
+    """Format values for display by trimming floating-point artifacts."""
+    try:
+        import pyarrow as pa  # Optional dependency for array values.
+    except Exception:
+        pa = None
+
+    if isinstance(value, float):
+        if value != value:
+            return "nan"
+        if value == float('inf'):
+            return "inf"
+        if value == float('-inf'):
+            return "-inf"
+        formatted = format(value, f".{sig_digits}g")
+        if formatted in ("-0", "-0.0"):
+            formatted = "0"
+        return formatted
+    if isinstance(value, (int, bool)):
+        return str(value)
+    if value is None:
+        return "None"
+    if pa is not None and isinstance(value, pa.Array):
+        return format_display_value(value.to_pylist(), sig_digits=sig_digits)
+    if isinstance(value, dict):
+        items = []
+        for k, v in value.items():
+            items.append(f"{k}: {format_display_value(v, sig_digits=sig_digits)}")
+        return "{" + ", ".join(items) + "}"
+    if isinstance(value, (list, tuple)):
+        inner = ", ".join(format_display_value(v, sig_digits=sig_digits) for v in value)
+        return "[" + inner + "]"
+    return str(value)

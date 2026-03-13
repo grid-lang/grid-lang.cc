@@ -4,6 +4,7 @@
 # It supports pyarrow arrays, lists, and custom object flattening for grid spilling.
 
 import re
+import copy
 import pyarrow as pa
 # Utilities for cell and column operations
 from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, prod, public_type_fields, object_public_keys, public_object_view
@@ -143,12 +144,94 @@ class ArrayHandler:
                 # Create a pipe connection from output to input
                 self.compiler.current_scope().connect_pipe(target_part, expr_part, line_number)
                 return
+        target_info = self._parse_assignment_target_details(
+            target_part,
+            scope,
+            line_number,
+        )
+        target = target_info['target']
+        is_range = target_info['is_range']
+        is_harr = target_info['is_harr']
+        is_dim_selector = target_info['is_dim_selector']
+        is_index_selector = target_info['is_index_selector']
+        sr = target_info['sr']
+        er = target_info['er']
+        var_name = target_info['var_name']
+        dim_name = target_info['dim_name']
+        dim_index = target_info['dim_index']
+        indices = target_info['indices']
+
+        implicit_expr = None
+        if expr_part.lstrip().startswith('@'):
+            implicit_expr = expr_part.lstrip()[1:].strip()
+            if not implicit_expr:
+                raise SyntaxError(
+                    f"Missing expression after '@' at line {line_number}")
+
+        value = None
+        # Evaluate RHS
+        if implicit_expr is None:
+            try:
+                # Check if this is an array operation by looking for array literals
+                # Array literals start with { and contain comma-separated values
+                array_literal_pattern = r'\{[^}]*,[^}]*\}'
+                array_literals = re.findall(array_literal_pattern, expr_part)
+
+                if '+' in expr_part and len(array_literals) >= 2:
+                    value = self.evaluate_array_operation(
+                        expr_part, line_number)
+                else:
+                    value = self.compiler.expr_evaluator.eval_or_eval_array(
+                        expr_part, scope, line_number)
+            except Exception as e:
+                raise
+
+        is_array_of_two_field_objects, reshaped_value = self._prepare_horizontal_reshape_value(
+            implicit_expr,
+            value,
+            expr_part,
+            is_harr,
+        )
+
+        return self._perform_assignment_write(
+            assignment_op=assignment_op,
+            target=target,
+            is_range=is_range,
+            is_harr=is_harr,
+            is_dim_selector=is_dim_selector,
+            is_index_selector=is_index_selector,
+            sr=sr,
+            er=er,
+            var_name=var_name,
+            dim_name=dim_name,
+            dim_index=dim_index,
+            indices=indices,
+            value=value,
+            expr_part=expr_part,
+            implicit_expr=implicit_expr,
+            scope=scope,
+            line_number=line_number,
+            reshaped_value=reshaped_value,
+            is_array_of_two_field_objects=is_array_of_two_field_objects,
+        )
+
+    def _prepare_horizontal_reshape_value(self, implicit_expr, value, expr_part, is_harr):
+        if implicit_expr is not None:
+            return False, None
+        reshaped_value = value
+        is_array_of_two_field_objects, reshaped_value = self._reshape_horizontal_two_field_object_array(
+            value,
+            expr_part,
+            is_harr,
+        )
+        return is_array_of_two_field_objects, reshaped_value
+
+    def _parse_assignment_target_details(self, target_part, scope, line_number):
         target, is_range, is_harr, is_dim_selector, is_index_selector = None, False, False, False, False
         sr, er = None, None
         var_name, dim_name, dim_index = None, None, None
         indices = None
 
-        # Parse target type
         if '[' in target_part and ']' in target_part and not target_part.startswith('[') and '!' not in target_part:
             m = re.match(r'^([\w_]+)\[([^\]]*)\]$', target_part)
             if m:
@@ -175,6 +258,27 @@ class ArrayHandler:
                 index_str_clean = index_str.strip('"')
                 dim_index = labels.get(index_str_clean, int(
                     index_str) - 1 if index_str.isdigit() else None)
+                if dim_index is None:
+                    try:
+                        eval_scope = self.compiler.current_scope().get_evaluation_scope()
+                        evaluated_index = self.compiler.expr_evaluator.eval_expr(
+                            index_str, eval_scope, line_number)
+                    except Exception as exc:
+                        raise ValueError(
+                            f"Invalid index '{index_str}' for dimension '{dim_name}' at line {line_number}") from exc
+                    if isinstance(evaluated_index, str):
+                        if evaluated_index in labels:
+                            dim_index = labels[evaluated_index]
+                        elif evaluated_index.isdigit():
+                            dim_index = int(evaluated_index) - 1
+                        else:
+                            raise ValueError(
+                                f"Invalid index '{evaluated_index}' for dimension '{dim_name}' at line {line_number}")
+                    elif isinstance(evaluated_index, (int, float)):
+                        dim_index = int(evaluated_index) - 1
+                    else:
+                        raise ValueError(
+                            f"Invalid index '{evaluated_index}' for dimension '{dim_name}' at line {line_number}")
                 if dim_index is None:
                     raise ValueError(
                         f"Invalid index '{index_str}' for dimension '{dim_name}' at line {line_number}")
@@ -207,7 +311,8 @@ class ArrayHandler:
                 if resolved:
                     target = resolved
                 elif ':' in inside:
-                    rm = re.match(r'^([A-Za-z]+\d+)\s*:\s*([A-Za-z]+\d+)$', inside)
+                    rm = re.match(
+                        r'^([A-Za-z]+\d+)\s*:\s*([A-Za-z]+\d+)$', inside)
                     if rm:
                         sr, er = rm.groups()
                         try:
@@ -252,92 +357,60 @@ class ArrayHandler:
                         raise SyntaxError(
                             f"Error interpolating '{inside}': {e} at line {line_number}")
         else:
-            # GridLang only allows assignments to grid addresses.
             raise SyntaxError(
                 f"Invalid assignment target: '{target_part}' at line {line_number}. "
                 "Use [address] := value.")
 
-        implicit_expr = None
-        if expr_part.lstrip().startswith('@'):
-            implicit_expr = expr_part.lstrip()[1:].strip()
-            if not implicit_expr:
-                raise SyntaxError(
-                    f"Missing expression after '@' at line {line_number}")
+        return {
+            'target': target,
+            'is_range': is_range,
+            'is_harr': is_harr,
+            'is_dim_selector': is_dim_selector,
+            'is_index_selector': is_index_selector,
+            'sr': sr,
+            'er': er,
+            'var_name': var_name,
+            'dim_name': dim_name,
+            'dim_index': dim_index,
+            'indices': indices,
+        }
 
-        # Evaluate RHS
-        if implicit_expr is None:
-            try:
-                # Check if this is an array operation by looking for array literals
-                # Array literals start with { and contain comma-separated values
-                array_literal_pattern = r'\{[^}]*,[^}]*\}'
-                array_literals = re.findall(array_literal_pattern, expr_part)
-
-                if '+' in expr_part and len(array_literals) >= 2:
-                    value = self.evaluate_array_operation(expr_part, line_number)
-                else:
-                    value = self.compiler.expr_evaluator.eval_or_eval_array(
-                        expr_part, scope, line_number)
-            except Exception as e:
-                raise
-
-        # Handle special reshaping for array of two-field objects in horizontal assignment
-        is_array_of_two_field_objects = False
-        object_type_name = None
-        values_per_object = 0
-        reshaped_value = None
-        if implicit_expr is None:
-            reshaped_value = value
-            if is_harr and expr_part.startswith('{') and expr_part.endswith('}'):
-                inner = expr_part[1:-1].strip()
-                elements = [elem.strip()
-                            for elem in inner.split(',') if elem.strip()]
-                # Check if all elements exist in scope
-                all_elements_exist = True
-                element_values = {}
-                for elem in elements:
-                    try:
-                        element_values[elem] = self.compiler.current_scope().get(
-                            elem)
-                    except NameError:
-                        all_elements_exist = False
-                        break
-
-                if all_elements_exist:
-                    first_elem = element_values[elements[0]]
-                    if isinstance(first_elem, dict):
-                        for type_name, fields in self.compiler.types_defined.items():
-                            field_defs = public_type_fields(fields)
-                            if object_public_keys(first_elem) == set(field_defs.keys()) and len(field_defs) == 2:
-                                object_type_name = type_name
-                                values_per_object = 2
-                                break
-                    if object_type_name:
-                        is_array_of_two_field_objects = all(
-                            isinstance(element_values[elem], dict) and
-                            object_public_keys(element_values[elem]) == set(
-                                public_type_fields(self.compiler.types_defined[object_type_name]).keys())
-                            for elem in elements
-                        )
-                if is_array_of_two_field_objects:
-                    if isinstance(value, list) and value and isinstance(value[0], list):
-                        flat_inner = value[0]
-                        num_objects = len(elements)
-                        if len(flat_inner) == num_objects * values_per_object:
-                            reshaped_value = [
-                                flat_inner[i * values_per_object:(i + 1) * values_per_object] for i in range(num_objects)]
-
-        # Perform assignment based on target type
+    def _perform_assignment_write(
+            self,
+            assignment_op,
+            target,
+            is_range,
+            is_harr,
+            is_dim_selector,
+            is_index_selector,
+            sr,
+            er,
+            var_name,
+            dim_name,
+            dim_index,
+            indices,
+            value,
+            expr_part,
+            implicit_expr,
+            scope,
+            line_number,
+            reshaped_value,
+            is_array_of_two_field_objects):
         if is_index_selector:
             result = self._assign_index_selector(
                 var_name, indices, value, line_number)
-            if value is None:  # Read operation
+            if value is None:
                 return result
-        elif is_dim_selector:
+            return None
+
+        if is_dim_selector:
             result = self._assign_dim_selector(
                 var_name, dim_name, dim_index, value, line_number)
-            if value is None:  # Read operation
+            if value is None:
                 return result
-        elif is_harr:
+            return None
+
+        if is_harr:
             if implicit_expr is not None:
                 raise SyntaxError(
                     f"Implicit intersection '@' is not supported for horizontal array targets at line {line_number}")
@@ -360,58 +433,122 @@ class ArrayHandler:
                     self.compiler._cell_array_map[target] = source_var
                 except Exception:
                     pass
-        elif is_range:
+            return None
+
+        if is_range:
             if implicit_expr is not None:
                 self.assign_implicit_intersection_range(
                     sr, er, implicit_expr, scope, line_number)
             else:
                 self.assign_range(sr, er, value, line_number)
-        else:
-            if implicit_expr is not None:
-                col, row = split_cell(target)
-                value = self._evaluate_implicit_intersection(
-                    implicit_expr, int(row), scope, line_number)
-            if isinstance(value, pa.Array):
-                value = value.to_pylist()
-            elif isinstance(value, pa.Scalar):
-                py_value = value.as_py()
-                value = int(py_value) if isinstance(
-                    py_value, float) and py_value.is_integer() else py_value
-            # Enforce cell-bound variable constraints before writing to grid.
-            bound_var = self.compiler._cell_var_map.get(target)
-            if bound_var:
-                defining_scope = self.compiler.current_scope().get_defining_scope(
-                    bound_var)
-                if defining_scope:
-                    defining_scope.update(bound_var, value, line_number)
-                else:
-                    inferred_type = self.compiler.array_handler.infer_type(
-                        value, line_number)
-                    if inferred_type == 'int':
-                        inferred_type = 'number'
-                    self.compiler.current_scope().define(
-                        bound_var, value, inferred_type, {}, is_uninitialized=False)
-            # Track equality bindings so future updates propagate to the cell.
-            # Avoid creating bindings inside private/loop scopes to prevent later iterations
-            # from overwriting previously written cells (e.g., FOR index loops).
-            if (assignment_op == ':=' and
-                    re.match(r'^[A-Za-z_][\w_]*$', expr_part) and
-                    not getattr(self.compiler.current_scope(), 'is_private', False)):
-                source_var = expr_part
-                try:
-                    # Ensure the source variable exists before binding
-                    self.compiler.current_scope().get(source_var)
-                    # Only bind if no conflicting mapping exists
-                    existing = self.compiler._cell_var_map.get(target)
-                    if existing and existing.lower() != source_var.lower():
-                        raise SyntaxError(
-                            f"Cell '{target}' already mapped to '{existing}' at line {line_number}")
-                    self.compiler._cell_var_map[target] = source_var
-                except Exception:
-                    pass
-            if isinstance(value, dict) and ('_type_name' in value or '_hidden_fields' in value):
-                value = public_object_view(value)
+            return None
+
+        if implicit_expr is not None:
+            col, row = split_cell(target)
+            value = self._evaluate_implicit_intersection(
+                implicit_expr, int(row), scope, line_number)
+        if isinstance(value, pa.Array):
+            value = value.to_pylist()
+        elif isinstance(value, pa.Scalar):
+            py_value = value.as_py()
+            value = int(py_value) if isinstance(
+                py_value, float) and py_value.is_integer() else py_value
+        if self._update_bound_array_cell(target, value, line_number):
             self.compiler.grid[target] = value
+            return None
+        bound_var = self.compiler._cell_var_map.get(target)
+        if bound_var:
+            defining_scope = self.compiler.current_scope().get_defining_scope(
+                bound_var)
+            if defining_scope:
+                defining_scope.update(bound_var, value, line_number)
+            else:
+                inferred_type = self.compiler.array_handler.infer_type(
+                    value, line_number)
+                if inferred_type == 'int':
+                    inferred_type = 'number'
+                self.compiler.current_scope().define(
+                    bound_var, value, inferred_type, {}, is_uninitialized=False)
+        if (assignment_op == ':=' and
+                re.match(r'^[A-Za-z_][\w_]*$', expr_part) and
+                not getattr(self.compiler.current_scope(), 'is_private', False)):
+            source_var = expr_part
+            try:
+                self.compiler.current_scope().get(source_var)
+                existing = self.compiler._cell_var_map.get(target)
+                if existing and existing.lower() != source_var.lower():
+                    raise SyntaxError(
+                        f"Cell '{target}' already mapped to '{existing}' at line {line_number}")
+                self.compiler._cell_var_map[target] = source_var
+            except Exception:
+                pass
+        if isinstance(value, dict) and ('_type_name' in value or '_hidden_fields' in value):
+            value = public_object_view(value)
+        self.compiler.grid[target] = value
+        return None
+
+    def _reshape_horizontal_two_field_object_array(self, value, expr_part, is_harr):
+        if not (is_harr and expr_part.startswith('{') and expr_part.endswith('}')):
+            return False, value
+
+        elements = self._parse_inline_object_elements(expr_part)
+        element_values = self._resolve_inline_object_values(elements)
+        if element_values is None:
+            return False, value
+
+        object_type_name = self._find_two_field_object_type(
+            element_values[elements[0]])
+        if not object_type_name:
+            return False, value
+
+        expected_fields = set(
+            public_type_fields(self.compiler.types_defined[object_type_name]).keys())
+        is_array_of_two_field_objects = all(
+            isinstance(element_values[elem], dict)
+            and object_public_keys(element_values[elem]) == expected_fields
+            for elem in elements
+        )
+        if not is_array_of_two_field_objects:
+            return False, value
+
+        reshaped_value = self._reshape_flat_object_values(
+            value, len(elements), 2)
+        return True, reshaped_value
+
+    def _parse_inline_object_elements(self, expr_part):
+        inner = expr_part[1:-1].strip()
+        return [elem.strip() for elem in inner.split(',') if elem.strip()]
+
+    def _resolve_inline_object_values(self, elements):
+        element_values = {}
+        for elem in elements:
+            try:
+                element_values[elem] = self.compiler.current_scope().get(elem)
+            except NameError:
+                return None
+        return element_values
+
+    def _find_two_field_object_type(self, value):
+        if not isinstance(value, dict):
+            return None
+        value_keys = object_public_keys(value)
+        for type_name, fields in self.compiler.types_defined.items():
+            field_defs = public_type_fields(fields)
+            if len(field_defs) == 2 and value_keys == set(field_defs.keys()):
+                return type_name
+        return None
+
+    def _reshape_flat_object_values(self, value, num_objects, values_per_object):
+        if not (isinstance(value, list) and value and isinstance(value[0], list)):
+            return value
+        flat_inner = value[0]
+        expected_length = num_objects * values_per_object
+        if len(flat_inner) != expected_length:
+            return value
+        return [
+            flat_inner[i * values_per_object:(i + 1) * values_per_object]
+            for i in range(num_objects)
+        ]
 
     def _rewrite_implicit_intersection(self, expr, row_number):
         pattern = re.compile(r'\[\s*\^?([A-Za-z]+)\s*\]')
@@ -563,11 +700,13 @@ class ArrayHandler:
                 raise NameError(
                     f"Variable '{var_name}' not defined at line {line_number}")
             # Auto-initialize array to fit requested indices
-            max_idx = [int(i) if isinstance(i, (int, float)) else 0 for i in indices]
+            max_idx = [int(i) if isinstance(i, (int, float))
+                       else 0 for i in indices]
             if len(max_idx) == 1:
                 arr = [None] * (max_idx[0] + 1)
             elif len(max_idx) == 2:
-                arr = [[None] * (max_idx[1] + 1) for _ in range(max_idx[0] + 1)]
+                arr = [[None] * (max_idx[1] + 1)
+                       for _ in range(max_idx[0] + 1)]
             else:
                 arr = [[[None for _ in range(max_idx[2] + 1)]
                         for _ in range(max_idx[1] + 1)]
@@ -765,6 +904,84 @@ class ArrayHandler:
             values=new_values
         ))
 
+    def _update_bound_array_cell(self, target, value, line_number=None):
+        """Update a bound array element/field when a mapped grid cell is assigned."""
+        bindings = self.compiler._cell_array_map
+        if not bindings:
+            return False
+        try:
+            target_col, target_row = split_cell(target)
+        except Exception:
+            return False
+        target_col_idx = col_to_num(target_col)
+        target_row_idx = int(target_row)
+        for start_cell, var_name in bindings.items():
+            try:
+                start_col, start_row = split_cell(start_cell)
+                start_col_idx = col_to_num(start_col)
+                start_row_idx = int(start_row)
+            except Exception:
+                continue
+            if target_row_idx < start_row_idx or target_col_idx < start_col_idx:
+                continue
+            row_offset = target_row_idx - start_row_idx
+            col_offset = target_col_idx - start_col_idx
+            defining_scope = self.compiler.current_scope().get_defining_scope(
+                var_name)
+            if not defining_scope:
+                continue
+            actual_key = defining_scope._get_case_insensitive_key(
+                var_name, defining_scope.variables) or var_name
+            constraints = defining_scope.constraints.get(actual_key, {})
+            dims = constraints.get('dim')
+            if isinstance(dims, dict) and 'dims' in dims:
+                dims = dims['dims']
+            if not isinstance(dims, list) or not dims:
+                continue
+            var_type = defining_scope.types.get(actual_key)
+            if not var_type or var_type.lower() not in self.compiler.types_defined:
+                continue
+            if len(dims) != 1:
+                continue
+            size_spec = dims[0][1]
+            if isinstance(size_spec, tuple):
+                size = size_spec[1] - size_spec[0] + 1
+            elif size_spec is None:
+                size = row_offset + 1
+            else:
+                size = int(size_spec)
+            if row_offset < 0 or row_offset >= size:
+                continue
+            type_def = self.compiler.types_defined.get(var_type.lower(), {})
+            field_names = list(
+                self.compiler._get_public_type_fields(type_def).keys())
+            if col_offset < 0 or col_offset >= len(field_names):
+                continue
+            arr = defining_scope.variables.get(actual_key)
+            if not isinstance(arr, list):
+                arr = self.create_object_array([size], None, line_number)
+            if row_offset >= len(arr):
+                arr.extend([None] * (row_offset + 1 - len(arr)))
+            element = arr[row_offset]
+            if not isinstance(element, dict):
+                element = {name: None for name in field_names}
+                element['_type_name'] = var_type.lower()
+                hidden_fields = type_def.get('_hidden_fields', set())
+                if hidden_fields:
+                    element['_hidden_fields'] = set(hidden_fields)
+                element.setdefault('grid', {})
+            field_name = field_names[col_offset]
+            element[field_name] = value
+            try:
+                self.compiler._recompute_computed_fields(
+                    element, line_number=line_number, changed_field=field_name)
+            except Exception:
+                pass
+            arr[row_offset] = element
+            defining_scope.update(actual_key, arr, line_number)
+            return True
+        return False
+
     def _assign_horizontal_array(self, target, value, expr_part, is_array_of_two_field_objects=False, line_number=None):
         """
         Assign an array horizontally (or vertically) to the grid starting at target cell.
@@ -778,7 +995,8 @@ class ArrayHandler:
         if isinstance(value, dict):
             # Special-case: spill an object's grid mapping when keys are (row, col) tuples
             if value and all(isinstance(k, tuple) and len(k) == 2 for k in value.keys()):
-                start_col = col_to_num(target[0:re.search(r'\d', target).start()])
+                start_col = col_to_num(
+                    target[0:re.search(r'\d', target).start()])
                 start_row = int(target[re.search(r'\d', target).start():])
                 for (row, col), val in value.items():
                     cell_to_assign = f"{num_to_col(start_col + (col - 1))}{start_row + (row - 1)}"
@@ -788,6 +1006,7 @@ class ArrayHandler:
             for i, val in enumerate(flattened_values):
                 cell_to_assign = offset_cell(target, i, 0)
                 self.compiler.grid[cell_to_assign] = val
+            return
         elif isinstance(value, list):
             is_object_array = False
             type_name = None
@@ -807,7 +1026,7 @@ class ArrayHandler:
                                 target, col_idx, row_idx)
                             self.compiler.grid[cell_to_assign] = val
                     return
-            elif is_array_of_two_field_objects:
+            if is_array_of_two_field_objects:
                 num_objects = len(value)
                 start_col = col_to_num(
                     target[0:re.search(r'\d', target).start()])
@@ -818,14 +1037,21 @@ class ArrayHandler:
                         new_cell = f"{num_to_col(start_col + col_idx)}{start_row + row_idx}"
                         self.compiler.grid[new_cell] = float(
                             object_values[col_idx])
-            else:
-                is_vertical = ';' in expr_part.strip(
-                )[1:-1] and ',' not in expr_part.strip()[1:-1]
-                flattened_values = self.flatten_array(value, line_number)
-                for i, val in enumerate(flattened_values):
-                    cell_to_assign = offset_cell(
-                        target, 0, i) if is_vertical else offset_cell(target, i, 0)
-                    self.compiler.grid[cell_to_assign] = val
+                return
+            if value and all(isinstance(row, (list, tuple)) for row in value):
+                for row_idx, row in enumerate(value):
+                    for col_idx, val in enumerate(row):
+                        cell_to_assign = offset_cell(
+                            target, col_idx, row_idx)
+                        self.compiler.grid[cell_to_assign] = val
+                return
+            is_vertical = ';' in expr_part.strip(
+            )[1:-1] and ',' not in expr_part.strip()[1:-1]
+            flattened_values = self.flatten_array(value, line_number)
+            for i, val in enumerate(flattened_values):
+                cell_to_assign = offset_cell(
+                    target, 0, i) if is_vertical else offset_cell(target, i, 0)
+                self.compiler.grid[cell_to_assign] = val
         elif isinstance(value, pa.Array):
             is_vertical = ';' in expr_part.strip(
             )[1:-1] and ',' not in expr_part.strip()[1:-1]
@@ -1020,7 +1246,8 @@ class ArrayHandler:
                     else:
                         result.append(value)
             else:
-                result.extend([obj[k] for k in sorted(object_public_keys(obj))])
+                result.extend([obj[k]
+                              for k in sorted(object_public_keys(obj))])
         else:
             result.append(obj)
         return result
@@ -1178,6 +1405,21 @@ class ArrayHandler:
             raise ValueError(
                 f"Unsupported array dimensions: {shape} at line {line_number}")
 
+    def create_object_array(self, shape, default_value=None, line_number=None):
+        """
+        Create a nested Python list for object arrays (custom types).
+        :param shape: List of dimension sizes.
+        :param default_value: Default value to assign in leaf nodes.
+        :param line_number: Line number for error reporting.
+        """
+        if not shape:
+            return copy.deepcopy(default_value)
+        size = shape[0]
+        if not isinstance(size, int):
+            raise ValueError(
+                f"Invalid object array dimension '{size}' at line {line_number}")
+        return [self.create_object_array(shape[1:], default_value, line_number) for _ in range(size)]
+
     def set_labels(self, var_name, dim_name, labels, line_number=None):
         """
         Set labels for a named dimension in an array.
@@ -1196,6 +1438,14 @@ class ArrayHandler:
         self.compiler.dim_labels.setdefault(var_name, {})
         self.compiler.dim_labels[var_name][dim_name] = {
             lbl: i for i, lbl in enumerate(labels)}
+
+    def _dim_size(self, size_spec, star_size=1):
+        if isinstance(size_spec, tuple):
+            start, end = size_spec
+            return end - start + 1
+        if size_spec is None:
+            return star_size
+        return size_spec
 
     def check_dimension_constraints(self, var, value, line_number=None):
         """
@@ -1248,7 +1498,8 @@ class ArrayHandler:
 
         if dims is None:
             return value
-        scope = self.compiler.current_scope().get_defining_scope(var) or self.compiler.current_scope()
+        scope = self.compiler.current_scope().get_defining_scope(
+            var) or self.compiler.current_scope()
         resolved_dims = []
         for name, size_spec in dims:
             if isinstance(size_spec, str):
@@ -1288,23 +1539,16 @@ class ArrayHandler:
         var_type = None
         scope = self.compiler.current_scope().get_defining_scope(var)
         if scope:
-            actual_key = scope._get_case_insensitive_key(var, scope.types) or var
+            actual_key = scope._get_case_insensitive_key(
+                var, scope.types) or var
             var_type = scope.types.get(actual_key)
         if var_type is None:
             var_type = self.compiler.types.get(var)
 
         if isinstance(value, dict) and var_type and var_type.lower() in self.compiler.types_defined:
             import copy
-            shape = []
-            for _, size_spec in dims:
-                if isinstance(size_spec, tuple):
-                    start, end = size_spec
-                    dim_size = end - start + 1
-                elif size_spec is None:
-                    dim_size = 1
-                else:
-                    dim_size = size_spec
-                shape.append(dim_size)
+            shape = [self._dim_size(size_spec, star_size=1)
+                     for _, size_spec in dims]
             total = 1
             for dim in shape:
                 total *= dim
@@ -1320,26 +1564,8 @@ class ArrayHandler:
             return reshaped
 
         if not isinstance(value, (list, pa.Array, pa.ListArray)) or isinstance(value, (int, float, str)):
-            shape = []
-            num_stars = sum(1 for _, size_spec in dims if size_spec is None)
-            if num_stars > 0:
-                for _, size_spec in dims:
-                    if isinstance(size_spec, tuple):
-                        start, end = size_spec
-                        dim_size = end - start + 1
-                    elif size_spec is None:
-                        dim_size = 1
-                    else:
-                        dim_size = size_spec
-                    shape.append(dim_size)
-            else:
-                for _, size_spec in dims:
-                    if isinstance(size_spec, tuple):
-                        start, end = size_spec
-                        dim_size = end - start + 1
-                    else:
-                        dim_size = size_spec
-                    shape.append(dim_size)
+            shape = [self._dim_size(size_spec, star_size=1)
+                     for _, size_spec in dims]
             pa_type = pa.float64() if self.compiler.types.get(
                 var) in ('number', 'array') else pa.string()
             return self.create_array(shape, value, pa_type, line_number)
@@ -1350,13 +1576,7 @@ class ArrayHandler:
             dims) if size_spec is None]
         known_product = 1
         for i, (_, size_spec) in enumerate(dims):
-            if isinstance(size_spec, tuple):
-                start, end = size_spec
-                dim_size = end - start + 1
-            elif size_spec is None:
-                dim_size = None
-            else:
-                dim_size = size_spec
+            dim_size = self._dim_size(size_spec, star_size=None)
             expected_shape.append(dim_size)
             if dim_size is not None:
                 known_product *= dim_size
