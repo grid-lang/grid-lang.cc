@@ -2071,6 +2071,29 @@ class GridLangExecutor:
 
         return True, i + 1
 
+    def _execute_for_assignment_combinations(
+            self, value_combinations, var_specs, assignment_line, assignment_line_number):
+        """Apply a ':=' assignment line over every loop value combination.
+
+        Each combo is run in its own private loop scope, defining each loop
+        variable and optional index variable before evaluating the line.
+        """
+        for combo in value_combinations:
+            self.push_scope(is_private=True, is_loop_scope=True)
+            for loop_idx, (var_name, index_var) in enumerate(var_specs):
+                self.current_scope().define(
+                    var_name, combo[loop_idx], 'number')
+                if index_var:
+                    if index_var in self.current_scope().variables:
+                        self.current_scope().update(
+                            index_var, loop_idx + 1)
+                    else:
+                        self.current_scope().define(
+                            index_var, loop_idx + 1, 'number')
+            self.array_handler.evaluate_line_with_assignment(
+                assignment_line, assignment_line_number, self.current_scope().get_evaluation_scope())
+            self.pop_scope()
+
     def _handle_for_and_syntax(self, lines, i, var_defs, is_block, line_number):
         if ' AND ' not in var_defs:
             return False, i
@@ -2225,21 +2248,10 @@ class GridLangExecutor:
             next_line, next_line_number = lines[i + 1]
             if ':=' in next_line:
                 value_combinations = list(generate_combinations())
-                for combo in value_combinations:
-                    self.push_scope(is_private=True, is_loop_scope=True)
-                    for loop_idx, loop in enumerate(and_loops):
-                        self.current_scope().define(
-                            loop['var_name'], combo[loop_idx], 'number')
-                        if loop['index_var']:
-                            if loop['index_var'] in self.current_scope().variables:
-                                self.current_scope().update(
-                                    loop['index_var'], loop_idx + 1)
-                            else:
-                                self.current_scope().define(
-                                    loop['index_var'], loop_idx + 1, 'number')
-                    self.array_handler.evaluate_line_with_assignment(
-                        next_line, next_line_number, self.current_scope().get_evaluation_scope())
-                    self.pop_scope()
+                self._execute_for_assignment_combinations(
+                    value_combinations,
+                    [(loop['var_name'], loop['index_var']) for loop in and_loops],
+                    next_line, next_line_number)
                 return True, i + 2
 
         return False, i
@@ -2339,18 +2351,10 @@ class GridLangExecutor:
             if assignment_line:
                 from itertools import product
                 value_combinations = list(product(*[loop['values'] for loop in nested_for_loops]))
-                for combo in value_combinations:
-                    self.push_scope(is_private=True, is_loop_scope=True)
-                    for loop_idx, loop in enumerate(nested_for_loops):
-                        self.current_scope().define(loop['var_name'], combo[loop_idx], 'number')
-                        if loop['index_var']:
-                            if loop['index_var'] in self.current_scope().variables:
-                                self.current_scope().update(loop['index_var'], loop_idx + 1)
-                            else:
-                                self.current_scope().define(loop['index_var'], loop_idx + 1, 'number')
-                    self.array_handler.evaluate_line_with_assignment(
-                        assignment_line, assignment_line_number, self.current_scope().get_evaluation_scope())
-                    self.pop_scope()
+                self._execute_for_assignment_combinations(
+                    value_combinations,
+                    [(loop['var_name'], loop['index_var']) for loop in nested_for_loops],
+                    assignment_line, assignment_line_number)
                 return True, current_i
 
         return False, i
@@ -3439,20 +3443,10 @@ class GridLangExecutor:
         if i + 1 < len(lines):
             next_line, next_line_number = lines[i + 1]
             if ':=' in next_line:
-                for combo in value_combinations:
-                    self.push_scope(
-                        is_private=True, is_loop_scope=True)
-                    for var_idx, (var_name, _, index_var, _, _, _, _) in enumerate(loop_configs):
-                        self.current_scope().define(
-                            var_name, combo[var_idx], 'number')
-                        if index_var:
-                            if index_var in self.current_scope().variables:
-                                self.current_scope().update(index_var, var_idx + 1)
-                            else:
-                                self.current_scope().define(index_var, var_idx + 1, 'number')
-                    self.array_handler.evaluate_line_with_assignment(
-                        next_line, next_line_number, self.current_scope().get_evaluation_scope())
-                    self.pop_scope()
+                self._execute_for_assignment_combinations(
+                    value_combinations,
+                    [(cfg[0], cfg[2]) for cfg in loop_configs],
+                    next_line, next_line_number)
 
         return i + 1
 
