@@ -4,7 +4,7 @@ Handles FOR loops, IF statements, LET statements, and block processing.
 """
 
 import re
-from utils import num_to_col
+from utils import num_to_col, split_var_defs
 
 # Regex patterns for block parsing
 HEADER_IF = re.compile(r'^\s*if\b(.+?)\bthen\s*$', re.I)
@@ -1283,7 +1283,7 @@ class GridLangControlFlow:
 
         var_list = []
         if ' and ' in var_def.lower():
-            var_parts = re.split(r'\s+and\s+', var_def, flags=re.I)
+            var_parts = split_var_defs(var_def)
             for var_part in var_parts:
                 var, type_name, constraints, expr = self.compiler._parse_variable_def(
                     var_part, line_number)

@@ -59,6 +59,9 @@ class GridLangParser:
         while i < len(parts):
             keyword = parts[i].lower()
             next_part = parts[i + 1].strip() if i + 1 < len(parts) else ''
+            if keyword == 'and':
+                i += 1
+                continue
             if keyword == 'not':
                 if next_part.lower() == 'null':
                     constraints['not_null'] = True
@@ -124,6 +127,7 @@ class GridLangParser:
                         raise SyntaxError(f"Invalid 'in' constraint syntax: '{next_part}' at line {line_number}")
                     constraints['in'] = next_part
             elif keyword in ('<=', '>=', '<', '>', '<>'):
+                self._check_comparison_series(parts, i, line_number)
                 if negated:
                     constraints[f'not_{keyword}'] = next_part
                     negated = False
@@ -134,6 +138,7 @@ class GridLangParser:
             elif keyword == 'index':
                 constraints['index'] = next_part
             elif keyword == '=':
+                self._check_comparison_series(parts, i, line_number)
                 if next_part.startswith('{'):
                     if ';' in next_part or '|' in next_part:
                         matrices = [m.strip()[1:-1] for m in next_part.split('|')]
@@ -196,6 +201,20 @@ class GridLangParser:
         self._merge_custom_type_constraints(type_name, constraints)
 
         return var, type_name, constraints, expr
+
+    def _check_comparison_series(self, parts, i, line_number):
+        """Require 'and' between comparison operators used in series.
+
+        A comparison operator at parts[i] is followed by its value at
+        parts[i + 1]. If another comparison operator directly follows the
+        value, the series lacks the required 'and' separator.
+        """
+        comparison_ops = {'<=', '>=', '<>', '<', '>', '='}
+        if (i + 2 < len(parts)
+                and parts[i + 2].lower() in comparison_ops):
+            raise SyntaxError(
+                f"Comparison operators in a series must be separated by "
+                f"'and' at line {line_number}")
 
     def _match_direct_assignment_patterns(self, def_str, line_number, constraints):
         field_match = re.match(r'^([\w_]+)\.(\w+)\s*=\s*(.+)$', def_str)
@@ -364,7 +383,7 @@ class GridLangParser:
 
     def _split_on_keywords(self, text):
         """Split a variable definition on keywords, skipping quoted sections."""
-        keywords = ['<=', '>=', '<>', '<', '>', '=', 'as', 'of', 'dim', 'in', 'init', 'index', 'not']
+        keywords = ['<=', '>=', '<>', '<', '>', '=', 'as', 'of', 'dim', 'in', 'init', 'index', 'and', 'not']
         parts = []
         current = ""
         in_quote = False

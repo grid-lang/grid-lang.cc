@@ -6,7 +6,7 @@ Handles type definitions, type code execution, and type-related operations.
 import copy
 import re
 import numbers
-from utils import get_case_insensitive_key
+from utils import get_case_insensitive_key, split_var_defs
 
 
 class GridLangTypeProcessor:
@@ -398,7 +398,7 @@ class GridLangTypeProcessor:
             raise SyntaxError(f"Unsupported loop syntax: {loop_line}")
 
         var_defs = match.group(1).strip()
-        var_parts = re.split(r'\s+and\s+', var_defs, flags=re.I)
+        var_parts = split_var_defs(var_defs)
         loop_defs = []
         for var_part in var_parts:
             part = var_part.strip()

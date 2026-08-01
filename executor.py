@@ -8,7 +8,7 @@ from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
 from control_flow import GridLangControlFlow
 from parser import GridLangParser
-from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, public_type_fields, object_public_keys, format_display_value
+from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, public_type_fields, object_public_keys, format_display_value, split_var_defs
 
 
 IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*')
@@ -357,7 +357,7 @@ class GridLangExecutor:
             return None
         if kind in {'let', 'for_assignment'} and allow_split and re.search(r'\s+and\s+', working, re.I):
             nodes = []
-            parts = re.split(r'\s+and\s+', working, flags=re.I)
+            parts = split_var_defs(working)
             for part in parts:
                 part = part.strip()
                 if not part:
@@ -1135,7 +1135,7 @@ class GridLangExecutor:
         has_block = line.lower().strip().endswith('then')
         var_list = []
         if ' and ' in var_def.lower():
-            var_parts = re.split(r'\s+and\s+', var_def, flags=re.I)
+            var_parts = split_var_defs(var_def)
             for var_part in var_parts:
                 var, type_name, constraints, expr = self._parse_variable_def(
                     var_part, line_number)
@@ -1347,9 +1347,10 @@ class GridLangExecutor:
             if self.current_scope().is_shadowed(var):
                 print(
                     f"Warning: LET defines '{var}' which shadows a variable in an outer scope at line {line_number}")
-            self.current_scope().define(
+            defining_scope = self.current_scope()
+            defining_scope.define(
                 var, None, type_name, constraints, is_uninitialized=True)
-            self.current_scope().mark_implicit_let(var)
+            defining_scope.mark_implicit_let(var)
 
         if expr is None:
             return
@@ -1658,7 +1659,7 @@ class GridLangExecutor:
             index_fallback = index_match_line.group(1)
         var_list = []
         if ' and ' in var_def.lower():
-            var_parts = re.split(r'\s+and\s+', var_def, flags=re.I)
+            var_parts = split_var_defs(var_def)
             for var_part in var_parts:
                 var, type_name, constraints, expr = self._parse_variable_def(
                     var_part, line_number)
@@ -1976,7 +1977,7 @@ class GridLangExecutor:
 
         var_list = []
         if ' and ' in var_defs.lower():
-            var_parts = re.split(r'\s+and\s+', var_defs, flags=re.I)
+            var_parts = split_var_defs(var_defs)
             for var_part in var_parts:
                 var, type_name, constraints, expr = self._parse_variable_def(
                     var_part, line_number)
@@ -2521,8 +2522,7 @@ class GridLangExecutor:
         var_list = []
         try:
             if ' and ' in var_defs.lower():
-                var_parts = re.split(
-                    r'\s+and\s+', var_defs, flags=re.I)
+                var_parts = split_var_defs(var_defs)
                 for var_part in var_parts:
                     var, type_name, constraints, value = self._parse_variable_def(
                         var_part, line_number)
@@ -3292,7 +3292,7 @@ class GridLangExecutor:
             line_number,
             var_defs,
             is_block):
-        var_parts = re.split(r'\s+and\s+', var_defs, flags=re.I)
+        var_parts = split_var_defs(var_defs)
         loop_configs = []
 
         for var_part in var_parts:

@@ -1,5 +1,16 @@
 import re
 
+_DEFINITION_AND_SPLIT = re.compile(r'\s+and\s+(?![<>=]|not\b)', re.I)
+
+
+def split_var_defs(s):
+    """Split a variable-definition list on 'and' that separates definitions.
+
+    An 'and' introducing a further comparison constraint (=, <, >, <>, >=,
+    <=) or a negated constraint ('not') is left intact.
+    """
+    return _DEFINITION_AND_SPLIT.split(s)
+
 
 def validate_cell_ref(cell_ref):
     # Convert to uppercase for validation
