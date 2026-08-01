@@ -4,6 +4,7 @@ Handles variable scoping, constraints, and pipe connections.
 """
 
 import copy
+import re
 
 import pyarrow as pa
 
@@ -106,8 +107,27 @@ class Scope:
             self.compiler.mark_dependency_resolved(actual_key)
         return materialized
 
+    def _validate_variable_name(self, name, line_number=None):
+        """Reject names that are not valid GridLang variable identifiers.
+
+        A variable name must start with a letter and may contain letters,
+        digits, '_' and '.' (never in the last position).
+        """
+        valid = (
+            name
+            and name[0].isalpha()
+            and not name.endswith('.')
+            and all(ch.isalnum() or ch in '._' for ch in name)
+        )
+        if valid:
+            return
+        at = f" at line {line_number}" if line_number else ""
+        raise SyntaxError(
+            f"Invalid variable name '{name}'{at}.")
+
     def define(self, name, value=None, type=None, constraints=None, is_uninitialized=False, line_number=None):
         effective_constraints = constraints or {}
+        self._validate_variable_name(name, line_number)
         # Check for case-insensitive conflicts
         existing_key = self._get_case_insensitive_key(name, self.variables)
         if existing_key and not is_uninitialized:

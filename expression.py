@@ -1878,24 +1878,28 @@ class ExpressionEvaluator:
                     raise IndexError(
                         f"Invalid indices {indices_str} for '{var_name}': {e} at line {line_number}")
 
-        # Handle numeric indexing (e.g., var[1] or var(0))
-        index_match = re.match(r'^([\w_]+)(?:\[(\d+)\]|\((\d+)\))$', expr)
+        # Handle explicit array indexing (e.g., var![3] or var![A1]).
+        # '!' disambiguates array element access from a function call.
+        handled, bang_result = self._try_eval_bang_index(
+            expr, scope, line_number)
+        if handled:
+            return bang_result
+
+        # Handle numeric parentheses indexing (e.g., var(0))
+        index_match = re.match(r'^([\w_]+)\((\d+)\)$', expr)
         if index_match:
-            var_name, index_bracket, index_paren = index_match.groups()
-            index = index_bracket or index_paren
+            var_name, index_paren = index_match.groups()
             if var_name in scope or var_name in self.compiler.variables:
                 array = scope.get(
                     var_name, self.compiler.variables.get(var_name))
                 try:
-                    idx = int(index)
-                    # Adjust for 1-based [n] or 0-based (n)
-                    idx = idx - 1 if index_bracket else idx
+                    idx = int(index_paren)
                     result = self.compiler.array_handler.get_array_element(
                         array, [idx], line_number)
                     return result
                 except (IndexError, ValueError) as e:
                     raise IndexError(
-                        f"Invalid index {index} for '{var_name}': {e} at line {line_number}")
+                        f"Invalid index {index_paren} for '{var_name}': {e} at line {line_number}")
 
         # Handle parentheses indexing with expressions (e.g., D(k+1))
         paren_expr_match = re.match(r'^([\w_]+)\(([^)]+)\)$', expr)
@@ -1918,13 +1922,6 @@ class ExpressionEvaluator:
                 except (IndexError, ValueError) as e:
                     raise IndexError(
                         f"Invalid index {index_expr} for '{var_name}': {e} at line {line_number}")
-
-        # Handle cell-based indexing (e.g., var[A1])
-        m = re.match(r'^([\w_]+)\[([A-Z]+\d+)\]$', expr)
-        if m:
-            var_name, cell_ref = m.groups()
-            if var_name in scope or var_name in self.compiler.variables:
-                return self.compiler.array_handler.resolve_cell_index(var_name, cell_ref, line_number)
 
         handled, curly_result = self._try_eval_curly_indexing_variants(
             expr, scope, line_number)
@@ -1968,6 +1965,47 @@ class ExpressionEvaluator:
             return cell_result
 
         return self._evaluate_with_python_fallback(expr, scope, line_number)
+
+    def _try_eval_bang_index(self, expr, scope, line_number):
+        """Evaluate explicit array indexing (e.g., var![3], var![A1]).
+
+        The '!' between the variable name and the bracket makes the intent
+        unambiguous: it is always array element access, never a function call.
+        """
+        m = re.match(r'^([\w_]+)!\[([^\]]+)\]$', expr)
+        if not m:
+            return False, None
+        var_name, index_expr = m.groups()
+        if var_name not in scope and var_name not in self.compiler.variables:
+            raise NameError(
+                f"Variable '{var_name}' not defined at line {line_number}")
+        array = scope.get(
+            var_name, self.compiler.variables.get(var_name))
+        if array is None:
+            raise ValueError(
+                f"Variable '{var_name}' is uninitialized at line {line_number}")
+
+        if re.match(r'^[A-Za-z]+\d+$', index_expr):
+            result = self.compiler.array_handler.resolve_cell_index(
+                var_name, index_expr, line_number)
+            return True, result
+
+        try:
+            index_value = self.eval_expr(index_expr, scope, line_number)
+        except Exception as e:
+            raise IndexError(
+                f"Invalid index '{index_expr}' for '{var_name}': {e} at line {line_number}")
+        if isinstance(index_value, float) and index_value.is_integer():
+            index_value = int(index_value)
+        # Bracket indexing is 1-based, so adjust to 0-based.
+        idx = index_value - 1
+        try:
+            result = self.compiler.array_handler.get_array_element(
+                array, [idx], line_number)
+        except (IndexError, ValueError) as e:
+            raise IndexError(
+                f"Invalid index {index_expr} for '{var_name}': {e} at line {line_number}")
+        return True, result
 
     def _try_eval_curly_indexing_variants(self, expr, scope, line_number):
         curly_brace_match = re.match(r'^([\w_]+)\{([^}]+)\}$', expr)
@@ -2114,6 +2152,10 @@ class ExpressionEvaluator:
         eval_expr = self._replace_fallback_curly_accesses(
             eval_expr, scope, line_number)
         eval_expr = self._replace_operators(eval_expr, line_number)
+        if re.match(r'^[\w_]+\[', eval_expr):
+            raise SyntaxError(
+                f"Array element access without '!' is no longer supported: "
+                f"'{expr}' at line {line_number}")
         python_scope = self._build_python_fallback_scope(scope, line_number)
         return self._eval_python_fallback_result(
             expr, eval_expr, python_scope, line_number)

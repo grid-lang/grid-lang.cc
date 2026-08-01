@@ -1386,9 +1386,9 @@ class GridLangControlFlow:
 
     def _try_process_let_indexed_assignment(self, var, expr, scope_dict, line_number):
         array_index_match = re.match(r'^([\w_]+)\{([^}]+)\}$', var)
-        cell_index_match = re.match(r'^([\w_]+)\[([^\]]+)\]$', var)
         paren_index_match = re.match(r'^([\w_]+)\(([^)]+)\)$', var)
-        if not (array_index_match or cell_index_match or paren_index_match):
+        bang_index_match = re.match(r'^([\w_]+)!\[([^\]]+)\]$', var)
+        if not (array_index_match or paren_index_match or bang_index_match):
             return False
         if array_index_match:
             var_name, indices_str = array_index_match.groups()
@@ -1401,8 +1401,8 @@ class GridLangControlFlow:
                     index_value = int(index_value)
                 indices.append(
                     index_value - 1 if isinstance(index_value, int) else index_value)
-        elif cell_index_match:
-            var_name, index_expr = cell_index_match.groups()
+        elif bang_index_match:
+            var_name, index_expr = bang_index_match.groups()
             try:
                 index_value = self.compiler.expr_evaluator.eval_expr(
                     index_expr, scope_dict, line_number)

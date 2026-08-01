@@ -300,8 +300,8 @@ class GridLangExecutor:
 
     def _parse_indexed_target(self, target, scope_dict, line_number):
         array_index_match = re.match(r'^([\w_]+)\{([^}]+)\}$', target)
-        cell_index_match = re.match(r'^([\w_]+)\[([^\]]+)\]$', target)
         paren_index_match = re.match(r'^([\w_]+)\(([^)]+)\)$', target)
+        bang_index_match = re.match(r'^([\w_]+)!\[([^\]]+)\]$', target)
         if array_index_match:
             var_name, indices_str = array_index_match.groups()
             indices = []
@@ -314,8 +314,8 @@ class GridLangExecutor:
                 indices.append(index_value - 1 if isinstance(
                     index_value, int) else index_value)
             return var_name, indices
-        if cell_index_match:
-            var_name, index_expr = cell_index_match.groups()
+        if bang_index_match:
+            var_name, index_expr = bang_index_match.groups()
             try:
                 index_value = self.expr_evaluator.eval_expr(
                     index_expr, scope_dict, line_number)
@@ -1236,9 +1236,9 @@ class GridLangExecutor:
     def _try_handle_let_index_assignment(
             self, var, expr, scope_dict, line_number):
         array_index_match = re.match(r'^([\w_]+)\{([^}]+)\}$', var)
-        cell_index_match = re.match(r'^([\w_]+)\[([^\]]+)\]$', var)
         paren_index_match = re.match(r'^([\w_]+)\(([^)]+)\)$', var)
-        if not (array_index_match or cell_index_match or paren_index_match):
+        bang_index_match = re.match(r'^([\w_]+)!\[([^\]]+)\]$', var)
+        if not (array_index_match or paren_index_match or bang_index_match):
             return False
 
         if array_index_match:
@@ -1252,8 +1252,8 @@ class GridLangExecutor:
                     index_value = int(index_value)
                 indices.append(
                     index_value - 1 if isinstance(index_value, int) else index_value)
-        elif cell_index_match:
-            var_name, index_expr = cell_index_match.groups()
+        elif bang_index_match:
+            var_name, index_expr = bang_index_match.groups()
             try:
                 index_value = self.expr_evaluator.eval_expr(
                     index_expr, scope_dict, line_number)
@@ -1349,7 +1349,8 @@ class GridLangExecutor:
                     f"Warning: LET defines '{var}' which shadows a variable in an outer scope at line {line_number}")
             defining_scope = self.current_scope()
             defining_scope.define(
-                var, None, type_name, constraints, is_uninitialized=True)
+                var, None, type_name, constraints, is_uninitialized=True,
+                line_number=line_number)
             defining_scope.mark_implicit_let(var)
 
         if expr is None:
