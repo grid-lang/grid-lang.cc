@@ -1385,40 +1385,10 @@ class GridLangControlFlow:
         return True
 
     def _try_process_let_indexed_assignment(self, var, expr, scope_dict, line_number):
-        array_index_match = re.match(r'^([\w_]+)\{([^}]+)\}$', var)
-        paren_index_match = re.match(r'^([\w_]+)\(([^)]+)\)$', var)
-        bang_index_match = re.match(r'^([\w_]+)!\[([^\]]+)\]$', var)
-        if not (array_index_match or paren_index_match or bang_index_match):
+        var_name, indices = self.compiler.expr_evaluator._parse_index_target(
+            var, scope_dict, line_number)
+        if var_name is None:
             return False
-        if array_index_match:
-            var_name, indices_str = array_index_match.groups()
-            indices = []
-            for index_expr in indices_str.split(','):
-                index_expr = index_expr.strip()
-                index_value = self.compiler.expr_evaluator.eval_expr(
-                    index_expr, scope_dict, line_number)
-                if isinstance(index_value, float) and index_value.is_integer():
-                    index_value = int(index_value)
-                indices.append(
-                    index_value - 1 if isinstance(index_value, int) else index_value)
-        elif bang_index_match:
-            var_name, index_expr = bang_index_match.groups()
-            try:
-                index_value = self.compiler.expr_evaluator.eval_expr(
-                    index_expr, scope_dict, line_number)
-                if isinstance(index_value, float) and index_value.is_integer():
-                    index_value = int(index_value)
-                indices = [index_value - 1]
-            except Exception:
-                indices = self.compiler.array_handler.cell_ref_to_indices(
-                    index_expr, line_number)
-        else:
-            var_name, index_expr = paren_index_match.groups()
-            index_value = self.compiler.expr_evaluator.eval_expr(
-                index_expr, scope_dict, line_number)
-            if isinstance(index_value, float) and index_value.is_integer():
-                index_value = int(index_value)
-            indices = [index_value - 1]
         value = self.compiler.expr_evaluator.eval_or_eval_array(
             expr, scope_dict, line_number)
         defining_scope = self.compiler.current_scope().get_defining_scope(var_name)

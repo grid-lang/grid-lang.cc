@@ -298,44 +298,6 @@ class GridLangExecutor:
         self.pop_scope()
         return True
 
-    def _parse_indexed_target(self, target, scope_dict, line_number):
-        array_index_match = re.match(r'^([\w_]+)\{([^}]+)\}$', target)
-        paren_index_match = re.match(r'^([\w_]+)\(([^)]+)\)$', target)
-        bang_index_match = re.match(r'^([\w_]+)!\[([^\]]+)\]$', target)
-        if array_index_match:
-            var_name, indices_str = array_index_match.groups()
-            indices = []
-            for index_expr in indices_str.split(','):
-                index_expr = index_expr.strip()
-                index_value = self.expr_evaluator.eval_expr(
-                    index_expr, scope_dict, line_number)
-                if isinstance(index_value, float) and index_value.is_integer():
-                    index_value = int(index_value)
-                indices.append(index_value - 1 if isinstance(
-                    index_value, int) else index_value)
-            return var_name, indices
-        if bang_index_match:
-            var_name, index_expr = bang_index_match.groups()
-            try:
-                index_value = self.expr_evaluator.eval_expr(
-                    index_expr, scope_dict, line_number)
-                if isinstance(index_value, float) and index_value.is_integer():
-                    index_value = int(index_value)
-                indices = [index_value - 1]
-            except Exception:
-                indices = self.array_handler.cell_ref_to_indices(
-                    index_expr, line_number)
-            return var_name, indices
-        if paren_index_match:
-            var_name, index_expr = paren_index_match.groups()
-            index_value = self.expr_evaluator.eval_expr(
-                index_expr, scope_dict, line_number)
-            if isinstance(index_value, float) and index_value.is_integer():
-                index_value = int(index_value)
-            indices = [index_value - 1]
-            return var_name, indices
-        return None, None
-
     def _parse_assignment_like_line(self, normalized, original_line, line_number, *, is_declaration=False, allow_split=True):
         """Capture assignment style statements for dependency analysis."""
         working = normalized
@@ -1235,41 +1197,10 @@ class GridLangExecutor:
 
     def _try_handle_let_index_assignment(
             self, var, expr, scope_dict, line_number):
-        array_index_match = re.match(r'^([\w_]+)\{([^}]+)\}$', var)
-        paren_index_match = re.match(r'^([\w_]+)\(([^)]+)\)$', var)
-        bang_index_match = re.match(r'^([\w_]+)!\[([^\]]+)\]$', var)
-        if not (array_index_match or paren_index_match or bang_index_match):
+        var_name, indices = self.expr_evaluator._parse_index_target(
+            var, scope_dict, line_number)
+        if var_name is None:
             return False
-
-        if array_index_match:
-            var_name, indices_str = array_index_match.groups()
-            indices = []
-            for index_expr in indices_str.split(','):
-                index_expr = index_expr.strip()
-                index_value = self.expr_evaluator.eval_expr(
-                    index_expr, scope_dict, line_number)
-                if isinstance(index_value, float) and index_value.is_integer():
-                    index_value = int(index_value)
-                indices.append(
-                    index_value - 1 if isinstance(index_value, int) else index_value)
-        elif bang_index_match:
-            var_name, index_expr = bang_index_match.groups()
-            try:
-                index_value = self.expr_evaluator.eval_expr(
-                    index_expr, scope_dict, line_number)
-                if isinstance(index_value, float) and index_value.is_integer():
-                    index_value = int(index_value)
-                indices = [index_value - 1]
-            except Exception:
-                indices = self.array_handler.cell_ref_to_indices(
-                    index_expr, line_number)
-        else:
-            var_name, index_expr = paren_index_match.groups()
-            index_value = self.expr_evaluator.eval_expr(
-                index_expr, scope_dict, line_number)
-            if isinstance(index_value, float) and index_value.is_integer():
-                index_value = int(index_value)
-            indices = [index_value - 1]
 
         value = self.expr_evaluator.eval_or_eval_array(
             expr, scope_dict, line_number)
@@ -4521,7 +4452,7 @@ class GridLangExecutor:
                 # Use the global scope to ensure we can access updated variable values
                 global_scope = self.get_global_scope()
 
-                indexed_var, indices = self._parse_indexed_target(
+                indexed_var, indices = self.expr_evaluator._parse_index_target(
                     var_name, self.current_scope().get_evaluation_scope(), line_number)
                 if indexed_var is not None:
                     defining_scope = self.current_scope().get_defining_scope(indexed_var)

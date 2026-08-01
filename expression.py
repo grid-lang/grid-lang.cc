@@ -1878,47 +1878,21 @@ class ExpressionEvaluator:
                     raise IndexError(
                         f"Invalid indices {indices_str} for '{var_name}': {e} at line {line_number}")
 
-        # Handle explicit array indexing (e.g., var![3] or var![A1]).
-        # '!' disambiguates array element access from a function call.
-        handled, bang_result = self._try_eval_bang_index(
-            expr, scope, line_number)
-        if handled:
-            return bang_result
-
-        # Handle numeric parentheses indexing (e.g., var(0))
-        index_match = re.match(r'^([\w_]+)\((\d+)\)$', expr)
+        # Handle indexed array access (e.g., var![3], var![A1], var(0), var(k+1)).
+        # '!' makes array element access unambiguous; parens are kept for
+        # compatibility (numeric parens index 0-based, other forms 1-based).
+        index_match = re.match(r'^([\w_]+)(?:!\[([^\]]+)\]|\(([^)]+)\))$', expr)
         if index_match:
-            var_name, index_paren = index_match.groups()
+            var_name, bang_index, paren_index = index_match.groups()
+            index_expr = bang_index or paren_index
             if var_name in scope or var_name in self.compiler.variables:
-                array = scope.get(
-                    var_name, self.compiler.variables.get(var_name))
                 try:
-                    idx = int(index_paren)
-                    result = self.compiler.array_handler.get_array_element(
-                        array, [idx], line_number)
-                    return result
-                except (IndexError, ValueError) as e:
-                    raise IndexError(
-                        f"Invalid index {index_paren} for '{var_name}': {e} at line {line_number}")
-
-        # Handle parentheses indexing with expressions (e.g., D(k+1))
-        paren_expr_match = re.match(r'^([\w_]+)\(([^)]+)\)$', expr)
-        if paren_expr_match:
-            var_name, index_expr = paren_expr_match.groups()
-            if var_name in scope or var_name in self.compiler.variables:
-                array = scope.get(
-                    var_name, self.compiler.variables.get(var_name))
-                try:
-                    # Evaluate the index expression (e.g., "k+1")
-                    index_value = self.eval_expr(
-                        index_expr, scope, line_number)
-                    if isinstance(index_value, float) and index_value.is_integer():
-                        index_value = int(index_value)
-                    # Parentheses indexing is 1-based, so adjust to 0-based
-                    idx = index_value - 1
-                    result = self.compiler.array_handler.get_array_element(
-                        array, [idx], line_number)
-                    return result
+                    if bang_index and re.match(r'^[A-Za-z]+\d+$', index_expr):
+                        return self.compiler.array_handler.resolve_cell_index(
+                            var_name, index_expr, line_number)
+                    base = 0 if paren_index and paren_index.isdigit() else 1
+                    return self._eval_array_element(
+                        var_name, index_expr, scope, line_number, base=base)
                 except (IndexError, ValueError) as e:
                     raise IndexError(
                         f"Invalid index {index_expr} for '{var_name}': {e} at line {line_number}")
@@ -1966,46 +1940,59 @@ class ExpressionEvaluator:
 
         return self._evaluate_with_python_fallback(expr, scope, line_number)
 
-    def _try_eval_bang_index(self, expr, scope, line_number):
-        """Evaluate explicit array indexing (e.g., var![3], var![A1]).
+    def _eval_array_element(self, var_name, index_expr, scope, line_number, base=1):
+        """Return the element of the array 'var_name' at index 'index_expr'.
 
-        The '!' between the variable name and the bracket makes the intent
-        unambiguous: it is always array element access, never a function call.
+        'index_expr' is the raw index text (e.g., "3", "k+1"); it must
+        evaluate to a number. 'base' selects 0- or 1-based indexing.
         """
-        m = re.match(r'^([\w_]+)!\[([^\]]+)\]$', expr)
-        if not m:
-            return False, None
-        var_name, index_expr = m.groups()
-        if var_name not in scope and var_name not in self.compiler.variables:
-            raise NameError(
-                f"Variable '{var_name}' not defined at line {line_number}")
-        array = scope.get(
-            var_name, self.compiler.variables.get(var_name))
-        if array is None:
-            raise ValueError(
-                f"Variable '{var_name}' is uninitialized at line {line_number}")
-
-        if re.match(r'^[A-Za-z]+\d+$', index_expr):
-            result = self.compiler.array_handler.resolve_cell_index(
-                var_name, index_expr, line_number)
-            return True, result
-
-        try:
-            index_value = self.eval_expr(index_expr, scope, line_number)
-        except Exception as e:
-            raise IndexError(
-                f"Invalid index '{index_expr}' for '{var_name}': {e} at line {line_number}")
+        index_value = self.eval_expr(index_expr, scope, line_number)
         if isinstance(index_value, float) and index_value.is_integer():
             index_value = int(index_value)
-        # Bracket indexing is 1-based, so adjust to 0-based.
-        idx = index_value - 1
-        try:
-            result = self.compiler.array_handler.get_array_element(
-                array, [idx], line_number)
-        except (IndexError, ValueError) as e:
-            raise IndexError(
-                f"Invalid index {index_expr} for '{var_name}': {e} at line {line_number}")
-        return True, result
+        array = scope.get(
+            var_name, self.compiler.variables.get(var_name))
+        return self.compiler.array_handler.get_array_element(
+            array, [index_value - base], line_number)
+
+    def _parse_index_target(self, target, scope, line_number):
+        """Parse an indexed assignment target (e.g., var{...}, var![...], var(...)).
+
+        Returns (var_name, indices) with 0-based indices, or (None, None)
+        if 'target' is not an indexed form.
+        """
+        array_index_match = re.match(r'^([\w_]+)\{([^}]+)\}$', target)
+        paren_index_match = re.match(r'^([\w_]+)\(([^)]+)\)$', target)
+        bang_index_match = re.match(r'^([\w_]+)!\[([^\]]+)\]$', target)
+        if array_index_match:
+            var_name, indices_str = array_index_match.groups()
+            indices = []
+            for index_expr in indices_str.split(','):
+                index_expr = index_expr.strip()
+                index_value = self.eval_expr(index_expr, scope, line_number)
+                if isinstance(index_value, float) and index_value.is_integer():
+                    index_value = int(index_value)
+                indices.append(
+                    index_value - 1 if isinstance(index_value, int) else index_value)
+            return var_name, indices
+        if bang_index_match:
+            var_name, index_expr = bang_index_match.groups()
+            try:
+                index_value = self.eval_expr(index_expr, scope, line_number)
+                if isinstance(index_value, float) and index_value.is_integer():
+                    index_value = int(index_value)
+                indices = [index_value - 1]
+            except Exception:
+                indices = self.compiler.array_handler.cell_ref_to_indices(
+                    index_expr, line_number)
+            return var_name, indices
+        if paren_index_match:
+            var_name, index_expr = paren_index_match.groups()
+            index_value = self.eval_expr(index_expr, scope, line_number)
+            if isinstance(index_value, float) and index_value.is_integer():
+                index_value = int(index_value)
+            indices = [index_value - 1]
+            return var_name, indices
+        return None, None
 
     def _try_eval_curly_indexing_variants(self, expr, scope, line_number):
         curly_brace_match = re.match(r'^([\w_]+)\{([^}]+)\}$', expr)
