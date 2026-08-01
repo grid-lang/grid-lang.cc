@@ -1429,7 +1429,7 @@ class GridLangExecutor:
             if constraints:
                 defining_scope = self.current_scope().get_defining_scope(var) or self.current_scope()
                 if var in self.pending_assignments and defining_scope.get(var) is None:
-                    expr, ln, deps = self.pending_assignments[var]
+                    expr, ln, deps, _ = self.pending_assignments[var]
                     unresolved = any(
                         dep != var and self.has_unresolved_dependency(
                             dep, scope=self.current_scope())
@@ -1476,7 +1476,7 @@ class GridLangExecutor:
             if constraints:
                 defining_scope = self.current_scope().get_defining_scope(var) or self.current_scope()
                 if var in self.pending_assignments and defining_scope.get(var) is None:
-                    expr, ln, deps = self.pending_assignments[var]
+                    expr, ln, deps, _ = self.pending_assignments[var]
                     unresolved = any(
                         dep != var and self.has_unresolved_dependency(
                             dep, scope=self.current_scope())
