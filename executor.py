@@ -1403,6 +1403,40 @@ class GridLangExecutor:
                 except Exception as e:
                     pass
 
+    def _resolve_pending_let_var(self, var, defining_scope):
+        """Resolve a pending assignment for a LET variable, if possible.
+
+        Returns the current value of the variable (or None if unresolved).
+        """
+        if var in self.pending_assignments and defining_scope.get(var) is None:
+            expr, ln, deps, _ = self.pending_assignments[var]
+            unresolved = any(
+                dep != var and self.has_unresolved_dependency(
+                    dep, scope=self.current_scope())
+                for dep in deps)
+            if not unresolved:
+                try:
+                    value = self.expr_evaluator.eval_or_eval_array(
+                        expr, defining_scope.get_full_scope(), ln)
+                    defining_scope.update(var, value, ln)
+                    del self.pending_assignments[var]
+                except Exception:
+                    pass
+        return defining_scope.get(var)
+
+    def _blank_dependent_assignments(self, lines, start_i, var):
+        """Blank out following ':=' lines that reference a given variable."""
+        j = start_i + 1
+        while j < len(lines):
+            next_line, next_line_number = lines[j]
+            if ':=' in next_line:
+                _, rhs = next_line.split(':=', 1)
+                rhs_vars = set(
+                    token.lower() for token in re.findall(r'\b[\w_]+\b', rhs))
+                if var.lower() in rhs_vars:
+                    lines[j] = ("", next_line_number)
+            j += 1
+
     def _execute_let_block(self, lines, i, line_number, var_list):
         self.push_scope(is_private=True)
         block_lines = []
@@ -1428,21 +1462,7 @@ class GridLangExecutor:
         for var, _, constraints, _ in var_list:
             if constraints:
                 defining_scope = self.current_scope().get_defining_scope(var) or self.current_scope()
-                if var in self.pending_assignments and defining_scope.get(var) is None:
-                    expr, ln, deps, _ = self.pending_assignments[var]
-                    unresolved = any(
-                        dep != var and self.has_unresolved_dependency(
-                            dep, scope=self.current_scope())
-                        for dep in deps)
-                    if not unresolved:
-                        try:
-                            value = self.expr_evaluator.eval_or_eval_array(
-                                expr, defining_scope.get_full_scope(), ln)
-                            defining_scope.update(var, value, ln)
-                            del self.pending_assignments[var]
-                        except Exception as e:
-                            pass
-                var_value = defining_scope.get(var)
+                var_value = self._resolve_pending_let_var(var, defining_scope)
                 if var_value is None:
                     self.pop_scope()
                     return block_end_i + 1
@@ -1475,32 +1495,9 @@ class GridLangExecutor:
         for var, _, constraints, _ in var_list:
             if constraints:
                 defining_scope = self.current_scope().get_defining_scope(var) or self.current_scope()
-                if var in self.pending_assignments and defining_scope.get(var) is None:
-                    expr, ln, deps, _ = self.pending_assignments[var]
-                    unresolved = any(
-                        dep != var and self.has_unresolved_dependency(
-                            dep, scope=self.current_scope())
-                        for dep in deps)
-                    if not unresolved:
-                        try:
-                            value = self.expr_evaluator.eval_or_eval_array(
-                                expr, defining_scope.get_full_scope(), ln)
-                            defining_scope.update(var, value, ln)
-                            del self.pending_assignments[var]
-                        except Exception as e:
-                            pass
-                var_value = defining_scope.get(var)
+                var_value = self._resolve_pending_let_var(var, defining_scope)
                 if var_value is None:
-                    j = i + 1
-                    while j < len(lines):
-                        next_line, next_line_number = lines[j]
-                        if ':=' in next_line:
-                            _, rhs = next_line.split(':=')
-                            rhs_vars = set(re.findall(
-                                r'\b[\w_]+\b(?=\s*(?:[\[\{]|$))', rhs.strip()))
-                            if var in rhs_vars:
-                                lines[j] = ("", next_line_number)
-                        j += 1
+                    self._blank_dependent_assignments(lines, i, var)
                     continue
                 for op, threshold in constraints.items() if constraints else []:
                     if op not in ('<', '>', '<=', '>='):
@@ -1512,29 +1509,11 @@ class GridLangExecutor:
                         if isinstance(var_value, (int, float)):
                             if op == '<' and var_value >= threshold_value:
                                 self.pending_assignments.clear()
-                                j = i + 1
-                                while j < len(lines):
-                                    next_line, next_line_number = lines[j]
-                                    if ':=' in next_line:
-                                        _, rhs = next_line.split(':=', 1)
-                                        rhs_vars = set(
-                                            token.lower() for token in re.findall(r'\b[\w_]+\b', rhs))
-                                        if var.lower() in rhs_vars:
-                                            lines[j] = ("", next_line_number)
-                                    j += 1
+                                self._blank_dependent_assignments(lines, i, var)
                                 continue
                             elif op == '>' and var_value <= threshold_value:
                                 self.pending_assignments.clear()
-                                j = i + 1
-                                while j < len(lines):
-                                    next_line, next_line_number = lines[j]
-                                    if ':=' in next_line:
-                                        _, rhs = next_line.split(':=', 1)
-                                        rhs_vars = set(
-                                            token.lower() for token in re.findall(r'\b[\w_]+\b', rhs))
-                                        if var.lower() in rhs_vars:
-                                            lines[j] = ("", next_line_number)
-                                    j += 1
+                                self._blank_dependent_assignments(lines, i, var)
                                 continue
                     except (TypeError, ValueError):
                         pass
@@ -1544,16 +1523,7 @@ class GridLangExecutor:
                             var, var_value, line_number)
                     except ValueError as e:
                         self.pending_assignments.clear()
-                        j = i + 1
-                        while j < len(lines):
-                            next_line, next_line_number = lines[j]
-                            if ':=' in next_line:
-                                _, rhs = next_line.split(':=', 1)
-                                rhs_vars = set(
-                                    token.lower() for token in re.findall(r'\b[\w_]+\b', rhs))
-                                if var.lower() in rhs_vars:
-                                    lines[j] = ("", next_line_number)
-                            j += 1
+                        self._blank_dependent_assignments(lines, i, var)
                         continue
         return i + 1
 
