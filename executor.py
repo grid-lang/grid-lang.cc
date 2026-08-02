@@ -1339,11 +1339,6 @@ class GridLangExecutor:
                 actual_type_key = defining_scope._get_case_insensitive_key(
                     var, defining_scope.types) or var
                 defining_scope.types[actual_type_key] = inferred_type
-            if defining_scope.types.get(var) == 'number' and not isinstance(evaluated_value, (int, float)):
-                raise TypeError(
-                    f"Cannot assign non-numeric value {evaluated_value} to '{var}' at line {line_number}")
-            if isinstance(evaluated_value, (int, float)):
-                evaluated_value = float(evaluated_value)
             search_scope.update(var, evaluated_value, line_number)
             if scope_dict is not None:
                 scope_dict[var] = evaluated_value

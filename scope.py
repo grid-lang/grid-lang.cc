@@ -389,26 +389,21 @@ class Scope:
         """Re-evaluate constraint expressions that depend on the changed variable"""
 
         # Find all variables that have constraint expressions depending on changed_var
-        for var_name, constraints in self.constraints.items():
+        for var_name, constraints in list(self.constraints.items()):
             for constraint_type, constraint_expr in constraints.items():
                 if constraint_type == 'constant' and isinstance(constraint_expr, str):
                     # Check if this constraint expression depends on the changed variable
                     if self._expression_depends_on(constraint_expr, changed_var):
                         try:
-                            # Re-evaluate the constraint expression
                             new_value = self.compiler.expr_evaluator.eval_or_eval_array(
                                 constraint_expr, self.get_full_scope(), line_number)
+                        except Exception:
+                            # Expression cannot be resolved yet; keep waiting.
+                            continue
 
-                            # Update the variable with the new value
-                            self.variables[var_name] = new_value
-                            self.uninitialized.discard(var_name)
-
-                            # Recursively re-evaluate constraints that depend on this variable
-                            self._re_evaluate_constraints(
-                                var_name, line_number)
-
-                        except Exception as e:
-                            pass
+                        # Assign through update() so dimension and type checks
+                        # apply; validation errors propagate to the caller.
+                        self.update(var_name, new_value, line_number)
 
     def _expression_depends_on(self, expr, var_name):
         """Check if an expression depends on a specific variable"""
@@ -427,11 +422,48 @@ class Scope:
         pattern = r'\b' + re.escape(var_name) + r'\b'
         return bool(re.search(pattern, expr_text))
 
+    def _validate_base_type(self, name, value, line_number=None):
+        """Validate that a scalar value matches the declared base type.
+
+        Arrays and custom-typed objects are validated by the dimension checks
+        and custom-type coercion respectively, so only scalar values are
+        checked here.
+        """
+        if value is None or isinstance(value, (list, tuple, pa.Array, dict)):
+            return
+        if value == '':
+            # Empty string is used as a placeholder by block predeclaration.
+            return
+        type_key = self._get_case_insensitive_key(name, self.types)
+        if not type_key:
+            return
+        var_type = self.types.get(type_key)
+        if var_type not in ('number', 'text'):
+            return
+        if hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined') and var_type in self.compiler.types_defined:
+            return
+        constraints = self.constraints.get(type_key, {}) or {}
+        if constraints.get('dim'):
+            return
+        if constraints.get('input') or constraints.get('output'):
+            # Inputs/outputs are validated by their own 'type' constraint or
+            # left loosely typed (untyped OUTPUT defaults to 'text').
+            return
+        actual_type = self.compiler.array_handler.infer_type(
+            value, line_number)
+        if var_type == 'number' and actual_type not in ('number', 'float64', 'int', 'int64'):
+            raise ValueError(
+                f"'{name}' must be a number, got {actual_type} at line {line_number}")
+        if var_type == 'text' and actual_type not in ('string', 'text'):
+            raise ValueError(
+                f"'{name}' must be text, got {actual_type} at line {line_number}")
+
     def _check_constraints(self, name, value, line_number=None):
         # Case-insensitive constraint lookup
         actual_key = self._get_case_insensitive_key(name, self.constraints)
         key_for_constraints = actual_key if actual_key is not None else name
         constraints = self.constraints.get(key_for_constraints, {})
+        self._validate_base_type(key_for_constraints, value, line_number)
         for constraint_type, constraint_expr in constraints.items():
             if constraint_type == 'constant':
                 if isinstance(constraint_expr, str):
