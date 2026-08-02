@@ -1235,19 +1235,45 @@ class GridLangExecutor:
             updated_array, 'to_pylist') else updated_array
         return True
 
-    def _process_let_standard_assignment(
+    def _infer_declared_type(self, expr, evaluated_value, line_number):
+        """Infer a declared variable's type from a constructor or its value."""
+        constructor_match = None
+        try:
+            constructor_match = re.match(
+                r'new\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', str(expr), re.I)
+        except Exception:
+            constructor_match = None
+        inferred_type = (
+            constructor_match.group(1) if constructor_match
+            else self.array_handler.infer_type(evaluated_value, line_number))
+        if inferred_type == 'int':
+            return 'number'
+        return inferred_type
+
+    def _bind_declared_var(
             self,
             var,
             type_name,
             constraints,
             expr,
-            scope_dict,
             line_number,
-            remaining_let_vars):
+            search_scope=None,
+            define_scope=None,
+            scope_dict=None,
+            shadow_keyword=None,
+            mark_implicit=False,
+            infer_type=False,
+            remaining_let_vars=()):
+        """Evaluate and bind a single declared variable.
+
+        Shared by LET and FOR '=' declarations. The binding is deferred to
+        pending_assignments when the expression references a name that is not
+        yet defined. Returns 'bound', 'deferred', or None when expr is None.
+        """
         constraints = dict(constraints or {})
-        # LET with '=' should behave like an equality binding, not a mutable assignment.
-        # Keep this limited to string expressions to avoid changing literal-list behavior
-        # that is parsed into Python lists by the parser.
+        # Declarations with '=' behave like an equality binding, not a mutable
+        # assignment. Keep this limited to string expressions to avoid changing
+        # literal-list behavior parsed into Python lists by the parser.
         if (
             expr is not None
             and isinstance(expr, str)
@@ -1266,34 +1292,39 @@ class GridLangExecutor:
         ):
             constraints['constant'] = expr
 
-        defining_scope = self.current_scope().get_defining_scope(var)
+        search_scope = search_scope or self.current_scope()
+        define_scope = define_scope or search_scope
+        defining_scope = search_scope.get_defining_scope(var)
         if defining_scope:
             if var in defining_scope.constraints and not constraints:
                 constraints = defining_scope.constraints[var]
             if constraints:
                 defining_scope.constraints[var] = constraints
             if expr is None and var in defining_scope.variables and defining_scope.variables[var] is not None:
-                return
+                return None
         else:
-            if self.current_scope().is_shadowed(var):
+            if shadow_keyword and self.current_scope().is_shadowed(var):
                 print(
-                    f"Warning: LET defines '{var}' which shadows a variable in an outer scope at line {line_number}")
-            defining_scope = self.current_scope()
-            defining_scope.define(
+                    f"Warning: {shadow_keyword} defines '{var}' which shadows a variable in an outer scope at line {line_number}")
+            define_scope.define(
                 var, None, type_name, constraints, is_uninitialized=True,
                 line_number=line_number)
-            defining_scope.mark_implicit_let(var)
+            if mark_implicit:
+                define_scope.mark_implicit_let(var)
+            defining_scope = define_scope
 
         if expr is None:
-            return
+            return None
+
         try:
             evaluated_value = self.expr_evaluator.eval_or_eval_array(
-                expr, scope_dict, line_number)
+                expr, scope_dict or search_scope.get_evaluation_scope(),
+                line_number)
             if constraints.get('with'):
                 evaluated_value = self._apply_with_constraints(
                     evaluated_value,
                     constraints.get('with', {}),
-                    self.current_scope().get_full_scope(),
+                    search_scope.get_full_scope(),
                     line_number,
                     type_name=type_name)
             if type_name:
@@ -1302,28 +1333,66 @@ class GridLangExecutor:
                 actual_constraint_key = defining_scope._get_case_insensitive_key(
                     var, defining_scope.constraints) or var
                 defining_scope.constraints[actual_constraint_key] = constraints
-            self.current_scope().update(var, evaluated_value, line_number)
-            scope_dict[var] = evaluated_value
-            pending_vars = [
-                pending_var for pending_var in list(self.pending_assignments.keys())
-                if not pending_var.startswith('__line_')
-            ]
-            for pending_var in pending_vars:
-                self._attempt_resolve_pending_var(
-                    pending_var, line_number)
+            elif infer_type:
+                inferred_type = self._infer_declared_type(
+                    expr, evaluated_value, line_number)
+                actual_type_key = defining_scope._get_case_insensitive_key(
+                    var, defining_scope.types) or var
+                defining_scope.types[actual_type_key] = inferred_type
+            if defining_scope.types.get(var) == 'number' and not isinstance(evaluated_value, (int, float)):
+                raise TypeError(
+                    f"Cannot assign non-numeric value {evaluated_value} to '{var}' at line {line_number}")
+            if isinstance(evaluated_value, (int, float)):
+                evaluated_value = float(evaluated_value)
+            search_scope.update(var, evaluated_value, line_number)
+            if scope_dict is not None:
+                scope_dict[var] = evaluated_value
+            return 'bound'
         except NameError as e:
             missing = self.extract_missing_dependencies(e)
-            future_refs = {
-                dep for dep in missing if dep.lower() in remaining_let_vars}
-            if future_refs:
-                raise NameError(
-                    f"Forward LET reference to {future_refs} at line {line_number}")
             if not missing:
                 raise
+            if remaining_let_vars:
+                future_refs = {
+                    dep for dep in missing if dep.lower() in remaining_let_vars}
+                if future_refs:
+                    raise NameError(
+                        f"Forward LET reference to {future_refs} at line {line_number}")
             for dep in missing:
                 self.mark_dependency_missing(dep)
             self.pending_assignments[var] = (
                 expr, line_number, set(missing), constraints)
+            return 'deferred'
+
+    def _process_let_standard_assignment(
+            self,
+            var,
+            type_name,
+            constraints,
+            expr,
+            scope_dict,
+            line_number,
+            remaining_let_vars):
+        status = self._bind_declared_var(
+            var,
+            type_name,
+            constraints,
+            expr,
+            line_number,
+            scope_dict=scope_dict,
+            shadow_keyword='LET',
+            mark_implicit=True,
+            remaining_let_vars=remaining_let_vars,
+        )
+        if status != 'bound':
+            return
+        pending_vars = [
+            pending_var for pending_var in list(self.pending_assignments.keys())
+            if not pending_var.startswith('__line_')
+        ]
+        for pending_var in pending_vars:
+            self._attempt_resolve_pending_var(
+                pending_var, line_number)
 
     def _run_let_second_pass(self, var_list, line_number):
         for var, _, _, expr in var_list:
@@ -2567,51 +2636,18 @@ class GridLangExecutor:
             return None
 
         var, type_name, constraints, value = var_list[0]
-        evaluated_value = self.expr_evaluator.eval_expr(
-            str(value), self.current_scope().get_evaluation_scope(), line_number)
-        if constraints.get('with'):
-            evaluated_value = self._apply_with_constraints(
-                evaluated_value,
-                constraints.get('with', {}),
-                self.current_scope().get_full_scope(),
-                line_number,
-                type_name=type_name,
-            )
-        constructor_match = None
-        try:
-            constructor_match = re.match(
-                r'new\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', str(value), re.I)
-        except Exception:
-            constructor_match = None
-        if type_name:
-            inferred_type = type_name
-        elif constructor_match:
-            inferred_type = constructor_match.group(1)
-        else:
-            inferred_type = self.array_handler.infer_type(
-                evaluated_value, line_number)
-        if inferred_type == 'int':
-            inferred_type = 'number'
-        defining_scope = self.current_scope().get_defining_scope(var)
-        if defining_scope:
-            if defining_scope.types.get(var) == 'number' and not isinstance(evaluated_value, (int, float)):
-                raise TypeError(
-                    f"Cannot assign non-numeric value {evaluated_value} to '{var}' at line {line_number}")
-            defining_scope.update(var, float(evaluated_value) if isinstance(
-                evaluated_value, (int, float)) else evaluated_value, line_number)
-        else:
-            if value and str(value) != str(evaluated_value):
-                if (
-                    inferred_type
-                    and inferred_type.lower() in self.types_defined
-                    and isinstance(value, list)
-                ):
-                    constraints['constant'] = value
-                else:
-                    constraints['constant'] = str(value)
-            self.get_global_scope().define(
-                var, evaluated_value, inferred_type, constraints, False)
-        self._resolve_for_assignment_pending(line_number)
+        status = self._bind_declared_var(
+            var,
+            type_name,
+            constraints,
+            value,
+            line_number,
+            search_scope=self.current_scope(),
+            define_scope=self.get_global_scope(),
+            infer_type=True,
+        )
+        if status != 'deferred':
+            self._resolve_for_assignment_pending(line_number)
         return i + 1
 
     def _try_handle_for_declaration_multi_assignments(
@@ -2626,47 +2662,16 @@ class GridLangExecutor:
         all_have_assignments = all(v[3] is not None for v in var_list)
         if all_have_assignments:
             for var, type_name, constraints, value in var_list:
-                evaluated_value = self.expr_evaluator.eval_expr(
-                    str(value), self.current_scope().get_evaluation_scope(), line_number)
-                if constraints.get('with'):
-                    evaluated_value = self._apply_with_constraints(
-                        evaluated_value,
-                        constraints.get('with', {}),
-                        self.current_scope().get_full_scope(),
-                        line_number,
-                        type_name=type_name,
-                    )
-                if constraints.get('with'):
-                    evaluated_value = self._apply_with_constraints(
-                        evaluated_value,
-                        constraints.get('with', {}),
-                        self.current_scope().get_full_scope(),
-                        line_number,
-                        type_name=type_name,
-                    )
-                inferred_type = type_name or self.array_handler.infer_type(
-                    evaluated_value, line_number)
-                if inferred_type == 'int':
-                    inferred_type = 'number'
-                defining_scope = self.current_scope().get_defining_scope(var)
-                if defining_scope:
-                    if defining_scope.types.get(var) == 'number' and not isinstance(evaluated_value, (int, float)):
-                        raise TypeError(
-                            f"Cannot assign non-numeric value {evaluated_value} to '{var}' at line {line_number}")
-                    defining_scope.update(var, float(evaluated_value) if isinstance(
-                        evaluated_value, (int, float)) else evaluated_value, line_number)
-                else:
-                    if value and str(value) != str(evaluated_value):
-                        if (
-                            inferred_type
-                            and inferred_type.lower() in self.types_defined
-                            and isinstance(value, list)
-                        ):
-                            constraints['constant'] = value
-                        else:
-                            constraints['constant'] = str(value)
-                    self.get_global_scope().define(
-                        var, evaluated_value, inferred_type, constraints, False)
+                self._bind_declared_var(
+                    var,
+                    type_name,
+                    constraints,
+                    value,
+                    line_number,
+                    search_scope=self.current_scope(),
+                    define_scope=self.get_global_scope(),
+                    infer_type=True,
+                )
             self._resolve_for_assignment_pending(line_number)
             return i + 1
 
