@@ -8,6 +8,81 @@ import re
 
 import pyarrow as pa
 
+from utils import num_to_col, split_cell, col_to_num
+
+
+class GridLiveView(dict):
+    """A live view of a grid, keyed by 1-based (row, col) tuples.
+
+    The grid cells are stored in a backing dict keyed by cell references such
+    as 'A1'; this view exposes the same contents through ``(row, col)`` keys,
+    matching the ``grid{row, col}`` syntax used inside type definitions.
+
+    When a compiler is passed, the backing store is the compiler's current
+    grid. Otherwise the view keeps its own private store, so type instances
+    can each have an isolated grid.
+    """
+
+    def __init__(self, store=None, compiler=None):
+        super().__init__()
+        if compiler is not None:
+            store = compiler.grid
+        self._store = store if store is not None else {}
+
+    @staticmethod
+    def _cell_ref(key):
+        row, col = key
+        return f"{num_to_col(int(col))}{int(row)}"
+
+    def _is_cell_key(self, key):
+        return isinstance(key, tuple) and len(key) == 2
+
+    def __getitem__(self, key):
+        if not self._is_cell_key(key):
+            return dict.__getitem__(self, key)
+        grid = self._store
+        cell = self._cell_ref(key)
+        if cell in grid:
+            return grid[cell]
+        return 0
+
+    def __setitem__(self, key, value):
+        if not self._is_cell_key(key):
+            dict.__setitem__(self, key, value)
+            return
+        self._store[self._cell_ref(key)] = value
+
+    def __contains__(self, key):
+        if not self._is_cell_key(key):
+            return dict.__contains__(self, key)
+        return self._cell_ref(key) in self._store
+
+    def __len__(self):
+        return len(self._store)
+
+    def __iter__(self):
+        for cell in self._store:
+            col, row = split_cell(cell)
+            yield (int(row), col_to_num(col))
+
+    def get(self, key, default=None):
+        if not self._is_cell_key(key):
+            return dict.get(self, key, default)
+        return self._store.get(self._cell_ref(key), default)
+
+    def keys(self):
+        return list(self.__iter__())
+
+    def values(self):
+        return list(self._store.values())
+
+    def items(self):
+        for key in self.__iter__():
+            yield key, self[key]
+
+    def copy(self):
+        return dict(self.items())
+
 
 class Scope:
     def __init__(self, compiler, parent=None, is_private=False):

@@ -14,6 +14,7 @@ from utils import (
     object_public_keys,
     get_case_insensitive_key,
 )
+from scope import GridLiveView
 
 
 
@@ -210,9 +211,9 @@ class ExpressionEvaluator:
             tensor = self._get_scope_value_case_insensitive(scope_lookup, var_name)
             if tensor is None:
                 return False, None
-            if isinstance(tensor, dict) and 'grid' in tensor and 'original_shape' in tensor:
+            if isinstance(tensor, dict) and 'grid' in tensor:
                 array = tensor['grid']
-                original_shape = tensor['original_shape']
+                original_shape = tensor.get('original_shape')
                 adjusted_indices = [idx - 1 for idx in indices]
                 try:
                     result = self.compiler.array_handler.get_array_element(
@@ -222,7 +223,7 @@ class ExpressionEvaluator:
                     raise IndexError(
                         f"Invalid indices {indices_str} for '{var_name}.grid': {e} at line {line_number}")
             raise TypeError(
-                f"Variable '{var_name}' does not have a 'grid' or 'original_shape' field at line {line_number}")
+                f"Variable '{var_name}' does not have a 'grid' field at line {line_number}")
         field_match = re.match(r'^([\w_]+)\.(\w+)$', expr)
         if not field_match:
             return False, None
@@ -693,6 +694,10 @@ class ExpressionEvaluator:
                 # Look for grid in the scope
                 if 'grid' in scope:
                     grid = scope['grid']
+                    if isinstance(grid, GridLiveView):
+                        # The predefined 'grid' variable flows through the
+                        # generic array-access path below.
+                        return expr
                     if isinstance(grid, dict):
                         # Convert tuple indices to the format used in the grid
                         if len(indices) == 2:
@@ -1887,7 +1892,8 @@ class ExpressionEvaluator:
             index_expr = bang_index or paren_index
             if var_name in scope or var_name in self.compiler.variables:
                 try:
-                    if bang_index and re.match(r'^[A-Za-z]+\d+$', index_expr):
+                    if bang_index and (re.match(r'^[A-Za-z]+\d+$', index_expr)
+                                       or var_name.lower() == 'grid'):
                         return self.compiler.array_handler.resolve_cell_index(
                             var_name, index_expr, line_number)
                     base = 0 if paren_index and paren_index.isdigit() else 1
@@ -1951,6 +1957,8 @@ class ExpressionEvaluator:
             index_value = int(index_value)
         array = scope.get(
             var_name, self.compiler.variables.get(var_name))
+        if isinstance(array, GridLiveView):
+            base = 1
         return self.compiler.array_handler.get_array_element(
             array, [index_value - base], line_number)
 

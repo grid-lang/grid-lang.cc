@@ -7,6 +7,7 @@ import copy
 import re
 import numbers
 from utils import get_case_insensitive_key, split_var_defs
+from scope import GridLiveView
 
 
 class GridLangTypeProcessor:
@@ -231,7 +232,7 @@ class GridLangTypeProcessor:
 
         # Add a 'grid' field only if constructor code references it
         if 'grid' not in value_dict and any('grid' in line.lower() for line in code_lines):
-            value_dict['grid'] = {}
+            value_dict['grid'] = GridLiveView()
 
         try:
             type_def = {}
@@ -381,7 +382,7 @@ class GridLangTypeProcessor:
 
             # Store in grid
             if 'grid' not in value_dict:
-                value_dict['grid'] = {}
+                value_dict['grid'] = GridLiveView()
             value_dict['grid'][(row, col_num)] = value
 
 
@@ -524,70 +525,39 @@ class GridLangTypeProcessor:
                 # Parse indices
                 indices = [idx.strip() for idx in indices_str.split(',')]
 
-                # Evaluate indices (they should be variables in scope)
-                scope = self.compiler.current_scope().get_full_scope()
+                # Ensure the instance carries a GridLiveView grid.
+                grid_store = value_dict.get('grid')
+                if not isinstance(grid_store, GridLiveView):
+                    grid_store = GridLiveView()
+                    value_dict['grid'] = grid_store
+
+                # Build a scope that includes the current loop variables, the
+                # instance fields, and the instance grid. grid{...} access in
+                # the value expression is handled by the generic array-access
+                # path via the GridLiveView in scope.
+                eval_scope = self._build_type_eval_scope(value_dict, {})
+
+                def _resolve_index(idx_expr):
+                    idx_value = eval_scope.get(idx_expr)
+                    if idx_value is None:
+                        try:
+                            idx_value = self.compiler.expr_evaluator.eval_expr(
+                                idx_expr, eval_scope, line_number)
+                        except Exception:
+                            idx_value = None
+                    if isinstance(idx_value, numbers.Real):
+                        idx_value = int(round(idx_value))
+                    return idx_value
+
                 try:
-                    idx1 = scope.get(indices[0])
-                    idx2 = scope.get(indices[1])
-                    if isinstance(idx1, numbers.Real):
-                        idx1 = int(round(idx1))
-                    if isinstance(idx2, numbers.Real):
-                        idx2 = int(round(idx2))
+                    idx1 = _resolve_index(indices[0])
+                    idx2 = _resolve_index(indices[1])
 
                     if idx1 is not None and idx2 is not None:
-                        # Create a special scope for evaluating the value expression
-                        # that includes the grid field and current loop variables
-                        eval_scope = scope.copy()
-                        eval_scope['grid'] = value_dict.get('grid', {})
-
-                        # Handle grid access in the expression (e.g., grid{a-1, b-1})
-                        # Replace grid{var1, var2} with actual values
-                        processed_expr = value_expr
-                        for idx_var in indices:
-                            if idx_var in scope:
-                                processed_expr = processed_expr.replace(
-                                    f'grid{{{idx_var}}}', f'grid[{scope[idx_var]}]')
-
-                        # Also handle grid{expr1, expr2} patterns
-                        grid_pattern = r'grid\{([^}]+)\}'
-
-                        def replace_grid_access(match):
-                            grid_indices = match.group(1).split(',')
-                            if len(grid_indices) == 2:
-                                idx1_expr, idx2_expr = grid_indices
-                                # Evaluate the index expressions
-                                try:
-                                    val1 = self.compiler.expr_evaluator.eval_expr(
-                                        idx1_expr.strip(), scope, line_number)
-                                    val2 = self.compiler.expr_evaluator.eval_expr(
-                                        idx2_expr.strip(), scope, line_number)
-                                    if isinstance(val1, numbers.Real):
-                                        val1 = int(round(val1))
-                                    if isinstance(val2, numbers.Real):
-                                        val2 = int(round(val2))
-                                    # Get the actual value from the grid
-                                    grid_value = value_dict.get(
-                                        'grid', {}).get((val1, val2))
-                                    if grid_value is None:
-                                        # If grid value doesn't exist, return 0 as default
-                                        # This allows the loop to continue with valid expressions
-                                        return "0"
-                                    return str(grid_value)
-                                except Exception as e:
-                                    return "0"
-                            return "0"
-
-                        # Process grid access patterns
-                        processed_expr = re.sub(
-                            grid_pattern, replace_grid_access, processed_expr)
-
-                        # Evaluate the processed expression
                         value = self.compiler.expr_evaluator.eval_expr(
-                            processed_expr, eval_scope, line_number)
+                            value_expr, eval_scope, line_number)
 
                         # Store in grid
-                        if 'grid' not in value_dict:
-                            value_dict['grid'] = {}
                         value_dict['grid'][(idx1, idx2)] = value
 
                 except Exception as e:
@@ -773,7 +743,11 @@ class GridLangTypeProcessor:
                     value_dict['_immutable_fields'] = imm
                     continue
                 if key == 'grid' and isinstance(val, dict):
-                    value_dict.setdefault('grid', {}).update(val)
+                    grid_store = value_dict.get('grid')
+                    if not isinstance(grid_store, GridLiveView):
+                        grid_store = GridLiveView()
+                        value_dict['grid'] = grid_store
+                    grid_store.update(val)
                     continue
                 value_dict[key] = val
             return

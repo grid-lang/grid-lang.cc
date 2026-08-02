@@ -8,6 +8,7 @@ from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
 from control_flow import GridLangControlFlow
 from parser import GridLangParser
+from scope import GridLiveView
 from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, public_type_fields, object_public_keys, format_display_value, split_var_defs
 
 
@@ -3733,7 +3734,20 @@ class GridLangExecutor:
                 is_grid_value = '.grid{' in value
                 evaluated_value = self.expr_evaluator.eval_or_eval_array(
                     value, scope_value, line_number, is_grid_dim=is_grid_value)
-                if isinstance(evaluated_value, dict):
+                if isinstance(evaluated_value, GridLiveView):
+                    # A grid view's cells are keyed by absolute cell references;
+                    # spill them into the current grid without clobbering the
+                    # anchor cell.
+                    anchor_written = False
+                    for cell_ref, val in evaluated_value._store.items():
+                        self.grid[cell_ref] = val
+                        if cell_ref.upper() == array_cell_ref.upper():
+                            anchor_written = True
+                    if not anchor_written:
+                        # Dense-grid semantics: an anchor cell not present in the
+                        # spilled grid reads as 0.
+                        self.grid[array_cell_ref] = 0
+                elif isinstance(evaluated_value, dict):
                     if all(isinstance(k, tuple) and len(k) == 2 for k in evaluated_value.keys()):
                         for (row, col), val in evaluated_value.items():
                             if isinstance(row, (int, float)) and isinstance(col, (int, float)):

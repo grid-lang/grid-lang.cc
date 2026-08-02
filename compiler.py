@@ -8,7 +8,7 @@ import pyarrow as pa
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
 from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value
-from scope import Scope
+from scope import Scope, GridLiveView
 from control_flow import GridLangControlFlow
 from type_processor import GridLangTypeProcessor
 from parser import GridLangParser
@@ -33,6 +33,11 @@ class GridLangCompiler:
     def __init__(self):
         self.grid = {}
         self.scopes = [Scope(self)]
+        # Predefine the 'grid' variable containing the current grid, like in a
+        # type definition, so programs can read and write cells with grid{row, col}.
+        self.scopes[0].variables['grid'] = GridLiveView(compiler=self)
+        self.scopes[0].constraints['grid'] = {
+            'dim': [('row', None), ('col', None)]}
         self.variables = self.current_scope().variables
         self.types = self.scopes[0].types
         self.dimensions = {}
@@ -228,7 +233,7 @@ class GridLangCompiler:
         hidden_fields = type_def.get('_hidden_fields', set())
         if hidden_fields:
             obj['_hidden_fields'] = set(hidden_fields)
-        obj.setdefault('grid', {})
+        obj.setdefault('grid', GridLiveView())
         try:
             self._recompute_computed_fields(obj, line_number=line_number)
         except Exception:
@@ -534,6 +539,10 @@ class GridLangCompiler:
                 for key, val in global_scope.variables.items():
                     if key.lower() in input_names:
                         continue
+                    if key.lower() == 'grid':
+                        # 'grid' is a live view bound to this compiler; the
+                        # sub-compiler seeds its own isolated grid instead.
+                        continue
                     seed_vars[key] = copy.deepcopy(val)
                     if key in global_scope.constraints:
                         seed_constraints[key] = copy.deepcopy(
@@ -680,7 +689,7 @@ class GridLangCompiler:
             hidden_fields = type_def.get('_hidden_fields', set())
             if hidden_fields:
                 value_dict['_hidden_fields'] = set(hidden_fields)
-            value_dict.setdefault('grid', {})
+            value_dict.setdefault('grid', GridLiveView())
             if exec_lines and execute_code:
                 self._execute_type_code(
                     exec_lines, var_name or type_name, value_dict, line_number, input_values)
@@ -722,7 +731,7 @@ class GridLangCompiler:
         hidden_fields = type_def.get('_hidden_fields', set())
         if hidden_fields:
             value_dict['_hidden_fields'] = set(hidden_fields)
-        value_dict.setdefault('grid', {})
+        value_dict.setdefault('grid', GridLiveView())
         if exec_lines and execute_code:
             # Track immutability for fields derived from inputs
             if inputs_list:
@@ -790,7 +799,7 @@ class GridLangCompiler:
                 hidden_fields = self.types_defined.get(expected_type, {}).get('_hidden_fields', set())
                 if hidden_fields and '_hidden_fields' not in coerced:
                     coerced['_hidden_fields'] = set(hidden_fields)
-                coerced.setdefault('grid', {})
+                coerced.setdefault('grid', GridLiveView())
                 return coerced
         return field_value
 
@@ -1068,6 +1077,10 @@ class GridLangCompiler:
                 seed_types = {}
                 for key, val in global_scope.variables.items():
                     if key.lower() in input_names:
+                        continue
+                    if key.lower() == 'grid':
+                        # 'grid' is a live view bound to this compiler; the
+                        # sub-compiler seeds its own isolated grid instead.
                         continue
                     seed_vars[key] = copy.deepcopy(val)
                     if key in global_scope.constraints:
@@ -1523,6 +1536,13 @@ class GridLangCompiler:
             for col_num in range(start_col_num, end_col_num + 1):
                 for row in range(int(start_row), int(end_row) + 1):
                     cell_refs.add(f"{num_to_col(col_num)}{row}")
+        # grid{row, col} references the current grid; treat literal indices
+        # as cell dependencies so assignments wait until the cell is written.
+        grid_matches = re.finditer(
+            r'\bgrid\s*\{\s*(\d+)\s*,\s*(\d+)\s*\}', expr, re.I)
+        for match in grid_matches:
+            row, col = int(match.group(1)), int(match.group(2))
+            cell_refs.add(f"{num_to_col(col)}{row}")
         if '$"' in expr:
             placeholders = re.findall(r'\{\s*([^}]*?)\s*\}', expr)
             for ph in placeholders:
@@ -1629,6 +1649,10 @@ class GridLangCompiler:
     def _reset_state(self):
         self.grid.clear()
         self.scopes = [Scope(self)]
+        # Re-seed the predefined 'grid' variable containing the current grid.
+        self.scopes[0].variables['grid'] = GridLiveView(compiler=self)
+        self.scopes[0].constraints['grid'] = {
+            'dim': [('row', None), ('col', None)]}
         self.variables = self.scopes[0].variables
         self.types = self.scopes[0].types
         self.pending_assignments = {}
@@ -1651,6 +1675,11 @@ class GridLangCompiler:
             seed_constraints = seed.get('constraints', {}) or {}
             seed_types = seed.get('types', {}) or {}
             for name, value in seed_vars.items():
+                # 'grid' is a predefined live view bound to this compiler; a
+                # fresh one is already seeded in __init__/_reset_state. Skip
+                # redefining it so subprocesses keep their own isolated grid.
+                if name.lower() == 'grid':
+                    continue
                 try:
                     scope.define(
                         name,

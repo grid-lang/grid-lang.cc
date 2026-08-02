@@ -10,6 +10,7 @@ import pyarrow as pa
 from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, prod, public_type_fields, object_public_keys, public_object_view
 from functools import reduce
 import operator
+from scope import GridLiveView
 
 
 class ArrayHandler:
@@ -39,6 +40,12 @@ class ArrayHandler:
         except NameError:
             raise NameError(
                 f"Variable '{var_name}' not defined at line {line_number}")
+        if var_name.lower() == 'grid':
+            # grid![cell] reads a cell directly from the current grid;
+            # grid![A] reads a whole column of the current grid.
+            if re.match(r'^[A-Za-z]+$', cell_ref):
+                return self.get_grid_column(cell_ref, line_number=line_number)
+            return self.compiler.grid.get(cell_ref, 0)
         # Convert to Python list for indexing
         if isinstance(arr, pa.Array):
             if not isinstance(arr, pa.ListArray):
@@ -173,9 +180,12 @@ class ArrayHandler:
         if implicit_expr is None:
             try:
                 # Check if this is an array operation by looking for array literals
-                # Array literals start with { and contain comma-separated values
-                array_literal_pattern = r'\{[^}]*,[^}]*\}'
-                array_literals = re.findall(array_literal_pattern, expr_part)
+                # Array literals start with { and contain comma-separated values.
+                # A { after an identifier is element indexing (e.g., arr{1, 2} or
+                # grid{row, col}), not an array literal.
+                array_literal_pattern = r'(?<![\w_])\{[^}]*,[^}]*\}'
+                array_literals = re.findall(
+                    array_literal_pattern, expr_part)
 
                 if '+' in expr_part and len(array_literals) >= 2:
                     value = self.evaluate_array_operation(
@@ -834,28 +844,6 @@ class ArrayHandler:
         :param line_number: Line number.
         :return: Read value if value is None.
         """
-        # Special-case: allow writing directly to the compiler grid via grid{row, col}
-        if var_name.lower() == 'grid' and len(indices) == 2:
-            try:
-                row_idx = int(indices[0])
-                col_idx = int(indices[1])
-                if row_idx < 1:
-                    row_idx += 1
-                if col_idx < 1:
-                    col_idx += 1
-            except ValueError:
-                raise ValueError(
-                    f"Invalid grid indices {indices} at line {line_number}")
-            if row_idx < 1 or col_idx < 1:
-                raise ValueError(
-                    f"Grid indices must be >= 1 at line {line_number}")
-            cell = f"{num_to_col(col_idx)}{row_idx}"
-            if value is None:
-                return self.compiler.grid.get(cell)
-            flat_value = self.flatten_array(value, line_number)
-            self.compiler.grid[cell] = flat_value[0] if flat_value else None
-            return
-
         try:
             arr = self.compiler.current_scope().get(var_name)
         except NameError:
@@ -992,6 +980,12 @@ class ArrayHandler:
         :param is_array_of_two_field_objects: Flag for special reshaping.
         :param line_number: Line number.
         """
+        if isinstance(value, GridLiveView):
+            # Spill a grid's cells (keyed by absolute cell references) into
+            # the current grid.
+            for cell_ref, val in value._store.items():
+                self.compiler.grid[cell_ref] = val
+            return
         if isinstance(value, dict):
             # Special-case: spill an object's grid mapping when keys are (row, col) tuples
             if value and all(isinstance(k, tuple) and len(k) == 2 for k in value.keys()):
@@ -1631,6 +1625,16 @@ class ArrayHandler:
         :return: Updated array.
         """
 
+        # The 'grid' variable is a live view of the current grid; indexing it
+        # writes directly to the grid cells (indices are 0-based row, col).
+        if isinstance(array, GridLiveView):
+            if len(indices) != 2:
+                raise ValueError(
+                    f"Expected 2 indices for the grid, got {len(indices)}"
+                    + (f" at line {line_number}" if line_number else ""))
+            array[(int(indices[0]) + 1, int(indices[1]) + 1)] = value
+            return array
+
         # Allow dynamic list-backed arrays (e.g., object arrays)
         if array is None or isinstance(array, list):
             if not indices:
@@ -1736,6 +1740,33 @@ class ArrayHandler:
             )
         return pa.array(flat[:shape[0]], type=pa.float64())
 
+    def get_grid_row(self, row_index, grid_source=None, line_number=None):
+        """Return a dense list of values in the given (1-based) grid row.
+
+        Unset cells within the grid's used extent read as 0.
+        """
+        grid_source = grid_source if grid_source is not None else self.compiler.grid
+        matrix = self.compiler._grid_to_matrix(grid_source)
+        if not matrix or row_index < 1 or row_index > len(matrix):
+            return []
+        return list(matrix[row_index - 1])
+
+    def get_grid_column(self, col_ref, grid_source=None, line_number=None):
+        """Return a dense list of values in the given grid column.
+
+        ``col_ref`` is a column letter (e.g. 'A'); unset cells within the
+        grid's used extent read as 0.
+        """
+        grid_source = grid_source if grid_source is not None else self.compiler.grid
+        if isinstance(col_ref, str) and re.match(r'^[A-Za-z]+$', col_ref):
+            col_num = col_to_num(col_ref)
+        else:
+            col_num = int(col_ref)
+        matrix = self.compiler._grid_to_matrix(grid_source)
+        if not matrix or col_num < 1 or col_num > len(matrix[0]):
+            return []
+        return [row[col_num - 1] for row in matrix]
+
     def get_array_element(self, arr, indices, line_number=None, return_struct=False, original_shape=None):
         """
         Get an element from an array using indices.
@@ -1746,6 +1777,19 @@ class ArrayHandler:
         :param original_shape: Original shape if provided.
         :return: Element value.
         """
+        # The 'grid' variable is a live view of the current grid; indexing it
+        # reads the grid cell directly (unset cells return 0), and a single
+        # index reads a whole row.
+        if isinstance(arr, GridLiveView):
+            if len(indices) == 1:
+                return self.get_grid_row(
+                    int(indices[0]) + 1, arr._store, line_number)
+            if len(indices) != 2:
+                raise ValueError(
+                    f"Expected 2 indices for the grid, got {len(indices)}"
+                    + (f" at line {line_number}" if line_number else ""))
+            return arr[(int(indices[0]) + 1, int(indices[1]) + 1)]
+
         # Handle dictionary with array (e.g., from grid DIM)
         if isinstance(arr, dict) and 'array' in arr and isinstance(arr['array'], pa.ListArray):
             original_shape = arr.get(

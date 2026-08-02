@@ -1423,13 +1423,6 @@ class GridLangControlFlow:
             debug_array = updated_array.to_pylist() if hasattr(
                 updated_array, 'to_pylist') else updated_array
             return True
-        if var_name.lower() == 'grid':
-            if len(indices) == 2:
-                row_idx = indices[0] + 1
-                col_idx = indices[1] + 1
-                cell = f"{num_to_col(col_idx)}{row_idx}"
-                self.compiler.grid[cell] = value
-            return True
         return True
 
     def _evaluate_if_condition(self, condition, line_number):
