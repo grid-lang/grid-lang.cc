@@ -1304,6 +1304,9 @@ class GridLangControlFlow:
                     var, expr, scope_dict, line_number):
                 continue
             defining_scope = self.compiler.current_scope().get_defining_scope(var)
+            if defining_scope and self.compiler._is_outer_scope(defining_scope):
+                # Subprocesses/functions shadow caller variables locally.
+                defining_scope = None
             if defining_scope:
                 if constraints:
                     defining_scope.constraints[var] = constraints

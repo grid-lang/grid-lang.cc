@@ -10,6 +10,11 @@ import pyarrow as pa
 
 from utils import num_to_col, split_cell, col_to_num
 
+# Stack of compiler run contexts: ``run()`` pushes the executing compiler and
+# pops it on exit. Used to detect writes that originate from a read-only
+# function sub-compiler and target a scope in that compiler's parent chain.
+_ACTIVE_RUNNERS = []
+
 
 class GridLiveView(dict):
     """A live view of a grid, keyed by 1-based (row, col) tuples.
@@ -20,14 +25,16 @@ class GridLiveView(dict):
 
     When a compiler is passed, the backing store is the compiler's current
     grid. Otherwise the view keeps its own private store, so type instances
-    can each have an isolated grid.
+    can each have an isolated grid. When ``read_only`` is set, writes to the
+    grid raise an error (functions may read, but not modify, the parent grid).
     """
 
-    def __init__(self, store=None, compiler=None):
+    def __init__(self, store=None, compiler=None, read_only=False):
         super().__init__()
         if compiler is not None:
             store = compiler.grid
         self._store = store if store is not None else {}
+        self._read_only = read_only
 
     @staticmethod
     def _cell_ref(key):
@@ -47,6 +54,10 @@ class GridLiveView(dict):
         return 0
 
     def __setitem__(self, key, value):
+        if self._read_only:
+            raise TypeError(
+                "The grid is read-only inside a function; functions cannot "
+                "write to the parent grid")
         if not self._is_cell_key(key):
             dict.__setitem__(self, key, value)
             return
@@ -229,6 +240,18 @@ class Scope:
     def update(self, name, value, line_number=None):
         defining_scope = self.get_defining_scope(name)
         if defining_scope:
+            # Functions are read-only with respect to the caller's scope chain.
+            if (getattr(self.compiler, '_outer_scope_read_only', False)
+                    and self.compiler._is_outer_scope(defining_scope)):
+                raise RuntimeError(
+                    f"Cannot assign to '{name}': variables in an outer scope are read-only inside a function at line {line_number}")
+            # Guard against writes routed through the defining scope object
+            # itself (whose compiler does not carry the read-only flag).
+            for runner in reversed(_ACTIVE_RUNNERS):
+                if (getattr(runner, '_outer_scope_read_only', False)
+                        and runner._is_outer_scope(defining_scope)):
+                    raise RuntimeError(
+                        f"Cannot assign to '{name}': variables in an outer scope are read-only inside a function at line {line_number}")
             # Get the actual key for case-insensitive update
             actual_key = defining_scope._get_case_insensitive_key(
                 name, defining_scope.variables)

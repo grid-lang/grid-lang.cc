@@ -35,9 +35,9 @@ class GridLangCompiler:
         self.scopes = [Scope(self)]
         # Predefine the 'grid' variable containing the current grid, like in a
         # type definition, so programs can read and write cells with grid{row, col}.
-        self.scopes[0].variables['grid'] = GridLiveView(compiler=self)
-        self.scopes[0].constraints['grid'] = {
-            'dim': [('row', None), ('col', None)]}
+        # Functions rebind this variable to the parent's grid (read-only) via
+        # _seed_grid_variable, so the caller sets _external_grid first.
+        self._seed_grid_variable()
         self.variables = self.current_scope().variables
         self.types = self.scopes[0].types
         self.dimensions = {}
@@ -267,6 +267,18 @@ class GridLangCompiler:
     def current_scope(self):
         return self.scopes[-1]
 
+    def _is_outer_scope(self, scope):
+        """Return True when the given scope belongs to the caller's scope chain."""
+        parent = getattr(self, '_parent_scope', None)
+        if parent is None:
+            return False
+        cur = parent
+        while cur is not None:
+            if cur is scope:
+                return True
+            cur = cur.parent
+        return False
+
     def push_scope(self, is_private=False, is_loop_scope=False):
         scope = Scope(self, parent=self.current_scope(), is_private=is_private)
         if is_loop_scope:
@@ -282,16 +294,28 @@ class GridLangCompiler:
     def run(self, code, args=None, suppress_output=False, return_output=False):
         """Delegates to the extracted run function."""
         from executor import GridLangExecutor
+        from scope import _ACTIVE_RUNNERS
 
         extracted = GridLangExecutor()
         # Store reference to compiler for output values access
         extracted.compiler = self
+        # Track this compiler as the currently executing context so that
+        # read-only function sub-compilers can reject writes to outer scopes
+        # routed through the defining scope object.
+        _ACTIVE_RUNNERS.append(self)
+        try:
+            return self._run_inner(extracted, code, args, suppress_output, return_output)
+        finally:
+            _ACTIVE_RUNNERS.pop()
+
+    def _run_inner(self, extracted, code, args=None, suppress_output=False, return_output=False):
         # Copy all necessary attributes from self to extracted
         for attr in ['grid', 'scopes', 'expr_evaluator', 'array_handler', 'types_defined',
                      'dimensions', 'pending_assignments', 'dim_labels', 'undefined_dependencies',
                      'dependency_graph', 'global_guard_entries', 'global_for_line_numbers',
                      'executed_global_for_lines', 'output_values', 'functions', 'subprocesses',
-                     'prompt_missing_inputs', '_allow_hidden_field_access', '_allow_hidden_member_calls']:
+                     'prompt_missing_inputs', '_allow_hidden_field_access', '_allow_hidden_member_calls',
+                     '_parent_scope', '_outer_scope_read_only']:
             if hasattr(self, attr):
                 setattr(extracted, attr, getattr(self, attr))
 
@@ -317,7 +341,8 @@ class GridLangCompiler:
                      'dimensions', 'pending_assignments', 'dim_labels', 'undefined_dependencies',
                      'dependency_graph', 'global_guard_entries', 'global_for_line_numbers',
                      'executed_global_for_lines', 'output_values', 'functions', 'subprocesses',
-                     'prompt_missing_inputs', '_allow_hidden_field_access', '_allow_hidden_member_calls']:
+                     'prompt_missing_inputs', '_allow_hidden_field_access', '_allow_hidden_member_calls',
+                     '_parent_scope', '_outer_scope_read_only']:
             if hasattr(extracted, attr):
                 setattr(self, attr, getattr(extracted, attr))
 
@@ -526,34 +551,18 @@ class GridLangCompiler:
         sub_compiler.preserve_functions = True
         sub_compiler._allow_hidden_field_access = True
         sub_compiler._allow_hidden_member_calls = True
-        # Seed function scope with global variables so functions can read globals.
+        # Functions reference the caller's scope chain live but read-only:
+        # reads resolve through the parent, writes to caller variables are
+        # rejected. The caller's grid is shared through a read-only live view.
+        sub_compiler._parent_scope = self.current_scope()
+        sub_compiler._outer_scope_read_only = True
+        sub_compiler._external_grid = self.grid
+        sub_compiler._external_grid_read_only = True
+        # Only compiler-level dimension metadata is copied.
         try:
             if getattr(self, 'scopes', None):
                 import copy
-                global_scope = self.scopes[0]
-                input_names = {d.get('name', '').lower()
-                               for d in input_defs if d.get('name')}
-                seed_vars = {}
-                seed_constraints = {}
-                seed_types = {}
-                for key, val in global_scope.variables.items():
-                    if key.lower() in input_names:
-                        continue
-                    if key.lower() == 'grid':
-                        # 'grid' is a live view bound to this compiler; the
-                        # sub-compiler seeds its own isolated grid instead.
-                        continue
-                    seed_vars[key] = copy.deepcopy(val)
-                    if key in global_scope.constraints:
-                        seed_constraints[key] = copy.deepcopy(
-                            global_scope.constraints[key])
-                    if key in global_scope.types:
-                        seed_types[key] = copy.deepcopy(
-                            global_scope.types[key])
                 sub_compiler._seed_globals = {
-                    'variables': seed_vars,
-                    'constraints': seed_constraints,
-                    'types': seed_types,
                     'dimensions': copy.deepcopy(getattr(self, 'dimensions', {})),
                     'dim_names': copy.deepcopy(getattr(self, 'dim_names', {})),
                     'dim_labels': copy.deepcopy(getattr(self, 'dim_labels', {})),
@@ -1065,34 +1074,14 @@ class GridLangCompiler:
         sub_compiler.preserve_types_defined = True
         sub_compiler.preserve_functions = True
         sub_compiler.preserve_subprocesses = True
-        # Seed subprocess scope with global variables so subprocesses can read globals.
+        # Subprocesses reference the caller's scope chain live: reads resolve to
+        # caller variables and writes (push/assignments) flow through. Only
+        # compiler-level dimension metadata is copied.
+        sub_compiler._parent_scope = self.current_scope()
         try:
             if getattr(self, 'scopes', None):
                 import copy
-                global_scope = self.scopes[0]
-                input_names = {name.lower()
-                               for name in (sp_def.get('inputs') or []) if name}
-                seed_vars = {}
-                seed_constraints = {}
-                seed_types = {}
-                for key, val in global_scope.variables.items():
-                    if key.lower() in input_names:
-                        continue
-                    if key.lower() == 'grid':
-                        # 'grid' is a live view bound to this compiler; the
-                        # sub-compiler seeds its own isolated grid instead.
-                        continue
-                    seed_vars[key] = copy.deepcopy(val)
-                    if key in global_scope.constraints:
-                        seed_constraints[key] = copy.deepcopy(
-                            global_scope.constraints[key])
-                    if key in global_scope.types:
-                        seed_types[key] = copy.deepcopy(
-                            global_scope.types[key])
                 sub_compiler._seed_globals = {
-                    'variables': seed_vars,
-                    'constraints': seed_constraints,
-                    'types': seed_types,
                     'dimensions': copy.deepcopy(getattr(self, 'dimensions', {})),
                     'dim_names': copy.deepcopy(getattr(self, 'dim_names', {})),
                     'dim_labels': copy.deepcopy(getattr(self, 'dim_labels', {})),
@@ -1161,24 +1150,6 @@ class GridLangCompiler:
                     flat.append(row)
             # Preserve any existing outputs, but make the grid-derived sequence available
             normalized_outputs.setdefault('grid', flat)
-
-        # Propagate shared variables back to caller scope when names overlap
-        if hasattr(self, 'current_scope'):
-            caller_scope = self.current_scope()
-            sub_vars = getattr(sub_compiler, '_last_scope_vars', {}) or {}
-            for var_name, val in sub_vars.items():
-                try:
-                    defining = caller_scope.get_defining_scope(var_name)
-                except Exception:
-                    defining = None
-                if defining:
-                    try:
-                        defining.update(var_name, copy.deepcopy(val), line_number)
-                    except Exception:
-                        try:
-                            defining.update(var_name, val, line_number)
-                        except Exception:
-                            pass
 
         if collect_all:
             return normalized_outputs
@@ -1646,13 +1617,32 @@ class GridLangCompiler:
             return True
         return False
 
-    def _reset_state(self):
-        self.grid.clear()
-        self.scopes = [Scope(self)]
-        # Re-seed the predefined 'grid' variable containing the current grid.
-        self.scopes[0].variables['grid'] = GridLiveView(compiler=self)
+    def _seed_grid_variable(self):
+        # Functions share the caller's grid through a read-only live view;
+        # other compilers (main, subprocess, type) get their own predefined grid.
+        external_grid = getattr(self, '_external_grid', None)
+        if external_grid is not None:
+            view = GridLiveView(
+                store=external_grid,
+                read_only=getattr(self, '_external_grid_read_only', False))
+        else:
+            view = GridLiveView(compiler=self)
+        self.scopes[0].variables['grid'] = view
         self.scopes[0].constraints['grid'] = {
             'dim': [('row', None), ('col', None)]}
+
+    def _reset_state(self):
+        self.grid.clear()
+        parent_scope = getattr(self, '_parent_scope', None)
+        if parent_scope is not None:
+            # Subprocesses and functions reference the caller's scope chain live
+            # instead of deep-copying global variables: reads resolve through the
+            # parent, writes flow through to caller variables.
+            self.scopes = [Scope(self, parent=parent_scope)]
+        else:
+            self.scopes = [Scope(self)]
+        # Re-seed the predefined 'grid' variable containing the current grid.
+        self._seed_grid_variable()
         self.variables = self.scopes[0].variables
         self.types = self.scopes[0].types
         self.pending_assignments = {}
@@ -1667,34 +1657,10 @@ class GridLangCompiler:
         self.root_scope = self.current_scope()  # Always set root scope here
         if hasattr(self, 'output_values'):
             self.output_values.clear()
-        # Seed globals for function/subprocess calls when provided.
+        # Seed only compiler-level metadata (dimensions) for function/subprocess
+        # calls; variables are shared live through the parent scope chain.
         seed = getattr(self, '_seed_globals', None)
         if seed:
-            scope = self.current_scope()
-            seed_vars = seed.get('variables', {}) or {}
-            seed_constraints = seed.get('constraints', {}) or {}
-            seed_types = seed.get('types', {}) or {}
-            for name, value in seed_vars.items():
-                # 'grid' is a predefined live view bound to this compiler; a
-                # fresh one is already seeded in __init__/_reset_state. Skip
-                # redefining it so subprocesses keep their own isolated grid.
-                if name.lower() == 'grid':
-                    continue
-                try:
-                    scope.define(
-                        name,
-                        value,
-                        seed_types.get(name),
-                        seed_constraints.get(name, {}),
-                        is_uninitialized=False)
-                except Exception:
-                    try:
-                        scope.variables[name] = value
-                        scope.types[name] = seed_types.get(name)
-                        scope.constraints[name] = seed_constraints.get(name, {})
-                        scope.uninitialized.discard(name)
-                    except Exception:
-                        pass
             try:
                 self.dimensions = seed.get('dimensions', {}) or {}
                 self.dim_names = seed.get('dim_names', {}) or {}
@@ -2145,6 +2111,9 @@ class GridLangCompiler:
             # Leave INIT for runtime evaluation to preserve execution order.
             self.current_scope().types.setdefault(var, type_name or 'unknown')
             existing_scope = self.current_scope().get_defining_scope(var)
+            if self._is_outer_scope(existing_scope):
+                # Subprocesses/functions shadow caller variables locally.
+                existing_scope = None
             if (not existing_scope) or (var not in existing_scope.variables):
                 self.current_scope().define(var, None, type_name or 'unknown',
                                             constraints, is_uninitialized=True)

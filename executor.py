@@ -77,6 +77,18 @@ class GridLangExecutor:
             # Fallback if no compiler reference
             return self.current_scope()
 
+    def _is_outer_defining_scope(self, scope):
+        """Return True when the given scope belongs to the caller's scope chain."""
+        parent = getattr(self, '_parent_scope', None)
+        if parent is None:
+            return False
+        cur = parent
+        while cur is not None:
+            if cur is scope:
+                return True
+            cur = cur.parent
+        return False
+
     def collect_input_output_variables(self):
         """Collect all input and output variables from the current scope"""
         global_scope = self.get_global_scope()
@@ -737,7 +749,12 @@ class GridLangExecutor:
                     f"Equality assignment to subprocess '{call_name}' is not allowed; use INIT instead at line {line_number}")
         scope = self.current_scope()
         defining_scope = scope.get_defining_scope(var)
-        if not defining_scope:
+        if defining_scope and self._is_outer_defining_scope(defining_scope):
+            # Subprocesses/functions shadow caller variables locally.
+            defining_scope = scope
+            defining_scope.define(var, None, type_name or 'unknown',
+                                  constraints, is_uninitialized=True)
+        elif not defining_scope:
             defining_scope = scope
             defining_scope.define(var, None, type_name or 'unknown',
                                   constraints, is_uninitialized=True)
@@ -1296,6 +1313,11 @@ class GridLangExecutor:
         search_scope = search_scope or self.current_scope()
         define_scope = define_scope or search_scope
         defining_scope = search_scope.get_defining_scope(var)
+        if defining_scope and self._is_outer_defining_scope(defining_scope):
+            # Subprocesses and functions reference the caller's scope chain
+            # live, so declarations shadow caller variables locally instead of
+            # writing through to the caller's scope.
+            defining_scope = None
         if defining_scope:
             if var in defining_scope.constraints and not constraints:
                 constraints = defining_scope.constraints[var]
@@ -1669,6 +1691,9 @@ class GridLangExecutor:
         # Process variables
         for var, type_name, constraints, expr in var_list:
             defining_scope = self.current_scope().get_defining_scope(var)
+            if defining_scope and self._is_outer_defining_scope(defining_scope):
+                # Subprocesses/functions shadow caller variables locally.
+                defining_scope = None
             if defining_scope:
                 if constraints:
                     defining_scope.constraints[var] = constraints
@@ -1992,6 +2017,9 @@ class GridLangExecutor:
 
         for var, type_name, constraints, expr in var_list:
             defining_scope = self.current_scope().get_defining_scope(var)
+            if defining_scope and self._is_outer_defining_scope(defining_scope):
+                # Subprocesses/functions shadow caller variables locally.
+                defining_scope = None
             if defining_scope and not defining_scope.is_implicit_let(var):
                 raise ValueError(
                     f"Variable '{var}' already defined in scope at line {line_number}")
@@ -2703,6 +2731,8 @@ class GridLangExecutor:
             line_number):
         for var, _, _, _ in var_list:
             defining_scope = self.current_scope().get_defining_scope(var)
+            if defining_scope and self._is_outer_defining_scope(defining_scope):
+                defining_scope = None
             if (defining_scope and not defining_scope.is_implicit_let(var) and
                     (not is_block and not (i + 1 < len(lines) and lines[i + 1][0].lower().startswith('let ')))):
                 raise ValueError(
@@ -2727,7 +2757,10 @@ class GridLangExecutor:
         if init_entries:
             for var, type_name, constraints in init_entries:
                 init_expr = constraints.get('init')
-                target_scope = self.current_scope().get_defining_scope(var) or self.current_scope()
+                defining = self.current_scope().get_defining_scope(var)
+                if defining and self._is_outer_defining_scope(defining):
+                    defining = None
+                target_scope = defining or self.current_scope()
                 actual_key = target_scope._get_case_insensitive_key(
                     var, target_scope.variables)
 
@@ -4712,8 +4745,10 @@ class GridLangExecutor:
                     scope.update(var_name, value)
                 except Exception as exc:
                     pass
-            scope = scope.parent if getattr(
-                scope, 'parent', None) and not scope.is_private else None
+            scope = scope.parent if (getattr(scope, 'parent', None)
+                                     and not scope.is_private
+                                     and getattr(scope.parent, 'compiler',
+                                                 None) is scope.compiler) else None
 
     def _process_deferred_assignments(self):
         """Process any deferred assignments stored with __line_ keys."""
