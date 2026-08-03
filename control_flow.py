@@ -1510,12 +1510,31 @@ class GridLangControlFlow:
             return result
         return self._evaluate_if_condition_default(condition, line_number)
 
+    def _resolve_implicit_operands(self, parts):
+        """Rewrite comparison parts that omit the left operand (e.g. 'x >= 1 and < 8')
+        by carrying over the left operand from the preceding part."""
+        resolved = []
+        last_left = None
+        for part in parts:
+            part = part.strip()
+            if last_left is not None and re.match(
+                    r'^(?:<>|!=|<=|>=|=|<|>)\s*\S', part, re.I):
+                resolved.append(f"{last_left} {part}")
+                continue
+            cmp_match = re.match(
+                r'^(.+?)\s*(?:<>|!=|<=|>=|=|<|>)\s*(.+)$', part, re.I)
+            last_left = cmp_match.group(1).strip() if cmp_match else None
+            resolved.append(part)
+        return resolved
+
     def _evaluate_if_logical_or_comparison(self, condition, line_number):
         if ' and ' in condition.lower() and not re.search(r'[<>=!]\s*and\s*[<>=!]', condition):
             parts = re.split(r'\s+and\s+', condition, flags=re.I)
+            parts = self._resolve_implicit_operands(parts)
             return True, all(self._evaluate_if_condition(part.strip(), line_number) for part in parts)
         if ' or ' in condition.lower() and not re.search(r'[<>=!]\s*or\s*[<>=!]', condition):
             parts = re.split(r'\s+or\s+', condition, flags=re.I)
+            parts = self._resolve_implicit_operands(parts)
             return True, any(self._evaluate_if_condition(part.strip(), line_number) for part in parts)
         handled, result = self._evaluate_if_comparison(condition, line_number)
         if handled:
