@@ -1800,12 +1800,13 @@ class ExpressionEvaluator:
                 f"Expression evaluation depth limit exceeded for '{expr}' at line {line_number}")
 
         expr = expr.strip()
-        if expr.endswith('?'):
-            expr = expr[:-1].strip()
-            if not expr:
+        if expr.startswith('?'):
+            logical_expr = expr[1:].strip()
+            if not logical_expr:
                 raise SyntaxError(
-                    f"Invalid boolean expression '?' at line {line_number}")
-            expr = f"(1 if ({expr}) else 0)"
+                    f"Invalid logical expression '?' at line {line_number}")
+            return self.compiler.control_flow._evaluate_if_condition(
+                logical_expr, line_number)
 
         handled, simple_value = self._try_eval_simple_variable(
             expr, scope, line_number)
@@ -2351,6 +2352,8 @@ class ExpressionEvaluator:
                 return float('nan')
             if isinstance(result, set):
                 result = sorted(list(result))
+            if isinstance(result, bool):
+                return result
             return float(result) if isinstance(result, (int, float)) else result
         except ZeroDivisionError:
             return float('nan')
