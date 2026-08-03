@@ -1260,17 +1260,10 @@ class GridLangExecutor:
             if defining_scope.is_uninitialized(actual_key) or arr is None:
                 raise ValueError(
                     f"Array variable '{var_name}' with dim * must be initialized with PUSH or INIT before LET at line {line_number}")
-        if isinstance(arr, dict) and 'array' in arr:
-            updated_array = self.array_handler.set_array_element(
-                arr['array'], indices, value, line_number)
-            arr['array'] = updated_array
-            defining_scope.variables[actual_key] = arr
-            scope_dict[actual_key] = arr
-        else:
-            updated_array = self.array_handler.set_array_element(
-                arr, indices, value, line_number)
-            defining_scope.variables[actual_key] = updated_array
-            scope_dict[actual_key] = updated_array
+        updated_array = self.array_handler.set_array_element(
+            arr, indices, value, line_number)
+        defining_scope.variables[actual_key] = updated_array
+        scope_dict[actual_key] = updated_array
         debug_array = updated_array.to_pylist() if hasattr(
             updated_array, 'to_pylist') else updated_array
         return True
@@ -3855,7 +3848,8 @@ class GridLangExecutor:
                 is_grid_value = '.grid{' in value
                 evaluated_value = self.expr_evaluator.eval_or_eval_array(
                     value, scope_value, line_number, is_grid_dim=is_grid_value)
-                self.grid[cell_ref] = evaluated_value
+                self.grid[cell_ref] = self.array_handler.to_display_value(
+                    evaluated_value)
         except Exception as e:
             raise RuntimeError(
                 f"Error evaluating '{value}': {e} at line {line_number}")

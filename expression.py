@@ -491,11 +491,13 @@ class ExpressionEvaluator:
     def _evaluate_pipe_array(self, expr, scope, line_number=None):
         """
         Evaluate piped arrays (e.g., {1,2} | {3,4}).
-        Concatenates arrays along the outer dimension.
+        Stacks the operand arrays along a new dimension at index 1:
+        [d0, d1, ...] | [d0, d1, ...] ... -> [d0, N, d1, ...]
+        The result is a column-major dict-form array (flat buffer + shape).
         :param expr: Piped array string.
         :param scope: Scope.
         :param line_number: Line number.
-        :return: Pyarrow ListArray of concatenated values.
+        :return: Dict-form N-D array (or plain pyarrow array for 1D results).
         """
         if not (expr.startswith('{') and expr.endswith('}')):
             raise SyntaxError(
@@ -506,7 +508,7 @@ class ExpressionEvaluator:
         for char in expr:
             if char == '|' and brace_level == 0:
                 if current.strip():
-                    arrays.append('{' + current.strip() + '}')
+                    arrays.append(current.strip())
                 current = ""
             else:
                 current += char
@@ -515,14 +517,14 @@ class ExpressionEvaluator:
                 elif char == '}':
                     brace_level -= 1
         if current.strip():
-            arrays.append('{' + current.strip() + '}')
+            arrays.append(current.strip())
         if brace_level != 0:
             raise SyntaxError(
                 f"Unmatched braces in pipe array: {expr} at line {line_number}")
         if not arrays:
             raise ValueError(f"Empty pipe expression at line {line_number}")
-        evaluated_arrays = []
-        shapes = []
+        operand_shapes = []
+        operand_flats = []
         for array_expr in arrays:
             if not (array_expr.startswith('{') and array_expr.endswith('}')):
                 raise SyntaxError(
@@ -530,46 +532,41 @@ class ExpressionEvaluator:
             array = self._evaluate_array(array_expr, scope, line_number)
             shape = self.compiler.array_handler.get_array_shape(
                 array, line_number)
-            shapes.append(shape)
-            evaluated_arrays.append(array)
-        dimensions = [len(shape) for shape in shapes]
-        if len(set(dimensions)) != 1:
+            flat = self.compiler.array_handler.flatten_array(
+                array, line_number)
+            operand_shapes.append(shape)
+            operand_flats.append([float(v) for v in flat])
+
+        base_shape = operand_shapes[0]
+        if any(s != base_shape for s in operand_shapes[1:]):
             raise ValueError(
-                f"All arrays in pipe operation must have the same number of dimensions: {dimensions} at line {line_number}")
-        num_dims = dimensions[0]
-        if num_dims == 1:
-            shapes = [(1, s[0]) if len(s) == 1 else s for s in shapes]
-            inner_dim = shapes[0][1]
-            if not all(s[1] == inner_dim for s in shapes):
-                raise ValueError(
-                    f"All arrays in pipe operation must have the same inner dimension: {shapes} at line {line_number}")
-        elif num_dims == 2:
-            inner_dim = shapes[0][1]
-            if not all(s[1] == inner_dim for s in shapes):
-                raise ValueError(
-                    f"All arrays in pipe operation must have the same inner dimension: {shapes} at line {line_number}")
-        else:
-            raise ValueError(
-                f"Pipe operator supports up to 2D arrays, got {num_dims}D at line {line_number}")
-        flat_values = []
-        row_lengths = []
-        for arr in evaluated_arrays:
-            arr_vals = arr.to_pylist() if isinstance(arr, pa.ListArray) else arr
-            if isinstance(arr_vals, list) and arr_vals and isinstance(arr_vals[0], list):
-                for row in arr_vals:
-                    flat_values.extend([float(v) for v in row])
-                    row_lengths.append(len(row))
-            else:
-                flat_values.extend([float(v) for v in arr_vals])
-                row_lengths.append(len(arr_vals))
-        offsets = [0]
-        current_offset = 0
-        for length in row_lengths:
-            current_offset += length
-            offsets.append(current_offset)
-        offsets = pa.array(offsets, type=pa.int32())
-        values = pa.array(flat_values, type=pa.float64())
-        return pa.ListArray.from_arrays(offsets, values)
+                f"All arrays in a pipe operation must have identical shapes: {operand_shapes} at line {line_number}")
+
+        num_operands = len(arrays)
+        result_shape = [base_shape[0], num_operands] + base_shape[1:]
+        total = 1
+        for s in result_shape:
+            total *= s
+
+        result_flat = []
+        for flat_idx in range(total):
+            rem = flat_idx
+            idxs = []
+            for s in result_shape:
+                idxs.append(rem % s)
+                rem //= s
+            operand_idx = idxs[1]
+            op_flat_idx = idxs[0]
+            stride = base_shape[0]
+            for k in range(2, len(idxs)):
+                op_flat_idx += idxs[k] * stride
+                stride *= base_shape[k - 1]
+            result_flat.append(operand_flats[operand_idx][op_flat_idx])
+
+        if len(result_shape) == 1:
+            return pa.array(result_flat, type=pa.float64())
+        return {'array': pa.array(result_flat, type=pa.float64()),
+                'shape': list(result_shape), 'original_shape': list(result_shape)}
 
     def _resolve_column_interpolated_cell(self, inside, scope, line_number=None):
         m = re.match(
@@ -1442,7 +1439,7 @@ class ExpressionEvaluator:
                 getattr(self.compiler, 'subprocesses', {}) or {})
         builtin_callables = {
             'len', 'mid', 'textsplit', 'counta', 'randarray', 'sortby',
-            'sqrt', 'rows'
+            'sqrt', 'rows', 'transpose'
         }
         if var_name.lower() in known_funcs:
             return match.group(0)
@@ -1547,7 +1544,7 @@ class ExpressionEvaluator:
     def _paren_access_replacer_with_check(self, match, scope, line_number):
         var_name, index_expr = match.groups()
         callable_names = {'SQRT', 'ABS', 'SIN', 'COS',
-                          'TAN', 'LOG', 'EXP', 'LEN', 'MID', 'TEXTSPLIT'}
+                          'TAN', 'LOG', 'EXP', 'LEN', 'MID', 'TEXTSPLIT', 'TRANSPOSE'}
         if hasattr(self.compiler, 'functions'):
             callable_names.update({n.upper() for n in self.compiler.functions.keys()})
         if hasattr(self.compiler, 'subprocesses'):
@@ -2147,6 +2144,8 @@ class ExpressionEvaluator:
             return result
         eval_expr = self._replace_fallback_curly_accesses(
             eval_expr, scope, line_number)
+        eval_expr = self._replace_piped_array_literals(
+            eval_expr, scope, line_number)
         eval_expr = self._replace_operators(eval_expr, line_number)
         if re.match(r'^[\w_]+\[', eval_expr):
             raise SyntaxError(
@@ -2289,6 +2288,25 @@ class ExpressionEvaluator:
                 raise IndexError(
                     f"Invalid indices {indices_str} for '{var_name}': {e} at line {line_number}")
         return eval_expr
+
+    def _replace_piped_array_literals(self, eval_expr, scope, line_number):
+        """Replace piped array literals ({...} | {...} ...) with python list
+        literals so builtins like Transpose can receive them as arrays.
+
+        A bare pipe literal is handled by _evaluate_array before reaching this
+        fallback; here we only need sub-expressions inside function calls.
+        """
+        pipe_chain_pattern = re.compile(
+            r'(\{[^{}]*\}(?:\s*\|\s*\{[^{}]*\})+)')
+        def replacer(m):
+            pipe_str = m.group(1)
+            try:
+                arr = self._evaluate_pipe_array(pipe_str, scope, line_number)
+                display = self.compiler.array_handler.to_display_value(arr)
+                return repr(display)
+            except Exception:
+                return m.group(0)
+        return pipe_chain_pattern.sub(replacer, eval_expr)
 
     def _build_python_fallback_scope(self, scope, line_number):
         if hasattr(scope, 'get_evaluation_scope'):
@@ -2589,6 +2607,40 @@ class ExpressionEvaluator:
             pairs.sort(key=lambda p: p[0])
             return [v for _, v in pairs]
 
+        def Transpose(arr):
+            """Return the transpose of an array (swaps the first two dims)."""
+            ah = self.compiler.array_handler
+            if isinstance(arr, dict) and 'array' in arr:
+                shape = list(arr.get('shape') or arr.get('original_shape'))
+                flat = ah.flatten_array(arr, None)
+            else:
+                shape = ah.get_array_shape(arr, None)
+                flat = ah.flatten_array(arr, None)
+            flat = [float(v) for v in flat]
+            if len(shape) <= 1:
+                if isinstance(arr, dict) and 'array' in arr:
+                    return arr
+                return pa.array(flat, type=pa.float64()) if flat else arr
+            new_shape = [shape[1], shape[0]] + shape[2:]
+            strides = []
+            acc = 1
+            for s in shape:
+                strides.append(acc)
+                acc *= s
+            new_total = acc
+            new_flat = []
+            for n_idx in range(new_total):
+                rem = n_idx
+                idxs = []
+                for s in new_shape:
+                    idxs.append(rem % s)
+                    rem //= s
+                old_idxs = [idxs[1], idxs[0]] + idxs[2:]
+                old_flat = sum(oi * st for oi, st in zip(old_idxs, strides))
+                new_flat.append(flat[old_flat])
+            return {'array': pa.array(new_flat, type=pa.float64()),
+                    'shape': list(new_shape), 'original_shape': list(new_shape)}
+
         globals_dict = {
             '__builtins__': {
                 'float': float,
@@ -2605,6 +2657,7 @@ class ExpressionEvaluator:
             'CountA': CountA,
             'RandArray': RandArray,
             'SortBy': SortBy,
+            'Transpose': Transpose,
             'SQRT': math.sqrt,
             'sqrt': math.sqrt,
             'Sqrt': math.sqrt,

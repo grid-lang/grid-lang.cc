@@ -47,11 +47,16 @@ class ArrayHandler:
                 return self.get_grid_column(cell_ref, line_number=line_number)
             return self.compiler.grid.get(cell_ref, 0)
         # Convert to Python list for indexing
+        nd_shape = None
+        if isinstance(arr, dict) and 'array' in arr:
+            nd_shape = list(arr.get('shape') or arr.get('original_shape') or [])
+            arr = arr['array']
         if isinstance(arr, pa.Array):
-            if not isinstance(arr, pa.ListArray):
+            if not isinstance(arr, pa.ListArray) and nd_shape is None:
                 raise TypeError(
                     f"Variable '{var_name}' is not a multi-dimensional array at line {line_number}")
-            arr_pylist = arr.to_pylist()
+            arr_pylist = arr.flatten().to_pylist() if isinstance(
+                arr, pa.ListArray) else arr.to_pylist()
         elif isinstance(arr, list):
             arr_pylist = arr
         else:
@@ -69,6 +74,8 @@ class ArrayHandler:
         # Get array dimensions
         dims = self.compiler.dimensions.get(var_name, [])
         shape = self.get_array_shape(arr, line_number)
+        if nd_shape is not None:
+            shape = nd_shape
 
         # Handle general 2D arrays
         if len(shape) == 2:
@@ -85,7 +92,16 @@ class ArrayHandler:
                 raise IndexError(
                     f"Column index {col_idx + 1} out of bounds for dimension size {cols} at line {line_number}")
 
-            # Access the element
+            # Access the element.  The grid maps the fastest (first) declared
+            # dim to grid rows and the slowest (last) dim to grid columns, so a
+            # cell reference (row, col) maps to indices [row_idx, col_idx] and
+            # the flat buffer is column-major: flat = row + rows*col.
+            if nd_shape is not None:
+                flat_idx = row_idx + rows * col_idx
+                if flat_idx < 0 or flat_idx >= len(arr_pylist):
+                    raise IndexError(
+                        f"Calculated index {flat_idx} out of bounds for array length {len(arr_pylist)} at line {line_number}")
+                return arr_pylist[flat_idx]
             try:
                 if isinstance(arr_pylist, list) and len(arr_pylist) > row_idx:
                     if isinstance(arr_pylist[row_idx], list) and len(arr_pylist[row_idx]) > col_idx:
@@ -494,7 +510,7 @@ class ArrayHandler:
                 pass
         if isinstance(value, dict) and ('_type_name' in value or '_hidden_fields' in value):
             value = public_object_view(value)
-        self.compiler.grid[target] = value
+        self.compiler.grid[target] = self.to_display_value(value)
         return None
 
     def _reshape_horizontal_two_field_object_array(self, value, expr_part, is_harr):
@@ -729,8 +745,9 @@ class ArrayHandler:
         # Handle cell reference index
         if len(indices) == 1 and re.match(r'^[A-Za-z]+\d+$', indices[0]):
             cell_ref = indices[0]
-            col_str, _ = split_cell(cell_ref)
+            col_str, row_str = split_cell(cell_ref)
             col_idx = col_to_num(col_str) - 1
+            row_idx = int(row_str) - 1
 
             if len(shape) != 2:
                 raise ValueError(
@@ -739,34 +756,30 @@ class ArrayHandler:
             if col_idx < 0 or col_idx >= shape[1]:
                 raise ValueError(
                     f"Column index {col_idx} out of bounds for dimension size {shape[1]} at line {line_number}")
+            if row_idx < 0 or row_idx >= shape[0]:
+                raise ValueError(
+                    f"Row index {row_idx} out of bounds for dimension size {shape[0]} at line {line_number}")
 
-            # Assume first dimension size 1
             if value is None:  # Read
-                result = arr[0][col_idx]
-                return result
+                return self.get_array_element(
+                    arr, [row_idx, col_idx], line_number)
             else:  # Write
                 flat_value = self.flatten_array(value, line_number)
                 if isinstance(arr, list):
                     if not arr:
                         arr.append([])
-                    while len(arr[0]) <= col_idx:
-                        arr[0].append(None)
-                    arr[0][col_idx] = flat_value[0] if flat_value else None
+                    while len(arr) <= row_idx:
+                        arr.append([])
+                    while len(arr[row_idx]) <= col_idx:
+                        arr[row_idx].append(None)
+                    arr[row_idx][col_idx] = flat_value[0] if flat_value else None
                     self.compiler.current_scope().update(var_name, arr, line_number)
                 else:
-                    flat_arr = arr.flatten().to_pylist()
-                    inner_size = shape[1]
-                    outer_size = shape[0]
-                    flat_arr = flat_arr + [0] * \
-                        (inner_size * outer_size - len(flat_arr))
-                    idx = col_idx
-                    flat_arr[idx] = float(flat_value[0]) if flat_value else 0
-                    new_values = pa.array(flat_arr, type=pa.float64())
-                    self.compiler.current_scope().update(var_name, pa.ListArray.from_arrays(
-                        offsets=pa.array(
-                            [i * inner_size for i in range(outer_size + 1)], type=pa.int32()),
-                        values=new_values
-                    ))
+                    updated = self.set_array_element(
+                        arr, [row_idx, col_idx],
+                        float(flat_value[0]) if flat_value else 0, line_number)
+                    self.compiler.current_scope().update(
+                        var_name, updated, line_number)
 
         else:
             # Numeric indices
@@ -805,34 +818,24 @@ class ArrayHandler:
                 _ensure(arr, idx_list, flat_value[0] if flat_value else None)
                 self.compiler.current_scope().update(var_name, arr, line_number)
             else:
-                inner_size = shape[1] if len(shape) > 1 else 1
-                outer_size = shape[0] if shape else 10
-                flat_arr = arr.flatten().to_pylist() if isinstance(
-                    arr, pa.ListArray) else arr.to_pylist() + [0] * (inner_size * outer_size - len(arr))
-                idx = 0
-                for i, index in enumerate(indices):
+                # pyarrow flat arrays or N-D dict-form arrays
+                idx_list = []
+                for index in indices:
                     try:
                         idx_val = int(index) - 1
                     except ValueError:
                         raise ValueError(
-                            f"Invalid index '{index}' for dimension {i} at line {line_number}")
-                    if idx_val < 0 or idx_val >= shape[i]:
+                            f"Invalid index '{index}' at line {line_number}")
+                    if idx_val < 0 or idx_val >= shape[len(idx_list)]:
                         raise ValueError(
                             f"Index {idx_val + 1} out of bounds at line {line_number}")
-                    idx += idx_val * (inner_size if i == 0 else 1)
+                    idx_list.append(idx_val)
                 if value is None:  # Read
-                    result = flat_arr[idx]
-                    return result
-                flat_arr[idx] = float(flat_value[0]) if flat_value else 0
-                new_values = pa.array(flat_arr, type=pa.float64())
-                if len(shape) > 1:
-                    self.compiler.current_scope().update(var_name, pa.ListArray.from_arrays(
-                        offsets=pa.array(
-                            [i * inner_size for i in range(outer_size + 1)], type=pa.int32()),
-                        values=new_values
-                    ))
-                else:
-                    self.compiler.current_scope().update(var_name, new_values)
+                    return self.get_array_element(
+                        arr, idx_list, line_number)
+                updated = self.set_array_element(
+                    arr, idx_list, flat_value[0] if flat_value else 0, line_number)
+                self.compiler.current_scope().update(var_name, updated, line_number)
 
     def _assign_dim_selector(self, var_name, dim_name, dim_index, value, line_number=None):
         """
@@ -860,37 +863,48 @@ class ArrayHandler:
             raise ValueError(
                 f"Value size {len(flat_value)} does not match dimension size {shape[1 - dim_idx]} at line {line_number}")
 
-        flat_arr = arr.flatten().to_pylist()
+        nd_shape = None
+        if isinstance(arr, dict) and 'array' in arr:
+            nd_shape = arr.get('shape') or arr.get('original_shape')
+            if nd_shape is not None:
+                nd_shape = list(nd_shape)
+            arr = arr['array']
+        flat_arr = arr.flatten().to_pylist() if isinstance(
+            arr, pa.ListArray) else arr.to_pylist()
         inner_size = shape[1] if len(shape) > 1 else 1
         outer_size = shape[0] if shape else max(10, dim_index + 1)
         flat_arr = flat_arr + [0] * (inner_size * outer_size - len(flat_arr))
 
+        # Column-major: first dim is fastest, flat = i0 + s0*i1
         if value is None:  # Read
             if dim_idx == 0:
-                start_idx = dim_index * inner_size
-                result = flat_arr[start_idx:start_idx + inner_size]
+                result = [flat_arr[dim_index + shape[0] * i]
+                          for i in range(shape[1])]
                 return result
             else:
-                result = [flat_arr[i * inner_size + dim_index]
+                result = [flat_arr[i + shape[0] * dim_index]
                           for i in range(shape[0])]
                 return result[0] if len(result) == 1 else result
 
         # Assignment
         if dim_idx == 0:
-            start_idx = dim_index * inner_size
-            for i, val in enumerate(flat_value):
-                flat_arr[start_idx +
-                         i] = float(val) if isinstance(val, (int, float)) else val
+            for i in range(shape[1]):
+                flat_arr[dim_index + shape[0] * i] = float(flat_value[i]) if isinstance(
+                    flat_value[i], (int, float)) else flat_value[i]
         else:
             for i in range(shape[0]):
-                flat_arr[i * inner_size + dim_index] = float(flat_value[i]) if isinstance(
+                flat_arr[i + shape[0] * dim_index] = float(flat_value[i]) if isinstance(
                     flat_value[i], (int, float)) else flat_value[i]
         new_values = pa.array(flat_arr, type=pa.float64())
-        self.compiler.current_scope().update(var_name, pa.ListArray.from_arrays(
-            offsets=pa.array(
-                [i * inner_size for i in range(outer_size + 1)], type=pa.int32()),
-            values=new_values
-        ))
+        if nd_shape is not None:
+            self.compiler.current_scope().update(var_name, {
+                'array': new_values, 'shape': nd_shape, 'original_shape': list(nd_shape)}, line_number)
+        else:
+            self.compiler.current_scope().update(var_name, pa.ListArray.from_arrays(
+                offsets=pa.array(
+                    [i * inner_size for i in range(outer_size + 1)], type=pa.int32()),
+                values=new_values
+            ), line_number)
 
     def _update_bound_array_cell(self, target, value, line_number=None):
         """Update a bound array element/field when a mapped grid cell is assigned."""
@@ -986,6 +1000,23 @@ class ArrayHandler:
             for cell_ref, val in value._store.items():
                 self.compiler.grid[cell_ref] = val
             return
+        if isinstance(value, dict) and 'array' in value:
+            # N-D array (column-major flat buffer + declared shape).
+            shape = value.get('shape') or value.get('original_shape')
+            shape = list(shape)
+            flat_vals = self.flatten_array(value, line_number)
+            if len(shape) >= 2:
+                # Grid rows = first dim (fastest), grid cols = last dim
+                for col_idx in range(shape[1]):
+                    for row_idx in range(shape[0]):
+                        cell_to_assign = offset_cell(target, col_idx, row_idx)
+                        self.compiler.grid[cell_to_assign] = flat_vals[row_idx +
+                                                                       shape[0] * col_idx]
+            else:
+                for i, val in enumerate(flat_vals):
+                    cell_to_assign = offset_cell(target, i, 0)
+                    self.compiler.grid[cell_to_assign] = val
+            return
         if isinstance(value, dict):
             # Special-case: spill an object's grid mapping when keys are (row, col) tuples
             if value and all(isinstance(k, tuple) and len(k) == 2 for k in value.keys()):
@@ -1053,11 +1084,11 @@ class ArrayHandler:
             flattened_values = value.flatten().to_pylist() if isinstance(
                 value, pa.ListArray) else value.to_pylist()
             if len(shape) > 1:
-                for row_idx in range(shape[0]):
-                    for col_idx in range(shape[1]):
+                for col_idx in range(shape[1]):
+                    for row_idx in range(shape[0]):
                         cell_to_assign = offset_cell(target, col_idx, row_idx)
-                        self.compiler.grid[cell_to_assign] = flattened_values[row_idx *
-                                                                              shape[1] + col_idx]
+                        self.compiler.grid[cell_to_assign] = flattened_values[row_idx +
+                                                                              shape[0] * col_idx]
             else:
                 for i, val in enumerate(flattened_values):
                     cell_to_assign = offset_cell(
@@ -1085,12 +1116,13 @@ class ArrayHandler:
             raise ValueError(
                 f"Invalid range: {num_cols}x{num_rows} at line {line_number}")
 
-        shape = self.get_array_shape(vals, line_number) if isinstance(
-            vals, (pa.Array, list)) else [1]
-        flat_vals = self.flatten_array(vals, line_number) if isinstance(
-            vals, (pa.Array, list)) else [vals]
+        is_array = isinstance(
+            vals, (list, pa.Array, pa.ListArray)) or (
+            isinstance(vals, dict) and 'array' in vals)
+        shape = self.get_array_shape(vals, line_number) if is_array else [1]
+        flat_vals = self.flatten_array(vals, line_number) if is_array else [vals]
 
-        if isinstance(vals, (list, pa.Array, pa.ListArray)):
+        if is_array:
             effective_shape = shape
             if len(shape) == 2 and shape[0] == 1:
                 effective_shape = [shape[1]]
@@ -1107,7 +1139,7 @@ class ArrayHandler:
                         cell = num_to_col(c) + str(sr)
                         value = flat_vals[i % len(flat_vals)]
                         self.compiler.grid[cell] = value
-                elif array_length == num_cols:  # Repeat across rows
+                elif array_length == num_cols:  # Repeat across rows (broadcast over first dim)
                     for r in range(sr, er + 1):
                         for c in range(sc, ec + 1):
                             col_idx = c - sc
@@ -1124,13 +1156,12 @@ class ArrayHandler:
                             idx += 1
             elif len(effective_shape) > 1:
                 if effective_shape[0] == num_rows and effective_shape[1] == num_cols:
-                    idx = 0
-                    for r in range(sr, sr + effective_shape[0]):
-                        for c in range(sc, sc + effective_shape[1]):
-                            cell = num_to_col(c) + str(r)
-                            value = flat_vals[idx]
+                    # Column-major: first dim is the fastest (grid row)
+                    for c in range(num_cols):
+                        for r in range(num_rows):
+                            cell = num_to_col(sc + c) + str(sr + r)
+                            value = flat_vals[r + effective_shape[0] * c]
                             self.compiler.grid[cell] = value
-                            idx += 1
                 elif effective_shape[0] == num_cols and effective_shape[1] == num_rows and num_cols == 1:
                     reshaped = [[flat_vals[i]] for i in range(len(flat_vals))]
                     idx = 0
@@ -1253,19 +1284,82 @@ class ArrayHandler:
         :param line_number: Line number.
         :return: Flattened list.
         """
+        if isinstance(arr, dict) and 'array' in arr:
+            inner = arr['array']
+            if isinstance(inner, pa.ListArray):
+                return inner.flatten().to_pylist()
+            if isinstance(inner, pa.Array):
+                return inner.to_pylist()
+            if isinstance(inner, list):
+                return self.flatten_array(inner, line_number)
+            return [inner]
         if isinstance(arr, pa.ListArray):
             return arr.flatten().to_pylist()
         if isinstance(arr, pa.Array):
             return arr.to_pylist()
         if isinstance(arr, list):
+            if not arr or not isinstance(arr[0], list):
+                return list(arr)
+            # Nested lists are the display form: the outermost index is the
+            # first declared dim (fastest). Column-major flatten:
+            # flat[i0 + s0*i1 + s0*s1*i2 + ...] = arr[i0][i1][i2]...
+            shape = []
+            node = arr
+            while node and isinstance(node, list):
+                shape.append(len(node))
+                node = node[0] if node else None
+            if not shape:
+                return []
+            total = 1
+            for s in shape:
+                total *= s
             result = []
-            for item in arr:
-                if isinstance(item, list):
-                    result.extend(self.flatten_array(item, line_number))
-                else:
-                    result.append(item)
+            for flat_idx in range(total):
+                node = arr
+                rem = flat_idx
+                for s in shape:
+                    node = node[rem % s]
+                    rem //= s
+                result.append(node)
             return result
         return [arr]
+
+    def to_display_value(self, value, line_number=None):
+        """Convert an internal array representation to its display form.
+
+        N-D arrays are stored as {'array', 'shape', 'original_shape'}; their
+        display form is a nested Python list laid out in the declared
+        dimension order (outermost index = first declared dim).
+        """
+        if not (isinstance(value, dict) and 'array' in value):
+            return value
+        shape = list(value.get('shape') or value.get('original_shape') or [])
+        inner = value['array']
+        if isinstance(inner, pa.ListArray):
+            flat = inner.flatten().to_pylist()
+        elif isinstance(inner, pa.Array):
+            flat = inner.to_pylist()
+        elif isinstance(inner, list):
+            flat = self.flatten_array(inner, line_number)
+        else:
+            return value
+        if len(shape) <= 1:
+            return flat
+        return self._nested_from_flat(flat, shape)
+
+    def _nested_from_flat(self, flat, shape):
+        if len(shape) == 1:
+            return list(flat)
+        s0 = shape[0]
+        inner_shape = shape[1:]
+        inner_size = 1
+        for s in inner_shape:
+            inner_size *= s
+        result = []
+        for i0 in range(s0):
+            inner_flat = flat[i0::s0][:inner_size]
+            result.append(self._nested_from_flat(inner_flat, inner_shape))
+        return result
 
     def infer_type(self, value, line_number=None):
         """
@@ -1274,6 +1368,8 @@ class ArrayHandler:
         :param line_number: Line number.
         :return: Inferred type string.
         """
+        if isinstance(value, dict) and 'array' in value:
+            return 'array'
         if isinstance(value, pa.ListArray) or (isinstance(value, list) and value and isinstance(value[0], list)):
             return 'array'
         if isinstance(value, (list, pa.Array)):
@@ -1295,6 +1391,10 @@ class ArrayHandler:
         :param line_number: Line number.
         :return: List of dimension sizes.
         """
+        if isinstance(arr, dict):
+            for key in ('shape', 'original_shape'):
+                if key in arr:
+                    return list(arr[key])
         if isinstance(arr, pa.ListArray):
             if not pa.types.is_list(arr.type):
                 return []
@@ -1345,27 +1445,34 @@ class ArrayHandler:
 
         # Initialize values
         if is_grid_dim and matrix_data:
+            # Grid DIM matrices stack along the LAST declared dim (depth).
+            # Each matrix is a 2D display: rows span the first dim, columns
+            # span the remaining dims flattened column-major.  Storage is
+            # column-major overall (first dim fastest, last dim slowest).
             if len(matrix_data) != shape[-1]:
                 raise ValueError(
-                    f"Expected {shape[-1]} matrices for last dimension, got {len(matrix_data)} at line {line_number}")
+                    f"Expected {shape[-1]} matrices for the last dimension, got {len(matrix_data)} at line {line_number}")
+            inner_size = 1
+            for dim in shape[:-1]:
+                inner_size *= dim
+            col_size = inner_size // shape[0]
             values = []
-            # For grid DIM arrays, we need to interleave the depths correctly
-            # Each row in the final array should contain all depths for that row
-            for row_idx in range(shape[0]):
-                for depth_idx in range(shape[-1]):
-                    matrix = matrix_data[depth_idx]
-                    if len(matrix) != shape[0]:
+            for matrix in matrix_data:
+                if len(matrix) != shape[0]:
+                    raise ValueError(
+                        f"Expected {shape[0]} rows per matrix, got {len(matrix)} at line {line_number}")
+                for sub in range(inner_size):
+                    i0 = sub % shape[0]
+                    j = sub // shape[0]
+                    row = matrix[i0]
+                    if len(row) != col_size:
                         raise ValueError(
-                            f"Expected {shape[0]} rows per matrix, got {len(matrix)} at line {line_number}")
-                    row = matrix[row_idx]
-                    if len(row) != shape[1]:
+                            f"Expected {col_size} columns per row, got {len(row)} at line {line_number}")
+                    val = row[j]
+                    if default_value is not None and float(val) != float(default_value):
                         raise ValueError(
-                            f"Expected {shape[1]} columns per row, got {len(row)} at line {line_number}")
-                    for val in row:
-                        if default_value is not None and float(val) != float(default_value):
-                            raise ValueError(
-                                f"Value {val} violates constraint {default_value} at line {line_number}")
-                        values.append(val)
+                            f"Value {val} violates constraint {default_value} at line {line_number}")
+                    values.append(val)
         else:
             if is_grid_dim and default_value is None:
                 raise ValueError(
@@ -1387,14 +1494,8 @@ class ArrayHandler:
         if len(shape) == 1:
             return pa.array(values, type=pa_type)
         elif len(shape) >= 2:
-            rows = shape[0]
-            cols = shape[1] * \
-                shape[2] if len(shape) == 3 and is_grid_dim else shape[1]
-            offsets = pa.array(
-                [i * cols for i in range(rows + 1)], type=pa.int32())
             flat_array = pa.array(values, type=pa_type)
-            result = pa.ListArray.from_arrays(offsets, flat_array)
-            return {'array': result, 'original_shape': shape} if is_grid_dim else result
+            return {'array': flat_array, 'shape': list(shape), 'original_shape': list(shape)}
         else:
             raise ValueError(
                 f"Unsupported array dimensions: {shape} at line {line_number}")
@@ -1518,8 +1619,10 @@ class ArrayHandler:
         dims = resolved_dims
         self.compiler.dimensions[var] = dims
         if dims == []:
-            if isinstance(value, (pa.Array, pa.ListArray)):
-                value = value.to_pylist()
+            if isinstance(value, (pa.Array, pa.ListArray)) or (
+                    isinstance(value, dict) and 'array' in value):
+                value = value.to_pylist() if isinstance(
+                    value, pa.Array) else self.flatten_array(value, line_number)
             if isinstance(value, list):
                 if len(value) == 1:
                     return value[0]
@@ -1539,7 +1642,7 @@ class ArrayHandler:
         if var_type is None:
             var_type = self.compiler.types.get(var)
 
-        if isinstance(value, dict) and var_type and var_type.lower() in self.compiler.types_defined:
+        if isinstance(value, dict) and 'array' not in value and var_type and var_type.lower() in self.compiler.types_defined:
             import copy
             shape = [self._dim_size(size_spec, star_size=1)
                      for _, size_spec in dims]
@@ -1557,7 +1660,8 @@ class ArrayHandler:
                 reshaped.append(row)
             return reshaped
 
-        if not isinstance(value, (list, pa.Array, pa.ListArray)) or isinstance(value, (int, float, str)):
+        is_nd_array = isinstance(value, dict) and 'array' in value
+        if not is_nd_array and (not isinstance(value, (list, pa.Array, pa.ListArray)) or isinstance(value, (int, float, str))):
             shape = [self._dim_size(size_spec, star_size=1)
                      for _, size_spec in dims]
             pa_type = pa.float64() if self.compiler.types.get(
@@ -1601,19 +1705,25 @@ class ArrayHandler:
         for dim in expected_shape:
             expected_total *= dim
         if total_elements != expected_total:
-            raise ValueError(
-                f"Element count mismatch for '{var}': expected {expected_total} elements, got {total_elements} at line {line_number}")
+            if (total_elements and expected_total % total_elements == 0
+                    and total_elements < expected_total):
+                # Column-major row-broadcast: a shorter 1D literal spans the
+                # slowest dim(s) and is repeated across the faster dims.
+                # dim {row:2, col:3} = {1,2,3} -> buffer [1,1,2,2,3,3]
+                repeat = expected_total // total_elements
+                broadcast = []
+                for v in flat_vals:
+                    broadcast.extend([v] * repeat)
+                flat_vals = broadcast
+                total_elements = expected_total
+            else:
+                raise ValueError(
+                    f"Element count mismatch for '{var}': expected {expected_total} elements, got {total_elements} at line {line_number}")
 
-        # Reshape to expected shape
+        # Reshape to expected shape (column-major flat buffer + declared shape)
         if len(expected_shape) == 1:
             return flat_vals
-        reshaped = []
-        stride = expected_shape[1] if len(expected_shape) > 1 else 1
-        for i in range(expected_shape[0]):
-            start = i * stride
-            row = flat_vals[start:start + stride]
-            reshaped.append(row)
-        return reshaped
+        return {'array': pa.array(flat_vals), 'shape': list(expected_shape), 'original_shape': list(expected_shape)}
 
     def set_array_element(self, array, indices, value, line_number=None):
         """
@@ -1659,20 +1769,31 @@ class ArrayHandler:
                     current = current[idx]
             return array
 
+        # N-D arrays are stored as a flat pyarrow buffer wrapped in a dict with
+        # the declared shape ({'array', 'shape', 'original_shape'}).  The
+        # first declared dim is the fastest: flat = i0 + s0*i1 + s0*s1*i2 + ...
+        nd_shape = None
+        if isinstance(array, dict) and 'array' in array:
+            nd_shape = array.get('shape') or array.get('original_shape')
+            if nd_shape is not None:
+                nd_shape = list(nd_shape)
+            array = array['array']
+
         # Handle simple arrays (like DoubleArray)
-        if not isinstance(array, pa.ListArray):
+        if not isinstance(array, (pa.Array, pa.ListArray)):
             if len(indices) == 1:
                 # For 1D arrays, convert to list, update, and convert back
-                arr_list = array.to_pylist()
+                arr_list = array.to_pylist() if isinstance(
+                    array, pa.Array) else list(array)
                 arr_list[indices[0]] = float(value) if isinstance(
                     value, (int, float)) else value
                 return pa.array(arr_list, type=array.type)
             else:
                 raise TypeError(
-                    f"Expected ListArray for multi-dimensional arrays, got {type(array)} at line {line_number}")
+                    f"Expected pyarrow array for multi-dimensional arrays, got {type(array)} at line {line_number}")
 
-        # Handle ListArray (existing logic)
-        shape = self.get_array_shape(array, line_number)
+        shape = nd_shape if nd_shape is not None else self.get_array_shape(
+            array, line_number)
         if len(indices) != len(shape):
             raise ValueError(
                 f"Expected {len(shape)} indices, got {len(indices)} at line {line_number}")
@@ -1681,35 +1802,27 @@ class ArrayHandler:
                 raise IndexError(
                     f"Index {idx} out of bounds for dimension {i} with size {shape[i]} at line {line_number}")
 
-        # For 2D arrays, use row-major indexing
-        if len(shape) == 2:
-            rows, cols = shape
-            flat_idx = indices[0] * cols + indices[1]
-        else:
-            # Calculate flat index for other dimensions
-            flat_idx = 0
-            stride = 1
-            for i in range(len(shape) - 1, -1, -1):
-                flat_idx += indices[i] * stride
-                stride *= shape[i]
+        # Column-major flat index
+        flat_idx = 0
+        stride = 1
+        for i, idx in enumerate(indices):
+            flat_idx += idx * stride
+            stride *= shape[i]
 
         # Get flat array and update value
-        flat_arr = array.flatten().to_pylist()
+        flat_arr = array.flatten().to_pylist() if isinstance(
+            array, pa.ListArray) else array.to_pylist()
         flat_arr[flat_idx] = float(value) if isinstance(
             value, (int, float)) else value
 
-        # For 2D arrays, reconstruct using the original shape
-        if len(shape) == 2:
-            rows, cols = shape
-            offsets = [i * cols for i in range(rows + 1)]
-            result = pa.ListArray.from_arrays(
-                pa.array(offsets, type=pa.int32()),
-                pa.array(flat_arr, type=pa.float64())
-            )
-            return result
-        else:
-            # For other dimensions, return the flat array
-            return pa.array(flat_arr, type=pa.float64())
+        flat_type = array.values.type if isinstance(
+            array, pa.ListArray) else array.type
+        new_flat = pa.array(flat_arr, type=flat_type)
+        if nd_shape is not None:
+            return {'array': new_flat, 'shape': list(nd_shape), 'original_shape': list(nd_shape)}
+        if len(shape) == 1:
+            return new_flat
+        return {'array': new_flat, 'shape': list(shape), 'original_shape': list(shape)}
 
     def reshape_array(self, arr, new_dims, line_number=None):
         """
@@ -1733,11 +1846,8 @@ class ArrayHandler:
             total_size *= s
         flat.extend([0] * (total_size - len(flat)))
         if len(shape) > 1:
-            return pa.ListArray.from_arrays(
-                offsets=pa.array([i * shape[1]
-                                 for i in range(shape[0] + 1)], type=pa.int32()),
-                values=pa.array(flat, type=pa.float64())
-            )
+            return {'array': pa.array(flat[:total_size], type=pa.float64()),
+                    'shape': list(shape), 'original_shape': list(shape)}
         return pa.array(flat[:shape[0]], type=pa.float64())
 
     def get_grid_row(self, row_index, grid_source=None, line_number=None):
@@ -1790,58 +1900,38 @@ class ArrayHandler:
                     + (f" at line {line_number}" if line_number else ""))
             return arr[(int(indices[0]) + 1, int(indices[1]) + 1)]
 
-        # Handle dictionary with array (e.g., from grid DIM)
-        if isinstance(arr, dict) and 'array' in arr and isinstance(arr['array'], pa.ListArray):
+        # Handle dictionary with array (e.g., from grid DIM or N-D storage)
+        if isinstance(arr, dict) and 'array' in arr:
             original_shape = arr.get(
-                'original_shape') if original_shape is None else original_shape
+                'shape') or arr.get('original_shape')
+            original_shape = list(original_shape)
             arr = arr['array']
 
-        # Get the shape to use for indexing - prefer original_shape if available
+        # Get the shape to use for indexing - prefer the declared shape
         shape = self.get_array_shape(arr, line_number)
         indexing_shape = original_shape if original_shape is not None else getattr(
             arr, 'original_shape', shape)
 
-        # Validate indices against the actual array shape (not the original shape)
+        # Validate indices against the declared shape
         if len(indices) != len(indexing_shape):
             raise ValueError(
                 f"Expected {len(indexing_shape)} indices for array with shape {indexing_shape}, got {len(indices)} at line {line_number}")
 
-        # For grid DIM arrays, validate against the original shape since that's what the user expects
         validation_shape = indexing_shape
         for i, idx in enumerate(indices):
             if idx < 0 or idx >= validation_shape[i]:
                 raise IndexError(
                     f"Index {idx} out of bounds for dimension {i} with size {validation_shape[i]} at line {line_number}")
 
-        # Handle array indexing
-        if isinstance(arr, pa.ListArray):
-            flat_arr = arr.flatten().to_pylist()
-
-            # For grid DIM arrays, the array is stored as 2D but should be accessed as 3D
-            # Check if this is a grid DIM array by looking at the original shape
-            if original_shape and len(original_shape) == 3 and len(shape) == 2:
-                # This is a 3D array stored as 2D (grid DIM case)
-                # Calculate the flat index using the original 3D shape
-                row = indices[0]
-                # For 3D arrays flattened to 2D, each row contains all depths for each column
-                # The layout is: [depth1_col0, depth1_col1, ..., depth1_colN, depth2_col0, depth2_col1, ..., depth2_colN]
-                # So for indices [row, col, depth], the position is: row * (cols * depths) + col + depth * cols
-                col = indices[1] + indices[2] * original_shape[1]
-                flat_idx = row * shape[1] + col
-            elif len(indexing_shape) == 2:
-                # 2D array indexing
-                row, col = indices
-                flat_idx = row * indexing_shape[1] + col
-            elif len(indexing_shape) == 3:
-                # 3D array indexing
-                flat_idx = indices[0] * indexing_shape[1] * \
-                    indexing_shape[2] + indices[1] * \
-                    indexing_shape[2] + indices[2]
-            else:
-                # N-dimensional array indexing
-                flat_idx = 0
-                for i, idx in enumerate(indices):
-                    flat_idx = flat_idx * indexing_shape[i] + idx
+        # Handle array indexing (column-major: first dim is fastest)
+        if isinstance(arr, (pa.Array, pa.ListArray)):
+            flat_arr = arr.flatten().to_pylist() if isinstance(
+                arr, pa.ListArray) else arr.to_pylist()
+            flat_idx = 0
+            stride = 1
+            for i, idx in enumerate(indices):
+                flat_idx += idx * stride
+                stride *= indexing_shape[i]
 
             if flat_idx < 0 or flat_idx >= len(flat_arr):
                 raise IndexError(
@@ -1851,9 +1941,9 @@ class ArrayHandler:
             if isinstance(result, dict) and 'value' in result:
                 return result['value']
             return result
-        elif isinstance(arr, pa.Array):
-            return arr[indices[0]].as_py()
         elif isinstance(arr, list):
+            # Python nested lists (e.g. object arrays) are stored outermost =
+            # first declared dim
             result = arr
             for idx in indices:
                 result = result[idx]
@@ -1870,11 +1960,18 @@ class ArrayHandler:
         :param line_number: Line number.
         :return: Filled pyarrow array.
         """
+        nd_shape = None
+        if isinstance(array, dict) and 'array' in array:
+            nd_shape = array.get('shape') or array.get('original_shape')
+            if nd_shape is not None:
+                nd_shape = list(nd_shape)
+            array = array['array']
         if not isinstance(array, (pa.Array, pa.ListArray)):
             raise ValueError(
                 f"Expected pyarrow Array or ListArray, got {type(array)} at line {line_number}")
 
-        shape = self.get_array_shape(array, line_number)
+        shape = nd_shape if nd_shape is not None else self.get_array_shape(
+            array, line_number)
         flat_size = 1
         for dim in shape:
             flat_size *= dim
@@ -1891,16 +1988,12 @@ class ArrayHandler:
         else:
             values = [float(value)] * flat_size
 
+        flat_type = array.values.type if isinstance(
+            array, pa.ListArray) else array.type
+        flat_arr = pa.array(values, type=flat_type)
         if len(shape) == 1:
-            return pa.array(values, type=pa.float64())
-
-        inner_size = shape[1]
-        outer_size = shape[0]
-        offsets = [i * inner_size for i in range(outer_size + 1)]
-        return pa.ListArray.from_arrays(
-            offsets=pa.array(offsets, type=pa.int32()),
-            values=pa.array(values, type=pa.float64())
-        )
+            return flat_arr
+        return {'array': flat_arr, 'shape': list(shape), 'original_shape': list(shape)}
 
     def get_array_dimensions(self, arr):
         """

@@ -1414,10 +1414,9 @@ class GridLangControlFlow:
                     f"Array variable '{var_name}' with dim * must be initialized with PUSH or INIT before LET at line {line_number}")
             if isinstance(arr, dict) and 'array' in arr:
                 updated_array = self.compiler.array_handler.set_array_element(
-                    arr['array'], indices, value, line_number)
-                arr['array'] = updated_array
-                defining_scope.variables[actual_key] = arr
-                scope_dict[actual_key] = arr
+                    arr, indices, value, line_number)
+                defining_scope.variables[actual_key] = updated_array
+                scope_dict[actual_key] = updated_array
             else:
                 updated_array = self.compiler.array_handler.set_array_element(
                     arr, indices, value, line_number)
