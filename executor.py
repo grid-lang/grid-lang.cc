@@ -247,12 +247,18 @@ class GridLangExecutor:
         self._process_when_triggers()
 
     def _set_var_value(self, var_name, value, line_number):
+        # Publisher-side write: a client equality binding wins over the pushed
+        # value, so skip the overwrite for client-owned variables.
+        owner = getattr(self, 'compiler', None) or self
+        if owner._set_by.get(('var', var_name.lower())) == 'client':
+            return
         defining_scope = self.current_scope().get_defining_scope(var_name)
         if defining_scope:
             defining_scope.update(var_name, value, line_number)
         else:
             self.current_scope().define(
                 var_name, value, None, {}, is_uninitialized=False)
+        owner._set_by[('var', var_name.lower())] = 'publisher'
 
     def _enqueue_push(self, var_name, value):
         key = var_name.lower()
@@ -783,6 +789,7 @@ class GridLangExecutor:
         except Exception:
             pass
         defining_scope.update(var, value, line_number)
+        self._register_listeners(var, expr, scope)
         return True
 
     def _execute_global_for_loops(self, lines):
@@ -1339,6 +1346,11 @@ class GridLangExecutor:
         if expr is None:
             return None
 
+        # Client-style equality bindings (no INIT) register as listeners so the
+        # expression re-evaluates whenever a dependency cell/var is pushed.
+        if 'init' not in constraints and expr is not None:
+            self._register_listeners(var, expr, search_scope)
+
         try:
             evaluated_value = self.expr_evaluator.eval_or_eval_array(
                 expr, scope_dict or search_scope.get_evaluation_scope(),
@@ -1629,7 +1641,11 @@ class GridLangExecutor:
             except Exception:
                 value = raw_value
             value = self._strip_init_copy_immutability(value)
+            owner = getattr(self, 'compiler', None) or self
             if actual_key in defining_scope.variables:
+                if owner._set_by.get(('var', actual_key.lower())) == 'client':
+                    committed = True
+                    continue
                 defining_scope.update(actual_key, value, line_number)
             else:
                 defining_scope.define(
@@ -1642,6 +1658,7 @@ class GridLangExecutor:
                 )
                 actual_key = defining_scope._get_case_insensitive_key(
                     var_name, defining_scope.variables) or var_name
+            owner._set_by[('var', actual_key.lower())] = 'publisher'
             self._enqueue_push(actual_key, value)
             committed = True
 
@@ -1803,11 +1820,16 @@ class GridLangExecutor:
                     var) or self.current_scope()
                 if values:
                     val = values[-1]
+                    owner = getattr(self, 'compiler', None) or self
+                    if owner._set_by.get(('var', var.lower())) == 'client':
+                        init_handled = True
+                        continue
                     try:
                         target_scope.update(var, val, line_number)
                     except NameError:
                         target_scope.define(
                             var, val, type_name, constraints, is_uninitialized=False)
+                    owner._set_by[('var', var.lower())] = 'publisher'
                     self._enqueue_push(var, val)
                     self._process_when_triggers()
                 init_handled = True
@@ -3708,11 +3730,15 @@ class GridLangExecutor:
                             if defining_scope:
                                 defining_scope.update(
                                     target, evaluated_value, line_number)
+                                self._register_listeners(
+                                    target, rhs, scope)
                             else:
                                 inferred_type = self.array_handler.infer_type(
                                     evaluated_value, line_number)
                                 scope.define(
                                     target, evaluated_value, inferred_type, {}, is_uninitialized=False)
+                                self._register_listeners(
+                                    target, rhs, scope)
                         else:
                             self.array_handler.evaluate_line_with_assignment(
                                 line, line_number, scope.get_evaluation_scope())
@@ -4543,13 +4569,7 @@ class GridLangExecutor:
                         continue
 
                     # Update the variable with the new value
-                    defining_scope = self.current_scope().get_defining_scope(var_name)
-                    if defining_scope:
-                        defining_scope.update(var_name, value, line_number)
-                    else:
-                        self.current_scope().define(
-                            var_name, value, 'number', {}, is_uninitialized=False)
-
+                    self._set_var_value(var_name, value, line_number)
                     collecting_via_compiler = hasattr(
                         self, 'compiler') and self.compiler is not None
                     if (var_name.lower() in global_scope.output_variables) and not collecting_via_compiler:

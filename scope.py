@@ -16,6 +16,25 @@ from utils import num_to_col, split_cell, col_to_num
 _ACTIVE_RUNNERS = []
 
 
+class _ListenerGrid(dict):
+    """Grid backing store that notifies the owning compiler on cell writes.
+
+    Every ``self.grid[cell] = value`` write funnels through here so that
+    client variables listening on grid cells can be recomputed when a
+    publisher (push/init) updates one of their dependency cells.
+    """
+
+    def __init__(self, owner=None):
+        super().__init__()
+        self._grid_owner = owner
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        owner = self._grid_owner
+        if owner is not None and hasattr(owner, '_notify_cell_changed'):
+            owner._notify_cell_changed(key, value)
+
+
 class GridLiveView(dict):
     """A live view of a grid, keyed by 1-based (row, col) tuples.
 
@@ -281,6 +300,8 @@ class Scope:
                     self.compiler._sync_cell_bindings(actual_key, value)
                 if hasattr(self.compiler, '_record_output_value'):
                     self.compiler._record_output_value(actual_key, value)
+                if hasattr(self.compiler, '_notify_var_changed'):
+                    self.compiler._notify_var_changed(actual_key, value)
             else:
                 # Variable exists in types or constraints but not variables
                 defining_scope._check_constraints(name, value, line_number)
@@ -295,6 +316,8 @@ class Scope:
                     self.compiler._sync_cell_bindings(name, value)
                 if hasattr(self.compiler, '_record_output_value'):
                     self.compiler._record_output_value(name, value)
+                if hasattr(self.compiler, '_notify_var_changed'):
+                    self.compiler._notify_var_changed(name, value)
         else:
             if self.is_shadowed(name) and not self.is_private:
                 print(

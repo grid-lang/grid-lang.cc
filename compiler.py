@@ -8,10 +8,21 @@ import pyarrow as pa
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
 from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value
-from scope import Scope, GridLiveView
+from scope import Scope, GridLiveView, _ListenerGrid
 from control_flow import GridLangControlFlow
 from type_processor import GridLangTypeProcessor
 from parser import GridLangParser
+
+
+_IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*')
+_STRING_LITERAL_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+_DEPENDENCY_IGNORED_TOKENS = {
+    'sum', 'rows', 'sqrt', 'min', 'max', 'abs', 'int', 'float', 'str', 'len',
+    'textsplit', 'print', 'push', 'true', 'false', 'none', 'nan', 'inf', 'and', 'or', 'not',
+    'if', 'then', 'else', 'elseif', 'end', 'do', 'for', 'while', 'when', 'step', 'return',
+    'index', 'as', 'dim', 'with', 'grid', 'output', 'input', 'number', 'text',
+    'array', 'mod', 'div', 'to', 'by', 'e', 'new', 'in', 'counta', 'rows'
+}
 
 
 class SubprocessResult:
@@ -31,7 +42,7 @@ class SubprocessResult:
 
 class GridLangCompiler:
     def __init__(self):
-        self.grid = {}
+        self.grid = _ListenerGrid(self)
         self.scopes = [Scope(self)]
         # Predefine the 'grid' variable containing the current grid, like in a
         # type definition, so programs can read and write cells with grid{row, col}.
@@ -40,6 +51,12 @@ class GridLangCompiler:
         self._seed_grid_variable()
         self.variables = self.current_scope().variables
         self.types = self.scopes[0].types
+        # Client/publisher listener registry. Cells and variables written by a
+        # client binding (: v = expr) register listeners; publisher updates
+        # (init/push) propagate to those listeners immediately.
+        self._listeners = {'cell': {}, 'var': {}}
+        self._set_by = {}
+        self._propagating = set()
         self.dimensions = {}
         self.dim_names = {}
         self.dim_labels = {}
@@ -1520,6 +1537,98 @@ class GridLangCompiler:
                 cell_refs.update(re.findall(r'\b[A-Za-z]+\d+\b', ph))
         return cell_refs
 
+    def _register_listeners(self, var_name, expr, scope):
+        """Register var_name as a client listener on every cell/var its expr reads.
+
+        Called during a client binding; the registry lives on this compiler so
+        notifications (reached via compiler references from scope/_ListenerGrid)
+        always touch the same objects.
+        """
+        if not expr or scope is None:
+            return
+        deps = set()
+        cleaned = _STRING_LITERAL_PATTERN.sub(' ', str(expr))
+        for token in _IDENTIFIER_TOKEN_PATTERN.findall(cleaned):
+            if not token:
+                continue
+            base = token.split('.')[0]
+            lower = base.lower()
+            if lower in _DEPENDENCY_IGNORED_TOKENS:
+                continue
+            if lower in self.types_defined:
+                continue
+            if lower in self.functions or lower in self.subprocesses:
+                continue
+            if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', base, re.I):
+                continue
+            deps.add(base)
+        cell_refs = self._extract_cell_refs(str(expr))
+        keys = []
+        for ref in sorted(cell_refs):
+            keys.append(('cell', ref.upper()))
+        for dep in deps:
+            if re.match(r'^[A-Za-z]+\d+$', dep):
+                continue
+            keys.append(('var', dep.lower()))
+        record = {'var': var_name, 'expr': str(expr), 'scope': scope,
+                  'deps': deps, 'cell_refs': cell_refs}
+        for kind, key in keys:
+            holder = self._listeners.setdefault(kind, {}).setdefault(key, {})
+            holder[(var_name.lower(), id(scope))] = record
+        if var_name:
+            self._set_by[('var', var_name.lower())] = 'client'
+
+    def _notify_var_changed(self, name, value):
+        self._propagate(('var', name.lower()), value)
+
+    def _notify_cell_changed(self, cell_ref, value):
+        self._propagate(('cell', cell_ref.upper()), value)
+
+    def _propagate(self, dep_key, value):
+        """Recompute every client listener that depends on dep_key."""
+        if dep_key in self._propagating:
+            return
+        entries = self._listeners.get(dep_key[0], {}).get(dep_key[1], {})
+        if not entries:
+            return
+        self._propagating.add(dep_key)
+        try:
+            for record in list(entries.values()):
+                try:
+                    self._recompute_client(record)
+                except Exception:
+                    pass
+        finally:
+            self._propagating.discard(dep_key)
+
+    def _recompute_client(self, record):
+        """Recompute a client variable from its stored expression."""
+        var_name = record.get('var')
+        expr = record.get('expr')
+        scope = record.get('scope')
+        if not var_name or not expr or scope is None:
+            return
+        defining_scope = scope.get_defining_scope(var_name)
+        if defining_scope is None or defining_scope.is_uninitialized(var_name):
+            return
+        for dep in record.get('deps', ()):
+            if self.has_unresolved_dependency(dep, scope=scope):
+                return
+        for ref in record.get('cell_refs', ()):
+            if ref not in self.grid:
+                return
+        val = self.expr_evaluator.eval_or_eval_array(
+            expr, scope.get_evaluation_scope(), None)
+        actual_key = defining_scope._get_case_insensitive_key(
+            var_name, defining_scope.types) or var_name
+        var_type = defining_scope.types.get(actual_key)
+        if val is not None and var_type and var_type.lower() in self.types_defined:
+            constraints = defining_scope.constraints.get(actual_key, {})
+            val, constraints = defining_scope._coerce_custom_type_value(
+                var_type, val, constraints, None)
+            defining_scope.constraints[actual_key] = constraints
+        defining_scope.update(var_name, val, None)
+
     def _split_assignment_expr(self, text):
         """Split on the first standalone '=' not part of comparison operators."""
         in_quote = False
@@ -1633,6 +1742,13 @@ class GridLangCompiler:
 
     def _reset_state(self):
         self.grid.clear()
+        # This method runs on the executor object (self.compiler is the owning
+        # compiler); listener/mechanism state must be reset on the compiler
+        # because notification hooks are reached through compiler references.
+        owner = getattr(self, 'compiler', None) or self
+        owner._listeners = {'cell': {}, 'var': {}}
+        owner._set_by = {}
+        owner._propagating = set()
         parent_scope = getattr(self, '_parent_scope', None)
         if parent_scope is not None:
             # Subprocesses and functions reference the caller's scope chain live
@@ -2330,6 +2446,8 @@ class GridLangCompiler:
                     expr, line_number, deps, constraints)
         self.current_scope().define(var, evaluated_value, type_name or 'unknown',
                                     constraints, is_uninitialized=is_uninitialized)
+        if expr:
+            self._register_listeners(var, expr, self.current_scope())
 
     def _parse_dim_size(self, size_str, line_number=None):
         """Delegate to parser."""
