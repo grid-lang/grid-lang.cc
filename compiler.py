@@ -21,8 +21,23 @@ _DEPENDENCY_IGNORED_TOKENS = {
     'textsplit', 'print', 'push', 'true', 'false', 'none', 'nan', 'inf', 'and', 'or', 'not',
     'if', 'then', 'else', 'elseif', 'end', 'do', 'for', 'while', 'when', 'step', 'return',
     'index', 'as', 'dim', 'with', 'grid', 'output', 'input', 'number', 'text',
-    'array', 'mod', 'div', 'to', 'by', 'e', 'new', 'in', 'counta', 'rows'
+    'array', 'mod', 'div', 'to', 'by', 'e', 'new', 'in', 'counta', 'rows', 'of', 'null'
 }
+
+
+def _strip_constraint_operands(expr):
+    """Remove constraint clauses (' of <unit>', ' as <type>', ' dim <n>',
+    ' not null') so dependency extraction doesn't treat unit/type names as
+    variable references."""
+    if not expr:
+        return expr
+    cleaned = _STRING_LITERAL_PATTERN.sub(' ', str(expr))
+    cleaned = re.sub(r'\b(?:of|as)\s+[A-Za-z_][A-Za-z0-9_]*', ' ', cleaned)
+    cleaned = re.sub(
+        r'\bdim\s+(?:\d+(?:\.\d*)?|nan|inf|[A-Za-z_][A-Za-z0-9_]*)',
+        ' ', cleaned, flags=re.I)
+    cleaned = re.sub(r'\bnot\s+null\b', ' ', cleaned, flags=re.I)
+    return cleaned
 
 
 class SubprocessResult:
@@ -131,7 +146,7 @@ class GridLangCompiler:
 
     def _resolve_type_inheritance(self):
         """Merge inherited fields and constraints into child type definitions."""
-        primitives = {'number', 'text', 'array', 'bool'}
+        primitives = {'number', 'text', 'logical'}
         progress = True
         while progress:
             progress = False
@@ -1490,7 +1505,7 @@ class GridLangCompiler:
         tokens = re.findall(r'[A-Za-z_][A-Za-z0-9_]*', cleaned)
         filtered = set()
         keyword_exclusions = {
-            'to', 'and', 'or', 'not', 'then', 'do', 'step', 'by', 'in', 'new'
+            'to', 'and', 'or', 'not', 'then', 'do', 'step', 'by', 'in', 'new', 'with'
         }
         for tok in tokens:
             if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', tok, re.I):
@@ -1547,7 +1562,7 @@ class GridLangCompiler:
         if not expr or scope is None:
             return
         deps = set()
-        cleaned = _STRING_LITERAL_PATTERN.sub(' ', str(expr))
+        cleaned = _strip_constraint_operands(expr)
         for token in _IDENTIFIER_TOKEN_PATTERN.findall(cleaned):
             if not token:
                 continue
