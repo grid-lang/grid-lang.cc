@@ -1433,6 +1433,14 @@ class GridLangControlFlow:
         Evaluate an IF condition, handling various types of constraints.
         """
 
+        # '!=' is not a GridLang operator; use '<>' for inequality
+        without_strings = re.sub(
+            r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '', condition)
+        if '!=' in without_strings:
+            raise SyntaxError(
+                f"'!=' is not a GridLang operator; use '<>' for inequality "
+                f"at line {line_number}")
+
         # Handle "not as" type constraints (e.g., "z not as text")
         not_type_match = re.match(
             r'^([\w_]+)\s+not\s+as\s+(\w+)(?:\s+dim\s+(.+))?$', condition, re.I)
@@ -1518,11 +1526,11 @@ class GridLangControlFlow:
         for part in parts:
             part = part.strip()
             if last_left is not None and re.match(
-                    r'^(?:<>|!=|<=|>=|=|<|>)\s*\S', part, re.I):
+                    r'^(?:<>|<=|>=|=|<|>)\s*\S', part, re.I):
                 resolved.append(f"{last_left} {part}")
                 continue
             cmp_match = re.match(
-                r'^(.+?)\s*(?:<>|!=|<=|>=|=|<|>)\s*(.+)$', part, re.I)
+                r'^(.+?)\s*(?:<>|<=|>=|=|<|>)\s*(.+)$', part, re.I)
             last_left = cmp_match.group(1).strip() if cmp_match else None
             resolved.append(part)
         return resolved
@@ -1546,7 +1554,7 @@ class GridLangControlFlow:
 
     def _evaluate_if_comparison(self, condition, line_number):
         comparison_match = re.match(
-            r'^(.+?)\s*(?<!not\s)(<>|!=|<=|>=|=|<|>)(?!\s*=)\s*(?!.*\s+(?:and|or)\s+)(.+)$', condition.strip(), re.I)
+            r'^(.+?)\s*(?<!not\s)(<>|<=|>=|=|<|>)(?!\s*=)\s*(?!.*\s+(?:and|or)\s+)(.+)$', condition.strip(), re.I)
         if not comparison_match:
             return False, None
         left_expr, operator, right_expr = comparison_match.groups()
@@ -1584,7 +1592,7 @@ class GridLangControlFlow:
                 left_expr.strip(), scope, line_number)
             right_val = self.compiler.expr_evaluator.eval_expr(
                 right_expr.strip(), scope, line_number)
-            if operator in ('!=', '<>'):
+            if operator == '<>':
                 return True, left_val != right_val
             if operator == '<=':
                 return True, left_val <= right_val

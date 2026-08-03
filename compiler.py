@@ -114,7 +114,7 @@ class GridLangCompiler:
 
     def _resolve_type_inheritance(self):
         """Merge inherited fields and constraints into child type definitions."""
-        primitives = {'number', 'text', 'array', 'bool'}
+        primitives = {'number', 'text', 'logical'}
         progress = True
         while progress:
             progress = False
@@ -1473,7 +1473,7 @@ class GridLangCompiler:
         tokens = re.findall(r'[A-Za-z_][A-Za-z0-9_]*', cleaned)
         filtered = set()
         keyword_exclusions = {
-            'to', 'and', 'or', 'not', 'then', 'do', 'step', 'by', 'in', 'new'
+            'to', 'and', 'or', 'not', 'then', 'do', 'step', 'by', 'in', 'new', 'with'
         }
         for tok in tokens:
             if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', tok, re.I):

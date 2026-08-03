@@ -1281,7 +1281,7 @@ class ArrayHandler:
         if isinstance(value, (int, float)):
             return 'number' if isinstance(value, float) else 'int'
         if isinstance(value, bool):
-            return 'bool'
+            return 'logical'
         if isinstance(value, str):
             return 'text'
         if isinstance(value, dict):

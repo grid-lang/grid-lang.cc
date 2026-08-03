@@ -19,8 +19,23 @@ DEPENDENCY_IGNORED_TOKENS = {
     'textsplit', 'print', 'push', 'true', 'false', 'none', 'nan', 'inf', 'and', 'or', 'not',
     'if', 'then', 'else', 'elseif', 'end', 'do', 'for', 'while', 'when', 'step', 'return',
     'index', 'as', 'dim', 'with', 'grid', 'output', 'input', 'number', 'text',
-    'array', 'mod', 'div', 'to', 'by', 'e', 'new', 'in', 'counta', 'rows'
+    'array', 'mod', 'div', 'to', 'by', 'e', 'new', 'in', 'counta', 'rows', 'of', 'null'
 }
+
+
+def _strip_constraint_operands(expr):
+    """Remove constraint clauses (' of <unit>', ' as <type>', ' dim <n>',
+    ' not null') so dependency extraction doesn't treat unit/type names as
+    variable references."""
+    if not expr:
+        return expr
+    cleaned = STRING_LITERAL_PATTERN.sub(' ', str(expr))
+    cleaned = re.sub(r'\b(?:of|as)\s+[A-Za-z_][A-Za-z0-9_]*', ' ', cleaned)
+    cleaned = re.sub(
+        r'\bdim\s+(?:\d+(?:\.\d*)?|nan|inf|[A-Za-z_][A-Za-z0-9_]*)',
+        ' ', cleaned, flags=re.I)
+    cleaned = re.sub(r'\bnot\s+null\b', ' ', cleaned, flags=re.I)
+    return cleaned
 
 
 def _is_numeric_token(token: str) -> bool:
@@ -106,7 +121,7 @@ class GridLangExecutor:
         """Return identifiers referenced in an expression string."""
         if not expr:
             return set()
-        cleaned = STRING_LITERAL_PATTERN.sub(' ', expr)
+        cleaned = _strip_constraint_operands(expr)
         tokens = IDENTIFIER_TOKEN_PATTERN.findall(cleaned)
         dependencies = set()
         for token in tokens:
@@ -3623,7 +3638,7 @@ class GridLangExecutor:
                         r'\b[\w_]+\b', clean_ph))
             if rhs_vars is None:
                 rhs_vars = set(re.findall(
-                    r'\b[\w_]+\b(?=\s*(?:[\[\{]|!\w+\s*\(|(?:\.\w+)?\s*$))', rhs))
+                    r'\b[\w_]+\b(?=\s*(?:[\[\{]|!\w+\s*\(|(?:\.\w+)?\s*$))', _strip_constraint_operands(rhs)))
             field_pairs = re.findall(r'\b([\w_]+)\.\s*([\w_]+)', rhs)
             if field_pairs:
                 base_fields = {base for base, _ in field_pairs}
