@@ -7,7 +7,7 @@ import re
 import copy
 import pyarrow as pa
 # Utilities for cell and column operations
-from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, prod, public_type_fields, object_public_keys, public_object_view
+from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, prod, public_type_fields, object_public_keys, public_object_view, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT
 from functools import reduce
 import operator
 from scope import GridLiveView
@@ -63,8 +63,15 @@ class ArrayHandler:
             raise TypeError(
                 f"Variable '{var_name}' is not an array at line {line_number}")
 
+        # Extended (N-D) addresses resolve directly to array indices.
+        if '.' in cell_ref:
+            indices = parse_address(cell_ref)
+            return self.get_array_element(
+                arr, [i - 1 for i in indices], line_number,
+                original_shape=nd_shape)
+
         # Validate and parse cell reference
-        validate_cell_ref(cell_ref)
+        parse_address(cell_ref)
         col, _ = split_cell(cell_ref)
         col_num = col_to_num(col)  # 1-based column number (A=1, B=2, etc.)
 
@@ -315,7 +322,7 @@ class ArrayHandler:
                 raise SyntaxError(f"Empty target '[]' at line {line_number}")
             if re.match(r'^[A-Za-z]+\d+$', inside):
                 try:
-                    validate_cell_ref(inside)
+                    parse_address(inside)
                     target = inside
                 except ValueError as e:
                     raise SyntaxError(
@@ -325,12 +332,18 @@ class ArrayHandler:
                 if not target:
                     raise SyntaxError(
                         f"Invalid array target '[^]' at line {line_number}")
-                try:
-                    validate_cell_ref(target)
+                if is_address(target):
                     is_harr = True
-                except ValueError as e:
-                    raise SyntaxError(
-                        f"Invalid array reference '{inside}': {e} at line {line_number}")
+                else:
+                    try:
+                        validate_cell_ref(target)
+                        is_harr = True
+                    except ValueError as e:
+                        raise SyntaxError(
+                            f"Invalid array reference '{inside}': {e} at line {line_number}")
+            elif is_address(inside):
+                # Extended (dotted) single-cell target, e.g. [A1.B1].
+                target = inside
             else:
                 resolved = self.compiler.expr_evaluator._resolve_column_interpolated_cell(
                     inside, scope, line_number)
@@ -338,12 +351,12 @@ class ArrayHandler:
                     target = resolved
                 elif ':' in inside:
                     rm = re.match(
-                        r'^([A-Za-z]+\d+)\s*:\s*([A-Za-z]+\d+)$', inside)
+                        rf'^({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})$', inside)
                     if rm:
                         sr, er = rm.groups()
                         try:
-                            validate_cell_ref(sr)
-                            validate_cell_ref(er)
+                            parse_address(sr)
+                            parse_address(er)
                             is_range = True
                         except ValueError as e:
                             raise SyntaxError(
@@ -353,11 +366,11 @@ class ArrayHandler:
                             final_inside = self.compiler.expr_evaluator._process_interpolation(
                                 f'$"{inside}"', scope, line_number)
                             rm = re.match(
-                                r'^([A-Za-z]+\d+)\s*:\s*([A-Za-z]+\d+)$', final_inside)
+                                rf'^({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})$', final_inside)
                             if rm:
                                 sr, er = rm.groups()
-                                validate_cell_ref(sr)
-                                validate_cell_ref(er)
+                                parse_address(sr)
+                                parse_address(er)
                                 is_range = True
                             else:
                                 raise SyntaxError(
@@ -370,12 +383,17 @@ class ArrayHandler:
                         final_inside = self.compiler.expr_evaluator._process_interpolation(
                             f'$"{inside}"', scope, line_number)
                         if re.match(r'^[A-Za-z]+\d+$', final_inside):
-                            validate_cell_ref(final_inside)
+                            parse_address(final_inside)
+                            target = final_inside
+                        elif is_address(final_inside):
                             target = final_inside
                         elif final_inside.startswith('^'):
                             target = final_inside[1:].strip()
-                            validate_cell_ref(target)
-                            is_harr = True
+                            if is_address(target):
+                                is_harr = True
+                            else:
+                                validate_cell_ref(target)
+                                is_harr = True
                         else:
                             raise SyntaxError(
                                 f"Interpolated target '{final_inside}' is invalid at line {line_number}")
@@ -994,6 +1012,15 @@ class ArrayHandler:
         :param is_array_of_two_field_objects: Flag for special reshaping.
         :param line_number: Line number.
         """
+        if isinstance(target, str) and '.' in target:
+            try:
+                indices = parse_address(target)
+            except ValueError:
+                indices = None
+            if indices is not None:
+                self._assign_extended_address(
+                    target, value, line_number)
+                return
         if isinstance(value, GridLiveView):
             # Spill a grid's cells (keyed by absolute cell references) into
             # the current grid.
@@ -1097,6 +1124,28 @@ class ArrayHandler:
         else:
             self.compiler.grid[target] = value
 
+    def _assign_extended_address(self, target, value, line_number=None):
+        """Write to an extended (N-D) address.
+
+        A matching grid DIM tensor receives the value at the addressed flat
+        position; otherwise the value is stored under the dotted key in the
+        current grid. Arrays spill along the last dimension of the address.
+        """
+        indices = parse_address(target)
+        if self._write_extended_tensor(indices, value, line_number):
+            return
+        if (isinstance(value, (list, pa.Array, pa.ListArray))
+                or (isinstance(value, dict) and 'array' in value)):
+            flat = self.flatten_array(value, line_number)
+        else:
+            flat = [value]
+        base = list(indices)
+        for i, val in enumerate(flat):
+            addr_indices = list(base)
+            addr_indices[-1] = base[-1] + i
+            self.compiler.grid[indices_to_address(
+                addr_indices)] = self.to_display_value(val)
+
     def assign_range(self, sr_ref, er_ref, vals, line_number=None):
         """
         Assign values to a range of cells (e.g., A1:B2 := {1,2;3,4}).
@@ -1106,6 +1155,9 @@ class ArrayHandler:
         :param vals: Values to assign (scalar, list, array).
         :param line_number: Line number.
         """
+        if '.' in sr_ref or '.' in er_ref:
+            self._assign_extended_range(sr_ref, er_ref, vals, line_number)
+            return
         scs, sro = split_cell(sr_ref)
         ecs, ero = split_cell(er_ref)
         sc, ec = col_to_num(scs), col_to_num(ecs)
@@ -1188,6 +1240,38 @@ class ArrayHandler:
                     value = flat_vals[0]
                     self.compiler.grid[cell] = value
 
+    def _assign_extended_range(self, sr_ref, er_ref, vals, line_number=None):
+        """Assign values to an extended (N-D) range.
+
+        The hyper-rectangle between the two addresses is filled in column-major
+        order (first index fastest). Scalars fill every cell; arrays repeat and
+        cycle over the flat buffer.
+        """
+        s_idx = parse_address(sr_ref)
+        e_idx = parse_address(er_ref)
+        if len(s_idx) != len(e_idx):
+            raise ValueError(
+                f"Range addresses '{sr_ref}' and '{er_ref}' must have the same rank at line {line_number}")
+        starts = [min(a, b) for a, b in zip(s_idx, e_idx)]
+        shape = [abs(a - b) + 1 for a, b in zip(s_idx, e_idx)]
+        is_array = isinstance(
+            vals, (list, pa.Array, pa.ListArray)) or (
+            isinstance(vals, dict) and 'array' in vals)
+        flat_vals = self.flatten_array(
+            vals, line_number) if is_array else [vals]
+        if not flat_vals:
+            return
+        for flat_i in range(prod(shape)):
+            rem = flat_i
+            idxs = []
+            for dim_size in shape:
+                idxs.append(rem % dim_size)
+                rem //= dim_size
+            addr = indices_to_address(
+                [starts[i] + idxs[i] for i in range(len(shape))])
+            self.compiler.grid[addr] = self.to_display_value(
+                flat_vals[flat_i % len(flat_vals)])
+
     def get_range_values(self, s_cell, e_cell, line_number=None):
         """
         Retrieve values from a grid range (e.g., A1:B2).
@@ -1221,6 +1305,33 @@ class ArrayHandler:
                 values.append(row_values)
         return values
 
+    def get_range_values_address(self, s_cell, e_cell, line_number=None):
+        """
+        Retrieve values from an extended (N-D) cell range.
+
+        The full hyper-rectangle between the two addresses is enumerated in
+        column-major order (first index fastest) and returned as nested lists
+        in declared-dim order. Both endpoints must have the same rank.
+        """
+        s_idx = parse_address(s_cell)
+        e_idx = parse_address(e_cell)
+        if len(s_idx) != len(e_idx):
+            raise ValueError(
+                f"Range addresses '{s_cell}' and '{e_cell}' must have the same rank at line {line_number}")
+        starts = [min(a, b) for a, b in zip(s_idx, e_idx)]
+        shape = [abs(a - b) + 1 for a, b in zip(s_idx, e_idx)]
+        flat_values = []
+        for flat_i in range(prod(shape)):
+            rem = flat_i
+            idxs = []
+            for dim_size in shape:
+                idxs.append(rem % dim_size)
+                rem //= dim_size
+            addr = indices_to_address(
+                [starts[i] + idxs[i] for i in range(len(shape))])
+            flat_values.append(self.lookup_cell(addr, line_number))
+        return self._nested_from_flat(flat_values, shape)
+
     def lookup_cell(self, cell_ref, line_number=None):
         """
         Lookup value in a grid cell, default to 0 if unset.
@@ -1231,9 +1342,85 @@ class ArrayHandler:
         # Case-insensitive lookup
         cell_ref_upper = cell_ref.upper()
         for key, value in self.compiler.grid.items():
-            if key.upper() == cell_ref_upper:
+            if isinstance(key, str) and key.upper() == cell_ref_upper:
+                return value
+        if '.' in cell_ref:
+            # Extended addresses fall back to any matching grid DIM tensor.
+            value = self._lookup_extended_address(cell_ref, line_number)
+            if value is not None:
                 return value
         return 0
+
+    def _iter_scopes(self):
+        scope = self.compiler.current_scope()
+        seen = set()
+        while scope is not None:
+            if id(scope) in seen:
+                break
+            seen.add(id(scope))
+            yield scope
+            scope = getattr(scope, 'parent', None)
+
+    def _iter_tensor_grid_vars(self):
+        """Yield grid DIM tensor stores (dicts with a 'grid' + shape)."""
+        seen = set()
+        for scope in self._iter_scopes():
+            for val in list(getattr(scope, 'variables', {}).values()):
+                if id(val) in seen:
+                    continue
+                seen.add(id(val))
+                if (isinstance(val, dict) and 'grid' in val
+                        and ('original_shape' in val or 'shape' in val)):
+                    yield val
+
+    def _tensor_index_for_indices(self, tensor, indices):
+        shape = list(tensor.get('original_shape') or tensor.get('shape') or [])
+        if len(shape) != len(indices):
+            return None, None
+        if not all(1 <= indices[i] <= shape[i] for i in range(len(shape))):
+            return None, None
+        flat_idx = 0
+        stride = 1
+        for i in range(len(indices)):
+            flat_idx += (indices[i] - 1) * stride
+            stride *= shape[i]
+        return flat_idx, shape
+
+    def _lookup_extended_address(self, cell_ref, line_number=None):
+        """Resolve a dotted address against grid DIM tensor stores."""
+        try:
+            indices = parse_address(cell_ref)
+        except ValueError:
+            return None
+        for tensor in self._iter_tensor_grid_vars():
+            flat_idx, shape = self._tensor_index_for_indices(tensor, indices)
+            if flat_idx is None:
+                continue
+            arr = tensor.get('grid')
+            if isinstance(arr, pa.Array):
+                flat = arr.flatten().to_pylist() if isinstance(
+                    arr, pa.ListArray) else arr.to_pylist()
+                if 0 <= flat_idx < len(flat):
+                    return flat[flat_idx]
+        return None
+
+    def _write_extended_tensor(self, indices, value, line_number=None):
+        """Write value into a matching grid DIM tensor's flat buffer."""
+        for tensor in self._iter_tensor_grid_vars():
+            flat_idx, shape = self._tensor_index_for_indices(tensor, indices)
+            if flat_idx is None:
+                continue
+            arr = tensor.get('grid')
+            if not isinstance(arr, pa.Array):
+                continue
+            flat = arr.flatten().to_pylist() if isinstance(
+                arr, pa.ListArray) else arr.to_pylist()
+            if not (0 <= flat_idx < len(flat)):
+                continue
+            flat[flat_idx] = value
+            tensor['grid'] = pa.array(flat)
+            return True
+        return False
 
     def flatten_object_fields(self, obj, line_number=None):
         """
@@ -1426,9 +1613,14 @@ class ArrayHandler:
         elif isinstance(arr, list):
             if not arr:
                 return [0]
-            if isinstance(arr[0], list):
-                return [len(arr), len(arr[0])]
-            return [len(arr)]
+            shape = []
+            node = arr
+            while isinstance(node, list) and node:
+                shape.append(len(node))
+                node = node[0]
+            if isinstance(node, list) and not node and shape:
+                shape.append(0)
+            return shape
         else:
             return [1]
 

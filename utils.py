@@ -43,9 +43,18 @@ def split_var_defs(s):
 
 
 def validate_cell_ref(cell_ref):
-    # Convert to uppercase for validation
-    cell_ref_upper = cell_ref.upper()
-    if not re.match(r'^[A-Z]+\d+$', cell_ref_upper):
+    """Validate a single 2D cell reference (e.g. 'A1').
+
+    Delegates to parse_address (the canonical address parser) and rejects
+    dotted N-D addresses and bare-number segments.
+    """
+    if not isinstance(cell_ref, str) or '.' in cell_ref:
+        raise ValueError(f"Invalid cell reference: '{cell_ref}'")
+    try:
+        indices = parse_address(cell_ref)
+    except ValueError:
+        raise ValueError(f"Invalid cell reference: '{cell_ref}'")
+    if len(indices) != 2:
         raise ValueError(f"Invalid cell reference: '{cell_ref}'")
 
 
@@ -83,6 +92,61 @@ def offset_cell(cell_ref, col_offset, row_offset):
     if new_row < 1:
         raise ValueError("Row offset results in invalid row")
     return f"{num_to_col(new_col_num)}{new_row}"
+
+
+# An N-D address is a dot-separated sequence of segments. Each segment is
+# either a 2D cell (letters+digits, contributing a (row, col) pair) or a bare
+# integer (contributing a single index). For example 'A3.B4.8' -> [3, 1, 4, 2, 8].
+_ADDRESS_FRAGMENT = r'[A-Za-z]+\d+(?:\.[A-Za-z]+\d+|\.[0-9]+)*'
+_ADDRESS_PATTERN = re.compile(r'^' + _ADDRESS_FRAGMENT + r'$')
+
+
+def is_address(value):
+    """Return True if value is a cell address, possibly dotted for N-D use."""
+    if not isinstance(value, str) or not value:
+        return False
+    return bool(_ADDRESS_PATTERN.match(value))
+
+
+def parse_address(address):
+    """Parse an N-D cell address into 1-based indices.
+
+    'A3' -> [3, 1]; 'A3.B4.8' -> [3, 1, 4, 2, 8].
+    Raises ValueError for malformed addresses.
+    """
+    if not isinstance(address, str) or not address:
+        raise ValueError(f"Invalid address: '{address}'")
+    indices = []
+    for part in address.split('.'):
+        if re.match(r'^[A-Za-z]+\d+$', part):
+            col, row = split_cell(part)
+            indices.append(int(row))
+            indices.append(col_to_num(col))
+        elif re.match(r'^\d+$', part):
+            indices.append(int(part))
+        else:
+            raise ValueError(f"Invalid address segment: '{part}'")
+    if not indices:
+        raise ValueError(f"Invalid address: '{address}'")
+    return indices
+
+
+def indices_to_address(indices):
+    """Build the canonical dotted address for segment-encoded 1-based indices.
+
+    Inverse of parse_address: index pairs (row, col) become letter+digits
+    segments and a trailing lone index becomes a bare number.
+    """
+    parts = []
+    i = 0
+    while i < len(indices):
+        if i + 1 < len(indices):
+            parts.append(f"{num_to_col(indices[i + 1])}{indices[i]}")
+            i += 2
+        else:
+            parts.append(str(indices[i]))
+            i += 1
+    return '.'.join(parts)
 
 
 def prod(iterable):

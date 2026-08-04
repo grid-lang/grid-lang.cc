@@ -9,7 +9,7 @@ from array_handler import ArrayHandler
 from control_flow import GridLangControlFlow
 from parser import GridLangParser
 from scope import GridLiveView
-from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, public_type_fields, object_public_keys, format_display_value, split_var_defs
+from utils import col_to_num, num_to_col, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address
 
 
 IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*')
@@ -36,6 +36,23 @@ def _strip_constraint_operands(expr):
         ' ', cleaned, flags=re.I)
     cleaned = re.sub(r'\bnot\s+null\b', ' ', cleaned, flags=re.I)
     return cleaned
+
+
+def _strip_cell_address_tokens(line, var_set):
+    """Remove cell-address segment tokens (A1, B4, ...) from a variable-token
+    set so dotted addresses like [A1.B1] or ranges [A1.B1:A2.B2] are not
+    misread as field accesses on variables named A1/A2."""
+    if not var_set:
+        return var_set
+    stripped = set()
+    for group in re.findall(r'\[([^\[\]]*)\]', line):
+        for piece in group.split(':'):
+            piece = piece.strip().lstrip('^')
+            if is_address(piece):
+                for seg in piece.split('.'):
+                    if re.match(r'^[A-Za-z]+\d+$', seg):
+                        stripped.add(seg)
+    return var_set - stripped
 
 
 def _is_numeric_token(token: str) -> bool:
@@ -3698,6 +3715,8 @@ class GridLangExecutor:
                     v for v in target_vars if v not in set(col_interp_base_cols)}
             rhs_vars = _filter_var_tokens(rhs_vars)
             target_vars = _filter_var_tokens(target_vars)
+            rhs_vars = _strip_cell_address_tokens(line, rhs_vars)
+            target_vars = _strip_cell_address_tokens(line, target_vars)
             if hasattr(self, 'compiler') and getattr(self.compiler, 'types_defined', None):
                 type_keys = set(self.compiler.types_defined.keys())
                 rhs_vars = {v for v in rhs_vars if v.lower()
@@ -3798,7 +3817,7 @@ class GridLangExecutor:
         try:
             if cell_ref.startswith('^'):
                 array_cell_ref = cell_ref[1:].strip()
-                validate_cell_ref(array_cell_ref)
+                parse_address(array_cell_ref)
                 scope_value = self.current_scope().get_evaluation_scope()
                 is_grid_value = '.grid{' in value
                 evaluated_value = self.expr_evaluator.eval_or_eval_array(
@@ -3845,7 +3864,7 @@ class GridLangExecutor:
                     self.array_handler._assign_horizontal_array(
                         array_cell_ref, evaluated_value, value, line_number=line_number)
             else:
-                validate_cell_ref(cell_ref)
+                parse_address(cell_ref)
                 scope_value = self.current_scope().get_evaluation_scope()
                 is_grid_value = '.grid{' in value
                 evaluated_value = self.expr_evaluator.eval_or_eval_array(

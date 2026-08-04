@@ -8,14 +8,15 @@ import math
 import random
 import pyarrow as pa
 from utils import (
-    validate_cell_ref,
     col_to_num,
     num_to_col,
     object_public_keys,
+    parse_address,
     get_case_insensitive_key,
+    is_address,
+    _ADDRESS_FRAGMENT,
 )
 from scope import GridLiveView
-
 
 
 class CaseInsensitiveDict(dict):
@@ -119,14 +120,29 @@ class ExpressionEvaluator:
                 result = sorted(list(result))
             return result
 
-        # Handle cell ranges (e.g., [A1:B2])
+        # Handle cell ranges (e.g., [A1:B2] or [A1.B1:A2.B2])
         range_match = re.match(
-            r'^\s*\[\s*([A-Z]+\d+)\s*:\s*([A-Z]+\d+)\s*\]\s*$', expr)
+            rf'^\s*\[\s*({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})\s*\]\s*$', expr)
         if range_match and not is_grid_dim:
             s_ref, e_ref = range_match.groups()
+            if '.' in s_ref or '.' in e_ref:
+                try:
+                    values = self.compiler.array_handler.get_range_values_address(
+                        s_ref, e_ref, line_number)
+                    flat_values = self.compiler.array_handler.flatten_array(
+                        values, line_number)
+                    if hasattr(self.compiler, 'last_dim_var') and self.compiler.last_dim_var:
+                        var_name = self.compiler.last_dim_var
+                        self.compiler.current_scope().update(
+                            var_name, flat_values)
+                        self.compiler.last_dim_var = None
+                    return pa.array(flat_values, type=pa.float64())
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Error evaluating range '{s_ref}:{e_ref}': {e} at line {line_number}")
             try:
-                validate_cell_ref(s_ref)
-                validate_cell_ref(e_ref)
+                parse_address(s_ref)
+                parse_address(e_ref)
                 values = self.compiler.array_handler.get_range_values(
                     s_ref, e_ref, line_number)
                 flat_values = [v for row in values for v in (
@@ -148,7 +164,7 @@ class ExpressionEvaluator:
         if expr.lower().startswith('sum([') and expr.endswith('])') and not is_grid_dim:
             inner_expr = expr[4:-2].strip()
             m = re.match(
-                r'^\[?([A-Z]+\d+)\s*:\s*([A-Z]+\d+)\]?$', inner_expr, re.I)
+                rf'^\[?({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})\]?$', inner_expr, re.I)
             if m:
                 start_ref, end_ref = m.groups()
                 return self._evaluate_sum_range(f"sum[{start_ref}:{end_ref}]", scope, line_number)
@@ -335,18 +351,24 @@ class ExpressionEvaluator:
         :param line_number: Line number.
         :return: Sum of numeric values in range.
         """
-        m = re.match(r'^sum\[([A-Z]+\d+)\s*:\s*([A-Z]+\d+)\]$', expr, re.I)
+        m = re.match(rf'^sum\[({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})\]$', expr, re.I)
         if not m:
             raise SyntaxError(
                 f"Invalid sum range syntax: {expr} at line {line_number}")
         start_ref, end_ref = m.groups()
         try:
-            validate_cell_ref(start_ref)
-            validate_cell_ref(end_ref)
-            values = self.compiler.array_handler.get_range_values(
-                start_ref, end_ref, line_number)
-            flat_values = [v for row in values for v in (
-                row if isinstance(row, list) else [row])]
+            if '.' in start_ref or '.' in end_ref:
+                values = self.compiler.array_handler.get_range_values_address(
+                    start_ref, end_ref, line_number)
+                flat_values = self.compiler.array_handler.flatten_array(
+                    values, line_number)
+            else:
+                parse_address(start_ref)
+                parse_address(end_ref)
+                values = self.compiler.array_handler.get_range_values(
+                    start_ref, end_ref, line_number)
+                flat_values = [v for row in values for v in (
+                    row if isinstance(row, list) else [row])]
             numeric_values = [
                 float(v) for v in flat_values if isinstance(v, (int, float))]
             return sum(numeric_values)
@@ -606,7 +628,7 @@ class ExpressionEvaluator:
 
         col_num = col_to_num(base_col) + index_value - 1
         cell_ref = f"{num_to_col(col_num)}{row_value}"
-        validate_cell_ref(cell_ref)
+        parse_address(cell_ref)
         return cell_ref
 
     def _parse_indexed_member_call(self, expr):
@@ -1177,15 +1199,39 @@ class ExpressionEvaluator:
         cell_ref = expr[1:-1].strip()
         if cell_ref.startswith('^'):
             cell_ref = cell_ref[1:].strip()
-        if not re.match(r'^[A-Za-z]+\d+$', cell_ref):
+        if not is_address(cell_ref):
             return False, None
         try:
-            validate_cell_ref(cell_ref)
             value = self.compiler.array_handler.lookup_cell(cell_ref, line_number)
             return True, value
         except ValueError as e:
             raise RuntimeError(
                 f"Invalid cell reference '{cell_ref}': {e} at line {line_number}")
+
+    def _try_eval_address_indexed_access(self, expr, scope, line_number):
+        """Evaluate v![A3.B4.8] (and v![A1]) as array element access via a cell
+        address. Non-bang v[...] falls through to the python-fallback guard,
+        which raises a syntax error for arrays; bracket calls are allowed for
+        functions (e.g. sum[...], handled before this fallback).
+        """
+        m = re.match(r'^([\w_]+)!\[([^\]]+)\]$', expr)
+        if not m:
+            return False, None
+        var_name, index_expr = m.groups()
+        if not is_address(index_expr):
+            return False, None
+        try:
+            self.compiler.current_scope().get(var_name)
+        except NameError:
+            return False, None
+        try:
+            return True, self.compiler.array_handler.resolve_cell_index(
+                var_name, index_expr, line_number)
+        except (NameError, TypeError):
+            return False, None
+        except (IndexError, ValueError) as e:
+            raise IndexError(
+                f"Invalid index '{index_expr}' for '{var_name}': {e} at line {line_number}")
 
     def _try_eval_indexed_member_call(self, expr, scope, line_number, depth):
         parsed_member = self._parse_indexed_member_call(expr)
@@ -1285,7 +1331,7 @@ class ExpressionEvaluator:
                         f"Invalid cell reference index '{index_value}' must be a positive integer at line {line_number}")
 
                 cell_ref = f"{col}{index_value}"
-                validate_cell_ref(cell_ref)
+                parse_address(cell_ref)
                 value = self.compiler.array_handler.lookup_cell(
                     cell_ref, line_number)
                 if isinstance(value, (int, float)):
@@ -1832,12 +1878,17 @@ class ExpressionEvaluator:
 
         # Handle ranges in expressions
         range_match = re.match(
-            r'^\s*\[\s*([A-Z]+\d+)\s*:\s*([A-Z]+\d+)\s*\]\s*$', expr)
+            rf'^\s*\[\s*({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})\s*\]\s*$', expr)
         if range_match:
             s_ref, e_ref = range_match.groups()
             try:
-                validate_cell_ref(s_ref)
-                validate_cell_ref(e_ref)
+                if '.' in s_ref or '.' in e_ref:
+                    # Extended (N-D) range: return the nested block.
+                    values = self.compiler.array_handler.get_range_values_address(
+                        s_ref, e_ref, line_number)
+                    return values
+                parse_address(s_ref)
+                parse_address(e_ref)
                 values = self.compiler.array_handler.get_range_values(
                     s_ref, e_ref, line_number)
                 flat_values = [v for row in values for v in (
@@ -1863,7 +1914,7 @@ class ExpressionEvaluator:
         if expr.lower().startswith('sum([') and expr.endswith('])'):
             inner_expr = expr[4:-2].strip()
             m = re.match(
-                r'^\[?([A-Z]+\d+)\s*:\s*([A-Z]+\d+)\]?$', inner_expr, re.I)
+                rf'^\[?({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})\]?$', inner_expr, re.I)
             if m:
                 start_ref, end_ref = m.groups()
                 return self._evaluate_sum_range(f"sum[{start_ref}:{end_ref}]", scope, line_number)
@@ -1905,7 +1956,7 @@ class ExpressionEvaluator:
             index_expr = bang_index or paren_index
             if var_name in scope or var_name in self.compiler.variables:
                 try:
-                    if bang_index and (re.match(r'^[A-Za-z]+\d+$', index_expr)
+                    if bang_index and (is_address(index_expr)
                                        or var_name.lower() == 'grid'):
                         return self.compiler.array_handler.resolve_cell_index(
                             var_name, index_expr, line_number)
@@ -1956,6 +2007,11 @@ class ExpressionEvaluator:
             expr, line_number)
         if handled:
             return cell_result
+
+        handled, address_result = self._try_eval_address_indexed_access(
+            expr, scope, line_number)
+        if handled:
+            return address_result
 
         return self._evaluate_with_python_fallback(expr, scope, line_number)
 
@@ -2180,11 +2236,12 @@ class ExpressionEvaluator:
         return {**scope, **cell_vars}
 
     def _replace_fallback_cell_refs(self, eval_expr, line_number):
-        cell_ref_pattern = re.compile(r'\[\^?([A-Za-z]+\d+)\]')
+        # Skip cell refs directly inside bracket indexing (v[A1.1]); the
+        # python-fallback guard reports those as missing '!' for arrays.
+        cell_ref_pattern = re.compile(rf'(?<![\w_])\[\^?({_ADDRESS_FRAGMENT})\]')
         cell_refs = cell_ref_pattern.findall(eval_expr)
         for cell_ref in cell_refs:
             try:
-                validate_cell_ref(cell_ref)
                 value = self.compiler.array_handler.lookup_cell(
                     cell_ref, line_number)
                 if isinstance(value, (int, float)):

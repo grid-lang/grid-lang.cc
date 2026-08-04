@@ -7,7 +7,7 @@ import copy
 import pyarrow as pa
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
-from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders
+from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT
 from scope import Scope, GridLiveView, _ListenerGrid
 from control_flow import GridLangControlFlow
 from type_processor import GridLangTypeProcessor
@@ -1527,12 +1527,35 @@ class GridLangCompiler:
 
     def _extract_cell_refs(self, expr):
         cell_refs = set()
-        single_matches = re.finditer(r'\[([A-Za-z]+\d+)\]', expr)
+        single_matches = re.finditer(rf'\[({_ADDRESS_FRAGMENT})\]', expr)
         for match in single_matches:
             cell_refs.add(match.group(1))
-        range_matches = re.finditer(r'\[([A-Za-z]+\d+):([A-Za-z]+\d+)\]', expr)
+        range_matches = re.finditer(rf'\[({_ADDRESS_FRAGMENT}):({_ADDRESS_FRAGMENT})\]', expr)
         for match in range_matches:
             start, end = match.group(1), match.group(2)
+            if '.' in start or '.' in end:
+                # Extended (N-D) range: register every enumerated cell.
+                try:
+                    s_idx = parse_address(start)
+                    e_idx = parse_address(end)
+                except ValueError:
+                    continue
+                if len(s_idx) != len(e_idx):
+                    continue
+                starts = [min(a, b) for a, b in zip(s_idx, e_idx)]
+                shape = [abs(a - b) + 1 for a, b in zip(s_idx, e_idx)]
+                total = 1
+                for dim in shape:
+                    total *= dim
+                for flat_i in range(total):
+                    rem = flat_i
+                    idxs = []
+                    for dim_size in shape:
+                        idxs.append(rem % dim_size)
+                        rem //= dim_size
+                    cell_refs.add(indices_to_address(
+                        [starts[i] + idxs[i] for i in range(len(shape))]))
+                continue
             start_col, start_row = split_cell(start)
             end_col, end_row = split_cell(end)
             start_col_num = col_to_num(start_col)
@@ -2573,7 +2596,7 @@ class GridLangCompiler:
         caret_flag, cell_ref, rhs = m.groups()
         cell_ref = cell_ref.upper()
         rhs = rhs.strip()
-        validate_cell_ref(cell_ref)
+        parse_address(cell_ref)
 
         # If this is an assignment, let the assignment handler manage it.
         var_def, expr = self._split_assignment_expr(rhs)
