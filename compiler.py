@@ -7,7 +7,7 @@ import copy
 import pyarrow as pa
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
-from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value
+from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders
 from scope import Scope, GridLiveView, _ListenerGrid
 from control_flow import GridLangControlFlow
 from type_processor import GridLangTypeProcessor
@@ -1548,8 +1548,11 @@ class GridLangCompiler:
             row, col = int(match.group(1)), int(match.group(2))
             cell_refs.add(f"{num_to_col(col)}{row}")
         if '$"' in expr:
-            placeholders = re.findall(r'\{\s*([^}]*?)\s*\}', expr)
-            for ph in placeholders:
+            # Only scan placeholders inside interpolated strings ($"...{...}").
+            # Naively scanning all '{...}' groups would also match array literal
+            # braces and quoted text values that look like cell refs (e.g. a text
+            # array like {"q6", "x7"}).
+            for ph in iter_interpolation_placeholders(expr):
                 cell_refs.update(re.findall(r'\b[A-Za-z]+\d+\b', ph))
         return cell_refs
 

@@ -8,7 +8,7 @@ import re
 
 import pyarrow as pa
 
-from utils import num_to_col, split_cell, col_to_num
+from utils import num_to_col, split_cell, col_to_num, iter_interpolation_placeholders
 
 # Stack of compiler run contexts: ``run()`` pushes the executing compiler and
 # pops it on exit. Used to detect writes that originate from a read-only
@@ -531,14 +531,18 @@ class Scope:
         # Simple dependency check - look for the variable name in the expression
         # This is a basic implementation; could be enhanced with proper parsing
         import re
-        expr_text = expr
-        if isinstance(expr, str) and ('$"' in expr or "$'" in expr):
-            # Keep only interpolation segments for dependency detection.
-            brace_parts = re.findall(r'\{([^{}]*)\}', expr)
-            expr_text = ' '.join(brace_parts)
-        else:
-            # Strip quoted strings to avoid false positives from literals.
-            expr_text = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', ' ', expr)
+        expr_text = expr if isinstance(expr, str) else str(expr)
+        extra = []
+        if '$"' in expr_text or "$'" in expr_text:
+            # Placeholders inside interpolated strings ($"...{expr}...") are
+            # real dependencies, so collect them from the interpolation spans.
+            extra = list(iter_interpolation_placeholders(expr_text))
+        # Strip quoted strings to avoid false positives from literals (e.g. a
+        # text array like {"b", "c"} must not be treated as a dependency on b).
+        expr_text = re.sub(
+            r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', ' ', expr_text)
+        if extra:
+            expr_text += ' ' + ' '.join(extra)
         # Create a pattern that matches the variable name as a whole word
         pattern = r'\b' + re.escape(var_name) + r'\b'
         return bool(re.search(pattern, expr_text))

@@ -112,7 +112,7 @@ class ExpressionEvaluator:
                 return self.compiler.array_handler.reshape_array(value, new_dims, line_number)
 
         # Evaluate inline arrays
-        if expr.startswith('{') and expr.endswith('}') and not expr.startswith('{$"') and not is_grid_dim:
+        if expr.startswith('{') and expr.endswith('}') and not is_grid_dim:
             result = self._evaluate_array(expr, scope, line_number)
             # Ensure array literals are returned as lists, not sets
             if isinstance(result, set):

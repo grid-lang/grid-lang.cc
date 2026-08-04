@@ -3,6 +3,36 @@ import re
 _DEFINITION_AND_SPLIT = re.compile(r'\s+and\s+(?![<>=]|not\b)', re.I)
 
 
+def iter_interpolation_placeholders(text):
+    """Yield the contents of {placeholder} groups inside interpolated strings.
+
+    Interpolated strings are delimited by $"..." (or $'...'); only braces
+    inside those spans are scanned. Array-literal braces and quoted text
+    values that merely look like identifiers are therefore ignored.
+    """
+    n = len(text)
+    scan = 0
+    while True:
+        i_dq = text.find('$"', scan)
+        i_sq = text.find("$'", scan)
+        if i_dq == -1 and i_sq == -1:
+            return
+        if i_sq == -1 or (i_dq != -1 and i_dq < i_sq):
+            start, marker = i_dq, '"'
+        else:
+            start, marker = i_sq, "'"
+        j = start + 2
+        while j < n:
+            if text[j] == marker and text[j - 1] != '\\':
+                break
+            j += 1
+        if j >= n:
+            return
+        for ph in re.findall(r'\{([^{}]*)\}', text[start + 2:j]):
+            yield ph
+        scan = j + 1
+
+
 def split_var_defs(s):
     """Split a variable-definition list on 'and' that separates definitions.
 
