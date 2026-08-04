@@ -471,15 +471,15 @@ class ExpressionEvaluator:
                             elem_str, full_scope, line_number)
                         if isinstance(evaluated, pa.Array):
                             row_elements.extend([float(v) if isinstance(
-                                v, (int, float)) else v for v in evaluated.to_pylist()])
+                                v, (int, float)) and not isinstance(v, bool) else v for v in evaluated.to_pylist()])
                         elif isinstance(evaluated, dict):
                             row_elements.append(evaluated)
                         elif isinstance(evaluated, list):
                             row_elements.extend([float(v) if isinstance(
-                                v, (int, float)) else v for v in evaluated])
+                                v, (int, float)) and not isinstance(v, bool) else v for v in evaluated])
                         else:
                             row_elements.append(float(evaluated) if isinstance(
-                                evaluated, (int, float)) else evaluated)
+                                evaluated, (int, float)) and not isinstance(evaluated, bool) else evaluated)
                     except Exception as e:
                         raise RuntimeError(
                             f"Error evaluating array element '{elem_str}': {e} at line {line_number}")
@@ -534,8 +534,10 @@ class ExpressionEvaluator:
                 array, line_number)
             flat = self.compiler.array_handler.flatten_array(
                 array, line_number)
+            flat = [float(v) if isinstance(v, (int, float))
+                    and not isinstance(v, bool) else v for v in flat]
             operand_shapes.append(shape)
-            operand_flats.append([float(v) for v in flat])
+            operand_flats.append(flat)
 
         base_shape = operand_shapes[0]
         if any(s != base_shape for s in operand_shapes[1:]):
@@ -564,9 +566,18 @@ class ExpressionEvaluator:
             result_flat.append(operand_flats[operand_idx][op_flat_idx])
 
         if len(result_shape) == 1:
-            return pa.array(result_flat, type=pa.float64())
-        return {'array': pa.array(result_flat, type=pa.float64()),
+            return pa.array(result_flat, type=self._infer_array_pa_type(result_flat))
+        pa_type = self._infer_array_pa_type(result_flat)
+        return {'array': pa.array(result_flat, type=pa_type),
                 'shape': list(result_shape), 'original_shape': list(result_shape)}
+
+    def _infer_array_pa_type(self, values):
+        """Pick a pyarrow type for a list of flat array values."""
+        if any(isinstance(v, str) for v in values):
+            return pa.string()
+        if any(isinstance(v, bool) for v in values):
+            return pa.bool_()
+        return pa.float64()
 
     def _resolve_column_interpolated_cell(self, inside, scope, line_number=None):
         m = re.match(
@@ -1355,6 +1366,8 @@ class ExpressionEvaluator:
         try:
             result = self.compiler.array_handler.get_array_element(
                 arr, adjusted_indices, line_number)
+            if isinstance(result, str):
+                return f'"{result}"'
             return str(result)
         except (IndexError, ValueError) as e:
             raise IndexError(
@@ -1797,6 +1810,8 @@ class ExpressionEvaluator:
                 f"Expression evaluation depth limit exceeded for '{expr}' at line {line_number}")
 
         expr = expr.strip()
+        if expr.lower() in ('true', 'false'):
+            return expr.lower() == 'true'
         if expr.startswith('?'):
             logical_expr = expr[1:].strip()
             if not logical_expr:
@@ -2529,6 +2544,8 @@ class ExpressionEvaluator:
         expr = re.sub(r'\bmod\b', '%', expr, flags=re.I)
         expr = expr.replace('\\', '//')
         expr = expr.replace('^', '**')
+        expr = re.sub(r'\btrue\b', 'True', expr, flags=re.I)
+        expr = re.sub(r'\bfalse\b', 'False', expr, flags=re.I)
         return expr
 
     def _get_eval_globals(self):
@@ -2616,11 +2633,12 @@ class ExpressionEvaluator:
             else:
                 shape = ah.get_array_shape(arr, None)
                 flat = ah.flatten_array(arr, None)
-            flat = [float(v) for v in flat]
+            flat = [float(v) if isinstance(v, (int, float))
+                    and not isinstance(v, bool) else v for v in flat]
             if len(shape) <= 1:
                 if isinstance(arr, dict) and 'array' in arr:
                     return arr
-                return pa.array(flat, type=pa.float64()) if flat else arr
+                return pa.array(flat, type=self._infer_array_pa_type(flat)) if flat else arr
             new_shape = [shape[1], shape[0]] + shape[2:]
             strides = []
             acc = 1
@@ -2638,7 +2656,7 @@ class ExpressionEvaluator:
                 old_idxs = [idxs[1], idxs[0]] + idxs[2:]
                 old_flat = sum(oi * st for oi, st in zip(old_idxs, strides))
                 new_flat.append(flat[old_flat])
-            return {'array': pa.array(new_flat, type=pa.float64()),
+            return {'array': pa.array(new_flat, type=self._infer_array_pa_type(new_flat)),
                     'shape': list(new_shape), 'original_shape': list(new_shape)}
 
         globals_dict = {

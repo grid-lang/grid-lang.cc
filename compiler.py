@@ -1505,7 +1505,8 @@ class GridLangCompiler:
         tokens = re.findall(r'[A-Za-z_][A-Za-z0-9_]*', cleaned)
         filtered = set()
         keyword_exclusions = {
-            'to', 'and', 'or', 'not', 'then', 'do', 'step', 'by', 'in', 'new', 'with'
+            'to', 'and', 'or', 'not', 'then', 'do', 'step', 'by', 'in', 'new', 'with',
+            'true', 'false'
         }
         for tok in tokens:
             if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', tok, re.I):
@@ -2407,7 +2408,8 @@ class GridLangCompiler:
                     potential_deps = re.findall(r'\b[\w_]+\b', expr_no_numbers)
                     built_in_functions = {
                         'sum', 'rows', 'sqrt', 'min', 'max', 'abs', 'int', 'float', 'str', 'len',
-                        'to', 'step', 'by', 'mod', 'div', 'and', 'or', 'not', 'new'}
+                        'to', 'step', 'by', 'mod', 'div', 'and', 'or', 'not', 'new',
+                        'true', 'false'}
                     known_funcs = set(getattr(self, 'functions', {}).keys())
                     known_subs = set(getattr(self, 'subprocesses', {}).keys())
                     known_types = set(getattr(self, 'types_defined', {}).keys())

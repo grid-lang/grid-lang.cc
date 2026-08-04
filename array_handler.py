@@ -1664,8 +1664,13 @@ class ArrayHandler:
         if not is_nd_array and (not isinstance(value, (list, pa.Array, pa.ListArray)) or isinstance(value, (int, float, str))):
             shape = [self._dim_size(size_spec, star_size=1)
                      for _, size_spec in dims]
-            pa_type = pa.float64() if self.compiler.types.get(
-                var) in ('number', 'array') else pa.string()
+            var_type = self.compiler.types.get(var)
+            if var_type in ('number', 'array'):
+                pa_type = pa.float64()
+            elif var_type == 'logical':
+                pa_type = pa.bool_()
+            else:
+                pa_type = pa.string()
             return self.create_array(shape, value, pa_type, line_number)
 
         # Compute expected shape
@@ -1845,10 +1850,17 @@ class ArrayHandler:
         for s in shape:
             total_size *= s
         flat.extend([0] * (total_size - len(flat)))
+        resized = flat[:total_size]
+        if any(isinstance(v, str) for v in resized):
+            pa_type = pa.string()
+        elif any(isinstance(v, bool) for v in resized):
+            pa_type = pa.bool_()
+        else:
+            pa_type = pa.float64()
         if len(shape) > 1:
-            return {'array': pa.array(flat[:total_size], type=pa.float64()),
+            return {'array': pa.array(resized, type=pa_type),
                     'shape': list(shape), 'original_shape': list(shape)}
-        return pa.array(flat[:shape[0]], type=pa.float64())
+        return pa.array(resized, type=pa_type)
 
     def get_grid_row(self, row_index, grid_source=None, line_number=None):
         """Return a dense list of values in the given (1-based) grid row.

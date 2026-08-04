@@ -3583,6 +3583,8 @@ class GridLangExecutor:
             var, type_name, constraints, value = self._parse_variable_def(
                 var_def, line_number)
             deps = set(re.findall(r'\b[\w_]+\b', expr))
+            deps = {d for d in deps
+                    if d.lower() not in DEPENDENCY_IGNORED_TOKENS}
             if not deps:
                 try:
                     evaluated_value = self.expr_evaluator.eval_expr(
