@@ -1459,11 +1459,7 @@ class GridLangControlFlow:
             if not defining_scope:
                 raise NameError(
                     f"Variable '{var_name}' not defined at line {line_number}")
-            if var_name in defining_scope.constraints:
-                var_constraints = defining_scope.constraints[var_name]
-                current_unit = (var_constraints.get('unit') or '').lower()
-                return current_unit != unit_name.lower()
-            return True
+            return self._current_unit_of(defining_scope, var_name) != unit_name.lower()
 
         # Handle "not null" constraints (optionally with equality)
         not_null_eq_match = re.match(
@@ -1563,7 +1559,8 @@ class GridLangControlFlow:
         scope.setdefault('false', False)
         scope.setdefault('none', None)
         if left_expr.strip() in current_scope.variables:
-            scope[left_expr.strip()] = current_scope.variables[left_expr.strip()]
+            scope[left_expr.strip()] = current_scope._wrap_for_eval(
+                left_expr.strip(), current_scope.variables[left_expr.strip()])
         try:
             if operator == '=':
                 dim_selector_present = (
@@ -1723,6 +1720,18 @@ class GridLangControlFlow:
                 return True, False
         return True, False
 
+    def _current_unit_of(self, defining_scope, var_name):
+        """Runtime unit of a variable, falling back to its declared unit."""
+        runtime = defining_scope.get_value_unit(var_name)
+        if runtime is not None:
+            return str(runtime).lower()
+        constraint_key = defining_scope._get_case_insensitive_key(
+            var_name, defining_scope.constraints)
+        if constraint_key:
+            declared = defining_scope.constraints[constraint_key].get('unit')
+            return str(declared).lower() if declared else None
+        return None
+
     def _evaluate_if_unit_constraint(self, condition, line_number):
         unit_match = re.match(r'^([\w_]+)\s+of\s+(\w+)$', condition, re.I)
         if not unit_match:
@@ -1732,12 +1741,7 @@ class GridLangControlFlow:
         if not defining_scope:
             raise NameError(
                 f"Variable '{var_name}' not defined at line {line_number}")
-        constraint_key = defining_scope._get_case_insensitive_key(
-            var_name, defining_scope.constraints)
-        if constraint_key:
-            var_constraints = defining_scope.constraints[constraint_key]
-            return True, (var_constraints.get('unit') or '').lower() == unit_name.lower()
-        return True, False
+        return True, self._current_unit_of(defining_scope, var_name) == unit_name.lower()
 
     def _evaluate_if_in_constraint(self, condition, line_number):
         in_match = re.match(r'^([\w_]+)\s+in\s+(.+)$', condition, re.I)

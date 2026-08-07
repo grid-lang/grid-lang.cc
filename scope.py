@@ -8,6 +8,7 @@ import re
 
 import pyarrow as pa
 
+from units import UNIT_ERROR, UnitValue, strip_units
 from utils import num_to_col, split_cell, col_to_num, iter_interpolation_placeholders
 
 # Stack of compiler run contexts: ``run()`` pushes the executing compiler and
@@ -29,7 +30,7 @@ class _ListenerGrid(dict):
         self._grid_owner = owner
 
     def __setitem__(self, key, value):
-        super().__setitem__(key, value)
+        super().__setitem__(key, strip_units(value))
         owner = self._grid_owner
         if owner is not None and hasattr(owner, '_notify_cell_changed'):
             owner._notify_cell_changed(key, value)
@@ -130,6 +131,57 @@ class Scope:
         self.output_variables = set()  # Variables that can only push values
         self.pipe_connections = {}  # Maps outputs to connected inputs
         self.implicit_let = set()
+        # Runtime unit of each variable's current value (lowercase keys).
+        # Values are stored stripped of the unit wrapper; reads re-wrap.
+        self.value_units = {}
+
+    def get_value_unit(self, name):
+        """Return the runtime unit of a variable (or None)."""
+        key = self._get_case_insensitive_key(name, self.value_units)
+        if key is None:
+            key = self._get_case_insensitive_key(name, self.variables)
+        if key is None:
+            return None
+        return self.value_units.get(key.lower()) or None
+
+    def _unit_convert(self, name, value, constraints=None, line_number=None):
+        """Decompose an incoming (possibly unit-bearing) value for storage.
+
+        Returns ``(stored_value, runtime_unit)``. A unit mismatch produces the
+        sticky ``#UNIT`` error value instead of raising.
+        """
+        constraints = constraints or {}
+        if isinstance(value, UnitValue):
+            if value.error:
+                return UNIT_ERROR, None
+            incoming = value.unit
+            plain = value.value
+        else:
+            incoming = None
+            plain = value
+
+        not_unit = constraints.get('not_unit')
+        if not_unit and incoming and str(incoming).lower() == str(not_unit).lower():
+            return UNIT_ERROR, None
+
+        declared = constraints.get('unit')
+        if declared:
+            declared = str(declared).lower()
+            if incoming and str(incoming).lower() != declared:
+                return UNIT_ERROR, None
+            return plain, declared
+        return plain, incoming
+
+    def _wrap_for_eval(self, name, value):
+        """Wrap a stored value for expression evaluation (read side)."""
+        if value == UNIT_ERROR:
+            return UnitValue(None, None, error=True)
+        if isinstance(value, UnitValue):
+            return value
+        unit = self.get_value_unit(name)
+        if unit:
+            return UnitValue(value, unit)
+        return value
 
     def _get_case_insensitive_key(self, name, dictionary):
         """Get a key from dictionary in a case-insensitive manner"""
@@ -196,17 +248,20 @@ class Scope:
         type_key = self._get_case_insensitive_key(actual_key, self.types) or actual_key
         var_type = self.types.get(type_key)
 
-        if materialized is not None and var_type and hasattr(self, 'compiler'):
+        materialized, runtime_unit = self._unit_convert(
+            actual_key, materialized, constraints, line_number)
+        if materialized is not None and materialized != UNIT_ERROR and var_type and hasattr(self, 'compiler'):
             materialized, constraints = self._coerce_custom_type_value(
                 var_type, materialized, constraints, line_number)
             self.constraints[constraints_key] = constraints
-        if materialized is not None and constraints and constraints.get('dim') and hasattr(self, 'compiler'):
+        if materialized is not None and materialized != UNIT_ERROR and constraints and constraints.get('dim') and hasattr(self, 'compiler'):
             materialized = self.compiler.array_handler.check_dimension_constraints(
                 actual_key, materialized, line_number)
         if materialized is not None:
             self._check_constraints(actual_key, materialized, line_number)
 
         self.variables[actual_key] = materialized
+        self.value_units[actual_key.lower()] = runtime_unit
         self.uninitialized.discard(actual_key)
         if hasattr(self.compiler, 'mark_dependency_resolved'):
             self.compiler.mark_dependency_resolved(actual_key)
@@ -238,15 +293,18 @@ class Scope:
         if existing_key and not is_uninitialized:
             raise ValueError(
                 f"Variable '{name}' conflicts with existing variable '{existing_key}' in this scope")
-        if value is not None and type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
+        value, runtime_unit = self._unit_convert(
+            name, value, effective_constraints, line_number)
+        if value is not None and value != UNIT_ERROR and type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
             value, effective_constraints = self._coerce_custom_type_value(
                 type, value, effective_constraints, line_number)
         if value is not None and not is_uninitialized:
-            if effective_constraints and effective_constraints.get('dim') and hasattr(self, 'compiler'):
+            if value != UNIT_ERROR and effective_constraints and effective_constraints.get('dim') and hasattr(self, 'compiler'):
                 value = self.compiler.array_handler.check_dimension_constraints(
                     name, value, line_number)
             self._check_constraints(name, value, line_number)
         self.variables[name] = value
+        self.value_units[name.lower()] = runtime_unit
         self.types[name] = type
         self.constraints[name] = effective_constraints
         if is_uninitialized:
@@ -277,7 +335,9 @@ class Scope:
             if actual_key:
                 var_type = defining_scope.types.get(actual_key)
                 constraints = defining_scope.constraints.get(actual_key, {})
-                if value is not None and var_type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
+                value, runtime_unit = self._unit_convert(
+                    name, value, constraints, line_number)
+                if value is not None and value != UNIT_ERROR and var_type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
                     value, constraints = defining_scope._coerce_custom_type_value(
                         var_type, value, constraints, line_number)
                     defining_scope.constraints[actual_key] = constraints
@@ -285,11 +345,12 @@ class Scope:
                 if defining_scope.constraints.get(actual_key, {}).get('input') and actual_key not in defining_scope.uninitialized:
                     raise ValueError(
                         f"Input variable '{actual_key}' cannot be updated at line {line_number}")
-                if defining_scope.constraints.get(actual_key, {}).get('dim'):
+                if value != UNIT_ERROR and defining_scope.constraints.get(actual_key, {}).get('dim'):
                     value = self.compiler.array_handler.check_dimension_constraints(
                         actual_key, value, line_number)
                 defining_scope._check_constraints(actual_key, value, line_number)
                 defining_scope.variables[actual_key] = value
+                defining_scope.value_units[actual_key.lower()] = runtime_unit
                 defining_scope.uninitialized.discard(actual_key)
 
                 # Re-evaluate constraint expressions that depend on this variable
@@ -304,8 +365,11 @@ class Scope:
                     self.compiler._notify_var_changed(actual_key, value)
             else:
                 # Variable exists in types or constraints but not variables
+                value, runtime_unit = self._unit_convert(
+                    name, value, defining_scope.constraints.get(name, {}), line_number)
                 defining_scope._check_constraints(name, value, line_number)
                 defining_scope.variables[name] = value
+                defining_scope.value_units[name.lower()] = runtime_unit
                 defining_scope.uninitialized.discard(name)
 
                 # Re-evaluate constraint expressions that depend on this variable
@@ -483,11 +547,12 @@ class Scope:
 
         # Add variables with case-insensitive mappings
         for var_name, var_value in current.variables.items():
-            full_scope[var_name] = var_value
+            wrapped = self._wrap_for_eval(var_name, var_value)
+            full_scope[var_name] = wrapped
             # Add lowercase version for case-insensitive access
-            full_scope[var_name.lower()] = var_value
+            full_scope[var_name.lower()] = wrapped
             # Add uppercase version for case-insensitive access
-            full_scope[var_name.upper()] = var_value
+            full_scope[var_name.upper()] = wrapped
 
         current = current.parent
         while current:
@@ -497,12 +562,13 @@ class Scope:
             for var_name, var_value in current.variables.items():
                 # Only add if not already present (to avoid overriding local variables)
                 if var_name not in full_scope:
-                    full_scope[var_name] = var_value
+                    wrapped = current._wrap_for_eval(var_name, var_value)
+                    full_scope[var_name] = wrapped
                     # Add case-insensitive versions only if not already present
                     if var_name.lower() not in full_scope:
-                        full_scope[var_name.lower()] = var_value
+                        full_scope[var_name.lower()] = wrapped
                     if var_name.upper() not in full_scope:
-                        full_scope[var_name.upper()] = var_value
+                        full_scope[var_name.upper()] = wrapped
             current = current.parent
         return full_scope
 
@@ -585,6 +651,9 @@ class Scope:
 
     def _check_constraints(self, name, value, line_number=None):
         # Case-insensitive constraint lookup
+        if value == UNIT_ERROR:
+            # A sticky unit error bypasses all constraint/type validation.
+            return
         actual_key = self._get_case_insensitive_key(name, self.constraints)
         key_for_constraints = actual_key if actual_key is not None else name
         constraints = self.constraints.get(key_for_constraints, {})
@@ -763,6 +832,7 @@ class Scope:
         full_scope = {}
         current = self
         while current and not current.is_private:
-            full_scope.update(current.variables)
+            for var_name, var_value in current.variables.items():
+                full_scope[var_name] = current._wrap_for_eval(var_name, var_value)
             current = current.parent
         return full_scope

@@ -9,6 +9,7 @@ from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
 from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT
 from scope import Scope, GridLiveView, _ListenerGrid
+from units import UNIT_ERROR, UnitValue
 from control_flow import GridLangControlFlow
 from type_processor import GridLangTypeProcessor
 from parser import GridLangParser
@@ -2732,6 +2733,18 @@ class GridLangCompiler:
         var_key = var_name.lower()
         if isinstance(value, pa.Array):
             value = value.to_pylist()
+        # Keep the unit attached so function/subprocess outputs retain it when
+        # they are returned to a caller (grid writes strip it instead).
+        if value == UNIT_ERROR:
+            value = UnitValue(None, None, error=True)
+        else:
+            scope = self.current_scope()
+            while scope is not None:
+                unit = scope.get_value_unit(var_name)
+                if unit:
+                    value = UnitValue(value, unit)
+                    break
+                scope = getattr(scope, 'parent', None)
         # Keep all pushed values in order
         existing = self.output_values.get(var_key, [])
         if not isinstance(existing, list):

@@ -2464,8 +2464,12 @@ class ExpressionEvaluator:
         scope = {}
         current = self
         while current and not current.is_private:
-            scope.update(
-                {k: v for k, v in current.variables.items() if k not in scope})
+            for k, v in current.variables.items():
+                if k not in scope:
+                    if hasattr(current, '_wrap_for_eval'):
+                        scope[k] = current._wrap_for_eval(k, v)
+                    else:
+                        scope[k] = v
             current = current.parent
         return scope
 

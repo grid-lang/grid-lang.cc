@@ -1569,6 +1569,9 @@ class ArrayHandler:
             return 'text'
         if isinstance(value, dict):
             return 'object'
+        from units import UnitValue
+        if isinstance(value, UnitValue):
+            return 'number'
         return 'unknown'
 
     def get_array_shape(self, arr, line_number=None):
