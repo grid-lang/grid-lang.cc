@@ -1351,8 +1351,10 @@ class GridLangExecutor:
             # writing through to the caller's scope.
             defining_scope = None
         if defining_scope:
-            if var in defining_scope.constraints and not constraints:
-                constraints = defining_scope.constraints[var]
+            if var in defining_scope.constraints:
+                merged = dict(defining_scope.constraints[var])
+                merged.update(constraints)
+                constraints = merged
             if constraints:
                 defining_scope.constraints[var] = constraints
             if expr is None and var in defining_scope.variables and defining_scope.variables[var] is not None:

@@ -1862,7 +1862,13 @@ class ArrayHandler:
             elif var_type == 'logical':
                 pa_type = pa.bool_()
             else:
-                pa_type = pa.string()
+                inferred = self.infer_type(value, line_number)
+                if inferred in ('number', 'float64', 'int', 'int64'):
+                    pa_type = pa.float64()
+                elif inferred == 'logical' or isinstance(value, bool):
+                    pa_type = pa.bool_()
+                else:
+                    pa_type = pa.string()
             return self.create_array(shape, value, pa_type, line_number)
 
         # Compute expected shape

@@ -443,9 +443,17 @@ class GridLangCompiler:
                                     'type': parsed_type,
                                     'constraints': parsed_constraints or {}
                                 })
-                    m_out = re.match(r'^\s*output\s+([\w_]+)', b, re.I)
+                    m_out = re.match(r'^\s*output\s+(.+)$', b, re.I)
                     if m_out:
-                        outputs.append(m_out.group(1).strip())
+                        try:
+                            parsed_var, parsed_type, parsed_constraints, _ = self.parser._parse_variable_def(
+                                b.strip(), body_ln)
+                        except Exception:
+                            parsed_var, parsed_type, parsed_constraints = None, None, {}
+                        if parsed_var:
+                            var_list = (parsed_constraints or {}).get('var_list') if parsed_constraints else None
+                            names = var_list if var_list else [parsed_var]
+                            outputs.extend(names)
                 entry = {
                     'name': func_name,
                     'code': func_code,
@@ -605,6 +613,27 @@ class GridLangCompiler:
             func_def['code'], list(args),
             suppress_output=True, return_output=True)
         outputs = func_result or {}
+
+        # Merge declared outputs from function scope when not pushed explicitly.
+        try:
+            last_scope_vars = getattr(sub_compiler, '_last_scope_vars', {}) or {}
+            for out_name in func_def.get('outputs', []) or []:
+                out_key = out_name.lower()
+                if out_key in outputs:
+                    continue
+                try:
+                    merged_val = sub_compiler.current_scope().get(out_name)
+                except Exception:
+                    merged_val = None
+                if merged_val is None:
+                    for key, value in last_scope_vars.items():
+                        if key.lower() == out_key:
+                            merged_val = value
+                            break
+                if merged_val is not None:
+                    outputs[out_key] = merged_val
+        except Exception:
+            pass
 
         # Normalize outputs to lists to preserve all pushed values
         normalized_outputs = {}
@@ -1127,6 +1156,10 @@ class GridLangCompiler:
         # Merge declared outputs from subprocess scope when not pushed explicitly.
         merged_outputs = dict(sub_output or {})
         try:
+            # The executor's scope stack diverges from the compiler's after
+            # _reset_state (a compiler-bound method), so fall back to the
+            # pre-clobber capture of the subprocess's final variables.
+            last_scope_vars = getattr(sub_compiler, '_last_scope_vars', {}) or {}
             for out_name in sp_def.get('outputs', []) or []:
                 out_key = out_name.lower()
                 if out_key in merged_outputs:
@@ -1135,6 +1168,11 @@ class GridLangCompiler:
                     merged_val = sub_compiler.current_scope().get(out_name)
                 except Exception:
                     merged_val = None
+                if merged_val is None:
+                    for key, value in last_scope_vars.items():
+                        if key.lower() == out_key:
+                            merged_val = value
+                            break
                 if merged_val is not None:
                     merged_outputs[out_key] = merged_val
         except Exception:
@@ -2173,34 +2211,42 @@ class GridLangCompiler:
 
         if parsed:
             var, type_name, constraints, expr = parsed
-            self.current_scope().define_output(
-                var, type_name, line_number, constraints)
-            if constraints.get('init') is not None:
-                init_expr = constraints.pop('init')
-                deps = set(self._extract_identifier_tokens(init_expr))
-                func_names = set(getattr(self, 'functions', {}).keys())
-                deps = {d for d in deps if d.lower() not in func_names}
-                unresolved = False
-                for dep in deps:
-                    dep_scope = self.current_scope().get_defining_scope(dep)
-                    if dep_scope and dep_scope.is_uninitialized(dep):
-                        unresolved = True
-                        break
-                    try:
-                        self.current_scope().get(dep)
-                    except Exception:
-                        unresolved = True
-                        break
-                if unresolved:
-                    self.pending_assignments[var] = (
-                        init_expr, line_number, deps)
-                else:
-                    eval_scope = self.current_scope().get_full_scope()
-                    import copy
-                    init_val = self.expr_evaluator.eval_expr(
-                        init_expr, eval_scope, line_number)
-                    init_val = copy.deepcopy(init_val)
-                    self.current_scope().update(var, init_val, line_number)
+            var_names = constraints.pop('var_list', [var])
+            for var_name in var_names:
+                self.current_scope().define_output(
+                    var_name, type_name, line_number, constraints)
+                if constraints.get('init') is not None:
+                    init_expr = constraints.get('init')
+                    deps = set(self._extract_identifier_tokens(init_expr))
+                    func_names = set(getattr(self, 'functions', {}).keys())
+                    deps = {d for d in deps if d.lower() not in func_names}
+                    unresolved = False
+                    for dep in deps:
+                        dep_scope = self.current_scope().get_defining_scope(dep)
+                        if dep_scope and dep_scope.is_uninitialized(dep):
+                            unresolved = True
+                            break
+                        try:
+                            self.current_scope().get(dep)
+                        except Exception:
+                            unresolved = True
+                            break
+                    if unresolved:
+                        self.pending_assignments[var_name] = (
+                            init_expr, line_number, deps, constraints)
+                    else:
+                        eval_scope = self.current_scope().get_full_scope()
+                        import copy
+                        init_val = self.expr_evaluator.eval_expr(
+                            init_expr, eval_scope, line_number)
+                        init_val = copy.deepcopy(init_val)
+                        if constraints.get('with'):
+                            init_val = self._apply_with_constraints(
+                                init_val, constraints.get('with', {}),
+                                eval_scope, line_number,
+                                type_name=type_name)
+                        self.current_scope().update(
+                            var_name, init_val, line_number)
             return
 
         var_def, expr = self._split_assignment_expr(a)
