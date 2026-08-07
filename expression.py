@@ -1858,6 +1858,8 @@ class ExpressionEvaluator:
         expr = expr.strip()
         if expr.lower() in ('true', 'false'):
             return expr.lower() == 'true'
+        if expr.lower() == 'none':
+            return self.eval_or_eval_array('{}', scope, line_number)
         if expr.startswith('?'):
             logical_expr = expr[1:].strip()
             if not logical_expr:

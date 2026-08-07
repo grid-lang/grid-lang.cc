@@ -334,7 +334,7 @@ class GridLangParser:
                 maxsplit=1,
                 flags=re.I,
             )[0].strip()
-            if dim_expr == '{}':
+            if dim_expr == '{}' or dim_expr.lower() == 'none':
                 constraints['dim'] = '{}'
                 return
 

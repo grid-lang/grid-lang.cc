@@ -1816,12 +1816,8 @@ class ArrayHandler:
                 value = value.to_pylist() if isinstance(
                     value, pa.Array) else self.flatten_array(value, line_number)
             if isinstance(value, list):
-                if len(value) == 1:
-                    return value[0]
-                if len(value) == 0:
-                    return None
                 raise ValueError(
-                    f"Dimension constraint for '{var}' expects a scalar at line {line_number}")
+                    f"Dimension constraint for '{var}' expects a scalar, received array value at line {line_number}")
             return value
 
         # Handle scalar broadcasting
