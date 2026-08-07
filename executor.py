@@ -1554,7 +1554,9 @@ class GridLangExecutor:
                 defining_scope = self.current_scope().get_defining_scope(var) or self.current_scope()
                 var_value = self._resolve_pending_let_var(var, defining_scope)
                 if var_value is None:
-                    self._blank_dependent_assignments(lines, i, var)
+                    # The variable is declared but not valued yet (it will be filled
+                    # by a later push). Downstream cell assignments defer through
+                    # the pending mechanism and re-run once the value arrives.
                     continue
                 for op, threshold in constraints.items() if constraints else []:
                     if op not in ('<', '>', '<=', '>='):
