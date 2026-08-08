@@ -9,6 +9,7 @@ from array_handler import ArrayHandler
 from control_flow import GridLangControlFlow
 from parser import GridLangParser
 from scope import GridLiveView
+from units import VALUE_ERROR, ConstraintError, error_value
 from utils import col_to_num, num_to_col, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address
 
 
@@ -1350,7 +1351,18 @@ class GridLangExecutor:
             # live, so declarations shadow caller variables locally instead of
             # writing through to the caller's scope.
             defining_scope = None
+        old_constant = None
+        old_value = None
         if defining_scope:
+            old_key = defining_scope._get_case_insensitive_key(
+                var, defining_scope.variables)
+            old_constraints_key = defining_scope._get_case_insensitive_key(
+                var, defining_scope.constraints)
+            if old_constraints_key:
+                old_constant = defining_scope.constraints[old_constraints_key].get(
+                    'constant')
+            if old_key:
+                old_value = defining_scope.variables[old_key]
             if var in defining_scope.constraints:
                 merged = dict(defining_scope.constraints[var])
                 merged.update(constraints)
@@ -1401,6 +1413,15 @@ class GridLangExecutor:
                 actual_type_key = defining_scope._get_case_insensitive_key(
                     var, defining_scope.types) or var
                 defining_scope.types[actual_type_key] = inferred_type
+            if (
+                old_constant is not None
+                and constraints.get('constant') is not None
+                and old_value is not None
+                and not self._let_values_match(old_value, evaluated_value)
+            ):
+                search_scope.update(
+                    var, error_value(VALUE_ERROR), line_number)
+                return 'bound'
             search_scope.update(var, evaluated_value, line_number)
             if scope_dict is not None:
                 scope_dict[var] = evaluated_value
@@ -1420,6 +1441,17 @@ class GridLangExecutor:
             self.pending_assignments[var] = (
                 expr, line_number, set(missing), constraints)
             return 'deferred'
+
+    def _let_values_match(self, a, b):
+        """Compare two bound values, tolerating numeric vs. unit forms."""
+        try:
+            result = (a == b)
+        except Exception:
+            return False
+        if isinstance(result, (list, tuple, pa.Array)):
+            items = list(result)
+            return bool(items) and all(bool(item) for item in items)
+        return bool(result)
 
     def _process_let_standard_assignment(
             self,
@@ -1482,19 +1514,6 @@ class GridLangExecutor:
                 except Exception:
                     pass
         return defining_scope.get(var)
-
-    def _blank_dependent_assignments(self, lines, start_i, var):
-        """Blank out following ':=' lines that reference a given variable."""
-        j = start_i + 1
-        while j < len(lines):
-            next_line, next_line_number = lines[j]
-            if ':=' in next_line:
-                _, rhs = next_line.split(':=', 1)
-                rhs_vars = set(
-                    token.lower() for token in re.findall(r'\b[\w_]+\b', rhs))
-                if var.lower() in rhs_vars:
-                    lines[j] = ("", next_line_number)
-            j += 1
 
     def _execute_let_block(self, lines, i, line_number, var_list):
         self.push_scope(is_private=True)
@@ -1569,12 +1588,12 @@ class GridLangExecutor:
                         threshold_value = float(threshold)
                         if isinstance(var_value, (int, float)):
                             if op == '<' and var_value >= threshold_value:
-                                self.pending_assignments.clear()
-                                self._blank_dependent_assignments(lines, i, var)
+                                defining_scope.update(
+                                    var, error_value(VALUE_ERROR), line_number)
                                 continue
                             elif op == '>' and var_value <= threshold_value:
-                                self.pending_assignments.clear()
-                                self._blank_dependent_assignments(lines, i, var)
+                                defining_scope.update(
+                                    var, error_value(VALUE_ERROR), line_number)
                                 continue
                     except (TypeError, ValueError):
                         pass
@@ -1582,9 +1601,9 @@ class GridLangExecutor:
                     try:
                         defining_scope._check_constraints(
                             var, var_value, line_number)
-                    except ValueError as e:
-                        self.pending_assignments.clear()
-                        self._blank_dependent_assignments(lines, i, var)
+                    except ConstraintError as exc:
+                        defining_scope.update(
+                            var, error_value(exc.code), line_number)
                         continue
         return i + 1
 
@@ -4804,6 +4823,30 @@ class GridLangExecutor:
                                      and getattr(scope.parent, 'compiler',
                                                  None) is scope.compiler) else None
 
+    def _deferred_dependency_unresolved(self, dep, scope):
+        """Whether a deferred assignment must keep waiting on ``dep``.
+
+        A declared variable that is merely uninitialized does not block
+        processing: reading it yields the sticky ``#N/A`` error value. Only
+        genuinely missing names, variables with an outstanding late
+        assignment, and dependencies still being computed keep a line pending.
+        """
+        if not dep:
+            return False
+        if re.match(r'^[A-Za-z]+\d+$', dep):
+            return dep not in self.grid
+        if dep.lower() in (self.functions or {}):
+            return False
+        if dep.lower() in self.undefined_dependencies:
+            return True
+        if dep in self.pending_assignments or dep in getattr(scope, 'pending_assignments', {}):
+            return True
+        if not scope.get_defining_scope(dep):
+            return True
+        if scope.is_uninitialized(dep):
+            return False
+        return self.has_unresolved_dependency(dep, scope=scope)
+
     def _process_deferred_assignments(self):
         """Process any deferred assignments stored with __line_ keys."""
 
@@ -4865,7 +4908,7 @@ class GridLangExecutor:
             try:
                 scope = self.current_scope()
                 unresolved = any(
-                    self.has_unresolved_dependency(dep, scope=scope)
+                    self._deferred_dependency_unresolved(dep, scope=scope)
                     for dep in deps)
                 if unresolved:
                     continue
@@ -4903,7 +4946,7 @@ class GridLangExecutor:
             try:
                 scope = self.current_scope()
                 unresolved = any(
-                    self.has_unresolved_dependency(dep, scope=scope)
+                    self._deferred_dependency_unresolved(dep, scope=scope)
                     for dep in deps)
                 if not unresolved:
                     # Process the assignment

@@ -9,7 +9,9 @@ from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
 from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT
 from scope import Scope, GridLiveView, _ListenerGrid
-from units import UNIT_ERROR, UnitValue
+from units import (
+    UNIT_ERROR, UnitValue, error_value, is_error_value, strip_units,
+)
 from control_flow import GridLangControlFlow
 from type_processor import GridLangTypeProcessor
 from parser import GridLangParser
@@ -2735,8 +2737,8 @@ class GridLangCompiler:
             value = value.to_pylist()
         # Keep the unit attached so function/subprocess outputs retain it when
         # they are returned to a caller (grid writes strip it instead).
-        if value == UNIT_ERROR:
-            value = UnitValue(None, None, error=True)
+        if is_error_value(value):
+            value = error_value(value if isinstance(value, str) else value.error_code)
         else:
             scope = self.current_scope()
             while scope is not None:

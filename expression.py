@@ -17,6 +17,7 @@ from utils import (
     _ADDRESS_FRAGMENT,
 )
 from scope import GridLiveView
+from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, UnitValue, error_value, is_error_value
 
 
 class CaseInsensitiveDict(dict):
@@ -232,7 +233,7 @@ class ExpressionEvaluator:
                 original_shape = tensor.get('original_shape')
                 adjusted_indices = [idx - 1 for idx in indices]
                 try:
-                    result = self.compiler.array_handler.get_array_element(
+                    result = self.compiler.array_handler.read_array_element(
                         array, adjusted_indices, line_number, original_shape=original_shape)
                     return True, result
                 except (IndexError, ValueError) as e:
@@ -1410,8 +1411,12 @@ class ExpressionEvaluator:
 
         # Get the array element
         try:
-            result = self.compiler.array_handler.get_array_element(
+            result = self.compiler.array_handler.read_array_element(
                 arr, adjusted_indices, line_number)
+            if is_error_value(result):
+                curly_expr = f"{var_name}{{{indices_str}}}"
+                return self._substitute_curly_result(
+                    curly_expr, curly_expr, result, scope)
             if isinstance(result, str):
                 return f'"{result}"'
             return str(result)
@@ -1591,8 +1596,11 @@ class ExpressionEvaluator:
             adjusted_index = index_value - 1
 
         try:
-            result = self.compiler.array_handler.get_array_element(
+            result = self.compiler.array_handler.read_array_element(
                 arr, [adjusted_index], line_number)
+            if is_error_value(result):
+                return self._substitute_curly_result(
+                    f"{var_name}({index_expr})", f"{var_name}({index_expr})", result, scope)
             if isinstance(result, str):
                 return f'"{result}"'
             return str(result)
@@ -1727,13 +1735,15 @@ class ExpressionEvaluator:
         if uexpr == '-#INF':
             return True, float('-inf')
         if uexpr == '#N/A':
-            return True, float('nan')
+            return True, error_value(NA_ERROR)
 
         # Handle numeric literals (integers, floats, scientific notation)
         try:
             nm = re.match(r'^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$', expr)
             if nm:
                 parsed = float(expr) if '.' in expr or 'e' in expr.lower() else int(expr)
+                if isinstance(parsed, float) and (math.isinf(parsed) or math.isnan(parsed)):
+                    return True, error_value(NUM_ERROR)
                 return True, parsed
         except ValueError:
             pass
@@ -1939,10 +1949,10 @@ class ExpressionEvaluator:
                         f"Variable '{var_name}' is uninitialized at line {line_number}")
                 try:
                     if isinstance(value, dict) and 'grid' in value:
-                        result = self.compiler.array_handler.get_array_element(
+                        result = self.compiler.array_handler.read_array_element(
                             value['grid'], indices, line_number, original_shape=value.get('original_shape'))
                     else:
-                        result = self.compiler.array_handler.get_array_element(
+                        result = self.compiler.array_handler.read_array_element(
                             value, indices, line_number)
                     return result
                 except (IndexError, ValueError) as e:
@@ -2030,7 +2040,7 @@ class ExpressionEvaluator:
             var_name, self.compiler.variables.get(var_name))
         if isinstance(array, GridLiveView):
             base = 1
-        return self.compiler.array_handler.get_array_element(
+        return self.compiler.array_handler.read_array_element(
             array, [index_value - base], line_number)
 
     def _parse_index_target(self, target, scope, line_number):
@@ -2130,7 +2140,7 @@ class ExpressionEvaluator:
                         adjusted_indices = indices
 
                 try:
-                    result = self.compiler.array_handler.get_array_element(
+                    result = self.compiler.array_handler.read_array_element(
                         array, adjusted_indices, line_number)
                     return True, result
                 except (IndexError, ValueError) as e:
@@ -2309,6 +2319,20 @@ class ExpressionEvaluator:
             result.append(row)
         return True, result
 
+    def _substitute_curly_result(self, eval_expr, curly_expr, result, scope):
+        """Substitute a curly-access result into an expression string.
+
+        An error value cannot be spliced into the Python source, so it is
+        injected into the evaluation scope under a placeholder name instead;
+        arithmetic on the placeholder then propagates the error.
+        """
+        if is_error_value(result):
+            code = result if isinstance(result, str) else result.error_code
+            placeholder = f"__gridlang_error_{abs(hash((curly_expr, code))) & 0xFFFFFFFF}"
+            scope[placeholder] = error_value(code)
+            return eval_expr.replace(curly_expr, placeholder)
+        return eval_expr.replace(curly_expr, str(result))
+
     def _replace_fallback_curly_accesses(self, eval_expr, scope, line_number):
         curly_brace_pattern = re.compile(r'([\w_]+)\{([^}]+)\}')
         curly_matches = curly_brace_pattern.findall(eval_expr)
@@ -2354,10 +2378,11 @@ class ExpressionEvaluator:
                     adjusted_idx = idx - 1
                     adjusted_indices.append(adjusted_idx)
             try:
-                result = self.compiler.array_handler.get_array_element(
+                result = self.compiler.array_handler.read_array_element(
                     array, adjusted_indices, line_number)
                 curly_expr = f"{var_name}{{{indices_str}}}"
-                eval_expr = eval_expr.replace(curly_expr, str(result))
+                eval_expr = self._substitute_curly_result(
+                    eval_expr, curly_expr, result, scope)
             except (IndexError, ValueError) as e:
                 raise IndexError(
                     f"Invalid indices {indices_str} for '{var_name}': {e} at line {line_number}")
@@ -2440,15 +2465,17 @@ class ExpressionEvaluator:
         try:
             globals_dict = self._get_eval_globals()
             result = eval(eval_expr, globals_dict, full_scope)
-            if isinstance(result, (int, float)) and math.isnan(result):
-                return float('nan')
+            if isinstance(result, (int, float)) and (math.isinf(result) or math.isnan(result)):
+                return error_value(NUM_ERROR)
             if isinstance(result, set):
                 result = sorted(list(result))
             if isinstance(result, bool):
                 return result
             return float(result) if isinstance(result, (int, float)) else result
         except ZeroDivisionError:
-            return float('nan')
+            return error_value(DIV0_ERROR)
+        except OverflowError:
+            return error_value(NUM_ERROR)
         except NameError as e:
             raise NameError(f"{e} at line {line_number}")
         except Exception as e:

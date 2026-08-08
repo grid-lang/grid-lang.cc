@@ -11,6 +11,7 @@ from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell
 from functools import reduce
 import operator
 from scope import GridLiveView
+from units import DIM_ERROR, REF_ERROR, ConstraintError, error_value, is_error_value
 
 
 class ArrayHandler:
@@ -1819,7 +1820,8 @@ class ArrayHandler:
                 value = value.to_pylist() if isinstance(
                     value, pa.Array) else self.flatten_array(value, line_number)
             if isinstance(value, list):
-                raise ValueError(
+                raise ConstraintError(
+                    DIM_ERROR,
                     f"Dimension constraint for '{var}' expects a scalar, received array value at line {line_number}")
             return value
 
@@ -1919,7 +1921,8 @@ class ArrayHandler:
                 flat_vals = broadcast
                 total_elements = expected_total
             else:
-                raise ValueError(
+                raise ConstraintError(
+                    DIM_ERROR,
                     f"Element count mismatch for '{var}': expected {expected_total} elements, got {total_elements} at line {line_number}")
 
         # Reshape to expected shape (column-major flat buffer + declared shape)
@@ -2104,7 +2107,8 @@ class ArrayHandler:
                 return self.get_grid_row(
                     int(indices[0]) + 1, arr._store, line_number)
             if len(indices) != 2:
-                raise ValueError(
+                raise ConstraintError(
+                    REF_ERROR,
                     f"Expected 2 indices for the grid, got {len(indices)}"
                     + (f" at line {line_number}" if line_number else ""))
             return arr[(int(indices[0]) + 1, int(indices[1]) + 1)]
@@ -2123,13 +2127,15 @@ class ArrayHandler:
 
         # Validate indices against the declared shape
         if len(indices) != len(indexing_shape):
-            raise ValueError(
+            raise ConstraintError(
+                REF_ERROR,
                 f"Expected {len(indexing_shape)} indices for array with shape {indexing_shape}, got {len(indices)} at line {line_number}")
 
         validation_shape = indexing_shape
         for i, idx in enumerate(indices):
             if idx < 0 or idx >= validation_shape[i]:
-                raise IndexError(
+                raise ConstraintError(
+                    REF_ERROR,
                     f"Index {idx} out of bounds for dimension {i} with size {validation_shape[i]} at line {line_number}")
 
         # Handle array indexing (column-major: first dim is fastest)
@@ -2143,7 +2149,8 @@ class ArrayHandler:
                 stride *= indexing_shape[i]
 
             if flat_idx < 0 or flat_idx >= len(flat_arr):
-                raise IndexError(
+                raise ConstraintError(
+                    REF_ERROR,
                     f"Calculated index {flat_idx} out of bounds for array length {len(flat_arr)} at line {line_number}")
 
             result = flat_arr[flat_idx]
@@ -2160,6 +2167,18 @@ class ArrayHandler:
         else:
             raise TypeError(
                 f"Cannot index non-array type {type(arr)} at line {line_number}")
+
+    def read_array_element(self, arr, indices, line_number=None, return_struct=False, original_shape=None):
+        """Read an element from an array; an invalid address produces the
+        sticky ``#REF`` error value instead of raising."""
+        if is_error_value(arr):
+            code = arr if isinstance(arr, str) else arr.error_code
+            return error_value(code)
+        try:
+            return self.get_array_element(
+                arr, indices, line_number, return_struct, original_shape)
+        except (IndexError, ConstraintError):
+            return error_value(REF_ERROR)
 
     def fill_array(self, array, value, line_number=None):
         """

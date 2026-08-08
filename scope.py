@@ -8,7 +8,10 @@ import re
 
 import pyarrow as pa
 
-from units import UNIT_ERROR, UnitValue, strip_units
+from units import (
+    DIM_ERROR, NA_ERROR, NUM_ERROR, TYPE_ERROR, UNIT_ERROR, VALUE_ERROR,
+    ConstraintError, UnitValue, error_value, is_error_value, strip_units,
+)
 from utils import num_to_col, split_cell, col_to_num, iter_interpolation_placeholders
 
 # Stack of compiler run contexts: ``run()`` pushes the executing compiler and
@@ -152,8 +155,8 @@ class Scope:
         """
         constraints = constraints or {}
         if isinstance(value, UnitValue):
-            if value.error:
-                return UNIT_ERROR, None
+            if value.error_code is not None:
+                return value.error_code, None
             incoming = value.unit
             plain = value.value
         else:
@@ -172,11 +175,35 @@ class Scope:
             return plain, declared
         return plain, incoming
 
+    def _has_pending_assignment(self, name):
+        """True when a late assignment for ``name`` is still outstanding."""
+        name_lower = name.lower()
+        scope = self
+        while scope is not None:
+            for key in scope.pending_assignments:
+                if key.lower() == name_lower:
+                    return True
+            scope = scope.parent
+        for key in getattr(self.compiler, 'pending_assignments', {}):
+            if key.lower() == name_lower:
+                return True
+        return False
+
     def _wrap_for_eval(self, name, value):
-        """Wrap a stored value for expression evaluation (read side)."""
-        if value == UNIT_ERROR:
-            return UnitValue(None, None, error=True)
+        """Wrap a stored value for expression evaluation (read side).
+
+        Sticky error codes are re-wrapped as error values; a None value from an
+        uninitialized variable (with no pending late assignment) reads as the
+        ``#N/A`` error value.
+        """
+        if is_error_value(value):
+            code = value if isinstance(value, str) else value.error_code
+            return error_value(code)
         if isinstance(value, UnitValue):
+            return value
+        if value is None:
+            if self.is_uninitialized(name) and not self._has_pending_assignment(name):
+                return error_value(NA_ERROR)
             return value
         unit = self.get_value_unit(name)
         if unit:
@@ -250,15 +277,23 @@ class Scope:
 
         materialized, runtime_unit = self._unit_convert(
             actual_key, materialized, constraints, line_number)
-        if materialized is not None and materialized != UNIT_ERROR and var_type and hasattr(self, 'compiler'):
+        if materialized is not None and not is_error_value(materialized) and var_type and hasattr(self, 'compiler'):
             materialized, constraints = self._coerce_custom_type_value(
                 var_type, materialized, constraints, line_number)
             self.constraints[constraints_key] = constraints
-        if materialized is not None and materialized != UNIT_ERROR and constraints and constraints.get('dim') and hasattr(self, 'compiler'):
-            materialized = self.compiler.array_handler.check_dimension_constraints(
-                actual_key, materialized, line_number)
+        if materialized is not None and not is_error_value(materialized) and constraints and constraints.get('dim') and hasattr(self, 'compiler'):
+            try:
+                materialized = self.compiler.array_handler.check_dimension_constraints(
+                    actual_key, materialized, line_number)
+            except ConstraintError as exc:
+                materialized = exc.code
+                runtime_unit = None
         if materialized is not None:
-            self._check_constraints(actual_key, materialized, line_number)
+            try:
+                self._check_constraints(actual_key, materialized, line_number)
+            except ConstraintError as exc:
+                materialized = exc.code
+                runtime_unit = None
 
         self.variables[actual_key] = materialized
         self.value_units[actual_key.lower()] = runtime_unit
@@ -295,14 +330,23 @@ class Scope:
                 f"Variable '{name}' conflicts with existing variable '{existing_key}' in this scope")
         value, runtime_unit = self._unit_convert(
             name, value, effective_constraints, line_number)
-        if value is not None and value != UNIT_ERROR and type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
+        if value is not None and not is_error_value(value) and type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
             value, effective_constraints = self._coerce_custom_type_value(
                 type, value, effective_constraints, line_number)
         if value is not None and not is_uninitialized:
-            if value != UNIT_ERROR and effective_constraints and effective_constraints.get('dim') and hasattr(self, 'compiler'):
-                value = self.compiler.array_handler.check_dimension_constraints(
-                    name, value, line_number)
-            self._check_constraints(name, value, line_number)
+            if not is_error_value(value) and effective_constraints and effective_constraints.get('dim') and hasattr(self, 'compiler'):
+                try:
+                    value = self.compiler.array_handler.check_dimension_constraints(
+                        name, value, line_number)
+                except ConstraintError as exc:
+                    value = exc.code
+                    runtime_unit = None
+            if not is_error_value(value):
+                try:
+                    self._check_constraints(name, value, line_number)
+                except ConstraintError as exc:
+                    value = exc.code
+                    runtime_unit = None
         self.variables[name] = value
         self.value_units[name.lower()] = runtime_unit
         self.types[name] = type
@@ -337,7 +381,7 @@ class Scope:
                 constraints = defining_scope.constraints.get(actual_key, {})
                 value, runtime_unit = self._unit_convert(
                     name, value, constraints, line_number)
-                if value is not None and value != UNIT_ERROR and var_type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
+                if value is not None and not is_error_value(value) and var_type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
                     value, constraints = defining_scope._coerce_custom_type_value(
                         var_type, value, constraints, line_number)
                     defining_scope.constraints[actual_key] = constraints
@@ -345,10 +389,19 @@ class Scope:
                 if defining_scope.constraints.get(actual_key, {}).get('input') and actual_key not in defining_scope.uninitialized:
                     raise ValueError(
                         f"Input variable '{actual_key}' cannot be updated at line {line_number}")
-                if value != UNIT_ERROR and defining_scope.constraints.get(actual_key, {}).get('dim'):
-                    value = self.compiler.array_handler.check_dimension_constraints(
-                        actual_key, value, line_number)
-                defining_scope._check_constraints(actual_key, value, line_number)
+                if not is_error_value(value) and defining_scope.constraints.get(actual_key, {}).get('dim'):
+                    try:
+                        value = self.compiler.array_handler.check_dimension_constraints(
+                            actual_key, value, line_number)
+                    except ConstraintError as exc:
+                        value = exc.code
+                        runtime_unit = None
+                if not is_error_value(value):
+                    try:
+                        defining_scope._check_constraints(actual_key, value, line_number)
+                    except ConstraintError as exc:
+                        value = exc.code
+                        runtime_unit = None
                 defining_scope.variables[actual_key] = value
                 defining_scope.value_units[actual_key.lower()] = runtime_unit
                 defining_scope.uninitialized.discard(actual_key)
@@ -367,7 +420,12 @@ class Scope:
                 # Variable exists in types or constraints but not variables
                 value, runtime_unit = self._unit_convert(
                     name, value, defining_scope.constraints.get(name, {}), line_number)
-                defining_scope._check_constraints(name, value, line_number)
+                if not is_error_value(value):
+                    try:
+                        defining_scope._check_constraints(name, value, line_number)
+                    except ConstraintError as exc:
+                        value = exc.code
+                        runtime_unit = None
                 defining_scope.variables[name] = value
                 defining_scope.value_units[name.lower()] = runtime_unit
                 defining_scope.uninitialized.discard(name)
@@ -643,16 +701,18 @@ class Scope:
         actual_type = self.compiler.array_handler.infer_type(
             value, line_number)
         if var_type == 'number' and actual_type not in ('number', 'float64', 'int', 'int64'):
-            raise ValueError(
+            raise ConstraintError(
+                TYPE_ERROR,
                 f"'{name}' must be a number, got {actual_type} at line {line_number}")
         if var_type == 'text' and actual_type not in ('string', 'text'):
-            raise ValueError(
+            raise ConstraintError(
+                TYPE_ERROR,
                 f"'{name}' must be text, got {actual_type} at line {line_number}")
 
     def _check_constraints(self, name, value, line_number=None):
         # Case-insensitive constraint lookup
-        if value == UNIT_ERROR:
-            # A sticky unit error bypasses all constraint/type validation.
+        if is_error_value(value):
+            # A sticky error bypasses all constraint/type validation.
             return
         actual_key = self._get_case_insensitive_key(name, self.constraints)
         key_for_constraints = actual_key if actual_key is not None else name
@@ -695,48 +755,59 @@ class Scope:
                     except Exception:
                         pass
                 if value != constraint_val:
-                    raise ValueError(
+                    raise ConstraintError(
+                        VALUE_ERROR,
                         f"Cannot change constant '{key_for_constraints}' at line {line_number}")
             elif constraint_type in ('<=', '>=', '<', '>'):
                 constraint_val = float(self.compiler.expr_evaluator.eval_or_eval_array(
                     constraint_expr, self.get_full_scope(), line_number))
                 if constraint_type == '<=' and value > constraint_val:
-                    raise ValueError(
+                    raise ConstraintError(
+                        VALUE_ERROR,
                         f"'{key_for_constraints}' exceeds maximum {constraint_val} at line {line_number}")
                 elif constraint_type == '>=' and value < constraint_val:
-                    raise ValueError(
+                    raise ConstraintError(
+                        VALUE_ERROR,
                         f"'{key_for_constraints}' is below minimum {constraint_val} at line {line_number}")
                 elif constraint_type == '<' and value >= constraint_val:
-                    raise ValueError(
+                    raise ConstraintError(
+                        VALUE_ERROR,
                         f"'{key_for_constraints}' is not less than {constraint_val} at line {line_number}")
                 elif constraint_type == '>' and value <= constraint_val:
-                    raise ValueError(
+                    raise ConstraintError(
+                        VALUE_ERROR,
                         f"'{key_for_constraints}' is not greater than {constraint_val} at line {line_number}")
             elif constraint_type == '<>':
                 constraint_val = self.compiler.expr_evaluator.eval_or_eval_array(
                     constraint_expr, self.get_full_scope(), line_number)
                 if isinstance(value, (list, tuple, set)):
                     if constraint_val in value:
-                        raise ValueError(
+                        raise ConstraintError(
+                            VALUE_ERROR,
                             f"'{key_for_constraints}' contains disallowed value {constraint_val} at line {line_number}")
                 elif value == constraint_val:
-                    raise ValueError(
+                    raise ConstraintError(
+                        VALUE_ERROR,
                         f"'{key_for_constraints}' must not equal {constraint_val} at line {line_number}")
             elif constraint_type.startswith('not_') and constraint_type[4:] in ('<=', '>=', '<', '>'):
                 op = constraint_type[4:]
                 constraint_val = float(self.compiler.expr_evaluator.eval_or_eval_array(
                     constraint_expr, self.get_full_scope(), line_number))
                 if op == '<' and value < constraint_val:
-                    raise ValueError(
+                    raise ConstraintError(
+                        VALUE_ERROR,
                         f"'{key_for_constraints}' must not be less than {constraint_val} at line {line_number}")
                 elif op == '<=' and value <= constraint_val:
-                    raise ValueError(
+                    raise ConstraintError(
+                        VALUE_ERROR,
                         f"'{key_for_constraints}' must be greater than {constraint_val} at line {line_number}")
                 elif op == '>' and value > constraint_val:
-                    raise ValueError(
+                    raise ConstraintError(
+                        VALUE_ERROR,
                         f"'{key_for_constraints}' must not be greater than {constraint_val} at line {line_number}")
                 elif op == '>=' and value >= constraint_val:
-                    raise ValueError(
+                    raise ConstraintError(
+                        VALUE_ERROR,
                         f"'{key_for_constraints}' must be less than {constraint_val} at line {line_number}")
             elif constraint_type == 'in':
                 allowed_values = constraint_expr
@@ -752,10 +823,12 @@ class Scope:
                     allowed_values = [allowed_values]
                 if isinstance(value, (list, tuple, set)):
                     if not all(item in allowed_values for item in value):
-                        raise ValueError(
+                        raise ConstraintError(
+                            VALUE_ERROR,
                             f"'{key_for_constraints}' values {value} not in allowed values {allowed_values} at line {line_number}")
                 elif value not in allowed_values:
-                    raise ValueError(
+                    raise ConstraintError(
+                        VALUE_ERROR,
                         f"'{key_for_constraints}' value {value} not in allowed values {allowed_values} at line {line_number}")
             elif constraint_type == 'range':
                 start_expr = constraint_expr.get('start')
@@ -767,39 +840,47 @@ class Scope:
                     end_expr, self.get_full_scope(), line_number))
                 val = float(value)
                 if not (start_val <= val <= end_val):
-                    raise ValueError(
+                    raise ConstraintError(
+                        VALUE_ERROR,
                         f"'{key_for_constraints}' value {value} not in range {start_val} to {end_val} at line {line_number}")
                 if step_expr is not None:
                     step_val = float(self.compiler.expr_evaluator.eval_or_eval_array(
                         step_expr, self.get_full_scope(), line_number))
                     if step_val == 0:
-                        raise ValueError(
+                        raise ConstraintError(
+                            VALUE_ERROR,
                             f"'{key_for_constraints}' range step cannot be 0 at line {line_number}")
                     steps = (val - start_val) / step_val
                     if abs(steps - round(steps)) > 1e-9:
-                        raise ValueError(
+                        raise ConstraintError(
+                            VALUE_ERROR,
                             f"'{key_for_constraints}' value {value} not aligned to step {step_val} starting at {start_val} at line {line_number}")
                 else:
                     if start_val.is_integer() and end_val.is_integer():
                         if not val.is_integer():
-                            raise ValueError(
+                            raise ConstraintError(
+                                VALUE_ERROR,
                                 f"'{key_for_constraints}' value {value} must be an integer in range {start_val} to {end_val} at line {line_number}")
             elif constraint_type == 'not_null':
                 if value is None:
-                    raise ValueError(
+                    raise ConstraintError(
+                        NA_ERROR,
                         f"'{key_for_constraints}' must not be null at line {line_number}")
                 if isinstance(value, str) and value == '':
-                    raise ValueError(
+                    raise ConstraintError(
+                        NA_ERROR,
                         f"'{key_for_constraints}' must not be empty at line {line_number}")
             elif constraint_type == 'type':
                 expected_type = constraint_expr.lower()
                 actual_type = self.compiler.array_handler.infer_type(
                     value, line_number)
                 if expected_type == 'number' and actual_type not in ('number', 'float64', 'int', 'int64'):
-                    raise ValueError(
+                    raise ConstraintError(
+                        TYPE_ERROR,
                         f"'{key_for_constraints}' must be a number, got {actual_type} at line {line_number}")
                 elif expected_type == 'text' and actual_type not in ('string', 'text'):
-                    raise ValueError(
+                    raise ConstraintError(
+                        TYPE_ERROR,
                         f"'{key_for_constraints}' must be text, got {actual_type} at line {line_number}")
             elif constraint_type == 'type_union':
                 actual_type = self.compiler.array_handler.infer_type(
@@ -811,21 +892,25 @@ class Scope:
                 if 'text' in allowed and actual_type in ('string', 'text'):
                     type_matches = True
                 if not type_matches:
-                    raise ValueError(
+                    raise ConstraintError(
+                        TYPE_ERROR,
                         f"'{key_for_constraints}' must be one of {sorted(allowed)} at line {line_number}")
             elif constraint_type == 'not_type':
                 expected_type = constraint_expr.lower()
                 actual_type = self.compiler.array_handler.infer_type(
                     value, line_number)
                 if expected_type == 'number' and actual_type in ('number', 'float64', 'int', 'int64'):
-                    raise ValueError(
+                    raise ConstraintError(
+                        TYPE_ERROR,
                         f"'{key_for_constraints}' must not be a number at line {line_number}")
                 elif expected_type == 'text' and actual_type in ('string', 'text'):
-                    raise ValueError(
+                    raise ConstraintError(
+                        TYPE_ERROR,
                         f"'{key_for_constraints}' must not be text at line {line_number}")
             elif constraint_type == 'not_unit':
                 if isinstance(value, str) and value == constraint_expr:
-                    raise ValueError(
+                    raise ConstraintError(
+                        UNIT_ERROR,
                         f"'{key_for_constraints}' must not be unit {constraint_expr} at line {line_number}")
 
     def get_full_scope(self):
