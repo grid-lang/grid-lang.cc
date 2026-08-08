@@ -1432,6 +1432,13 @@ class GridLangControlFlow:
         Evaluate an IF condition, handling various types of constraints.
         """
 
+        # A leading '?' is the truth-test prefix used in value context
+        # ('[B1] := ? a = b'); inside a condition (If/When/guard) it is
+        # redundant, so tolerate it as if it were absent.
+        condition = condition.strip()
+        if condition.startswith('?'):
+            condition = condition[1:].strip()
+
         # '!=' is not a GridLang operator; use '<>' for inequality
         without_strings = re.sub(
             r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '', condition)
@@ -1439,6 +1446,13 @@ class GridLangControlFlow:
             raise SyntaxError(
                 f"'!=' is not a GridLang operator; use '<>' for inequality "
                 f"at line {line_number}")
+
+        # '==' is not a GridLang operator; a bare comparison is an assignment,
+        # so equality must be requested explicitly with '? a = b'.
+        if '==' in without_strings:
+            raise SyntaxError(
+                f"'==' is not a GridLang operator; use '? a = b' to get a "
+                f"logical value at line {line_number}")
 
         # Handle "not as" type constraints (e.g., "z not as text")
         not_type_match = re.match(

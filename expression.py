@@ -6,6 +6,7 @@
 import re
 import math
 import random
+import ast
 import pyarrow as pa
 from utils import (
     col_to_num,
@@ -1413,13 +1414,9 @@ class ExpressionEvaluator:
         try:
             result = self.compiler.array_handler.read_array_element(
                 arr, adjusted_indices, line_number)
-            if is_error_value(result):
-                curly_expr = f"{var_name}{{{indices_str}}}"
-                return self._substitute_curly_result(
-                    curly_expr, curly_expr, result, scope)
-            if isinstance(result, str):
-                return f'"{result}"'
-            return str(result)
+            curly_expr = f"{var_name}{{{indices_str}}}"
+            return self._substitute_curly_result(
+                curly_expr, curly_expr, result, scope)
         except (IndexError, ValueError) as e:
             raise IndexError(
                 f"Invalid indices {indices_str} for '{var_name}': {e} at line {line_number}")
@@ -1598,12 +1595,8 @@ class ExpressionEvaluator:
         try:
             result = self.compiler.array_handler.read_array_element(
                 arr, [adjusted_index], line_number)
-            if is_error_value(result):
-                return self._substitute_curly_result(
-                    f"{var_name}({index_expr})", f"{var_name}({index_expr})", result, scope)
-            if isinstance(result, str):
-                return f'"{result}"'
-            return str(result)
+            return self._substitute_curly_result(
+                f"{var_name}({index_expr})", f"{var_name}({index_expr})", result, scope)
         except (IndexError, ValueError) as e:
             raise IndexError(
                 f"Invalid index {index_expr} for '{var_name}': {e} at line {line_number}")
@@ -2220,7 +2213,8 @@ class ExpressionEvaluator:
     def _evaluate_with_python_fallback(self, expr, scope, line_number):
         eval_expr = expr
         full_scope = self._build_fallback_cell_scope(scope)
-        eval_expr = self._replace_fallback_cell_refs(eval_expr, line_number)
+        eval_expr = self._replace_fallback_cell_refs(
+            eval_expr, scope, line_number)
         handled, result = self._try_eval_fallback_array_operation(
             eval_expr, full_scope, line_number)
         if handled:
@@ -2247,25 +2241,31 @@ class ExpressionEvaluator:
                 pass
         return {**scope, **cell_vars}
 
-    def _replace_fallback_cell_refs(self, eval_expr, line_number):
+    def _replace_fallback_cell_refs(self, eval_expr, scope, line_number):
         # Skip cell refs directly inside bracket indexing (v[A1.1]); the
         # python-fallback guard reports those as missing '!' for arrays.
-        cell_ref_pattern = re.compile(rf'(?<![\w_])\[\^?({_ADDRESS_FRAGMENT})\]')
-        cell_refs = cell_ref_pattern.findall(eval_expr)
-        for cell_ref in cell_refs:
+        # Values are injected into 'scope' under placeholder names rather than
+        # spliced into the source: plain numbers are safe to splice, but inf,
+        # nan and text would break or lose quoting, and a naive .replace()
+        # would corrupt '[A1]' inside '[A11]'.
+        cell_ref_pattern = re.compile(
+            rf'(?<![\w_])\[(\^?)({_ADDRESS_FRAGMENT})\]')
+
+        def replacer(m):
+            caret, cell_ref = m.group(1), m.group(2)
             try:
                 value = self.compiler.array_handler.lookup_cell(
                     cell_ref, line_number)
-                if isinstance(value, (int, float)):
-                    replacement = str(value)
-                else:
-                    replacement = f'"{value}"'
-                eval_expr = eval_expr.replace(f'[{cell_ref}]', replacement)
-                eval_expr = eval_expr.replace(f'[^{cell_ref}]', replacement)
             except ValueError as e:
                 raise RuntimeError(
                     f"Invalid cell reference '{cell_ref}': {e} at line {line_number}")
-        return eval_expr
+            if is_error_value(value):
+                value = error_value(value)
+            placeholder = self._inject_eval_placeholder(
+                f'[{caret}{cell_ref}]', value, scope)
+            return placeholder
+
+        return cell_ref_pattern.sub(replacer, eval_expr)
 
     def _try_eval_fallback_array_operation(self, eval_expr, full_scope, line_number):
         array_op_match = re.match(
@@ -2319,19 +2319,24 @@ class ExpressionEvaluator:
             result.append(row)
         return True, result
 
-    def _substitute_curly_result(self, eval_expr, curly_expr, result, scope):
-        """Substitute a curly-access result into an expression string.
+    def _inject_eval_placeholder(self, source, result, scope):
+        """Store 'result' in 'scope' under a deterministic placeholder name
+        and return that name. Never splice values into expression source."""
+        placeholder = f"__gridlang_value_{abs(hash((source, repr(result)))) & 0xFFFFFFFF}"
+        scope[placeholder] = result
+        return placeholder
 
-        An error value cannot be spliced into the Python source, so it is
-        injected into the evaluation scope under a placeholder name instead;
-        arithmetic on the placeholder then propagates the error.
+    def _substitute_curly_result(self, eval_expr, curly_expr, result, scope):
+        """Substitute an array-access result into an expression string.
+
+        The result is never spliced into the Python source: an error value
+        would become a comment ('#REF'), a string would lose its quotes, and
+        inf/nan would become bare names. Instead it is injected into the
+        evaluation scope under a deterministic placeholder name; arithmetic on
+        the placeholder then propagates the value (including sticky errors).
         """
-        if is_error_value(result):
-            code = result if isinstance(result, str) else result.error_code
-            placeholder = f"__gridlang_error_{abs(hash((curly_expr, code))) & 0xFFFFFFFF}"
-            scope[placeholder] = error_value(code)
-            return eval_expr.replace(curly_expr, placeholder)
-        return eval_expr.replace(curly_expr, str(result))
+        placeholder = self._inject_eval_placeholder(curly_expr, result, scope)
+        return eval_expr.replace(curly_expr, placeholder)
 
     def _replace_fallback_curly_accesses(self, eval_expr, scope, line_number):
         curly_brace_pattern = re.compile(r'([\w_]+)\{([^}]+)\}')
@@ -2464,7 +2469,9 @@ class ExpressionEvaluator:
     def _eval_python_fallback_result(self, original_expr, eval_expr, full_scope, line_number):
         try:
             globals_dict = self._get_eval_globals()
-            result = eval(eval_expr, globals_dict, full_scope)
+            tree = ast.parse(eval_expr, mode='eval')
+            result = self._walk_ast_node(
+                tree.body, full_scope, globals_dict, line_number)
             if isinstance(result, (int, float)) and (math.isinf(result) or math.isnan(result)):
                 return error_value(NUM_ERROR)
             if isinstance(result, set):
@@ -2476,11 +2483,175 @@ class ExpressionEvaluator:
             return error_value(DIV0_ERROR)
         except OverflowError:
             return error_value(NUM_ERROR)
+        except SyntaxError as e:
+            raise SyntaxError(
+                f"Invalid expression '{original_expr}': {e} at line {line_number}")
         except NameError as e:
             raise NameError(f"{e} at line {line_number}")
         except Exception as e:
             raise RuntimeError(
                 f"Error evaluating '{original_expr}': {e} at line {line_number}")
+
+    def _resolve_fallback_name(self, name, full_scope, globals_dict):
+        """Resolve a name exactly as eval() would: locals, then globals, then
+        the restricted builtins dict. All lookups are case-insensitive."""
+        if name in full_scope:
+            return full_scope[name]
+        if name in globals_dict:
+            return globals_dict[name]
+        builtins_dict = globals_dict.get('__builtins__')
+        if isinstance(builtins_dict, dict) and name in builtins_dict:
+            return builtins_dict[name]
+        raise NameError(f"Name '{name}' is not defined")
+
+    def _walk_ast_node(self, node, full_scope, globals_dict, line_number):
+        """Evaluate a single parsed expression node.
+
+        Replaces the string-based eval() with a restricted AST interpreter:
+        only the node types below are accepted, all names resolve through the
+        same locals/globals/builtins chain eval() used, and every operator
+        dispatches to ordinary Python operators so UnitValue sticky errors
+        propagate exactly as before.
+        """
+        node_type = type(node)
+        if node_type is ast.Constant:
+            return node.value
+        if node_type is ast.Name:
+            return self._resolve_fallback_name(node.id, full_scope, globals_dict)
+        if node_type is ast.BinOp:
+            left = self._walk_ast_node(
+                node.left, full_scope, globals_dict, line_number)
+            right = self._walk_ast_node(
+                node.right, full_scope, globals_dict, line_number)
+            return self._apply_fallback_binop(node.op, left, right)
+        if node_type is ast.UnaryOp:
+            operand = self._walk_ast_node(
+                node.operand, full_scope, globals_dict, line_number)
+            return self._apply_fallback_unop(node.op, operand)
+        if node_type is ast.Compare:
+            left = self._walk_ast_node(
+                node.left, full_scope, globals_dict, line_number)
+            for op, comparator in zip(node.ops, node.comparators):
+                right = self._walk_ast_node(
+                    comparator, full_scope, globals_dict, line_number)
+                cmp_result = self._apply_fallback_compare(op, left, right)
+                if len(node.ops) == 1:
+                    return cmp_result
+                if is_error_value(cmp_result):
+                    return cmp_result
+                if not cmp_result:
+                    return False
+                left = right
+            return True
+        if node_type is ast.BoolOp:
+            result = None
+            for value_node in node.values:
+                result = self._walk_ast_node(
+                    value_node, full_scope, globals_dict, line_number)
+                if isinstance(node.op, ast.Or) and result:
+                    return result
+                if isinstance(node.op, ast.And) and not result:
+                    return result
+            return result
+        if node_type is ast.Call:
+            func = self._walk_ast_node(
+                node.func, full_scope, globals_dict, line_number)
+            args = [self._walk_ast_node(
+                a, full_scope, globals_dict, line_number) for a in node.args]
+            kwargs = {}
+            for kw in node.keywords:
+                if kw.arg is None:
+                    raise RuntimeError(
+                        f"Unsupported ** expansion at line {line_number}")
+                kwargs[kw.arg] = self._walk_ast_node(
+                    kw.value, full_scope, globals_dict, line_number)
+            return func(*args, **kwargs)
+        if node_type is ast.Attribute:
+            obj = self._walk_ast_node(
+                node.value, full_scope, globals_dict, line_number)
+            return getattr(obj, node.attr)
+        if node_type is ast.Subscript:
+            value = self._walk_ast_node(
+                node.value, full_scope, globals_dict, line_number)
+            index = self._walk_ast_slice(
+                node.slice, full_scope, globals_dict, line_number)
+            return value[index]
+        if node_type is ast.List:
+            return [self._walk_ast_node(
+                e, full_scope, globals_dict, line_number) for e in node.elts]
+        if node_type is ast.Tuple:
+            return tuple(self._walk_ast_node(
+                e, full_scope, globals_dict, line_number) for e in node.elts)
+        if node_type is ast.Dict:
+            return {self._walk_ast_node(
+                k, full_scope, globals_dict, line_number): self._walk_ast_node(
+                    v, full_scope, globals_dict, line_number)
+                for k, v in zip(node.keys, node.values) if k is not None}
+        if node_type is ast.Set:
+            return {self._walk_ast_node(
+                e, full_scope, globals_dict, line_number) for e in node.elts}
+        if node_type is ast.IfExp:
+            test = self._walk_ast_node(
+                node.test, full_scope, globals_dict, line_number)
+            branch = node.body if test else node.orelse
+            return self._walk_ast_node(
+                branch, full_scope, globals_dict, line_number)
+        raise RuntimeError(
+            f"Unsupported expression construct '{node_type.__name__}' at line {line_number}")
+
+    def _walk_ast_slice(self, node, full_scope, globals_dict, line_number):
+        if isinstance(node, ast.Slice):
+            return slice(
+                self._walk_ast_node(node.lower, full_scope, globals_dict, line_number) if node.lower else None,
+                self._walk_ast_node(node.upper, full_scope, globals_dict, line_number) if node.upper else None,
+                self._walk_ast_node(node.step, full_scope, globals_dict, line_number) if node.step else None)
+        return self._walk_ast_node(node, full_scope, globals_dict, line_number)
+
+    def _apply_fallback_binop(self, op, left, right):
+        if isinstance(op, ast.Add):
+            return left + right
+        if isinstance(op, ast.Sub):
+            return left - right
+        if isinstance(op, ast.Mult):
+            return left * right
+        if isinstance(op, ast.Div):
+            return left / right
+        if isinstance(op, ast.FloorDiv):
+            return left // right
+        if isinstance(op, ast.Mod):
+            return left % right
+        if isinstance(op, ast.Pow):
+            return left ** right
+        raise RuntimeError(
+            f"Unsupported binary operator '{type(op).__name__}'")
+
+    def _apply_fallback_unop(self, op, operand):
+        if isinstance(op, ast.USub):
+            return -operand
+        if isinstance(op, ast.UAdd):
+            return +operand
+        if isinstance(op, ast.Not):
+            return not operand
+        if isinstance(op, ast.Invert):
+            return ~operand
+        raise RuntimeError(
+            f"Unsupported unary operator '{type(op).__name__}'")
+
+    def _apply_fallback_compare(self, op, left, right):
+        if isinstance(op, ast.Eq):
+            return left == right
+        if isinstance(op, ast.NotEq):
+            return left != right
+        if isinstance(op, ast.Lt):
+            return left < right
+        if isinstance(op, ast.LtE):
+            return left <= right
+        if isinstance(op, ast.Gt):
+            return left > right
+        if isinstance(op, ast.GtE):
+            return left >= right
+        raise RuntimeError(
+            f"Unsupported comparison operator '{type(op).__name__}'")
 
     def get_full_scope(self):
         """Get the full evaluation scope (alias to get_evaluation_scope)."""
