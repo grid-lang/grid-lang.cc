@@ -54,6 +54,12 @@ class GridLangParser:
             constraints['var_list'] = var_names
         else:
             var = re.sub(r'^(input|output)\s+', '', parts[0], flags=re.I).strip()
+        first_word = var.split()[0] if var.split() else ''
+        if re.match(r'^(let|for|if|when|declare|input|output)\b', first_word, re.I):
+            raise SyntaxError(
+                f"'{first_word}' is an instruction and must be at the start "
+                f"of a line, or after 'Then', 'Else', 'Do' or ':' at line "
+                f"{line_number}")
         i = 1
         negated = False
         while i < len(parts):
@@ -152,7 +158,7 @@ class GridLangParser:
                                     v_clean = v.strip()
                                     if (v_clean.startswith('"') and v_clean.endswith('"')) or (
                                             v_clean.startswith("'") and v_clean.endswith("'")):
-                                        parsed_row.append(v_clean[1:-1])
+                                        parsed_row.append(v_clean)
                                     else:
                                         try:
                                             parsed_row.append(float(v_clean))
@@ -167,7 +173,7 @@ class GridLangParser:
                         for v in values_str:
                             v_clean = v.strip()
                             if (v_clean.startswith('"') and v_clean.endswith('"')) or (v_clean.startswith("'") and v_clean.endswith("'")):
-                                val = v_clean[1:-1]
+                                val = v_clean
                             else:
                                 try:
                                     val = float(v_clean)
@@ -388,6 +394,8 @@ class GridLangParser:
         current = ""
         in_quote = False
         quote_char = None
+        brace_depth = 0
+        truth_open = False
         i = 0
         lower_text = text.lower()
 
@@ -404,8 +412,19 @@ class GridLangParser:
                 i += 1
                 continue
 
+            if not in_quote and ch == '{':
+                brace_depth += 1
+                current += ch
+                i += 1
+                continue
+            if not in_quote and ch == '}' and brace_depth > 0:
+                brace_depth -= 1
+                current += ch
+                i += 1
+                continue
+
             matched = None
-            if not in_quote:
+            if not in_quote and brace_depth == 0 and not truth_open:
                 for kw in keywords:
                     if lower_text.startswith(kw, i):
                         # For word keywords, ensure boundaries
@@ -423,12 +442,18 @@ class GridLangParser:
                     parts.append(current.strip())
                 parts.append(matched)
                 current = ""
+                truth_open = False
                 i += len(matched)
                 # Skip following whitespace to mimic regex split behavior
                 while i < len(text) and text[i].isspace():
                     i += 1
             else:
                 current += ch
+                if ch == '?' and not in_quote and brace_depth == 0:
+                    # A '?' truth-test operator (e.g. "a or ? 9 = 9") makes the
+                    # rest of the current token atomic: its '=' is equality,
+                    # not a constraint separator.
+                    truth_open = True
                 i += 1
 
         if current.strip():

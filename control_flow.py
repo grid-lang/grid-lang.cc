@@ -1439,6 +1439,16 @@ class GridLangControlFlow:
         if condition.startswith('?'):
             condition = condition[1:].strip()
 
+        # Instructions (Let, For, If, ...) may only start a statement, so
+        # one appearing inside an expression is invalid.
+        instruction_match = re.match(
+            r'^(let|for|if|when|input|output|declare)\b', condition, re.I)
+        if instruction_match:
+            raise SyntaxError(
+                f"'{instruction_match.group(1)}' is an instruction and must "
+                f"be at the start of a line, or after 'Then', 'Else', 'Do' "
+                f"or ':' at line {line_number}")
+
         # '!=' is not a GridLang operator; use '<>' for inequality
         without_strings = re.sub(
             r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '', condition)

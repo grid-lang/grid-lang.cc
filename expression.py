@@ -80,8 +80,8 @@ class ExpressionEvaluator:
         :param is_grid_dim: Use grid dimension logic if True.
         :return: Evaluated value (scalar, list, or pyarrow Array).
         """
-        if isinstance(expr, list):  # Skip if already a dimension constraint list
-            return expr
+        if isinstance(expr, list):
+            return self._eval_array_literal_elements(expr, scope, line_number)
         expr = expr.strip()
         if is_grid_dim and '--' in expr:
             expr = expr.split('--')[0].strip()
@@ -196,6 +196,30 @@ class ExpressionEvaluator:
             return self.eval_expr(expr, scope, line_number)
 
         raise NameError(f"Name '{expr}' not defined at line {line_number}")
+
+    def _eval_array_literal_elements(self, expr, scope, line_number=None):
+        """Evaluate an array-literal list into concrete values.
+
+        Elements may be numbers (kept as-is), quoted text (unquoted and kept),
+        or Grid expressions (truth tests, arithmetic, variable refs...) which
+        are evaluated via eval_expr. Nested lists (matrices) recurse.
+        """
+        result = []
+        for element in expr:
+            if isinstance(element, list):
+                result.append(self._eval_array_literal_elements(
+                    element, scope, line_number))
+            elif isinstance(element, str):
+                element = element.strip()
+                if ((element.startswith('"') and element.endswith('"'))
+                        or (element.startswith("'") and element.endswith("'"))):
+                    result.append(element[1:-1])
+                else:
+                    result.append(self.eval_expr(
+                        element, scope, line_number))
+            else:
+                result.append(element)
+        return result
 
     def _get_scope_lookup(self, scope):
         if isinstance(scope, dict):
@@ -2469,6 +2493,7 @@ class ExpressionEvaluator:
     def _eval_python_fallback_result(self, original_expr, eval_expr, full_scope, line_number):
         try:
             globals_dict = self._get_eval_globals()
+            eval_expr = self._rewrite_truth_tests(eval_expr)
             tree = ast.parse(eval_expr, mode='eval')
             result = self._walk_ast_node(
                 tree.body, full_scope, globals_dict, line_number)
@@ -2491,6 +2516,89 @@ class ExpressionEvaluator:
         except Exception as e:
             raise RuntimeError(
                 f"Error evaluating '{original_expr}': {e} at line {line_number}")
+
+    def _rewrite_truth_tests(self, expr):
+        """Rewrite '?' truth-test operators into explicit markers.
+
+        A '?' is a unary operator that turns the following expression into a
+        truth-test value; inside it '=' is equality (Grid semantics), not
+        assignment. '? a = 1 or 9 = 9' becomes
+        'gridlang_truth(a == 1 or 9 == 9)', which the AST walker evaluates.
+        Only the first '?' matters: a truth-test binds the remainder of the
+        expression, so it is replaced as a whole (nested '?' is not yet
+        supported).
+        """
+        out = []
+        in_quote = False
+        quote_char = None
+        i = 0
+        n = len(expr)
+        while i < n:
+            ch = expr[i]
+            if ch in ('"', "'"):
+                if not in_quote:
+                    in_quote = True
+                    quote_char = ch
+                elif quote_char == ch:
+                    in_quote = False
+                    quote_char = None
+                out.append(ch)
+                i += 1
+                continue
+            if ch == '?' and not in_quote:
+                rest = expr[i + 1:].lstrip()
+                out.append('gridlang_truth(')
+                out.append(self._rewrite_truth_test_body(rest))
+                out.append(')')
+                return ''.join(out)
+            out.append(ch)
+            i += 1
+        return ''.join(out)
+
+    def _rewrite_truth_test_body(self, s):
+        """Rewrite a truth-test body into Python boolean syntax.
+
+        '=' becomes '==' and '<>' becomes '!=', while '<', '>', '<=', '>='
+        are left intact. Quoted strings are skipped.
+        """
+        out = []
+        in_quote = False
+        quote_char = None
+        i = 0
+        n = len(s)
+        while i < n:
+            ch = s[i]
+            if ch in ('"', "'"):
+                if not in_quote:
+                    in_quote = True
+                    quote_char = ch
+                elif quote_char == ch:
+                    in_quote = False
+                    quote_char = None
+                out.append(ch)
+                i += 1
+                continue
+            if in_quote:
+                out.append(ch)
+                i += 1
+                continue
+            nxt = s[i + 1] if i + 1 < n else ''
+            if ch == '<' and nxt == '>':
+                out.append('!=')
+                i += 2
+            elif ch == '<' and nxt == '=':
+                out.append('<=')
+                i += 2
+            elif ch == '>' and nxt == '=':
+                out.append('>=')
+                i += 2
+            elif ch == '=':
+                out.append('==')
+                i += 1
+            else:
+                out.append(ch)
+                i += 1
+        return ''.join(out)
 
     def _resolve_fallback_name(self, name, full_scope, globals_dict):
         """Resolve a name exactly as eval() would: locals, then globals, then
@@ -2554,6 +2662,15 @@ class ExpressionEvaluator:
                     return result
             return result
         if node_type is ast.Call:
+            if (isinstance(node.func, ast.Name)
+                    and node.func.id == 'gridlang_truth'):
+                # A '?' truth-test marker: evaluate its single argument
+                # (already rewritten with '=' as '==') and return the value.
+                if len(node.args) != 1 or node.keywords:
+                    raise RuntimeError(
+                        f"Invalid truth-test at line {line_number}")
+                return self._walk_ast_node(
+                    node.args[0], full_scope, globals_dict, line_number)
             func = self._walk_ast_node(
                 node.func, full_scope, globals_dict, line_number)
             args = [self._walk_ast_node(

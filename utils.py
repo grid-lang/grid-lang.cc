@@ -37,9 +37,49 @@ def split_var_defs(s):
     """Split a variable-definition list on 'and' that separates definitions.
 
     An 'and' introducing a further comparison constraint (=, <, >, <>, >=,
-    <=) or a negated constraint ('not') is left intact.
+    <=) or a negated constraint ('not') is left intact. A '?' truth-test
+    value expression (e.g. "? a = 5 and 1 = 1") is a single value, so any
+    'and' inside it is left intact too.
     """
-    return _DEFINITION_AND_SPLIT.split(s)
+    marker = _truth_test_begin(s)
+    if marker is None:
+        return _DEFINITION_AND_SPLIT.split(s)
+    head = s[:marker]
+    tail = s[marker:]
+    parts = _DEFINITION_AND_SPLIT.split(head)
+    parts[-1] = parts[-1] + tail
+    return [part for part in parts if part]
+
+
+def _truth_test_begin(s):
+    """Return the index of the '?' that starts a truth-test value.
+
+    A truth-test is a '?' directly following the '=' that introduces a
+    variable's value expression. Since it extends to the end of the string,
+    only the first occurrence matters.
+    """
+    in_quote = False
+    quote_char = None
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch in ('"', "'"):
+            if not in_quote:
+                in_quote = True
+                quote_char = ch
+            elif quote_char == ch:
+                in_quote = False
+                quote_char = None
+            i += 1
+            continue
+        if not in_quote and ch == '=':
+            j = i + 1
+            while j < len(s) and s[j].isspace():
+                j += 1
+            if j < len(s) and s[j] == '?':
+                return j
+        i += 1
+    return None
 
 
 def validate_cell_ref(cell_ref):
