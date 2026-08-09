@@ -4,7 +4,6 @@ import re
 import math
 import sys
 import copy
-import pyarrow as pa
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
 from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT
@@ -253,8 +252,8 @@ class GridLangCompiler:
         if inputs_list:
             raise ValueError(
                 f"Cannot convert array to type '{type_name}' with constructor inputs at line {line_number}")
-        if isinstance(value, pa.Array):
-            value = value.to_pylist()
+        if isinstance(value, dict) and 'array' in value:
+            value = list(value['array'])
         if not isinstance(value, list):
             return value
         public_fields = list(self._get_public_type_fields(type_def).keys())
@@ -528,8 +527,8 @@ class GridLangCompiler:
         if vectorize and not collect_all:
             array_args = []
             for idx, arg in enumerate(args):
-                if isinstance(arg, pa.Array):
-                    array_args.append((idx, arg.to_pylist()))
+                if isinstance(arg, dict) and 'array' in arg:
+                    array_args.append((idx, list(arg['array'])))
                 elif isinstance(arg, (list, tuple)):
                     array_args.append((idx, list(arg)))
             if array_args:
@@ -554,8 +553,8 @@ class GridLangCompiler:
                         for i in range(count):
                             elem_args = []
                             for arg in args:
-                                if isinstance(arg, pa.Array):
-                                    elem_args.append(arg.to_pylist()[i])
+                                if isinstance(arg, dict) and 'array' in arg:
+                                    elem_args.append(list(arg['array'])[i])
                                 elif isinstance(arg, (list, tuple)):
                                     elem_args.append(list(arg)[i])
                                 else:
@@ -859,7 +858,7 @@ class GridLangCompiler:
         expected_type = field_type.lower()
         if expected_type not in self.types_defined:
             return field_value
-        if isinstance(field_value, (list, pa.Array)):
+        if isinstance(field_value, (list, dict)):
             return self._convert_array_to_object(expected_type, field_value, line_number)
         if isinstance(field_value, dict):
             actual_type = field_value.get('_type_name')
@@ -1074,8 +1073,8 @@ class GridLangCompiler:
         target = binding.strip()
         if not target:
             return
-        if isinstance(values, pa.Array):
-            values = values.to_pylist()
+        if isinstance(values, dict) and 'array' in values:
+            values = list(values['array'])
         simple_value = values[0] if isinstance(
             values, list) and len(values) == 1 else values
 
@@ -1087,7 +1086,7 @@ class GridLangCompiler:
                 inner, scope.get_evaluation_scope(), line_number) or inner
             validate_cell_ref(cell_ref)
             if isinstance(values, list):
-                all_scalars = all(not isinstance(v, (list, dict, pa.Array))
+                all_scalars = all(not isinstance(v, (list, dict))
                                   for v in values)
                 if all_scalars:
                     # For scalar pushes, keep the last value only
@@ -1201,8 +1200,8 @@ class GridLangCompiler:
         def _normalize_grid(value):
             if value is None:
                 return []
-            if isinstance(value, pa.Array):
-                value = value.to_pylist()
+            if isinstance(value, dict) and 'array' in value:
+                value = value['array']
             if isinstance(value, dict):
                 return self._grid_to_matrix(value)
             if isinstance(value, list):
@@ -2295,8 +2294,8 @@ class GridLangCompiler:
                         self.current_scope().define(
                             var, value, type_name.lower(), constraints, is_uninitialized=False, line_number=line_number)
                     else:
-                        pa_type = pa.float64() if effective_type in (
-                            'number', 'array') else pa.string()
+                        pa_type = 'number' if effective_type in (
+                            'number', 'array') else 'text'
                         value = self.array_handler.create_array(
                             shape, 0 if effective_type in ('number', 'array') else '', pa_type, line_number)
                         self.current_scope().define(
@@ -2633,8 +2632,8 @@ class GridLangCompiler:
         else:
             self.current_scope().define(
                 var, value, inferred_type, constraints, is_uninitialized=False, line_number=line_number)
-        self.grid[cell] = value.to_pylist() if isinstance(
-            value, pa.Array) else value
+        self.grid[cell] = self.array_handler.flatten_array(
+            value, line_number) if isinstance(value, dict) and 'array' in value else value
         self._cell_var_map[cell] = var
 
     def _process_cell_binding_declaration(self, line, line_number=None):
@@ -2699,8 +2698,8 @@ class GridLangCompiler:
         try:
             current_value = self.current_scope().get(var)
             if current_value is not None:
-                converted = current_value.to_pylist() if isinstance(
-                    current_value, pa.Array) else current_value
+                converted = self.array_handler.flatten_array(
+                    current_value, line_number) if isinstance(current_value, dict) and 'array' in current_value else current_value
                 self.grid[cell_ref] = converted
                 self._record_output_value(var, converted)
         except NameError:
@@ -2721,8 +2720,8 @@ class GridLangCompiler:
                     self.grid[cell] = value
         for cell, mapped_var in self._cell_var_map.items():
             if mapped_var.lower() == var_lower:
-                converted = value.to_pylist() if isinstance(
-                    value, pa.Array) else value
+                converted = self.array_handler.flatten_array(
+                    value, None) if isinstance(value, dict) and 'array' in value else value
                 self.grid[cell] = converted
 
     def _record_output_value(self, var_name, value):
@@ -2733,8 +2732,8 @@ class GridLangCompiler:
         if not global_scope.is_output(var_name):
             return
         var_key = var_name.lower()
-        if isinstance(value, pa.Array):
-            value = value.to_pylist()
+        if isinstance(value, dict) and 'array' in value:
+            value = list(value['array'])
         # Keep the unit attached so function/subprocess outputs retain it when
         # they are returned to a caller (grid writes strip it instead).
         if is_error_value(value):
@@ -2763,8 +2762,8 @@ class GridLangCompiler:
 
     def _debug_export_value(self, value):
         """Format runtime values for debug CSV output."""
-        if isinstance(value, pa.Array):
-            value = value.to_pylist()
+        if isinstance(value, dict) and 'array' in value:
+            value = list(value['array'])
         if isinstance(value, dict):
             value = public_object_view(value)
         elif isinstance(value, list):
@@ -2772,8 +2771,8 @@ class GridLangCompiler:
             for item in value:
                 if isinstance(item, dict):
                     normalized.append(public_object_view(item))
-                elif isinstance(item, pa.Array):
-                    normalized.append(item.to_pylist())
+                elif isinstance(item, (list, dict)):
+                    normalized.append(self._debug_export_value(item))
                 else:
                     normalized.append(item)
             value = normalized

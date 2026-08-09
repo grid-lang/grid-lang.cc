@@ -264,11 +264,6 @@ def public_object_view(obj):
 
 def format_display_value(value, sig_digits=15):
     """Format values for display by trimming floating-point artifacts."""
-    try:
-        import pyarrow as pa  # Optional dependency for array values.
-    except Exception:
-        pa = None
-
     if isinstance(value, float):
         if value != value:
             return "nan"
@@ -284,8 +279,8 @@ def format_display_value(value, sig_digits=15):
         return str(value)
     if value is None:
         return "None"
-    if pa is not None and isinstance(value, pa.Array):
-        return format_display_value(value.to_pylist(), sig_digits=sig_digits)
+    if isinstance(value, dict) and 'array' in value:
+        return format_display_value(list(value['array']), sig_digits=sig_digits)
     if isinstance(value, dict):
         items = []
         for k, v in value.items():

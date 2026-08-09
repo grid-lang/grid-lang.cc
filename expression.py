@@ -7,7 +7,6 @@ import re
 import math
 import random
 import ast
-import pyarrow as pa
 from utils import (
     col_to_num,
     num_to_col,
@@ -78,7 +77,7 @@ class ExpressionEvaluator:
         :param scope: The current scope dictionary.
         :param line_number: Optional line number for error reporting.
         :param is_grid_dim: Use grid dimension logic if True.
-        :return: Evaluated value (scalar, list, or pyarrow Array).
+        :return: Evaluated value (scalar, list, or dict-form array).
         """
         if isinstance(expr, list):
             return self._eval_array_literal_elements(expr, scope, line_number)
@@ -138,7 +137,7 @@ class ExpressionEvaluator:
                         self.compiler.current_scope().update(
                             var_name, flat_values)
                         self.compiler.last_dim_var = None
-                    return pa.array(flat_values, type=pa.float64())
+                    return list(flat_values)
                 except Exception as e:
                     raise RuntimeError(
                         f"Error evaluating range '{s_ref}:{e_ref}': {e} at line {line_number}")
@@ -153,7 +152,7 @@ class ExpressionEvaluator:
                     var_name = self.compiler.last_dim_var
                     self.compiler.current_scope().update(var_name, flat_values)
                     self.compiler.last_dim_var = None
-                return pa.array(flat_values, type=pa.float64())
+                return list(flat_values)
             except Exception as e:
                 raise RuntimeError(
                     f"Error evaluating range '{s_ref}:{e_ref}': {e} at line {line_number}")
@@ -289,7 +288,7 @@ class ExpressionEvaluator:
                     raise PermissionError(
                         f"Hidden field '{field}' is not accessible at line {line_number}")
                 return True, tensor[actual_field]
-        if isinstance(tensor, pa.ListArray):
+        if isinstance(tensor, (list, tuple, dict)):
             shape = self.compiler.array_handler.get_array_shape(
                 tensor, line_number)
             zero_indices = [1] * len(shape)
@@ -316,10 +315,10 @@ class ExpressionEvaluator:
                 obj_value = self.compiler.current_scope().get(obj_name)
             except Exception:
                 obj_value = None
-        if not isinstance(obj_value, (list, tuple, pa.Array)):
+        if not isinstance(obj_value, (list, tuple, dict)):
             return False, None
-        obj_list = obj_value.to_pylist() if isinstance(
-            obj_value, pa.Array) else list(obj_value)
+        obj_list = list(obj_value) if isinstance(obj_value, (list, tuple)) else list(
+            self.compiler.array_handler.flatten_array(obj_value, line_number))
         args_list = []
         if args_part.strip():
             args_list = [a.strip()
@@ -420,9 +419,12 @@ class ExpressionEvaluator:
                 raise NameError(
                     f"Variable '{var}' not defined at line {line_number}")
             value = scope[var]
-            if isinstance(value, (pa.Array, list)):
-                value = sum(value.to_pylist() if isinstance(
-                    value, pa.Array) else value)
+            if isinstance(value, (list, dict)):
+                if isinstance(value, dict):
+                    value = self.compiler.array_handler.flatten_array(
+                        value, line_number)
+                else:
+                    value = sum(value)
             elif not isinstance(value, (int, float)):
                 raise TypeError(
                     f"Cannot sum non-numeric value for '{var}' at line {line_number}")
@@ -453,11 +455,10 @@ class ExpressionEvaluator:
         if m_member_array_fallback:
             obj_name, method_name, args_part = m_member_array_fallback.groups()
             obj_value = full_scope.get(obj_name)
-            if isinstance(obj_value, (list, tuple, pa.Array)):
-                if isinstance(obj_value, pa.Array):
-                    obj_list = obj_value.to_pylist()
-                else:
-                    obj_list = list(obj_value)
+            if isinstance(obj_value, (list, tuple, dict)):
+                obj_list = list(obj_value) if isinstance(
+                    obj_value, (list, tuple)) else list(
+                    self.compiler.array_handler.flatten_array(obj_value, line_number))
                 element_type = None
                 for elem in obj_list:
                     if isinstance(elem, dict):
@@ -517,10 +518,7 @@ class ExpressionEvaluator:
                     try:
                         evaluated = self.eval_or_eval_array(
                             elem_str, full_scope, line_number)
-                        if isinstance(evaluated, pa.Array):
-                            row_elements.extend([float(v) if isinstance(
-                                v, (int, float)) and not isinstance(v, bool) else v for v in evaluated.to_pylist()])
-                        elif isinstance(evaluated, dict):
+                        if isinstance(evaluated, dict):
                             row_elements.append(evaluated)
                         elif isinstance(evaluated, list):
                             row_elements.extend([float(v) if isinstance(
@@ -545,7 +543,7 @@ class ExpressionEvaluator:
         :param expr: Piped array string.
         :param scope: Scope.
         :param line_number: Line number.
-        :return: Dict-form N-D array (or plain pyarrow array for 1D results).
+        :return: Dict-form N-D array (or plain list for 1D results).
         """
         if not (expr.startswith('{') and expr.endswith('}')):
             raise SyntaxError(
@@ -614,18 +612,17 @@ class ExpressionEvaluator:
             result_flat.append(operand_flats[operand_idx][op_flat_idx])
 
         if len(result_shape) == 1:
-            return pa.array(result_flat, type=self._infer_array_pa_type(result_flat))
-        pa_type = self._infer_array_pa_type(result_flat)
-        return {'array': pa.array(result_flat, type=pa_type),
+            return list(result_flat)
+        return {'array': list(result_flat),
                 'shape': list(result_shape), 'original_shape': list(result_shape)}
 
     def _infer_array_pa_type(self, values):
-        """Pick a pyarrow type for a list of flat array values."""
+        """Pick the array value kind for a list of flat array values."""
         if any(isinstance(v, str) for v in values):
-            return pa.string()
+            return 'text'
         if any(isinstance(v, bool) for v in values):
-            return pa.bool_()
-        return pa.float64()
+            return 'logical'
+        return 'number'
 
     def _resolve_column_interpolated_cell(self, inside, scope, line_number=None):
         m = re.match(
@@ -905,12 +902,12 @@ class ExpressionEvaluator:
         return True, result
 
     def _try_eval_array_member_call(self, obj_value, obj_type, method_name, args_part, scope, line_number):
-        if not isinstance(obj_value, (list, tuple, pa.Array)):
+        if not isinstance(obj_value, (list, tuple)) and not (
+                isinstance(obj_value, dict) and 'array' in obj_value):
             return False, None
-        if isinstance(obj_value, pa.Array):
-            obj_list = obj_value.to_pylist()
-        else:
-            obj_list = list(obj_value)
+        obj_list = list(obj_value) if isinstance(
+            obj_value, (list, tuple)) else list(
+            self.compiler.array_handler.flatten_array(obj_value, line_number))
 
         element_type = obj_type
         func_key = None
@@ -1464,8 +1461,7 @@ class ExpressionEvaluator:
                 return match.group(0)
         actual_field = get_case_insensitive_key(obj_value, field_name) or field_name
         field_val = obj_value.get(actual_field)
-        import pyarrow as pa
-        if not isinstance(field_val, (list, tuple, pa.Array)):
+        if not isinstance(field_val, (list, tuple, dict)):
             return match.group(0)
         range_match = re.match(r'^\s*(.+)\s+to\s+(.+?)\s*$', index_expr, re.I)
         if range_match:
@@ -1482,12 +1478,12 @@ class ExpressionEvaluator:
                     f"Error evaluating index expression '{index_expr}': {e} at line {line_number}")
             start_idx = start_value - 1
             end_idx = end_value - 1
-            if isinstance(field_val, pa.Array):
-                return repr(field_val.to_pylist()[start_idx:end_idx + 1])
             if isinstance(field_val, list):
                 return repr(field_val[start_idx:end_idx + 1])
             if isinstance(field_val, tuple):
                 return repr(list(field_val[start_idx:end_idx + 1]))
+            return repr(self.compiler.array_handler.flatten_array(
+                field_val, line_number)[start_idx:end_idx + 1])
         try:
             index_value = self.eval_expr(index_expr, scope, line_number)
             if isinstance(index_value, float) and index_value.is_integer():
@@ -1496,10 +1492,11 @@ class ExpressionEvaluator:
             return match.group(0)
         idx = index_value - 1
         try:
-            if isinstance(field_val, pa.Array):
-                result = field_val.to_pylist()[idx]
-            else:
+            if isinstance(field_val, (list, tuple)):
                 result = field_val[idx]
+            else:
+                result = self.compiler.array_handler.flatten_array(
+                    field_val, line_number)[idx]
         except Exception:
             return match.group(0)
         if isinstance(result, str):
@@ -1546,8 +1543,7 @@ class ExpressionEvaluator:
             except NameError:
                 return match.group(0)
 
-        import pyarrow as pa
-        if not isinstance(arr, (list, tuple, dict, pa.Array)):
+        if not isinstance(arr, (list, tuple, dict)):
             return match.group(0)
 
         # Check if this array is 0-based or 1-based based on dimension constraints
@@ -1594,14 +1590,12 @@ class ExpressionEvaluator:
             else:
                 start_idx = start_value - 1
                 end_idx = end_value - 1
-            if isinstance(arr, pa.Array):
-                arr_list = arr.to_pylist()
-                return repr(arr_list[start_idx:end_idx + 1])
             if isinstance(arr, list):
                 return repr(arr[start_idx:end_idx + 1])
             if isinstance(arr, tuple):
                 return repr(list(arr[start_idx:end_idx + 1]))
-            return match.group(0)
+            return repr(self.compiler.array_handler.flatten_array(
+                arr, line_number)[start_idx:end_idx + 1])
 
         try:
             index_value = self.eval_expr(index_expr, scope, line_number)
@@ -1861,7 +1855,7 @@ class ExpressionEvaluator:
                     obj_type = defining_scope.types.get(actual_key)
         except Exception:
             pass
-        if isinstance(obj_value, (list, tuple, pa.Array)):
+        if isinstance(obj_value, (list, tuple, dict)):
             handled, array_member_result = self._try_eval_array_member_call(
                 obj_value, obj_type, method_name, args_part, scope, line_number)
             if handled:
@@ -1927,8 +1921,9 @@ class ExpressionEvaluator:
                         f"Range '{s_ref}:{e_ref}' may depend on unassigned grid cells at line {line_number}; defer initialization")
                 result = []
                 for v in flat_values:
-                    if isinstance(v, pa.Array):
-                        result.extend([float(x) for x in v.to_pylist()])
+                    if isinstance(v, (list, dict)):
+                        result.extend(self.compiler.array_handler.flatten_array(
+                            v, line_number))
                     else:
                         result.append(float(v) if isinstance(
                             v, (int, float)) else v)
@@ -2218,8 +2213,8 @@ class ExpressionEvaluator:
                         raise ValueError(
                             f"Index {idx} out of bounds for dimension {i} of '{var_name}' (size {dim_size}) at line {line_number}")
                 adjusted_indices.append(adjusted_idx)
-            if isinstance(arr, pa.ListArray):
-                arr = arr.to_pylist()
+            if isinstance(arr, dict) and 'array' in arr:
+                arr = list(arr['array'])
             elif not isinstance(arr, list):
                 raise ValueError(
                     f"Cannot index into non-array variable '{var_name}' at line {line_number}")
@@ -2305,8 +2300,21 @@ class ExpressionEvaluator:
             raise ValueError(
                 f"Arrays must have the same shape for operation {op}: {shapes} at line {line_number}")
         rows, cols = shapes[0]
-        arr1_vals = arr1 if isinstance(arr1, list) else arr1.to_pylist()
-        arr2_vals = arr2 if isinstance(arr2, list) else arr2.to_pylist()
+
+        def _to_nested(arr):
+            if isinstance(arr, list):
+                return arr
+            if isinstance(arr, dict) and 'array' in arr:
+                flat = list(arr['array'])
+                shape = arr.get('shape', [])
+                if len(shape) == 2 and shape[0] * shape[1] == len(flat):
+                    return [flat[r * shape[1]:(r + 1) * shape[1]]
+                            for r in range(shape[0])]
+                return [flat]
+            return [arr]
+
+        arr1_vals = _to_nested(arr1)
+        arr2_vals = _to_nested(arr2)
         result = []
         for row_i in range(rows):
             row = []
@@ -2909,7 +2917,7 @@ class ExpressionEvaluator:
             end = float(end)
             step = float(step) if step else 1.0
             count = int((end - start) / step) + 1
-            return pa.array([start + i * step for i in range(count)], type=pa.float64())
+            return [start + i * step for i in range(count)]
         raise ValueError(f"Invalid sequence: '{expr}' at line {line_number}")
 
     def _replace_operators(self, expr, line_number=None):
@@ -2943,8 +2951,8 @@ class ExpressionEvaluator:
         def Len(val):
             if isinstance(val, str):
                 return len(val)
-            if isinstance(val, pa.Array):
-                items = val.to_pylist()
+            if isinstance(val, dict) and 'array' in val:
+                items = list(val['array'])
             elif isinstance(val, (list, tuple)):
                 items = list(val)
             else:
@@ -2969,8 +2977,8 @@ class ExpressionEvaluator:
             return str(text).split(str(delimiter))
 
         def _to_list(val):
-            if isinstance(val, pa.Array):
-                return val.to_pylist()
+            if isinstance(val, dict) and 'array' in val:
+                return list(val['array'])
             if isinstance(val, (list, tuple, set)):
                 return list(val)
             return [val]
@@ -2979,7 +2987,8 @@ class ExpressionEvaluator:
             items = _to_list(val)
             count = 0
             for item in items:
-                if isinstance(item, pa.Array):
+                if isinstance(item, list) or (
+                        isinstance(item, dict) and 'array' in item):
                     count += CountA(item)
                 elif item is None:
                     continue
@@ -3016,7 +3025,7 @@ class ExpressionEvaluator:
             if len(shape) <= 1:
                 if isinstance(arr, dict) and 'array' in arr:
                     return arr
-                return pa.array(flat, type=self._infer_array_pa_type(flat)) if flat else arr
+                return list(flat) if flat else arr
             new_shape = [shape[1], shape[0]] + shape[2:]
             strides = []
             acc = 1
@@ -3034,7 +3043,7 @@ class ExpressionEvaluator:
                 old_idxs = [idxs[1], idxs[0]] + idxs[2:]
                 old_flat = sum(oi * st for oi, st in zip(old_idxs, strides))
                 new_flat.append(flat[old_flat])
-            return {'array': pa.array(new_flat, type=self._infer_array_pa_type(new_flat)),
+            return {'array': list(new_flat),
                     'shape': list(new_shape), 'original_shape': list(new_shape)}
 
         globals_dict = {
@@ -3046,7 +3055,6 @@ class ExpressionEvaluator:
                 'sum': sum
             },
             'math': math,
-            'pa': pa,
             'Len': Len,
             'Mid': Mid,
             'TextSplit': TextSplit,

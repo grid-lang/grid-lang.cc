@@ -6,7 +6,6 @@ setup(
     py_modules=['main', 'compiler', 'expression', 'array_handler', 'utils', 'scope',
                 'control_flow', 'type_processor', 'parser', 'executor'],
     packages=find_packages(),
-    install_requires=['pyarrow'],  # Add pyarrow dependency
     entry_points={
         'console_scripts': [
             'grid=main:main'  # Entry point to main function

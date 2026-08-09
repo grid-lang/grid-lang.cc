@@ -483,8 +483,9 @@ class GridLangTypeProcessor:
 
             result = self.compiler.expr_evaluator.eval_or_eval_array(
                 range_expr, eval_scope, line_number)
-            if hasattr(result, 'to_pylist'):
-                return result.to_pylist()
+            if isinstance(result, dict):
+                return self.compiler.array_handler.flatten_array(
+                    result, line_number)
             if isinstance(result, (list, tuple)):
                 return list(result)
             if isinstance(result, numbers.Real):

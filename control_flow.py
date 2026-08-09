@@ -158,9 +158,8 @@ class GridLangControlFlow:
 
             # Create an array with the specified size
             dim_size = int(dim_size)
-            import pyarrow as pa
             # Initialize array with zeros
-            initial_array = pa.array([0.0] * dim_size, type=pa.float64())
+            initial_array = [0.0] * dim_size
 
             # Define the variable with the initialized array
             scope.define(var_name, initial_array, type_name.lower(),
@@ -1412,18 +1411,10 @@ class GridLangControlFlow:
             if has_star and (defining_scope.is_uninitialized(actual_key) or arr is None):
                 raise ValueError(
                     f"Array variable '{var_name}' with dim * must be initialized with PUSH or INIT before LET at line {line_number}")
-            if isinstance(arr, dict) and 'array' in arr:
-                updated_array = self.compiler.array_handler.set_array_element(
-                    arr, indices, value, line_number)
-                defining_scope.variables[actual_key] = updated_array
-                scope_dict[actual_key] = updated_array
-            else:
-                updated_array = self.compiler.array_handler.set_array_element(
-                    arr, indices, value, line_number)
-                defining_scope.variables[actual_key] = updated_array
-                scope_dict[actual_key] = updated_array
-            debug_array = updated_array.to_pylist() if hasattr(
-                updated_array, 'to_pylist') else updated_array
+            updated_array = self.compiler.array_handler.set_array_element(
+                arr, indices, value, line_number)
+            defining_scope.variables[actual_key] = updated_array
+            scope_dict[actual_key] = updated_array
             return True
         return True
 

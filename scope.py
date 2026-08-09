@@ -6,8 +6,6 @@ Handles variable scoping, constraints, and pipe connections.
 import copy
 import re
 
-import pyarrow as pa
-
 from units import (
     DIM_ERROR, NA_ERROR, NUM_ERROR, TYPE_ERROR, UNIT_ERROR, VALUE_ERROR,
     ConstraintError, UnitValue, error_value, is_error_value, strip_units,
@@ -230,14 +228,14 @@ class Scope:
         ):
             return adjusted_value, adjusted_constraints
 
-        if isinstance(adjusted_value, pa.Array) and not adjusted_constraints.get('dim'):
-            adjusted_value = adjusted_value.to_pylist()
+        if isinstance(adjusted_value, dict) and 'array' in adjusted_value and not adjusted_constraints.get('dim'):
+            adjusted_value = list(adjusted_value['array'])
         if isinstance(adjusted_value, list) and not adjusted_constraints.get('dim'):
             adjusted_value = self.compiler._convert_array_to_object(
                 type_name, adjusted_value, line_number)
 
         constant_expr = adjusted_constraints.get('constant')
-        raw_is_typed_literal = isinstance(constant_expr, (list, tuple, pa.Array))
+        raw_is_typed_literal = isinstance(constant_expr, (list, tuple, dict))
         if isinstance(constant_expr, str):
             constant_text = constant_expr.strip()
             raw_is_typed_literal = constant_text.startswith('{') and constant_text.endswith('}')
@@ -678,7 +676,7 @@ class Scope:
         and custom-type coercion respectively, so only scalar values are
         checked here.
         """
-        if value is None or isinstance(value, (list, tuple, pa.Array, dict)):
+        if value is None or isinstance(value, (list, tuple, dict)):
             return
         if value == '':
             # Empty string is used as a placeholder by block predeclaration.
@@ -817,8 +815,8 @@ class Scope:
                             constraint_expr, self.get_full_scope(), line_number)
                     except Exception:
                         allowed_values = constraint_expr
-                if isinstance(allowed_values, pa.Array):
-                    allowed_values = allowed_values.to_pylist()
+                if isinstance(allowed_values, dict) and 'array' in allowed_values:
+                    allowed_values = list(allowed_values['array'])
                 if isinstance(allowed_values, str):
                     allowed_values = [allowed_values]
                 if isinstance(value, (list, tuple, set)):

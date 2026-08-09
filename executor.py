@@ -3,7 +3,6 @@ import re
 import math
 import copy
 from collections import deque
-import pyarrow as pa
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
 from control_flow import GridLangControlFlow
@@ -1282,8 +1281,6 @@ class GridLangExecutor:
             arr, indices, value, line_number)
         defining_scope.variables[actual_key] = updated_array
         scope_dict[actual_key] = updated_array
-        debug_array = updated_array.to_pylist() if hasattr(
-            updated_array, 'to_pylist') else updated_array
         return True
 
     def _infer_declared_type(self, expr, evaluated_value, line_number):
@@ -1448,7 +1445,7 @@ class GridLangExecutor:
             result = (a == b)
         except Exception:
             return False
-        if isinstance(result, (list, tuple, pa.Array)):
+        if isinstance(result, (list, tuple)):
             items = list(result)
             return bool(items) and all(bool(item) for item in items)
         return bool(result)
@@ -1901,10 +1898,8 @@ class GridLangExecutor:
                         shape.append(size)
                     public_fields = public_type_fields(
                         self.types_defined[type_name.lower()])
-                    pa_type = pa.struct([(f, pa.string() if public_fields.get(
-                        f) == 'text' else pa.float64()) for f in public_fields])
                     array = self.array_handler.create_array(
-                        shape, None, pa_type, line_number)
+                        shape, None, 'number', line_number)
                     for i in range(shape[0]):
                         for j in range(shape[1]):
                             for k in range(shape[2]):
@@ -2027,7 +2022,7 @@ class GridLangExecutor:
                 else:
                     default_value = 0 if type_name.lower() == 'number' else None
                     array_data = self.array_handler.create_array(
-                        shape, default_value, pa.float64(), line_number)
+                        shape, default_value, type_name.lower() if type_name.lower() in ('number', 'text', 'logical') else 'number', line_number)
 
                 # Define the variable with the created array
                 self.current_scope().define(var_name, array_data,
@@ -2053,8 +2048,7 @@ class GridLangExecutor:
                 ]
             else:
                 # Initialize array with zeros
-                initial_array = pa.array(
-                    [0.0] * dim_size, type=pa.float64())
+                initial_array = [0.0] * dim_size
 
             # Define the variable with the initialized array
             self.current_scope().define(var_name, initial_array, type_name.lower(),
@@ -2677,16 +2671,12 @@ class GridLangExecutor:
                     shape = [size_spec for _, size_spec in dims]
                     public_fields = public_type_fields(
                         self.types_defined[type_name.lower()])
-                    struct_fields = [(f.lower(), pa.string() if public_fields.get(
-                        f.lower()) == 'text' else pa.float64()) for f in public_fields]
-                    struct_fields.append(('value', pa.float64()))
-                    pa_type = pa.struct(struct_fields)
                     default_struct = {f.lower(): with_constraints.get(
                         f) for f in public_fields}
                     default_struct['value'] = float(
                         value) if value else 1.0
                     array = self.array_handler.create_array(
-                        shape, default_struct, pa_type, line_number)
+                        shape, default_struct, 'number', line_number)
                     self.current_scope().define(
                         var, array, 'array', constraints, is_uninitialized=False)
                     for field in public_fields:
@@ -3076,8 +3066,9 @@ class GridLangExecutor:
         except Exception:
             raise SyntaxError(
                 f"Invalid range expression: {range_expr} at line {line_number}")
-        if hasattr(evaluated, 'to_pylist'):
-            return evaluated.to_pylist()
+        if isinstance(evaluated, dict):
+            return self.array_handler.flatten_array(
+                evaluated, line_number)
         if isinstance(evaluated, (list, tuple)):
             return list(evaluated)
         if evaluated is None:
@@ -3376,8 +3367,9 @@ class GridLangExecutor:
                     eval_scope = self.current_scope().get_evaluation_scope()
                     evaluated = self.expr_evaluator.eval_or_eval_array(
                         range_expr, eval_scope, line_number)
-                    if hasattr(evaluated, 'to_pylist'):
-                        values = evaluated.to_pylist()
+                    if isinstance(evaluated, dict):
+                        values = self.array_handler.flatten_array(
+                            evaluated, line_number)
                     elif isinstance(evaluated, (list, tuple)):
                         values = list(evaluated)
                     elif evaluated is None:
@@ -3974,7 +3966,7 @@ class GridLangExecutor:
             if dim_constraints:
                 dims = dim_constraints.get('dims', [])
                 shape = [size for label, size in dims]
-                pa_type = pa.float64()
+                pa_type = 'number'
                 matrix_data = dim_constraints.get('matrix_data')
                 data_var = dim_constraints.get('data_var')
                 if data_var:
@@ -4596,16 +4588,12 @@ class GridLangExecutor:
                         arr = defining_scope.variables.get(actual_key)
                         if isinstance(arr, dict) and 'array' in arr:
                             arr_value = arr['array']
-                            if self._has_star_dim(constraints) and isinstance(arr_value, pa.Array):
-                                arr_value = arr_value.to_pylist()
                             updated_array = self.array_handler.set_array_element(
                                 arr_value, indices, value, line_number)
                             arr['array'] = updated_array
                             defining_scope.variables[actual_key] = arr
                         else:
                             arr_value = arr
-                            if self._has_star_dim(constraints) and isinstance(arr_value, pa.Array):
-                                arr_value = arr_value.to_pylist()
                             updated_array = self.array_handler.set_array_element(
                                 arr_value, indices, value, line_number)
                             defining_scope.variables[actual_key] = updated_array
@@ -4677,16 +4665,12 @@ class GridLangExecutor:
         arr = defining_scope.variables.get(actual_key)
         if isinstance(arr, dict) and 'array' in arr:
             arr_value = arr['array']
-            if self._has_star_dim(constraints) and isinstance(arr_value, pa.Array):
-                arr_value = arr_value.to_pylist()
             updated_array = self.array_handler.set_array_element(
                 arr_value, indices, value, line_number)
             arr['array'] = updated_array
             defining_scope.variables[actual_key] = arr
         else:
             arr_value = arr
-            if self._has_star_dim(constraints) and isinstance(arr_value, pa.Array):
-                arr_value = arr_value.to_pylist()
             updated_array = self.array_handler.set_array_element(
                 arr_value, indices, value, line_number)
             defining_scope.variables[actual_key] = updated_array
@@ -4804,8 +4788,8 @@ class GridLangExecutor:
                         value = self.array_handler.create_object_array(
                             shape, None, None)
                     else:
-                        pa_type = pa.float64() if var_type in (
-                            'number', 'array') else pa.string()
+                        pa_type = 'number' if var_type in (
+                            'number', 'array') else 'text'
                         default_value = 0 if var_type in (
                             'number', 'array') else ''
                         value = self.array_handler.create_array(
