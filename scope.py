@@ -672,13 +672,12 @@ class Scope:
     def _validate_base_type(self, name, value, line_number=None):
         """Validate that a scalar value matches the declared base type.
 
-        Arrays and custom-typed objects are validated by the dimension checks
-        and custom-type coercion respectively, so only scalar values are
-        checked here.
+        Arrays declared with a base type are validated element-by-element
+        (see array_handler.validate_array_element_types).  Custom-typed
+        objects are validated by custom-type coercion, so only plain scalar
+        values fall through to the scalar checks below.
         """
-        if value is None or isinstance(value, (list, tuple, dict)):
-            return
-        if value == '':
+        if value is None or value == '':
             # Empty string is used as a placeholder by block predeclaration.
             return
         type_key = self._get_case_insensitive_key(name, self.types)
@@ -690,11 +689,16 @@ class Scope:
         if hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined') and var_type in self.compiler.types_defined:
             return
         constraints = self.constraints.get(type_key, {}) or {}
-        if constraints.get('dim'):
-            return
         if constraints.get('input') or constraints.get('output'):
             # Inputs/outputs are validated by their own 'type' constraint or
             # left loosely typed (untyped OUTPUT defaults to 'text').
+            return
+        if isinstance(value, (list, tuple, dict)):
+            if constraints.get('dim'):
+                self.compiler.array_handler.validate_array_element_types(
+                    name, value, var_type, line_number)
+            return
+        if constraints.get('dim'):
             return
         actual_type = self.compiler.array_handler.infer_type(
             value, line_number)

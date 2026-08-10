@@ -11,7 +11,7 @@ from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell
 from functools import reduce
 import operator
 from scope import GridLiveView
-from units import DIM_ERROR, REF_ERROR, ConstraintError, error_value, is_error_value
+from units import DIM_ERROR, REF_ERROR, TYPE_ERROR, ConstraintError, error_value, is_error_value
 
 
 class ArrayHandler:
@@ -1690,6 +1690,33 @@ class ArrayHandler:
         if size_spec is None:
             return star_size
         return size_spec
+
+    def validate_array_element_types(self, var, value, var_type, line_number=None):
+        """Validate that every scalar element of a dim array matches the declared base type.
+
+        None (uninitialized), error values, and nested objects are left
+        untouched.  A mismatched scalar raises a type error so the whole
+        array assignment is rejected (mirrors scalar base-type checking).
+        :param var: Variable name.
+        :param value: Array value (any supported storage form).
+        :param var_type: Declared base type ('number', 'text').
+        :param line_number: Line number for error reporting.
+        """
+        flat = self.flatten_array(value, line_number)
+        for element in flat:
+            if element is None or is_error_value(element):
+                continue
+            if isinstance(element, (list, dict)):
+                continue
+            actual_type = self.infer_type(element, line_number)
+            if var_type == 'number' and actual_type not in ('number', 'float64', 'int', 'int64'):
+                raise ConstraintError(
+                    TYPE_ERROR,
+                    f"'{var}' must be a number array, got a {actual_type} element at line {line_number}")
+            if var_type == 'text' and actual_type not in ('string', 'text'):
+                raise ConstraintError(
+                    TYPE_ERROR,
+                    f"'{var}' must be a text array, got a {actual_type} element at line {line_number}")
 
     def check_dimension_constraints(self, var, value, line_number=None):
         """
