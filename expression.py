@@ -6,16 +6,18 @@
 import re
 import math
 import random
-import pyarrow as pa
+import ast
 from utils import (
-    validate_cell_ref,
     col_to_num,
     num_to_col,
     object_public_keys,
+    parse_address,
     get_case_insensitive_key,
+    is_address,
+    _ADDRESS_FRAGMENT,
 )
 from scope import GridLiveView
-
+from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, UnitValue, error_value, is_error_value
 
 
 class CaseInsensitiveDict(dict):
@@ -75,10 +77,10 @@ class ExpressionEvaluator:
         :param scope: The current scope dictionary.
         :param line_number: Optional line number for error reporting.
         :param is_grid_dim: Use grid dimension logic if True.
-        :return: Evaluated value (scalar, list, or pyarrow Array).
+        :return: Evaluated value (scalar, list, or dict-form array).
         """
-        if isinstance(expr, list):  # Skip if already a dimension constraint list
-            return expr
+        if isinstance(expr, list):
+            return self._eval_array_literal_elements(expr, scope, line_number)
         expr = expr.strip()
         if is_grid_dim and '--' in expr:
             expr = expr.split('--')[0].strip()
@@ -112,21 +114,36 @@ class ExpressionEvaluator:
                 return self.compiler.array_handler.reshape_array(value, new_dims, line_number)
 
         # Evaluate inline arrays
-        if expr.startswith('{') and expr.endswith('}') and not expr.startswith('{$"') and not is_grid_dim:
+        if expr.startswith('{') and expr.endswith('}') and not is_grid_dim:
             result = self._evaluate_array(expr, scope, line_number)
             # Ensure array literals are returned as lists, not sets
             if isinstance(result, set):
                 result = sorted(list(result))
             return result
 
-        # Handle cell ranges (e.g., [A1:B2])
+        # Handle cell ranges (e.g., [A1:B2] or [A1.B1:A2.B2])
         range_match = re.match(
-            r'^\s*\[\s*([A-Z]+\d+)\s*:\s*([A-Z]+\d+)\s*\]\s*$', expr)
+            rf'^\s*\[\s*({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})\s*\]\s*$', expr)
         if range_match and not is_grid_dim:
             s_ref, e_ref = range_match.groups()
+            if '.' in s_ref or '.' in e_ref:
+                try:
+                    values = self.compiler.array_handler.get_range_values_address(
+                        s_ref, e_ref, line_number)
+                    flat_values = self.compiler.array_handler.flatten_array(
+                        values, line_number)
+                    if hasattr(self.compiler, 'last_dim_var') and self.compiler.last_dim_var:
+                        var_name = self.compiler.last_dim_var
+                        self.compiler.current_scope().update(
+                            var_name, flat_values)
+                        self.compiler.last_dim_var = None
+                    return list(flat_values)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Error evaluating range '{s_ref}:{e_ref}': {e} at line {line_number}")
             try:
-                validate_cell_ref(s_ref)
-                validate_cell_ref(e_ref)
+                parse_address(s_ref)
+                parse_address(e_ref)
                 values = self.compiler.array_handler.get_range_values(
                     s_ref, e_ref, line_number)
                 flat_values = [v for row in values for v in (
@@ -135,7 +152,7 @@ class ExpressionEvaluator:
                     var_name = self.compiler.last_dim_var
                     self.compiler.current_scope().update(var_name, flat_values)
                     self.compiler.last_dim_var = None
-                return pa.array(flat_values, type=pa.float64())
+                return list(flat_values)
             except Exception as e:
                 raise RuntimeError(
                     f"Error evaluating range '{s_ref}:{e_ref}': {e} at line {line_number}")
@@ -148,7 +165,7 @@ class ExpressionEvaluator:
         if expr.lower().startswith('sum([') and expr.endswith('])') and not is_grid_dim:
             inner_expr = expr[4:-2].strip()
             m = re.match(
-                r'^\[?([A-Z]+\d+)\s*:\s*([A-Z]+\d+)\]?$', inner_expr, re.I)
+                rf'^\[?({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})\]?$', inner_expr, re.I)
             if m:
                 start_ref, end_ref = m.groups()
                 return self._evaluate_sum_range(f"sum[{start_ref}:{end_ref}]", scope, line_number)
@@ -178,6 +195,30 @@ class ExpressionEvaluator:
             return self.eval_expr(expr, scope, line_number)
 
         raise NameError(f"Name '{expr}' not defined at line {line_number}")
+
+    def _eval_array_literal_elements(self, expr, scope, line_number=None):
+        """Evaluate an array-literal list into concrete values.
+
+        Elements may be numbers (kept as-is), quoted text (unquoted and kept),
+        or Grid expressions (truth tests, arithmetic, variable refs...) which
+        are evaluated via eval_expr. Nested lists (matrices) recurse.
+        """
+        result = []
+        for element in expr:
+            if isinstance(element, list):
+                result.append(self._eval_array_literal_elements(
+                    element, scope, line_number))
+            elif isinstance(element, str):
+                element = element.strip()
+                if ((element.startswith('"') and element.endswith('"'))
+                        or (element.startswith("'") and element.endswith("'"))):
+                    result.append(element[1:-1])
+                else:
+                    result.append(self.eval_expr(
+                        element, scope, line_number))
+            else:
+                result.append(element)
+        return result
 
     def _get_scope_lookup(self, scope):
         if isinstance(scope, dict):
@@ -216,7 +257,7 @@ class ExpressionEvaluator:
                 original_shape = tensor.get('original_shape')
                 adjusted_indices = [idx - 1 for idx in indices]
                 try:
-                    result = self.compiler.array_handler.get_array_element(
+                    result = self.compiler.array_handler.read_array_element(
                         array, adjusted_indices, line_number, original_shape=original_shape)
                     return True, result
                 except (IndexError, ValueError) as e:
@@ -247,7 +288,7 @@ class ExpressionEvaluator:
                     raise PermissionError(
                         f"Hidden field '{field}' is not accessible at line {line_number}")
                 return True, tensor[actual_field]
-        if isinstance(tensor, pa.ListArray):
+        if isinstance(tensor, (list, tuple, dict)):
             shape = self.compiler.array_handler.get_array_shape(
                 tensor, line_number)
             zero_indices = [1] * len(shape)
@@ -274,10 +315,10 @@ class ExpressionEvaluator:
                 obj_value = self.compiler.current_scope().get(obj_name)
             except Exception:
                 obj_value = None
-        if not isinstance(obj_value, (list, tuple, pa.Array)):
+        if not isinstance(obj_value, (list, tuple, dict)):
             return False, None
-        obj_list = obj_value.to_pylist() if isinstance(
-            obj_value, pa.Array) else list(obj_value)
+        obj_list = list(obj_value) if isinstance(obj_value, (list, tuple)) else list(
+            self.compiler.array_handler.flatten_array(obj_value, line_number))
         args_list = []
         if args_part.strip():
             args_list = [a.strip()
@@ -335,18 +376,24 @@ class ExpressionEvaluator:
         :param line_number: Line number.
         :return: Sum of numeric values in range.
         """
-        m = re.match(r'^sum\[([A-Z]+\d+)\s*:\s*([A-Z]+\d+)\]$', expr, re.I)
+        m = re.match(rf'^sum\[({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})\]$', expr, re.I)
         if not m:
             raise SyntaxError(
                 f"Invalid sum range syntax: {expr} at line {line_number}")
         start_ref, end_ref = m.groups()
         try:
-            validate_cell_ref(start_ref)
-            validate_cell_ref(end_ref)
-            values = self.compiler.array_handler.get_range_values(
-                start_ref, end_ref, line_number)
-            flat_values = [v for row in values for v in (
-                row if isinstance(row, list) else [row])]
+            if '.' in start_ref or '.' in end_ref:
+                values = self.compiler.array_handler.get_range_values_address(
+                    start_ref, end_ref, line_number)
+                flat_values = self.compiler.array_handler.flatten_array(
+                    values, line_number)
+            else:
+                parse_address(start_ref)
+                parse_address(end_ref)
+                values = self.compiler.array_handler.get_range_values(
+                    start_ref, end_ref, line_number)
+                flat_values = [v for row in values for v in (
+                    row if isinstance(row, list) else [row])]
             numeric_values = [
                 float(v) for v in flat_values if isinstance(v, (int, float))]
             return sum(numeric_values)
@@ -372,9 +419,12 @@ class ExpressionEvaluator:
                 raise NameError(
                     f"Variable '{var}' not defined at line {line_number}")
             value = scope[var]
-            if isinstance(value, (pa.Array, list)):
-                value = sum(value.to_pylist() if isinstance(
-                    value, pa.Array) else value)
+            if isinstance(value, (list, dict)):
+                if isinstance(value, dict):
+                    value = self.compiler.array_handler.flatten_array(
+                        value, line_number)
+                else:
+                    value = sum(value)
             elif not isinstance(value, (int, float)):
                 raise TypeError(
                     f"Cannot sum non-numeric value for '{var}' at line {line_number}")
@@ -405,11 +455,10 @@ class ExpressionEvaluator:
         if m_member_array_fallback:
             obj_name, method_name, args_part = m_member_array_fallback.groups()
             obj_value = full_scope.get(obj_name)
-            if isinstance(obj_value, (list, tuple, pa.Array)):
-                if isinstance(obj_value, pa.Array):
-                    obj_list = obj_value.to_pylist()
-                else:
-                    obj_list = list(obj_value)
+            if isinstance(obj_value, (list, tuple, dict)):
+                obj_list = list(obj_value) if isinstance(
+                    obj_value, (list, tuple)) else list(
+                    self.compiler.array_handler.flatten_array(obj_value, line_number))
                 element_type = None
                 for elem in obj_list:
                     if isinstance(elem, dict):
@@ -469,17 +518,14 @@ class ExpressionEvaluator:
                     try:
                         evaluated = self.eval_or_eval_array(
                             elem_str, full_scope, line_number)
-                        if isinstance(evaluated, pa.Array):
-                            row_elements.extend([float(v) if isinstance(
-                                v, (int, float)) else v for v in evaluated.to_pylist()])
-                        elif isinstance(evaluated, dict):
+                        if isinstance(evaluated, dict):
                             row_elements.append(evaluated)
                         elif isinstance(evaluated, list):
                             row_elements.extend([float(v) if isinstance(
-                                v, (int, float)) else v for v in evaluated])
+                                v, (int, float)) and not isinstance(v, bool) else v for v in evaluated])
                         else:
                             row_elements.append(float(evaluated) if isinstance(
-                                evaluated, (int, float)) else evaluated)
+                                evaluated, (int, float)) and not isinstance(evaluated, bool) else evaluated)
                     except Exception as e:
                         raise RuntimeError(
                             f"Error evaluating array element '{elem_str}': {e} at line {line_number}")
@@ -491,11 +537,13 @@ class ExpressionEvaluator:
     def _evaluate_pipe_array(self, expr, scope, line_number=None):
         """
         Evaluate piped arrays (e.g., {1,2} | {3,4}).
-        Concatenates arrays along the outer dimension.
+        Stacks the operand arrays along a new dimension at index 1:
+        [d0, d1, ...] | [d0, d1, ...] ... -> [d0, N, d1, ...]
+        The result is a column-major dict-form array (flat buffer + shape).
         :param expr: Piped array string.
         :param scope: Scope.
         :param line_number: Line number.
-        :return: Pyarrow ListArray of concatenated values.
+        :return: Dict-form N-D array (or plain list for 1D results).
         """
         if not (expr.startswith('{') and expr.endswith('}')):
             raise SyntaxError(
@@ -506,7 +554,7 @@ class ExpressionEvaluator:
         for char in expr:
             if char == '|' and brace_level == 0:
                 if current.strip():
-                    arrays.append('{' + current.strip() + '}')
+                    arrays.append(current.strip())
                 current = ""
             else:
                 current += char
@@ -515,14 +563,14 @@ class ExpressionEvaluator:
                 elif char == '}':
                     brace_level -= 1
         if current.strip():
-            arrays.append('{' + current.strip() + '}')
+            arrays.append(current.strip())
         if brace_level != 0:
             raise SyntaxError(
                 f"Unmatched braces in pipe array: {expr} at line {line_number}")
         if not arrays:
             raise ValueError(f"Empty pipe expression at line {line_number}")
-        evaluated_arrays = []
-        shapes = []
+        operand_shapes = []
+        operand_flats = []
         for array_expr in arrays:
             if not (array_expr.startswith('{') and array_expr.endswith('}')):
                 raise SyntaxError(
@@ -530,46 +578,51 @@ class ExpressionEvaluator:
             array = self._evaluate_array(array_expr, scope, line_number)
             shape = self.compiler.array_handler.get_array_shape(
                 array, line_number)
-            shapes.append(shape)
-            evaluated_arrays.append(array)
-        dimensions = [len(shape) for shape in shapes]
-        if len(set(dimensions)) != 1:
+            flat = self.compiler.array_handler.flatten_array(
+                array, line_number)
+            flat = [float(v) if isinstance(v, (int, float))
+                    and not isinstance(v, bool) else v for v in flat]
+            operand_shapes.append(shape)
+            operand_flats.append(flat)
+
+        base_shape = operand_shapes[0]
+        if any(s != base_shape for s in operand_shapes[1:]):
             raise ValueError(
-                f"All arrays in pipe operation must have the same number of dimensions: {dimensions} at line {line_number}")
-        num_dims = dimensions[0]
-        if num_dims == 1:
-            shapes = [(1, s[0]) if len(s) == 1 else s for s in shapes]
-            inner_dim = shapes[0][1]
-            if not all(s[1] == inner_dim for s in shapes):
-                raise ValueError(
-                    f"All arrays in pipe operation must have the same inner dimension: {shapes} at line {line_number}")
-        elif num_dims == 2:
-            inner_dim = shapes[0][1]
-            if not all(s[1] == inner_dim for s in shapes):
-                raise ValueError(
-                    f"All arrays in pipe operation must have the same inner dimension: {shapes} at line {line_number}")
-        else:
-            raise ValueError(
-                f"Pipe operator supports up to 2D arrays, got {num_dims}D at line {line_number}")
-        flat_values = []
-        row_lengths = []
-        for arr in evaluated_arrays:
-            arr_vals = arr.to_pylist() if isinstance(arr, pa.ListArray) else arr
-            if isinstance(arr_vals, list) and arr_vals and isinstance(arr_vals[0], list):
-                for row in arr_vals:
-                    flat_values.extend([float(v) for v in row])
-                    row_lengths.append(len(row))
-            else:
-                flat_values.extend([float(v) for v in arr_vals])
-                row_lengths.append(len(arr_vals))
-        offsets = [0]
-        current_offset = 0
-        for length in row_lengths:
-            current_offset += length
-            offsets.append(current_offset)
-        offsets = pa.array(offsets, type=pa.int32())
-        values = pa.array(flat_values, type=pa.float64())
-        return pa.ListArray.from_arrays(offsets, values)
+                f"All arrays in a pipe operation must have identical shapes: {operand_shapes} at line {line_number}")
+
+        num_operands = len(arrays)
+        result_shape = [base_shape[0], num_operands] + base_shape[1:]
+        total = 1
+        for s in result_shape:
+            total *= s
+
+        result_flat = []
+        for flat_idx in range(total):
+            rem = flat_idx
+            idxs = []
+            for s in result_shape:
+                idxs.append(rem % s)
+                rem //= s
+            operand_idx = idxs[1]
+            op_flat_idx = idxs[0]
+            stride = base_shape[0]
+            for k in range(2, len(idxs)):
+                op_flat_idx += idxs[k] * stride
+                stride *= base_shape[k - 1]
+            result_flat.append(operand_flats[operand_idx][op_flat_idx])
+
+        if len(result_shape) == 1:
+            return list(result_flat)
+        return {'array': list(result_flat),
+                'shape': list(result_shape), 'original_shape': list(result_shape)}
+
+    def _infer_array_pa_type(self, values):
+        """Pick the array value kind for a list of flat array values."""
+        if any(isinstance(v, str) for v in values):
+            return 'text'
+        if any(isinstance(v, bool) for v in values):
+            return 'logical'
+        return 'number'
 
     def _resolve_column_interpolated_cell(self, inside, scope, line_number=None):
         m = re.match(
@@ -598,7 +651,7 @@ class ExpressionEvaluator:
 
         col_num = col_to_num(base_col) + index_value - 1
         cell_ref = f"{num_to_col(col_num)}{row_value}"
-        validate_cell_ref(cell_ref)
+        parse_address(cell_ref)
         return cell_ref
 
     def _parse_indexed_member_call(self, expr):
@@ -849,12 +902,12 @@ class ExpressionEvaluator:
         return True, result
 
     def _try_eval_array_member_call(self, obj_value, obj_type, method_name, args_part, scope, line_number):
-        if not isinstance(obj_value, (list, tuple, pa.Array)):
+        if not isinstance(obj_value, (list, tuple)) and not (
+                isinstance(obj_value, dict) and 'array' in obj_value):
             return False, None
-        if isinstance(obj_value, pa.Array):
-            obj_list = obj_value.to_pylist()
-        else:
-            obj_list = list(obj_value)
+        obj_list = list(obj_value) if isinstance(
+            obj_value, (list, tuple)) else list(
+            self.compiler.array_handler.flatten_array(obj_value, line_number))
 
         element_type = obj_type
         func_key = None
@@ -1169,15 +1222,39 @@ class ExpressionEvaluator:
         cell_ref = expr[1:-1].strip()
         if cell_ref.startswith('^'):
             cell_ref = cell_ref[1:].strip()
-        if not re.match(r'^[A-Za-z]+\d+$', cell_ref):
+        if not is_address(cell_ref):
             return False, None
         try:
-            validate_cell_ref(cell_ref)
             value = self.compiler.array_handler.lookup_cell(cell_ref, line_number)
             return True, value
         except ValueError as e:
             raise RuntimeError(
                 f"Invalid cell reference '{cell_ref}': {e} at line {line_number}")
+
+    def _try_eval_address_indexed_access(self, expr, scope, line_number):
+        """Evaluate v![A3.B4.8] (and v![A1]) as array element access via a cell
+        address. Non-bang v[...] falls through to the python-fallback guard,
+        which raises a syntax error for arrays; bracket calls are allowed for
+        functions (e.g. sum[...], handled before this fallback).
+        """
+        m = re.match(r'^([\w_]+)!\[([^\]]+)\]$', expr)
+        if not m:
+            return False, None
+        var_name, index_expr = m.groups()
+        if not is_address(index_expr):
+            return False, None
+        try:
+            self.compiler.current_scope().get(var_name)
+        except NameError:
+            return False, None
+        try:
+            return True, self.compiler.array_handler.resolve_cell_index(
+                var_name, index_expr, line_number)
+        except (NameError, TypeError):
+            return False, None
+        except (IndexError, ValueError) as e:
+            raise IndexError(
+                f"Invalid index '{index_expr}' for '{var_name}': {e} at line {line_number}")
 
     def _try_eval_indexed_member_call(self, expr, scope, line_number, depth):
         parsed_member = self._parse_indexed_member_call(expr)
@@ -1277,7 +1354,7 @@ class ExpressionEvaluator:
                         f"Invalid cell reference index '{index_value}' must be a positive integer at line {line_number}")
 
                 cell_ref = f"{col}{index_value}"
-                validate_cell_ref(cell_ref)
+                parse_address(cell_ref)
                 value = self.compiler.array_handler.lookup_cell(
                     cell_ref, line_number)
                 if isinstance(value, (int, float)):
@@ -1356,9 +1433,11 @@ class ExpressionEvaluator:
 
         # Get the array element
         try:
-            result = self.compiler.array_handler.get_array_element(
+            result = self.compiler.array_handler.read_array_element(
                 arr, adjusted_indices, line_number)
-            return str(result)
+            curly_expr = f"{var_name}{{{indices_str}}}"
+            return self._substitute_curly_result(
+                curly_expr, curly_expr, result, scope)
         except (IndexError, ValueError) as e:
             raise IndexError(
                 f"Invalid indices {indices_str} for '{var_name}': {e} at line {line_number}")
@@ -1382,8 +1461,7 @@ class ExpressionEvaluator:
                 return match.group(0)
         actual_field = get_case_insensitive_key(obj_value, field_name) or field_name
         field_val = obj_value.get(actual_field)
-        import pyarrow as pa
-        if not isinstance(field_val, (list, tuple, pa.Array)):
+        if not isinstance(field_val, (list, tuple, dict)):
             return match.group(0)
         range_match = re.match(r'^\s*(.+)\s+to\s+(.+?)\s*$', index_expr, re.I)
         if range_match:
@@ -1400,12 +1478,12 @@ class ExpressionEvaluator:
                     f"Error evaluating index expression '{index_expr}': {e} at line {line_number}")
             start_idx = start_value - 1
             end_idx = end_value - 1
-            if isinstance(field_val, pa.Array):
-                return repr(field_val.to_pylist()[start_idx:end_idx + 1])
             if isinstance(field_val, list):
                 return repr(field_val[start_idx:end_idx + 1])
             if isinstance(field_val, tuple):
                 return repr(list(field_val[start_idx:end_idx + 1]))
+            return repr(self.compiler.array_handler.flatten_array(
+                field_val, line_number)[start_idx:end_idx + 1])
         try:
             index_value = self.eval_expr(index_expr, scope, line_number)
             if isinstance(index_value, float) and index_value.is_integer():
@@ -1414,10 +1492,11 @@ class ExpressionEvaluator:
             return match.group(0)
         idx = index_value - 1
         try:
-            if isinstance(field_val, pa.Array):
-                result = field_val.to_pylist()[idx]
-            else:
+            if isinstance(field_val, (list, tuple)):
                 result = field_val[idx]
+            else:
+                result = self.compiler.array_handler.flatten_array(
+                    field_val, line_number)[idx]
         except Exception:
             return match.group(0)
         if isinstance(result, str):
@@ -1442,7 +1521,7 @@ class ExpressionEvaluator:
                 getattr(self.compiler, 'subprocesses', {}) or {})
         builtin_callables = {
             'len', 'mid', 'textsplit', 'counta', 'randarray', 'sortby',
-            'sqrt', 'rows'
+            'sqrt', 'rows', 'transpose'
         }
         if var_name.lower() in known_funcs:
             return match.group(0)
@@ -1464,8 +1543,7 @@ class ExpressionEvaluator:
             except NameError:
                 return match.group(0)
 
-        import pyarrow as pa
-        if not isinstance(arr, (list, tuple, dict, pa.Array)):
+        if not isinstance(arr, (list, tuple, dict)):
             return match.group(0)
 
         # Check if this array is 0-based or 1-based based on dimension constraints
@@ -1512,14 +1590,12 @@ class ExpressionEvaluator:
             else:
                 start_idx = start_value - 1
                 end_idx = end_value - 1
-            if isinstance(arr, pa.Array):
-                arr_list = arr.to_pylist()
-                return repr(arr_list[start_idx:end_idx + 1])
             if isinstance(arr, list):
                 return repr(arr[start_idx:end_idx + 1])
             if isinstance(arr, tuple):
                 return repr(list(arr[start_idx:end_idx + 1]))
-            return match.group(0)
+            return repr(self.compiler.array_handler.flatten_array(
+                arr, line_number)[start_idx:end_idx + 1])
 
         try:
             index_value = self.eval_expr(index_expr, scope, line_number)
@@ -1535,11 +1611,10 @@ class ExpressionEvaluator:
             adjusted_index = index_value - 1
 
         try:
-            result = self.compiler.array_handler.get_array_element(
+            result = self.compiler.array_handler.read_array_element(
                 arr, [adjusted_index], line_number)
-            if isinstance(result, str):
-                return f'"{result}"'
-            return str(result)
+            return self._substitute_curly_result(
+                f"{var_name}({index_expr})", f"{var_name}({index_expr})", result, scope)
         except (IndexError, ValueError) as e:
             raise IndexError(
                 f"Invalid index {index_expr} for '{var_name}': {e} at line {line_number}")
@@ -1547,7 +1622,7 @@ class ExpressionEvaluator:
     def _paren_access_replacer_with_check(self, match, scope, line_number):
         var_name, index_expr = match.groups()
         callable_names = {'SQRT', 'ABS', 'SIN', 'COS',
-                          'TAN', 'LOG', 'EXP', 'LEN', 'MID', 'TEXTSPLIT'}
+                          'TAN', 'LOG', 'EXP', 'LEN', 'MID', 'TEXTSPLIT', 'TRANSPOSE'}
         if hasattr(self.compiler, 'functions'):
             callable_names.update({n.upper() for n in self.compiler.functions.keys()})
         if hasattr(self.compiler, 'subprocesses'):
@@ -1671,13 +1746,15 @@ class ExpressionEvaluator:
         if uexpr == '-#INF':
             return True, float('-inf')
         if uexpr == '#N/A':
-            return True, float('nan')
+            return True, error_value(NA_ERROR)
 
         # Handle numeric literals (integers, floats, scientific notation)
         try:
             nm = re.match(r'^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$', expr)
             if nm:
                 parsed = float(expr) if '.' in expr or 'e' in expr.lower() else int(expr)
+                if isinstance(parsed, float) and (math.isinf(parsed) or math.isnan(parsed)):
+                    return True, error_value(NUM_ERROR)
                 return True, parsed
         except ValueError:
             pass
@@ -1778,7 +1855,7 @@ class ExpressionEvaluator:
                     obj_type = defining_scope.types.get(actual_key)
         except Exception:
             pass
-        if isinstance(obj_value, (list, tuple, pa.Array)):
+        if isinstance(obj_value, (list, tuple, dict)):
             handled, array_member_result = self._try_eval_array_member_call(
                 obj_value, obj_type, method_name, args_part, scope, line_number)
             if handled:
@@ -1800,6 +1877,10 @@ class ExpressionEvaluator:
                 f"Expression evaluation depth limit exceeded for '{expr}' at line {line_number}")
 
         expr = expr.strip()
+        if expr.lower() in ('true', 'false'):
+            return expr.lower() == 'true'
+        if expr.lower() == 'none':
+            return self.eval_or_eval_array('{}', scope, line_number)
         if expr.startswith('?'):
             logical_expr = expr[1:].strip()
             if not logical_expr:
@@ -1820,12 +1901,17 @@ class ExpressionEvaluator:
 
         # Handle ranges in expressions
         range_match = re.match(
-            r'^\s*\[\s*([A-Z]+\d+)\s*:\s*([A-Z]+\d+)\s*\]\s*$', expr)
+            rf'^\s*\[\s*({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})\s*\]\s*$', expr)
         if range_match:
             s_ref, e_ref = range_match.groups()
             try:
-                validate_cell_ref(s_ref)
-                validate_cell_ref(e_ref)
+                if '.' in s_ref or '.' in e_ref:
+                    # Extended (N-D) range: return the nested block.
+                    values = self.compiler.array_handler.get_range_values_address(
+                        s_ref, e_ref, line_number)
+                    return values
+                parse_address(s_ref)
+                parse_address(e_ref)
                 values = self.compiler.array_handler.get_range_values(
                     s_ref, e_ref, line_number)
                 flat_values = [v for row in values for v in (
@@ -1835,8 +1921,9 @@ class ExpressionEvaluator:
                         f"Range '{s_ref}:{e_ref}' may depend on unassigned grid cells at line {line_number}; defer initialization")
                 result = []
                 for v in flat_values:
-                    if isinstance(v, pa.Array):
-                        result.extend([float(x) for x in v.to_pylist()])
+                    if isinstance(v, (list, dict)):
+                        result.extend(self.compiler.array_handler.flatten_array(
+                            v, line_number))
                     else:
                         result.append(float(v) if isinstance(
                             v, (int, float)) else v)
@@ -1851,7 +1938,7 @@ class ExpressionEvaluator:
         if expr.lower().startswith('sum([') and expr.endswith('])'):
             inner_expr = expr[4:-2].strip()
             m = re.match(
-                r'^\[?([A-Z]+\d+)\s*:\s*([A-Z]+\d+)\]?$', inner_expr, re.I)
+                rf'^\[?({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})\]?$', inner_expr, re.I)
             if m:
                 start_ref, end_ref = m.groups()
                 return self._evaluate_sum_range(f"sum[{start_ref}:{end_ref}]", scope, line_number)
@@ -1874,10 +1961,10 @@ class ExpressionEvaluator:
                         f"Variable '{var_name}' is uninitialized at line {line_number}")
                 try:
                     if isinstance(value, dict) and 'grid' in value:
-                        result = self.compiler.array_handler.get_array_element(
+                        result = self.compiler.array_handler.read_array_element(
                             value['grid'], indices, line_number, original_shape=value.get('original_shape'))
                     else:
-                        result = self.compiler.array_handler.get_array_element(
+                        result = self.compiler.array_handler.read_array_element(
                             value, indices, line_number)
                     return result
                 except (IndexError, ValueError) as e:
@@ -1893,7 +1980,7 @@ class ExpressionEvaluator:
             index_expr = bang_index or paren_index
             if var_name in scope or var_name in self.compiler.variables:
                 try:
-                    if bang_index and (re.match(r'^[A-Za-z]+\d+$', index_expr)
+                    if bang_index and (is_address(index_expr)
                                        or var_name.lower() == 'grid'):
                         return self.compiler.array_handler.resolve_cell_index(
                             var_name, index_expr, line_number)
@@ -1945,6 +2032,11 @@ class ExpressionEvaluator:
         if handled:
             return cell_result
 
+        handled, address_result = self._try_eval_address_indexed_access(
+            expr, scope, line_number)
+        if handled:
+            return address_result
+
         return self._evaluate_with_python_fallback(expr, scope, line_number)
 
     def _eval_array_element(self, var_name, index_expr, scope, line_number, base=1):
@@ -1960,7 +2052,7 @@ class ExpressionEvaluator:
             var_name, self.compiler.variables.get(var_name))
         if isinstance(array, GridLiveView):
             base = 1
-        return self.compiler.array_handler.get_array_element(
+        return self.compiler.array_handler.read_array_element(
             array, [index_value - base], line_number)
 
     def _parse_index_target(self, target, scope, line_number):
@@ -2060,7 +2152,7 @@ class ExpressionEvaluator:
                         adjusted_indices = indices
 
                 try:
-                    result = self.compiler.array_handler.get_array_element(
+                    result = self.compiler.array_handler.read_array_element(
                         array, adjusted_indices, line_number)
                     return True, result
                 except (IndexError, ValueError) as e:
@@ -2121,8 +2213,8 @@ class ExpressionEvaluator:
                         raise ValueError(
                             f"Index {idx} out of bounds for dimension {i} of '{var_name}' (size {dim_size}) at line {line_number}")
                 adjusted_indices.append(adjusted_idx)
-            if isinstance(arr, pa.ListArray):
-                arr = arr.to_pylist()
+            if isinstance(arr, dict) and 'array' in arr:
+                arr = list(arr['array'])
             elif not isinstance(arr, list):
                 raise ValueError(
                     f"Cannot index into non-array variable '{var_name}' at line {line_number}")
@@ -2140,12 +2232,15 @@ class ExpressionEvaluator:
     def _evaluate_with_python_fallback(self, expr, scope, line_number):
         eval_expr = expr
         full_scope = self._build_fallback_cell_scope(scope)
-        eval_expr = self._replace_fallback_cell_refs(eval_expr, line_number)
+        eval_expr = self._replace_fallback_cell_refs(
+            eval_expr, scope, line_number)
         handled, result = self._try_eval_fallback_array_operation(
             eval_expr, full_scope, line_number)
         if handled:
             return result
         eval_expr = self._replace_fallback_curly_accesses(
+            eval_expr, scope, line_number)
+        eval_expr = self._replace_piped_array_literals(
             eval_expr, scope, line_number)
         eval_expr = self._replace_operators(eval_expr, line_number)
         if re.match(r'^[\w_]+\[', eval_expr):
@@ -2165,24 +2260,31 @@ class ExpressionEvaluator:
                 pass
         return {**scope, **cell_vars}
 
-    def _replace_fallback_cell_refs(self, eval_expr, line_number):
-        cell_ref_pattern = re.compile(r'\[\^?([A-Za-z]+\d+)\]')
-        cell_refs = cell_ref_pattern.findall(eval_expr)
-        for cell_ref in cell_refs:
+    def _replace_fallback_cell_refs(self, eval_expr, scope, line_number):
+        # Skip cell refs directly inside bracket indexing (v[A1.1]); the
+        # python-fallback guard reports those as missing '!' for arrays.
+        # Values are injected into 'scope' under placeholder names rather than
+        # spliced into the source: plain numbers are safe to splice, but inf,
+        # nan and text would break or lose quoting, and a naive .replace()
+        # would corrupt '[A1]' inside '[A11]'.
+        cell_ref_pattern = re.compile(
+            rf'(?<![\w_])\[(\^?)({_ADDRESS_FRAGMENT})\]')
+
+        def replacer(m):
+            caret, cell_ref = m.group(1), m.group(2)
             try:
-                validate_cell_ref(cell_ref)
                 value = self.compiler.array_handler.lookup_cell(
                     cell_ref, line_number)
-                if isinstance(value, (int, float)):
-                    replacement = str(value)
-                else:
-                    replacement = f'"{value}"'
-                eval_expr = eval_expr.replace(f'[{cell_ref}]', replacement)
-                eval_expr = eval_expr.replace(f'[^{cell_ref}]', replacement)
             except ValueError as e:
                 raise RuntimeError(
                     f"Invalid cell reference '{cell_ref}': {e} at line {line_number}")
-        return eval_expr
+            if is_error_value(value):
+                value = error_value(value)
+            placeholder = self._inject_eval_placeholder(
+                f'[{caret}{cell_ref}]', value, scope)
+            return placeholder
+
+        return cell_ref_pattern.sub(replacer, eval_expr)
 
     def _try_eval_fallback_array_operation(self, eval_expr, full_scope, line_number):
         array_op_match = re.match(
@@ -2198,8 +2300,21 @@ class ExpressionEvaluator:
             raise ValueError(
                 f"Arrays must have the same shape for operation {op}: {shapes} at line {line_number}")
         rows, cols = shapes[0]
-        arr1_vals = arr1 if isinstance(arr1, list) else arr1.to_pylist()
-        arr2_vals = arr2 if isinstance(arr2, list) else arr2.to_pylist()
+
+        def _to_nested(arr):
+            if isinstance(arr, list):
+                return arr
+            if isinstance(arr, dict) and 'array' in arr:
+                flat = list(arr['array'])
+                shape = arr.get('shape', [])
+                if len(shape) == 2 and shape[0] * shape[1] == len(flat):
+                    return [flat[r * shape[1]:(r + 1) * shape[1]]
+                            for r in range(shape[0])]
+                return [flat]
+            return [arr]
+
+        arr1_vals = _to_nested(arr1)
+        arr2_vals = _to_nested(arr2)
         result = []
         for row_i in range(rows):
             row = []
@@ -2235,6 +2350,25 @@ class ExpressionEvaluator:
                         f"Error computing {val1} {op} {val2} at position [{row_i}][{col_i}]: {e} at line {line_number}")
             result.append(row)
         return True, result
+
+    def _inject_eval_placeholder(self, source, result, scope):
+        """Store 'result' in 'scope' under a deterministic placeholder name
+        and return that name. Never splice values into expression source."""
+        placeholder = f"__gridlang_value_{abs(hash((source, repr(result)))) & 0xFFFFFFFF}"
+        scope[placeholder] = result
+        return placeholder
+
+    def _substitute_curly_result(self, eval_expr, curly_expr, result, scope):
+        """Substitute an array-access result into an expression string.
+
+        The result is never spliced into the Python source: an error value
+        would become a comment ('#REF'), a string would lose its quotes, and
+        inf/nan would become bare names. Instead it is injected into the
+        evaluation scope under a deterministic placeholder name; arithmetic on
+        the placeholder then propagates the value (including sticky errors).
+        """
+        placeholder = self._inject_eval_placeholder(curly_expr, result, scope)
+        return eval_expr.replace(curly_expr, placeholder)
 
     def _replace_fallback_curly_accesses(self, eval_expr, scope, line_number):
         curly_brace_pattern = re.compile(r'([\w_]+)\{([^}]+)\}')
@@ -2281,14 +2415,34 @@ class ExpressionEvaluator:
                     adjusted_idx = idx - 1
                     adjusted_indices.append(adjusted_idx)
             try:
-                result = self.compiler.array_handler.get_array_element(
+                result = self.compiler.array_handler.read_array_element(
                     array, adjusted_indices, line_number)
                 curly_expr = f"{var_name}{{{indices_str}}}"
-                eval_expr = eval_expr.replace(curly_expr, str(result))
+                eval_expr = self._substitute_curly_result(
+                    eval_expr, curly_expr, result, scope)
             except (IndexError, ValueError) as e:
                 raise IndexError(
                     f"Invalid indices {indices_str} for '{var_name}': {e} at line {line_number}")
         return eval_expr
+
+    def _replace_piped_array_literals(self, eval_expr, scope, line_number):
+        """Replace piped array literals ({...} | {...} ...) with python list
+        literals so builtins like Transpose can receive them as arrays.
+
+        A bare pipe literal is handled by _evaluate_array before reaching this
+        fallback; here we only need sub-expressions inside function calls.
+        """
+        pipe_chain_pattern = re.compile(
+            r'(\{[^{}]*\}(?:\s*\|\s*\{[^{}]*\})+)')
+        def replacer(m):
+            pipe_str = m.group(1)
+            try:
+                arr = self._evaluate_pipe_array(pipe_str, scope, line_number)
+                display = self.compiler.array_handler.to_display_value(arr)
+                return repr(display)
+            except Exception:
+                return m.group(0)
+        return pipe_chain_pattern.sub(replacer, eval_expr)
 
     def _build_python_fallback_scope(self, scope, line_number):
         if hasattr(scope, 'get_evaluation_scope'):
@@ -2347,21 +2501,282 @@ class ExpressionEvaluator:
     def _eval_python_fallback_result(self, original_expr, eval_expr, full_scope, line_number):
         try:
             globals_dict = self._get_eval_globals()
-            result = eval(eval_expr, globals_dict, full_scope)
-            if isinstance(result, (int, float)) and math.isnan(result):
-                return float('nan')
+            eval_expr = self._rewrite_truth_tests(eval_expr)
+            tree = ast.parse(eval_expr, mode='eval')
+            result = self._walk_ast_node(
+                tree.body, full_scope, globals_dict, line_number)
+            if isinstance(result, (int, float)) and (math.isinf(result) or math.isnan(result)):
+                return error_value(NUM_ERROR)
             if isinstance(result, set):
                 result = sorted(list(result))
             if isinstance(result, bool):
                 return result
             return float(result) if isinstance(result, (int, float)) else result
         except ZeroDivisionError:
-            return float('nan')
+            return error_value(DIV0_ERROR)
+        except OverflowError:
+            return error_value(NUM_ERROR)
+        except SyntaxError as e:
+            raise SyntaxError(
+                f"Invalid expression '{original_expr}': {e} at line {line_number}")
         except NameError as e:
             raise NameError(f"{e} at line {line_number}")
         except Exception as e:
             raise RuntimeError(
                 f"Error evaluating '{original_expr}': {e} at line {line_number}")
+
+    def _rewrite_truth_tests(self, expr):
+        """Rewrite '?' truth-test operators into explicit markers.
+
+        A '?' is a unary operator that turns the following expression into a
+        truth-test value; inside it '=' is equality (Grid semantics), not
+        assignment. '? a = 1 or 9 = 9' becomes
+        'gridlang_truth(a == 1 or 9 == 9)', which the AST walker evaluates.
+        Only the first '?' matters: a truth-test binds the remainder of the
+        expression, so it is replaced as a whole (nested '?' is not yet
+        supported).
+        """
+        out = []
+        in_quote = False
+        quote_char = None
+        i = 0
+        n = len(expr)
+        while i < n:
+            ch = expr[i]
+            if ch in ('"', "'"):
+                if not in_quote:
+                    in_quote = True
+                    quote_char = ch
+                elif quote_char == ch:
+                    in_quote = False
+                    quote_char = None
+                out.append(ch)
+                i += 1
+                continue
+            if ch == '?' and not in_quote:
+                rest = expr[i + 1:].lstrip()
+                out.append('gridlang_truth(')
+                out.append(self._rewrite_truth_test_body(rest))
+                out.append(')')
+                return ''.join(out)
+            out.append(ch)
+            i += 1
+        return ''.join(out)
+
+    def _rewrite_truth_test_body(self, s):
+        """Rewrite a truth-test body into Python boolean syntax.
+
+        '=' becomes '==' and '<>' becomes '!=', while '<', '>', '<=', '>='
+        are left intact. Quoted strings are skipped.
+        """
+        out = []
+        in_quote = False
+        quote_char = None
+        i = 0
+        n = len(s)
+        while i < n:
+            ch = s[i]
+            if ch in ('"', "'"):
+                if not in_quote:
+                    in_quote = True
+                    quote_char = ch
+                elif quote_char == ch:
+                    in_quote = False
+                    quote_char = None
+                out.append(ch)
+                i += 1
+                continue
+            if in_quote:
+                out.append(ch)
+                i += 1
+                continue
+            nxt = s[i + 1] if i + 1 < n else ''
+            if ch == '<' and nxt == '>':
+                out.append('!=')
+                i += 2
+            elif ch == '<' and nxt == '=':
+                out.append('<=')
+                i += 2
+            elif ch == '>' and nxt == '=':
+                out.append('>=')
+                i += 2
+            elif ch == '=':
+                out.append('==')
+                i += 1
+            else:
+                out.append(ch)
+                i += 1
+        return ''.join(out)
+
+    def _resolve_fallback_name(self, name, full_scope, globals_dict):
+        """Resolve a name exactly as eval() would: locals, then globals, then
+        the restricted builtins dict. All lookups are case-insensitive."""
+        if name in full_scope:
+            return full_scope[name]
+        if name in globals_dict:
+            return globals_dict[name]
+        builtins_dict = globals_dict.get('__builtins__')
+        if isinstance(builtins_dict, dict) and name in builtins_dict:
+            return builtins_dict[name]
+        raise NameError(f"Name '{name}' is not defined")
+
+    def _walk_ast_node(self, node, full_scope, globals_dict, line_number):
+        """Evaluate a single parsed expression node.
+
+        Replaces the string-based eval() with a restricted AST interpreter:
+        only the node types below are accepted, all names resolve through the
+        same locals/globals/builtins chain eval() used, and every operator
+        dispatches to ordinary Python operators so UnitValue sticky errors
+        propagate exactly as before.
+        """
+        node_type = type(node)
+        if node_type is ast.Constant:
+            return node.value
+        if node_type is ast.Name:
+            return self._resolve_fallback_name(node.id, full_scope, globals_dict)
+        if node_type is ast.BinOp:
+            left = self._walk_ast_node(
+                node.left, full_scope, globals_dict, line_number)
+            right = self._walk_ast_node(
+                node.right, full_scope, globals_dict, line_number)
+            return self._apply_fallback_binop(node.op, left, right)
+        if node_type is ast.UnaryOp:
+            operand = self._walk_ast_node(
+                node.operand, full_scope, globals_dict, line_number)
+            return self._apply_fallback_unop(node.op, operand)
+        if node_type is ast.Compare:
+            left = self._walk_ast_node(
+                node.left, full_scope, globals_dict, line_number)
+            for op, comparator in zip(node.ops, node.comparators):
+                right = self._walk_ast_node(
+                    comparator, full_scope, globals_dict, line_number)
+                cmp_result = self._apply_fallback_compare(op, left, right)
+                if len(node.ops) == 1:
+                    return cmp_result
+                if is_error_value(cmp_result):
+                    return cmp_result
+                if not cmp_result:
+                    return False
+                left = right
+            return True
+        if node_type is ast.BoolOp:
+            result = None
+            for value_node in node.values:
+                result = self._walk_ast_node(
+                    value_node, full_scope, globals_dict, line_number)
+                if isinstance(node.op, ast.Or) and result:
+                    return result
+                if isinstance(node.op, ast.And) and not result:
+                    return result
+            return result
+        if node_type is ast.Call:
+            if (isinstance(node.func, ast.Name)
+                    and node.func.id == 'gridlang_truth'):
+                # A '?' truth-test marker: evaluate its single argument
+                # (already rewritten with '=' as '==') and return the value.
+                if len(node.args) != 1 or node.keywords:
+                    raise RuntimeError(
+                        f"Invalid truth-test at line {line_number}")
+                return self._walk_ast_node(
+                    node.args[0], full_scope, globals_dict, line_number)
+            func = self._walk_ast_node(
+                node.func, full_scope, globals_dict, line_number)
+            args = [self._walk_ast_node(
+                a, full_scope, globals_dict, line_number) for a in node.args]
+            kwargs = {}
+            for kw in node.keywords:
+                if kw.arg is None:
+                    raise RuntimeError(
+                        f"Unsupported ** expansion at line {line_number}")
+                kwargs[kw.arg] = self._walk_ast_node(
+                    kw.value, full_scope, globals_dict, line_number)
+            return func(*args, **kwargs)
+        if node_type is ast.Attribute:
+            obj = self._walk_ast_node(
+                node.value, full_scope, globals_dict, line_number)
+            return getattr(obj, node.attr)
+        if node_type is ast.Subscript:
+            value = self._walk_ast_node(
+                node.value, full_scope, globals_dict, line_number)
+            index = self._walk_ast_slice(
+                node.slice, full_scope, globals_dict, line_number)
+            return value[index]
+        if node_type is ast.List:
+            return [self._walk_ast_node(
+                e, full_scope, globals_dict, line_number) for e in node.elts]
+        if node_type is ast.Tuple:
+            return tuple(self._walk_ast_node(
+                e, full_scope, globals_dict, line_number) for e in node.elts)
+        if node_type is ast.Dict:
+            return {self._walk_ast_node(
+                k, full_scope, globals_dict, line_number): self._walk_ast_node(
+                    v, full_scope, globals_dict, line_number)
+                for k, v in zip(node.keys, node.values) if k is not None}
+        if node_type is ast.Set:
+            return {self._walk_ast_node(
+                e, full_scope, globals_dict, line_number) for e in node.elts}
+        if node_type is ast.IfExp:
+            test = self._walk_ast_node(
+                node.test, full_scope, globals_dict, line_number)
+            branch = node.body if test else node.orelse
+            return self._walk_ast_node(
+                branch, full_scope, globals_dict, line_number)
+        raise RuntimeError(
+            f"Unsupported expression construct '{node_type.__name__}' at line {line_number}")
+
+    def _walk_ast_slice(self, node, full_scope, globals_dict, line_number):
+        if isinstance(node, ast.Slice):
+            return slice(
+                self._walk_ast_node(node.lower, full_scope, globals_dict, line_number) if node.lower else None,
+                self._walk_ast_node(node.upper, full_scope, globals_dict, line_number) if node.upper else None,
+                self._walk_ast_node(node.step, full_scope, globals_dict, line_number) if node.step else None)
+        return self._walk_ast_node(node, full_scope, globals_dict, line_number)
+
+    def _apply_fallback_binop(self, op, left, right):
+        if isinstance(op, ast.Add):
+            return left + right
+        if isinstance(op, ast.Sub):
+            return left - right
+        if isinstance(op, ast.Mult):
+            return left * right
+        if isinstance(op, ast.Div):
+            return left / right
+        if isinstance(op, ast.FloorDiv):
+            return left // right
+        if isinstance(op, ast.Mod):
+            return left % right
+        if isinstance(op, ast.Pow):
+            return left ** right
+        raise RuntimeError(
+            f"Unsupported binary operator '{type(op).__name__}'")
+
+    def _apply_fallback_unop(self, op, operand):
+        if isinstance(op, ast.USub):
+            return -operand
+        if isinstance(op, ast.UAdd):
+            return +operand
+        if isinstance(op, ast.Not):
+            return not operand
+        if isinstance(op, ast.Invert):
+            return ~operand
+        raise RuntimeError(
+            f"Unsupported unary operator '{type(op).__name__}'")
+
+    def _apply_fallback_compare(self, op, left, right):
+        if isinstance(op, ast.Eq):
+            return left == right
+        if isinstance(op, ast.NotEq):
+            return left != right
+        if isinstance(op, ast.Lt):
+            return left < right
+        if isinstance(op, ast.LtE):
+            return left <= right
+        if isinstance(op, ast.Gt):
+            return left > right
+        if isinstance(op, ast.GtE):
+            return left >= right
+        raise RuntimeError(
+            f"Unsupported comparison operator '{type(op).__name__}'")
 
     def get_full_scope(self):
         """Get the full evaluation scope (alias to get_evaluation_scope)."""
@@ -2372,8 +2787,12 @@ class ExpressionEvaluator:
         scope = {}
         current = self
         while current and not current.is_private:
-            scope.update(
-                {k: v for k, v in current.variables.items() if k not in scope})
+            for k, v in current.variables.items():
+                if k not in scope:
+                    if hasattr(current, '_wrap_for_eval'):
+                        scope[k] = current._wrap_for_eval(k, v)
+                    else:
+                        scope[k] = v
             current = current.parent
         return scope
 
@@ -2498,7 +2917,7 @@ class ExpressionEvaluator:
             end = float(end)
             step = float(step) if step else 1.0
             count = int((end - start) / step) + 1
-            return pa.array([start + i * step for i in range(count)], type=pa.float64())
+            return [start + i * step for i in range(count)]
         raise ValueError(f"Invalid sequence: '{expr}' at line {line_number}")
 
     def _replace_operators(self, expr, line_number=None):
@@ -2511,6 +2930,8 @@ class ExpressionEvaluator:
         expr = re.sub(r'\bmod\b', '%', expr, flags=re.I)
         expr = expr.replace('\\', '//')
         expr = expr.replace('^', '**')
+        expr = re.sub(r'\btrue\b', 'True', expr, flags=re.I)
+        expr = re.sub(r'\bfalse\b', 'False', expr, flags=re.I)
         return expr
 
     def _get_eval_globals(self):
@@ -2530,8 +2951,8 @@ class ExpressionEvaluator:
         def Len(val):
             if isinstance(val, str):
                 return len(val)
-            if isinstance(val, pa.Array):
-                items = val.to_pylist()
+            if isinstance(val, dict) and 'array' in val:
+                items = list(val['array'])
             elif isinstance(val, (list, tuple)):
                 items = list(val)
             else:
@@ -2556,8 +2977,8 @@ class ExpressionEvaluator:
             return str(text).split(str(delimiter))
 
         def _to_list(val):
-            if isinstance(val, pa.Array):
-                return val.to_pylist()
+            if isinstance(val, dict) and 'array' in val:
+                return list(val['array'])
             if isinstance(val, (list, tuple, set)):
                 return list(val)
             return [val]
@@ -2566,7 +2987,8 @@ class ExpressionEvaluator:
             items = _to_list(val)
             count = 0
             for item in items:
-                if isinstance(item, pa.Array):
+                if isinstance(item, list) or (
+                        isinstance(item, dict) and 'array' in item):
                     count += CountA(item)
                 elif item is None:
                     continue
@@ -2589,6 +3011,41 @@ class ExpressionEvaluator:
             pairs.sort(key=lambda p: p[0])
             return [v for _, v in pairs]
 
+        def Transpose(arr):
+            """Return the transpose of an array (swaps the first two dims)."""
+            ah = self.compiler.array_handler
+            if isinstance(arr, dict) and 'array' in arr:
+                shape = list(arr.get('shape') or arr.get('original_shape'))
+                flat = ah.flatten_array(arr, None)
+            else:
+                shape = ah.get_array_shape(arr, None)
+                flat = ah.flatten_array(arr, None)
+            flat = [float(v) if isinstance(v, (int, float))
+                    and not isinstance(v, bool) else v for v in flat]
+            if len(shape) <= 1:
+                if isinstance(arr, dict) and 'array' in arr:
+                    return arr
+                return list(flat) if flat else arr
+            new_shape = [shape[1], shape[0]] + shape[2:]
+            strides = []
+            acc = 1
+            for s in shape:
+                strides.append(acc)
+                acc *= s
+            new_total = acc
+            new_flat = []
+            for n_idx in range(new_total):
+                rem = n_idx
+                idxs = []
+                for s in new_shape:
+                    idxs.append(rem % s)
+                    rem //= s
+                old_idxs = [idxs[1], idxs[0]] + idxs[2:]
+                old_flat = sum(oi * st for oi, st in zip(old_idxs, strides))
+                new_flat.append(flat[old_flat])
+            return {'array': list(new_flat),
+                    'shape': list(new_shape), 'original_shape': list(new_shape)}
+
         globals_dict = {
             '__builtins__': {
                 'float': float,
@@ -2598,13 +3055,13 @@ class ExpressionEvaluator:
                 'sum': sum
             },
             'math': math,
-            'pa': pa,
             'Len': Len,
             'Mid': Mid,
             'TextSplit': TextSplit,
             'CountA': CountA,
             'RandArray': RandArray,
             'SortBy': SortBy,
+            'Transpose': Transpose,
             'SQRT': math.sqrt,
             'sqrt': math.sqrt,
             'Sqrt': math.sqrt,

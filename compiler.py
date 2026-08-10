@@ -4,14 +4,42 @@ import re
 import math
 import sys
 import copy
-import pyarrow as pa
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
-from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value
-from scope import Scope, GridLiveView
+from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT
+from scope import Scope, GridLiveView, _ListenerGrid
+from units import (
+    UNIT_ERROR, UnitValue, error_value, is_error_value, strip_units,
+)
 from control_flow import GridLangControlFlow
 from type_processor import GridLangTypeProcessor
 from parser import GridLangParser
+
+
+_IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*')
+_STRING_LITERAL_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+_DEPENDENCY_IGNORED_TOKENS = {
+    'sum', 'rows', 'sqrt', 'min', 'max', 'abs', 'int', 'float', 'str', 'len',
+    'textsplit', 'print', 'push', 'true', 'false', 'none', 'nan', 'inf', 'and', 'or', 'not',
+    'if', 'then', 'else', 'elseif', 'end', 'do', 'for', 'while', 'when', 'step', 'return',
+    'index', 'as', 'dim', 'with', 'grid', 'output', 'input', 'number', 'text',
+    'array', 'mod', 'div', 'to', 'by', 'e', 'new', 'in', 'counta', 'rows', 'of', 'null'
+}
+
+
+def _strip_constraint_operands(expr):
+    """Remove constraint clauses (' of <unit>', ' as <type>', ' dim <n>',
+    ' not null') so dependency extraction doesn't treat unit/type names as
+    variable references."""
+    if not expr:
+        return expr
+    cleaned = _STRING_LITERAL_PATTERN.sub(' ', str(expr))
+    cleaned = re.sub(r'\b(?:of|as)\s+[A-Za-z_][A-Za-z0-9_]*', ' ', cleaned)
+    cleaned = re.sub(
+        r'\bdim\s+(?:\d+(?:\.\d*)?|nan|inf|[A-Za-z_][A-Za-z0-9_]*)',
+        ' ', cleaned, flags=re.I)
+    cleaned = re.sub(r'\bnot\s+null\b', ' ', cleaned, flags=re.I)
+    return cleaned
 
 
 class SubprocessResult:
@@ -31,7 +59,7 @@ class SubprocessResult:
 
 class GridLangCompiler:
     def __init__(self):
-        self.grid = {}
+        self.grid = _ListenerGrid(self)
         self.scopes = [Scope(self)]
         # Predefine the 'grid' variable containing the current grid, like in a
         # type definition, so programs can read and write cells with grid{row, col}.
@@ -40,6 +68,12 @@ class GridLangCompiler:
         self._seed_grid_variable()
         self.variables = self.current_scope().variables
         self.types = self.scopes[0].types
+        # Client/publisher listener registry. Cells and variables written by a
+        # client binding (: v = expr) register listeners; publisher updates
+        # (init/push) propagate to those listeners immediately.
+        self._listeners = {'cell': {}, 'var': {}}
+        self._set_by = {}
+        self._propagating = set()
         self.dimensions = {}
         self.dim_names = {}
         self.dim_labels = {}
@@ -218,8 +252,8 @@ class GridLangCompiler:
         if inputs_list:
             raise ValueError(
                 f"Cannot convert array to type '{type_name}' with constructor inputs at line {line_number}")
-        if isinstance(value, pa.Array):
-            value = value.to_pylist()
+        if isinstance(value, dict) and 'array' in value:
+            value = list(value['array'])
         if not isinstance(value, list):
             return value
         public_fields = list(self._get_public_type_fields(type_def).keys())
@@ -411,9 +445,17 @@ class GridLangCompiler:
                                     'type': parsed_type,
                                     'constraints': parsed_constraints or {}
                                 })
-                    m_out = re.match(r'^\s*output\s+([\w_]+)', b, re.I)
+                    m_out = re.match(r'^\s*output\s+(.+)$', b, re.I)
                     if m_out:
-                        outputs.append(m_out.group(1).strip())
+                        try:
+                            parsed_var, parsed_type, parsed_constraints, _ = self.parser._parse_variable_def(
+                                b.strip(), body_ln)
+                        except Exception:
+                            parsed_var, parsed_type, parsed_constraints = None, None, {}
+                        if parsed_var:
+                            var_list = (parsed_constraints or {}).get('var_list') if parsed_constraints else None
+                            names = var_list if var_list else [parsed_var]
+                            outputs.extend(names)
                 entry = {
                     'name': func_name,
                     'code': func_code,
@@ -485,8 +527,8 @@ class GridLangCompiler:
         if vectorize and not collect_all:
             array_args = []
             for idx, arg in enumerate(args):
-                if isinstance(arg, pa.Array):
-                    array_args.append((idx, arg.to_pylist()))
+                if isinstance(arg, dict) and 'array' in arg:
+                    array_args.append((idx, list(arg['array'])))
                 elif isinstance(arg, (list, tuple)):
                     array_args.append((idx, list(arg)))
             if array_args:
@@ -511,8 +553,8 @@ class GridLangCompiler:
                         for i in range(count):
                             elem_args = []
                             for arg in args:
-                                if isinstance(arg, pa.Array):
-                                    elem_args.append(arg.to_pylist()[i])
+                                if isinstance(arg, dict) and 'array' in arg:
+                                    elem_args.append(list(arg['array'])[i])
                                 elif isinstance(arg, (list, tuple)):
                                     elem_args.append(list(arg)[i])
                                 else:
@@ -573,6 +615,27 @@ class GridLangCompiler:
             func_def['code'], list(args),
             suppress_output=True, return_output=True)
         outputs = func_result or {}
+
+        # Merge declared outputs from function scope when not pushed explicitly.
+        try:
+            last_scope_vars = getattr(sub_compiler, '_last_scope_vars', {}) or {}
+            for out_name in func_def.get('outputs', []) or []:
+                out_key = out_name.lower()
+                if out_key in outputs:
+                    continue
+                try:
+                    merged_val = sub_compiler.current_scope().get(out_name)
+                except Exception:
+                    merged_val = None
+                if merged_val is None:
+                    for key, value in last_scope_vars.items():
+                        if key.lower() == out_key:
+                            merged_val = value
+                            break
+                if merged_val is not None:
+                    outputs[out_key] = merged_val
+        except Exception:
+            pass
 
         # Normalize outputs to lists to preserve all pushed values
         normalized_outputs = {}
@@ -795,7 +858,7 @@ class GridLangCompiler:
         expected_type = field_type.lower()
         if expected_type not in self.types_defined:
             return field_value
-        if isinstance(field_value, (list, pa.Array)):
+        if isinstance(field_value, (list, dict)):
             return self._convert_array_to_object(expected_type, field_value, line_number)
         if isinstance(field_value, dict):
             actual_type = field_value.get('_type_name')
@@ -1010,8 +1073,8 @@ class GridLangCompiler:
         target = binding.strip()
         if not target:
             return
-        if isinstance(values, pa.Array):
-            values = values.to_pylist()
+        if isinstance(values, dict) and 'array' in values:
+            values = list(values['array'])
         simple_value = values[0] if isinstance(
             values, list) and len(values) == 1 else values
 
@@ -1023,7 +1086,7 @@ class GridLangCompiler:
                 inner, scope.get_evaluation_scope(), line_number) or inner
             validate_cell_ref(cell_ref)
             if isinstance(values, list):
-                all_scalars = all(not isinstance(v, (list, dict, pa.Array))
+                all_scalars = all(not isinstance(v, (list, dict))
                                   for v in values)
                 if all_scalars:
                     # For scalar pushes, keep the last value only
@@ -1095,6 +1158,10 @@ class GridLangCompiler:
         # Merge declared outputs from subprocess scope when not pushed explicitly.
         merged_outputs = dict(sub_output or {})
         try:
+            # The executor's scope stack diverges from the compiler's after
+            # _reset_state (a compiler-bound method), so fall back to the
+            # pre-clobber capture of the subprocess's final variables.
+            last_scope_vars = getattr(sub_compiler, '_last_scope_vars', {}) or {}
             for out_name in sp_def.get('outputs', []) or []:
                 out_key = out_name.lower()
                 if out_key in merged_outputs:
@@ -1103,6 +1170,11 @@ class GridLangCompiler:
                     merged_val = sub_compiler.current_scope().get(out_name)
                 except Exception:
                     merged_val = None
+                if merged_val is None:
+                    for key, value in last_scope_vars.items():
+                        if key.lower() == out_key:
+                            merged_val = value
+                            break
                 if merged_val is not None:
                     merged_outputs[out_key] = merged_val
         except Exception:
@@ -1128,8 +1200,8 @@ class GridLangCompiler:
         def _normalize_grid(value):
             if value is None:
                 return []
-            if isinstance(value, pa.Array):
-                value = value.to_pylist()
+            if isinstance(value, dict) and 'array' in value:
+                value = value['array']
             if isinstance(value, dict):
                 return self._grid_to_matrix(value)
             if isinstance(value, list):
@@ -1473,7 +1545,8 @@ class GridLangCompiler:
         tokens = re.findall(r'[A-Za-z_][A-Za-z0-9_]*', cleaned)
         filtered = set()
         keyword_exclusions = {
-            'to', 'and', 'or', 'not', 'then', 'do', 'step', 'by', 'in', 'new', 'with'
+            'to', 'and', 'or', 'not', 'then', 'do', 'step', 'by', 'in', 'new', 'with',
+            'true', 'false'
         }
         for tok in tokens:
             if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', tok, re.I):
@@ -1494,12 +1567,35 @@ class GridLangCompiler:
 
     def _extract_cell_refs(self, expr):
         cell_refs = set()
-        single_matches = re.finditer(r'\[([A-Za-z]+\d+)\]', expr)
+        single_matches = re.finditer(rf'\[({_ADDRESS_FRAGMENT})\]', expr)
         for match in single_matches:
             cell_refs.add(match.group(1))
-        range_matches = re.finditer(r'\[([A-Za-z]+\d+):([A-Za-z]+\d+)\]', expr)
+        range_matches = re.finditer(rf'\[({_ADDRESS_FRAGMENT}):({_ADDRESS_FRAGMENT})\]', expr)
         for match in range_matches:
             start, end = match.group(1), match.group(2)
+            if '.' in start or '.' in end:
+                # Extended (N-D) range: register every enumerated cell.
+                try:
+                    s_idx = parse_address(start)
+                    e_idx = parse_address(end)
+                except ValueError:
+                    continue
+                if len(s_idx) != len(e_idx):
+                    continue
+                starts = [min(a, b) for a, b in zip(s_idx, e_idx)]
+                shape = [abs(a - b) + 1 for a, b in zip(s_idx, e_idx)]
+                total = 1
+                for dim in shape:
+                    total *= dim
+                for flat_i in range(total):
+                    rem = flat_i
+                    idxs = []
+                    for dim_size in shape:
+                        idxs.append(rem % dim_size)
+                        rem //= dim_size
+                    cell_refs.add(indices_to_address(
+                        [starts[i] + idxs[i] for i in range(len(shape))]))
+                continue
             start_col, start_row = split_cell(start)
             end_col, end_row = split_cell(end)
             start_col_num = col_to_num(start_col)
@@ -1515,10 +1611,105 @@ class GridLangCompiler:
             row, col = int(match.group(1)), int(match.group(2))
             cell_refs.add(f"{num_to_col(col)}{row}")
         if '$"' in expr:
-            placeholders = re.findall(r'\{\s*([^}]*?)\s*\}', expr)
-            for ph in placeholders:
+            # Only scan placeholders inside interpolated strings ($"...{...}").
+            # Naively scanning all '{...}' groups would also match array literal
+            # braces and quoted text values that look like cell refs (e.g. a text
+            # array like {"q6", "x7"}).
+            for ph in iter_interpolation_placeholders(expr):
                 cell_refs.update(re.findall(r'\b[A-Za-z]+\d+\b', ph))
         return cell_refs
+
+    def _register_listeners(self, var_name, expr, scope):
+        """Register var_name as a client listener on every cell/var its expr reads.
+
+        Called during a client binding; the registry lives on this compiler so
+        notifications (reached via compiler references from scope/_ListenerGrid)
+        always touch the same objects.
+        """
+        if not expr or scope is None:
+            return
+        deps = set()
+        cleaned = _strip_constraint_operands(expr)
+        for token in _IDENTIFIER_TOKEN_PATTERN.findall(cleaned):
+            if not token:
+                continue
+            base = token.split('.')[0]
+            lower = base.lower()
+            if lower in _DEPENDENCY_IGNORED_TOKENS:
+                continue
+            if lower in self.types_defined:
+                continue
+            if lower in self.functions or lower in self.subprocesses:
+                continue
+            if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', base, re.I):
+                continue
+            deps.add(base)
+        cell_refs = self._extract_cell_refs(str(expr))
+        keys = []
+        for ref in sorted(cell_refs):
+            keys.append(('cell', ref.upper()))
+        for dep in deps:
+            if re.match(r'^[A-Za-z]+\d+$', dep):
+                continue
+            keys.append(('var', dep.lower()))
+        record = {'var': var_name, 'expr': str(expr), 'scope': scope,
+                  'deps': deps, 'cell_refs': cell_refs}
+        for kind, key in keys:
+            holder = self._listeners.setdefault(kind, {}).setdefault(key, {})
+            holder[(var_name.lower(), id(scope))] = record
+        if var_name:
+            self._set_by[('var', var_name.lower())] = 'client'
+
+    def _notify_var_changed(self, name, value):
+        self._propagate(('var', name.lower()), value)
+
+    def _notify_cell_changed(self, cell_ref, value):
+        self._propagate(('cell', cell_ref.upper()), value)
+
+    def _propagate(self, dep_key, value):
+        """Recompute every client listener that depends on dep_key."""
+        if dep_key in self._propagating:
+            return
+        entries = self._listeners.get(dep_key[0], {}).get(dep_key[1], {})
+        if not entries:
+            return
+        self._propagating.add(dep_key)
+        try:
+            for record in list(entries.values()):
+                try:
+                    self._recompute_client(record)
+                except Exception:
+                    pass
+        finally:
+            self._propagating.discard(dep_key)
+
+    def _recompute_client(self, record):
+        """Recompute a client variable from its stored expression."""
+        var_name = record.get('var')
+        expr = record.get('expr')
+        scope = record.get('scope')
+        if not var_name or not expr or scope is None:
+            return
+        defining_scope = scope.get_defining_scope(var_name)
+        if defining_scope is None or defining_scope.is_uninitialized(var_name):
+            return
+        for dep in record.get('deps', ()):
+            if self.has_unresolved_dependency(dep, scope=scope):
+                return
+        for ref in record.get('cell_refs', ()):
+            if ref not in self.grid:
+                return
+        val = self.expr_evaluator.eval_or_eval_array(
+            expr, scope.get_evaluation_scope(), None)
+        actual_key = defining_scope._get_case_insensitive_key(
+            var_name, defining_scope.types) or var_name
+        var_type = defining_scope.types.get(actual_key)
+        if val is not None and var_type and var_type.lower() in self.types_defined:
+            constraints = defining_scope.constraints.get(actual_key, {})
+            val, constraints = defining_scope._coerce_custom_type_value(
+                var_type, val, constraints, None)
+            defining_scope.constraints[actual_key] = constraints
+        defining_scope.update(var_name, val, None)
 
     def _split_assignment_expr(self, text):
         """Split on the first standalone '=' not part of comparison operators."""
@@ -1633,6 +1824,13 @@ class GridLangCompiler:
 
     def _reset_state(self):
         self.grid.clear()
+        # This method runs on the executor object (self.compiler is the owning
+        # compiler); listener/mechanism state must be reset on the compiler
+        # because notification hooks are reached through compiler references.
+        owner = getattr(self, 'compiler', None) or self
+        owner._listeners = {'cell': {}, 'var': {}}
+        owner._set_by = {}
+        owner._propagating = set()
         parent_scope = getattr(self, '_parent_scope', None)
         if parent_scope is not None:
             # Subprocesses and functions reference the caller's scope chain live
@@ -2015,34 +2213,42 @@ class GridLangCompiler:
 
         if parsed:
             var, type_name, constraints, expr = parsed
-            self.current_scope().define_output(
-                var, type_name, line_number, constraints)
-            if constraints.get('init') is not None:
-                init_expr = constraints.pop('init')
-                deps = set(self._extract_identifier_tokens(init_expr))
-                func_names = set(getattr(self, 'functions', {}).keys())
-                deps = {d for d in deps if d.lower() not in func_names}
-                unresolved = False
-                for dep in deps:
-                    dep_scope = self.current_scope().get_defining_scope(dep)
-                    if dep_scope and dep_scope.is_uninitialized(dep):
-                        unresolved = True
-                        break
-                    try:
-                        self.current_scope().get(dep)
-                    except Exception:
-                        unresolved = True
-                        break
-                if unresolved:
-                    self.pending_assignments[var] = (
-                        init_expr, line_number, deps)
-                else:
-                    eval_scope = self.current_scope().get_full_scope()
-                    import copy
-                    init_val = self.expr_evaluator.eval_expr(
-                        init_expr, eval_scope, line_number)
-                    init_val = copy.deepcopy(init_val)
-                    self.current_scope().update(var, init_val, line_number)
+            var_names = constraints.pop('var_list', [var])
+            for var_name in var_names:
+                self.current_scope().define_output(
+                    var_name, type_name, line_number, constraints)
+                if constraints.get('init') is not None:
+                    init_expr = constraints.get('init')
+                    deps = set(self._extract_identifier_tokens(init_expr))
+                    func_names = set(getattr(self, 'functions', {}).keys())
+                    deps = {d for d in deps if d.lower() not in func_names}
+                    unresolved = False
+                    for dep in deps:
+                        dep_scope = self.current_scope().get_defining_scope(dep)
+                        if dep_scope and dep_scope.is_uninitialized(dep):
+                            unresolved = True
+                            break
+                        try:
+                            self.current_scope().get(dep)
+                        except Exception:
+                            unresolved = True
+                            break
+                    if unresolved:
+                        self.pending_assignments[var_name] = (
+                            init_expr, line_number, deps, constraints)
+                    else:
+                        eval_scope = self.current_scope().get_full_scope()
+                        import copy
+                        init_val = self.expr_evaluator.eval_expr(
+                            init_expr, eval_scope, line_number)
+                        init_val = copy.deepcopy(init_val)
+                        if constraints.get('with'):
+                            init_val = self._apply_with_constraints(
+                                init_val, constraints.get('with', {}),
+                                eval_scope, line_number,
+                                type_name=type_name)
+                        self.current_scope().update(
+                            var_name, init_val, line_number)
             return
 
         var_def, expr = self._split_assignment_expr(a)
@@ -2088,8 +2294,8 @@ class GridLangCompiler:
                         self.current_scope().define(
                             var, value, type_name.lower(), constraints, is_uninitialized=False, line_number=line_number)
                     else:
-                        pa_type = pa.float64() if effective_type in (
-                            'number', 'array') else pa.string()
+                        pa_type = 'number' if effective_type in (
+                            'number', 'array') else 'text'
                         value = self.array_handler.create_array(
                             shape, 0 if effective_type in ('number', 'array') else '', pa_type, line_number)
                         self.current_scope().define(
@@ -2276,7 +2482,8 @@ class GridLangCompiler:
                     potential_deps = re.findall(r'\b[\w_]+\b', expr_no_numbers)
                     built_in_functions = {
                         'sum', 'rows', 'sqrt', 'min', 'max', 'abs', 'int', 'float', 'str', 'len',
-                        'to', 'step', 'by', 'mod', 'div', 'and', 'or', 'not', 'new'}
+                        'to', 'step', 'by', 'mod', 'div', 'and', 'or', 'not', 'new',
+                        'true', 'false'}
                     known_funcs = set(getattr(self, 'functions', {}).keys())
                     known_subs = set(getattr(self, 'subprocesses', {}).keys())
                     known_types = set(getattr(self, 'types_defined', {}).keys())
@@ -2330,6 +2537,8 @@ class GridLangCompiler:
                     expr, line_number, deps, constraints)
         self.current_scope().define(var, evaluated_value, type_name or 'unknown',
                                     constraints, is_uninitialized=is_uninitialized)
+        if expr:
+            self._register_listeners(var, expr, self.current_scope())
 
     def _parse_dim_size(self, size_str, line_number=None):
         """Delegate to parser."""
@@ -2423,8 +2632,8 @@ class GridLangCompiler:
         else:
             self.current_scope().define(
                 var, value, inferred_type, constraints, is_uninitialized=False, line_number=line_number)
-        self.grid[cell] = value.to_pylist() if isinstance(
-            value, pa.Array) else value
+        self.grid[cell] = self.array_handler.flatten_array(
+            value, line_number) if isinstance(value, dict) and 'array' in value else value
         self._cell_var_map[cell] = var
 
     def _process_cell_binding_declaration(self, line, line_number=None):
@@ -2435,7 +2644,7 @@ class GridLangCompiler:
         caret_flag, cell_ref, rhs = m.groups()
         cell_ref = cell_ref.upper()
         rhs = rhs.strip()
-        validate_cell_ref(cell_ref)
+        parse_address(cell_ref)
 
         # If this is an assignment, let the assignment handler manage it.
         var_def, expr = self._split_assignment_expr(rhs)
@@ -2489,8 +2698,8 @@ class GridLangCompiler:
         try:
             current_value = self.current_scope().get(var)
             if current_value is not None:
-                converted = current_value.to_pylist() if isinstance(
-                    current_value, pa.Array) else current_value
+                converted = self.array_handler.flatten_array(
+                    current_value, line_number) if isinstance(current_value, dict) and 'array' in current_value else current_value
                 self.grid[cell_ref] = converted
                 self._record_output_value(var, converted)
         except NameError:
@@ -2511,8 +2720,8 @@ class GridLangCompiler:
                     self.grid[cell] = value
         for cell, mapped_var in self._cell_var_map.items():
             if mapped_var.lower() == var_lower:
-                converted = value.to_pylist() if isinstance(
-                    value, pa.Array) else value
+                converted = self.array_handler.flatten_array(
+                    value, None) if isinstance(value, dict) and 'array' in value else value
                 self.grid[cell] = converted
 
     def _record_output_value(self, var_name, value):
@@ -2523,8 +2732,20 @@ class GridLangCompiler:
         if not global_scope.is_output(var_name):
             return
         var_key = var_name.lower()
-        if isinstance(value, pa.Array):
-            value = value.to_pylist()
+        if isinstance(value, dict) and 'array' in value:
+            value = list(value['array'])
+        # Keep the unit attached so function/subprocess outputs retain it when
+        # they are returned to a caller (grid writes strip it instead).
+        if is_error_value(value):
+            value = error_value(value if isinstance(value, str) else value.error_code)
+        else:
+            scope = self.current_scope()
+            while scope is not None:
+                unit = scope.get_value_unit(var_name)
+                if unit:
+                    value = UnitValue(value, unit)
+                    break
+                scope = getattr(scope, 'parent', None)
         # Keep all pushed values in order
         existing = self.output_values.get(var_key, [])
         if not isinstance(existing, list):
@@ -2541,8 +2762,8 @@ class GridLangCompiler:
 
     def _debug_export_value(self, value):
         """Format runtime values for debug CSV output."""
-        if isinstance(value, pa.Array):
-            value = value.to_pylist()
+        if isinstance(value, dict) and 'array' in value:
+            value = list(value['array'])
         if isinstance(value, dict):
             value = public_object_view(value)
         elif isinstance(value, list):
@@ -2550,8 +2771,8 @@ class GridLangCompiler:
             for item in value:
                 if isinstance(item, dict):
                     normalized.append(public_object_view(item))
-                elif isinstance(item, pa.Array):
-                    normalized.append(item.to_pylist())
+                elif isinstance(item, (list, dict)):
+                    normalized.append(self._debug_export_value(item))
                 else:
                     normalized.append(item)
             value = normalized

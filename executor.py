@@ -3,13 +3,13 @@ import re
 import math
 import copy
 from collections import deque
-import pyarrow as pa
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
 from control_flow import GridLangControlFlow
 from parser import GridLangParser
 from scope import GridLiveView
-from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, public_type_fields, object_public_keys, format_display_value, split_var_defs
+from units import VALUE_ERROR, ConstraintError, error_value
+from utils import col_to_num, num_to_col, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address
 
 
 IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*')
@@ -36,6 +36,23 @@ def _strip_constraint_operands(expr):
         ' ', cleaned, flags=re.I)
     cleaned = re.sub(r'\bnot\s+null\b', ' ', cleaned, flags=re.I)
     return cleaned
+
+
+def _strip_cell_address_tokens(line, var_set):
+    """Remove cell-address segment tokens (A1, B4, ...) from a variable-token
+    set so dotted addresses like [A1.B1] or ranges [A1.B1:A2.B2] are not
+    misread as field accesses on variables named A1/A2."""
+    if not var_set:
+        return var_set
+    stripped = set()
+    for group in re.findall(r'\[([^\[\]]*)\]', line):
+        for piece in group.split(':'):
+            piece = piece.strip().lstrip('^')
+            if is_address(piece):
+                for seg in piece.split('.'):
+                    if re.match(r'^[A-Za-z]+\d+$', seg):
+                        stripped.add(seg)
+    return var_set - stripped
 
 
 def _is_numeric_token(token: str) -> bool:
@@ -262,12 +279,18 @@ class GridLangExecutor:
         self._process_when_triggers()
 
     def _set_var_value(self, var_name, value, line_number):
+        # Publisher-side write: a client equality binding wins over the pushed
+        # value, so skip the overwrite for client-owned variables.
+        owner = getattr(self, 'compiler', None) or self
+        if owner._set_by.get(('var', var_name.lower())) == 'client':
+            return
         defining_scope = self.current_scope().get_defining_scope(var_name)
         if defining_scope:
             defining_scope.update(var_name, value, line_number)
         else:
             self.current_scope().define(
                 var_name, value, None, {}, is_uninitialized=False)
+        owner._set_by[('var', var_name.lower())] = 'publisher'
 
     def _enqueue_push(self, var_name, value):
         key = var_name.lower()
@@ -798,6 +821,7 @@ class GridLangExecutor:
         except Exception:
             pass
         defining_scope.update(var, value, line_number)
+        self._register_listeners(var, expr, scope)
         return True
 
     def _execute_global_for_loops(self, lines):
@@ -1253,19 +1277,10 @@ class GridLangExecutor:
             if defining_scope.is_uninitialized(actual_key) or arr is None:
                 raise ValueError(
                     f"Array variable '{var_name}' with dim * must be initialized with PUSH or INIT before LET at line {line_number}")
-        if isinstance(arr, dict) and 'array' in arr:
-            updated_array = self.array_handler.set_array_element(
-                arr['array'], indices, value, line_number)
-            arr['array'] = updated_array
-            defining_scope.variables[actual_key] = arr
-            scope_dict[actual_key] = arr
-        else:
-            updated_array = self.array_handler.set_array_element(
-                arr, indices, value, line_number)
-            defining_scope.variables[actual_key] = updated_array
-            scope_dict[actual_key] = updated_array
-        debug_array = updated_array.to_pylist() if hasattr(
-            updated_array, 'to_pylist') else updated_array
+        updated_array = self.array_handler.set_array_element(
+            arr, indices, value, line_number)
+        defining_scope.variables[actual_key] = updated_array
+        scope_dict[actual_key] = updated_array
         return True
 
     def _infer_declared_type(self, expr, evaluated_value, line_number):
@@ -1333,9 +1348,22 @@ class GridLangExecutor:
             # live, so declarations shadow caller variables locally instead of
             # writing through to the caller's scope.
             defining_scope = None
+        old_constant = None
+        old_value = None
         if defining_scope:
-            if var in defining_scope.constraints and not constraints:
-                constraints = defining_scope.constraints[var]
+            old_key = defining_scope._get_case_insensitive_key(
+                var, defining_scope.variables)
+            old_constraints_key = defining_scope._get_case_insensitive_key(
+                var, defining_scope.constraints)
+            if old_constraints_key:
+                old_constant = defining_scope.constraints[old_constraints_key].get(
+                    'constant')
+            if old_key:
+                old_value = defining_scope.variables[old_key]
+            if var in defining_scope.constraints:
+                merged = dict(defining_scope.constraints[var])
+                merged.update(constraints)
+                constraints = merged
             if constraints:
                 defining_scope.constraints[var] = constraints
             if expr is None and var in defining_scope.variables and defining_scope.variables[var] is not None:
@@ -1353,6 +1381,11 @@ class GridLangExecutor:
 
         if expr is None:
             return None
+
+        # Client-style equality bindings (no INIT) register as listeners so the
+        # expression re-evaluates whenever a dependency cell/var is pushed.
+        if 'init' not in constraints and expr is not None:
+            self._register_listeners(var, expr, search_scope)
 
         try:
             evaluated_value = self.expr_evaluator.eval_or_eval_array(
@@ -1377,6 +1410,15 @@ class GridLangExecutor:
                 actual_type_key = defining_scope._get_case_insensitive_key(
                     var, defining_scope.types) or var
                 defining_scope.types[actual_type_key] = inferred_type
+            if (
+                old_constant is not None
+                and constraints.get('constant') is not None
+                and old_value is not None
+                and not self._let_values_match(old_value, evaluated_value)
+            ):
+                search_scope.update(
+                    var, error_value(VALUE_ERROR), line_number)
+                return 'bound'
             search_scope.update(var, evaluated_value, line_number)
             if scope_dict is not None:
                 scope_dict[var] = evaluated_value
@@ -1396,6 +1438,17 @@ class GridLangExecutor:
             self.pending_assignments[var] = (
                 expr, line_number, set(missing), constraints)
             return 'deferred'
+
+    def _let_values_match(self, a, b):
+        """Compare two bound values, tolerating numeric vs. unit forms."""
+        try:
+            result = (a == b)
+        except Exception:
+            return False
+        if isinstance(result, (list, tuple)):
+            items = list(result)
+            return bool(items) and all(bool(item) for item in items)
+        return bool(result)
 
     def _process_let_standard_assignment(
             self,
@@ -1459,19 +1512,6 @@ class GridLangExecutor:
                     pass
         return defining_scope.get(var)
 
-    def _blank_dependent_assignments(self, lines, start_i, var):
-        """Blank out following ':=' lines that reference a given variable."""
-        j = start_i + 1
-        while j < len(lines):
-            next_line, next_line_number = lines[j]
-            if ':=' in next_line:
-                _, rhs = next_line.split(':=', 1)
-                rhs_vars = set(
-                    token.lower() for token in re.findall(r'\b[\w_]+\b', rhs))
-                if var.lower() in rhs_vars:
-                    lines[j] = ("", next_line_number)
-            j += 1
-
     def _execute_let_block(self, lines, i, line_number, var_list):
         self.push_scope(is_private=True)
         block_lines = []
@@ -1532,7 +1572,9 @@ class GridLangExecutor:
                 defining_scope = self.current_scope().get_defining_scope(var) or self.current_scope()
                 var_value = self._resolve_pending_let_var(var, defining_scope)
                 if var_value is None:
-                    self._blank_dependent_assignments(lines, i, var)
+                    # The variable is declared but not valued yet (it will be filled
+                    # by a later push). Downstream cell assignments defer through
+                    # the pending mechanism and re-run once the value arrives.
                     continue
                 for op, threshold in constraints.items() if constraints else []:
                     if op not in ('<', '>', '<=', '>='):
@@ -1543,12 +1585,12 @@ class GridLangExecutor:
                         threshold_value = float(threshold)
                         if isinstance(var_value, (int, float)):
                             if op == '<' and var_value >= threshold_value:
-                                self.pending_assignments.clear()
-                                self._blank_dependent_assignments(lines, i, var)
+                                defining_scope.update(
+                                    var, error_value(VALUE_ERROR), line_number)
                                 continue
                             elif op == '>' and var_value <= threshold_value:
-                                self.pending_assignments.clear()
-                                self._blank_dependent_assignments(lines, i, var)
+                                defining_scope.update(
+                                    var, error_value(VALUE_ERROR), line_number)
                                 continue
                     except (TypeError, ValueError):
                         pass
@@ -1556,9 +1598,9 @@ class GridLangExecutor:
                     try:
                         defining_scope._check_constraints(
                             var, var_value, line_number)
-                    except ValueError as e:
-                        self.pending_assignments.clear()
-                        self._blank_dependent_assignments(lines, i, var)
+                    except ConstraintError as exc:
+                        defining_scope.update(
+                            var, error_value(exc.code), line_number)
                         continue
         return i + 1
 
@@ -1644,7 +1686,11 @@ class GridLangExecutor:
             except Exception:
                 value = raw_value
             value = self._strip_init_copy_immutability(value)
+            owner = getattr(self, 'compiler', None) or self
             if actual_key in defining_scope.variables:
+                if owner._set_by.get(('var', actual_key.lower())) == 'client':
+                    committed = True
+                    continue
                 defining_scope.update(actual_key, value, line_number)
             else:
                 defining_scope.define(
@@ -1657,6 +1703,7 @@ class GridLangExecutor:
                 )
                 actual_key = defining_scope._get_case_insensitive_key(
                     var_name, defining_scope.variables) or var_name
+            owner._set_by[('var', actual_key.lower())] = 'publisher'
             self._enqueue_push(actual_key, value)
             committed = True
 
@@ -1818,11 +1865,16 @@ class GridLangExecutor:
                     var) or self.current_scope()
                 if values:
                     val = values[-1]
+                    owner = getattr(self, 'compiler', None) or self
+                    if owner._set_by.get(('var', var.lower())) == 'client':
+                        init_handled = True
+                        continue
                     try:
                         target_scope.update(var, val, line_number)
                     except NameError:
                         target_scope.define(
                             var, val, type_name, constraints, is_uninitialized=False)
+                    owner._set_by[('var', var.lower())] = 'publisher'
                     self._enqueue_push(var, val)
                     self._process_when_triggers()
                 init_handled = True
@@ -1846,10 +1898,8 @@ class GridLangExecutor:
                         shape.append(size)
                     public_fields = public_type_fields(
                         self.types_defined[type_name.lower()])
-                    pa_type = pa.struct([(f, pa.string() if public_fields.get(
-                        f) == 'text' else pa.float64()) for f in public_fields])
                     array = self.array_handler.create_array(
-                        shape, None, pa_type, line_number)
+                        shape, None, 'number', line_number)
                     for i in range(shape[0]):
                         for j in range(shape[1]):
                             for k in range(shape[2]):
@@ -1972,7 +2022,7 @@ class GridLangExecutor:
                 else:
                     default_value = 0 if type_name.lower() == 'number' else None
                     array_data = self.array_handler.create_array(
-                        shape, default_value, pa.float64(), line_number)
+                        shape, default_value, type_name.lower() if type_name.lower() in ('number', 'text', 'logical') else 'number', line_number)
 
                 # Define the variable with the created array
                 self.current_scope().define(var_name, array_data,
@@ -1998,8 +2048,7 @@ class GridLangExecutor:
                 ]
             else:
                 # Initialize array with zeros
-                initial_array = pa.array(
-                    [0.0] * dim_size, type=pa.float64())
+                initial_array = [0.0] * dim_size
 
             # Define the variable with the initialized array
             self.current_scope().define(var_name, initial_array, type_name.lower(),
@@ -2622,16 +2671,12 @@ class GridLangExecutor:
                     shape = [size_spec for _, size_spec in dims]
                     public_fields = public_type_fields(
                         self.types_defined[type_name.lower()])
-                    struct_fields = [(f.lower(), pa.string() if public_fields.get(
-                        f.lower()) == 'text' else pa.float64()) for f in public_fields]
-                    struct_fields.append(('value', pa.float64()))
-                    pa_type = pa.struct(struct_fields)
                     default_struct = {f.lower(): with_constraints.get(
                         f) for f in public_fields}
                     default_struct['value'] = float(
                         value) if value else 1.0
                     array = self.array_handler.create_array(
-                        shape, default_struct, pa_type, line_number)
+                        shape, default_struct, 'number', line_number)
                     self.current_scope().define(
                         var, array, 'array', constraints, is_uninitialized=False)
                     for field in public_fields:
@@ -3021,8 +3066,9 @@ class GridLangExecutor:
         except Exception:
             raise SyntaxError(
                 f"Invalid range expression: {range_expr} at line {line_number}")
-        if hasattr(evaluated, 'to_pylist'):
-            return evaluated.to_pylist()
+        if isinstance(evaluated, dict):
+            return self.array_handler.flatten_array(
+                evaluated, line_number)
         if isinstance(evaluated, (list, tuple)):
             return list(evaluated)
         if evaluated is None:
@@ -3321,8 +3367,9 @@ class GridLangExecutor:
                     eval_scope = self.current_scope().get_evaluation_scope()
                     evaluated = self.expr_evaluator.eval_or_eval_array(
                         range_expr, eval_scope, line_number)
-                    if hasattr(evaluated, 'to_pylist'):
-                        values = evaluated.to_pylist()
+                    if isinstance(evaluated, dict):
+                        values = self.array_handler.flatten_array(
+                            evaluated, line_number)
                     elif isinstance(evaluated, (list, tuple)):
                         values = list(evaluated)
                     elif evaluated is None:
@@ -3568,6 +3615,8 @@ class GridLangExecutor:
             var, type_name, constraints, value = self._parse_variable_def(
                 var_def, line_number)
             deps = set(re.findall(r'\b[\w_]+\b', expr))
+            deps = {d for d in deps
+                    if d.lower() not in DEPENDENCY_IGNORED_TOKENS}
             if not deps:
                 try:
                     evaluated_value = self.expr_evaluator.eval_expr(
@@ -3681,6 +3730,8 @@ class GridLangExecutor:
                     v for v in target_vars if v not in set(col_interp_base_cols)}
             rhs_vars = _filter_var_tokens(rhs_vars)
             target_vars = _filter_var_tokens(target_vars)
+            rhs_vars = _strip_cell_address_tokens(line, rhs_vars)
+            target_vars = _strip_cell_address_tokens(line, target_vars)
             if hasattr(self, 'compiler') and getattr(self.compiler, 'types_defined', None):
                 type_keys = set(self.compiler.types_defined.keys())
                 rhs_vars = {v for v in rhs_vars if v.lower()
@@ -3723,11 +3774,15 @@ class GridLangExecutor:
                             if defining_scope:
                                 defining_scope.update(
                                     target, evaluated_value, line_number)
+                                self._register_listeners(
+                                    target, rhs, scope)
                             else:
                                 inferred_type = self.array_handler.infer_type(
                                     evaluated_value, line_number)
                                 scope.define(
                                     target, evaluated_value, inferred_type, {}, is_uninitialized=False)
+                                self._register_listeners(
+                                    target, rhs, scope)
                         else:
                             self.array_handler.evaluate_line_with_assignment(
                                 line, line_number, scope.get_evaluation_scope())
@@ -3777,7 +3832,7 @@ class GridLangExecutor:
         try:
             if cell_ref.startswith('^'):
                 array_cell_ref = cell_ref[1:].strip()
-                validate_cell_ref(array_cell_ref)
+                parse_address(array_cell_ref)
                 scope_value = self.current_scope().get_evaluation_scope()
                 is_grid_value = '.grid{' in value
                 evaluated_value = self.expr_evaluator.eval_or_eval_array(
@@ -3824,12 +3879,13 @@ class GridLangExecutor:
                     self.array_handler._assign_horizontal_array(
                         array_cell_ref, evaluated_value, value, line_number=line_number)
             else:
-                validate_cell_ref(cell_ref)
+                parse_address(cell_ref)
                 scope_value = self.current_scope().get_evaluation_scope()
                 is_grid_value = '.grid{' in value
                 evaluated_value = self.expr_evaluator.eval_or_eval_array(
                     value, scope_value, line_number, is_grid_dim=is_grid_value)
-                self.grid[cell_ref] = evaluated_value
+                self.grid[cell_ref] = self.array_handler.to_display_value(
+                    evaluated_value)
         except Exception as e:
             raise RuntimeError(
                 f"Error evaluating '{value}': {e} at line {line_number}")
@@ -3910,7 +3966,7 @@ class GridLangExecutor:
             if dim_constraints:
                 dims = dim_constraints.get('dims', [])
                 shape = [size for label, size in dims]
-                pa_type = pa.float64()
+                pa_type = 'number'
                 matrix_data = dim_constraints.get('matrix_data')
                 data_var = dim_constraints.get('data_var')
                 if data_var:
@@ -4532,16 +4588,12 @@ class GridLangExecutor:
                         arr = defining_scope.variables.get(actual_key)
                         if isinstance(arr, dict) and 'array' in arr:
                             arr_value = arr['array']
-                            if self._has_star_dim(constraints) and isinstance(arr_value, pa.Array):
-                                arr_value = arr_value.to_pylist()
                             updated_array = self.array_handler.set_array_element(
                                 arr_value, indices, value, line_number)
                             arr['array'] = updated_array
                             defining_scope.variables[actual_key] = arr
                         else:
                             arr_value = arr
-                            if self._has_star_dim(constraints) and isinstance(arr_value, pa.Array):
-                                arr_value = arr_value.to_pylist()
                             updated_array = self.array_handler.set_array_element(
                                 arr_value, indices, value, line_number)
                             defining_scope.variables[actual_key] = updated_array
@@ -4558,13 +4610,7 @@ class GridLangExecutor:
                         continue
 
                     # Update the variable with the new value
-                    defining_scope = self.current_scope().get_defining_scope(var_name)
-                    if defining_scope:
-                        defining_scope.update(var_name, value, line_number)
-                    else:
-                        self.current_scope().define(
-                            var_name, value, 'number', {}, is_uninitialized=False)
-
+                    self._set_var_value(var_name, value, line_number)
                     collecting_via_compiler = hasattr(
                         self, 'compiler') and self.compiler is not None
                     if (var_name.lower() in global_scope.output_variables) and not collecting_via_compiler:
@@ -4619,16 +4665,12 @@ class GridLangExecutor:
         arr = defining_scope.variables.get(actual_key)
         if isinstance(arr, dict) and 'array' in arr:
             arr_value = arr['array']
-            if self._has_star_dim(constraints) and isinstance(arr_value, pa.Array):
-                arr_value = arr_value.to_pylist()
             updated_array = self.array_handler.set_array_element(
                 arr_value, indices, value, line_number)
             arr['array'] = updated_array
             defining_scope.variables[actual_key] = arr
         else:
             arr_value = arr
-            if self._has_star_dim(constraints) and isinstance(arr_value, pa.Array):
-                arr_value = arr_value.to_pylist()
             updated_array = self.array_handler.set_array_element(
                 arr_value, indices, value, line_number)
             defining_scope.variables[actual_key] = updated_array
@@ -4746,8 +4788,8 @@ class GridLangExecutor:
                         value = self.array_handler.create_object_array(
                             shape, None, None)
                     else:
-                        pa_type = pa.float64() if var_type in (
-                            'number', 'array') else pa.string()
+                        pa_type = 'number' if var_type in (
+                            'number', 'array') else 'text'
                         default_value = 0 if var_type in (
                             'number', 'array') else ''
                         value = self.array_handler.create_array(
@@ -4764,6 +4806,30 @@ class GridLangExecutor:
                                      and not scope.is_private
                                      and getattr(scope.parent, 'compiler',
                                                  None) is scope.compiler) else None
+
+    def _deferred_dependency_unresolved(self, dep, scope):
+        """Whether a deferred assignment must keep waiting on ``dep``.
+
+        A declared variable that is merely uninitialized does not block
+        processing: reading it yields the sticky ``#N/A`` error value. Only
+        genuinely missing names, variables with an outstanding late
+        assignment, and dependencies still being computed keep a line pending.
+        """
+        if not dep:
+            return False
+        if re.match(r'^[A-Za-z]+\d+$', dep):
+            return dep not in self.grid
+        if dep.lower() in (self.functions or {}):
+            return False
+        if dep.lower() in self.undefined_dependencies:
+            return True
+        if dep in self.pending_assignments or dep in getattr(scope, 'pending_assignments', {}):
+            return True
+        if not scope.get_defining_scope(dep):
+            return True
+        if scope.is_uninitialized(dep):
+            return False
+        return self.has_unresolved_dependency(dep, scope=scope)
 
     def _process_deferred_assignments(self):
         """Process any deferred assignments stored with __line_ keys."""
@@ -4826,7 +4892,7 @@ class GridLangExecutor:
             try:
                 scope = self.current_scope()
                 unresolved = any(
-                    self.has_unresolved_dependency(dep, scope=scope)
+                    self._deferred_dependency_unresolved(dep, scope=scope)
                     for dep in deps)
                 if unresolved:
                     continue
@@ -4864,7 +4930,7 @@ class GridLangExecutor:
             try:
                 scope = self.current_scope()
                 unresolved = any(
-                    self.has_unresolved_dependency(dep, scope=scope)
+                    self._deferred_dependency_unresolved(dep, scope=scope)
                     for dep in deps)
                 if not unresolved:
                     # Process the assignment

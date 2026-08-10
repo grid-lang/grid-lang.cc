@@ -1,0 +1,22 @@
+input needle as number
+: haystack = {-5, -1, 0, 4, 5, 22, 29, 31, 50, 67}
+
+for low, high as number
+for mid as number = (low + high) \ 2  ' mid listener
+push low = 1
+push high = rows(haystack)
+
+When low <= high do
+  let element = haystack(mid)
+  if needle = element then
+    return mid
+  elseif needle < element then
+    push low
+    push high = mid - 1
+  else
+    push low = mid + 1
+    push high
+  end
+end
+
+return $"Finished looking for {needle} in {haystack}."
