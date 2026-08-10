@@ -1,13 +1,12 @@
 # GridLang
 
-GridLang is a Python-based tool for compiling and processing `.grid` files. This repository contains the source code for the `grid` command-line tool, which uses the `GridLangCompiler` to process input files, handle inputs/outputs, run tests, and optionally export results to CSV format.
+GridLang is a Python-based tool for compiling and processing `.grid` files. This repository contains the source code for the `grid` command-line tool, which uses the `GridLangCompiler` to process input files, handle inputs/outputs, and optionally export results to CSV format.
 
 ## Prerequisites
 
 - **Python**: Version 3.7 or higher (tested with Python 3.11).
 - **pip**: Python package manager (included with Python).
 - **Git**: For cloning the repository (optional if downloading as a ZIP).
-- **pyarrow**: Required dependency for data handling.
 - **PyInstaller**: Optional, for creating a standalone `grid.exe` executable.
 
 ## Installation
@@ -60,7 +59,7 @@ Install the package and its dependencies using `setuptools`:
 pip install .
 ```
 
-This installs the `gridlang` package, its dependency (`pyarrow`), and creates the `grid` command in your Python environment’s `Scripts` directory (e.g., `C:\Users\johndoe\AppData\Local\Programs\Python\Python311\Scripts` on Windows). The entry point is defined in `setup.py` as `grid=main:main`.
+This installs the `gridlang` package, and creates the `grid` command in your Python environment’s `Scripts` directory (e.g., `C:\Users\johndoe\AppData\Local\Programs\Python\Python311\Scripts` on Windows). The entry point is defined in `setup.py` as `grid=main:main`.
 
 #### Option 2: Create a Standalone Executable with PyInstaller
 
@@ -81,6 +80,7 @@ This installs the `gridlang` package, its dependency (`pyarrow`), and creates th
      --add-data "type_processor.py;." \
      --add-data "parser.py;." \
      --add-data "executor.py;." \
+     --add-data "units.py;." \
      --name grid main.py
    ```
 3. The executable will be created in `dist\grid\grid.exe`.
@@ -98,7 +98,7 @@ grid --help
 This should display:
 
 ```
-Usage: grid <filename.grid> [arg1] [arg2] ... [--debug]
+Usage: grid <grid_file> [arg1] [arg2] ... [--debug]
 ```
 
 If you see a `command not found` error, add the Python `Scripts` directory to your PATH:
@@ -154,31 +154,14 @@ The `grid` command processes `.grid` files using the `GridLangCompiler`. It supp
    grid binsearch.grid 22
    ```
 
-4. **Run in test mode**:
-
-   - Provide test names or identifiers to run them via the built-in test runner:
-
-   ```bash
-   grid MyTestName AnotherTest
-   ```
-
-   - Or run the contents of a `.grid` file directly in a minimal runner using `-r`:
-
-   ```bash
-   grid -r example.grid
-   ```
-
-   ```
-
-   ```
-
 ### Creating a Sample `.grid` File
 
 Create a file named `example.grid` in the `grid-lang.cc` directory:
 
 ```
-A1 = 42
-B2 = "Hello"
+[A1] := 42
+[B2] := "Hello"
+Return [A1]
 ```
 
 Then run:
@@ -190,8 +173,7 @@ grid example.grid
 ### Expected Output
 
 ```
-A1 = 42
-B2 = Hello
+output: 42
 ```
 
 ## Project Structure
@@ -199,7 +181,7 @@ B2 = Hello
 ```
 grid-lang.cc/
 ├── setup.py           # Package configuration and entry point (grid=main:main)
-├── main.py            # CLI entry point; routes to program or test mode
+├── main.py            # CLI entry point
 ├── compiler.py        # GridLangCompiler orchestration
 ├── executor.py        # Core execution engine used by compiler.run
 ├── parser.py          # Parsing helpers for types/dimensions
@@ -209,9 +191,9 @@ grid-lang.cc/
 ├── expression.py      # Expression parsing/evaluation
 ├── array_handler.py   # Array operations, dimensions, labels
 ├── utils.py           # Utility helpers (cell refs, column/row math)
+├── units.py           # Unit tracking and sticky error values (#UNIT, #DIV/0, ...)
 ├── example.grid       # Example GridLang program
 ├── binsearch.grid     # Example program using arguments
-├── example.csv        # Example CSV output (debug)
 ├── README.md          # This file
 └── build/             # Build artifacts (if present)
 ```
@@ -232,11 +214,6 @@ grid-lang.cc/
   - Add Python and Scripts to PATH:
     ```bash
     set PATH=%PATH%;C:\Users\johndoe\AppData\Local\Programs\Python\Python311;C:\Users\johndoe\AppData\Local\Programs\Python\Python311\Scripts
-    ```
-- **Error: `ModuleNotFoundError: No module named 'pyarrow'`**:
-  - Install `pyarrow`:
-    ```bash
-    pip install pyarrow
     ```
 
 ## Development
