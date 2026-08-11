@@ -280,13 +280,43 @@ def format_display_value(value, sig_digits=15):
     if value is None:
         return "None"
     if isinstance(value, dict) and 'array' in value:
-        return format_display_value(list(value['array']), sig_digits=sig_digits)
+        flat = list(value['array'])
+        shape = list(value.get('shape') or value.get('original_shape') or [])
+        stride = shape[0] if len(shape) > 1 and shape[0] else (len(flat) or 1)
+        rows = [flat[i:i + stride] for i in range(0, len(flat), stride)]
+        return _format_nd(rows, sig_digits)
     if isinstance(value, dict):
         items = []
         for k, v in value.items():
             items.append(f"{k}: {format_display_value(v, sig_digits=sig_digits)}")
         return "{" + ", ".join(items) + "}"
     if isinstance(value, (list, tuple)):
-        inner = ", ".join(format_display_value(v, sig_digits=sig_digits) for v in value)
-        return "[" + inner + "]"
+        if value and any(isinstance(v, (list, tuple)) for v in value):
+            return _format_nd([_flatten_scalars(v) for v in value], sig_digits)
+        return "[" + ", ".join(
+            format_display_value(v, sig_digits=sig_digits) for v in value) + "]"
     return str(value)
+
+
+def _format_nd(rows, sig_digits):
+    """Render array rows inside braces with a space before each value, pipe
+    and closing brace, e.g. ``{ 1, 2 | 3, 4 }``.  Empty values render as
+    nothing, so missing entries collapse into runs of commas and pipes."""
+    rendered = []
+    for row in rows:
+        parts = [format_display_value(v, sig_digits=sig_digits) for v in row]
+        r = " " + parts[0] if parts else ""
+        for p in parts[1:]:
+            r += ("," if p == "" else ", " + p)
+        rendered.append(r)
+    out = rendered[0] if rendered else ""
+    for r in rendered[1:]:
+        out += " |" + r
+    return "{" + out + " }"
+
+
+def _flatten_scalars(value):
+    """Flatten nested lists into a flat list of scalar values."""
+    if isinstance(value, (list, tuple)):
+        return [x for v in value for x in _flatten_scalars(v)]
+    return [value]
