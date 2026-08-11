@@ -23,6 +23,22 @@ DEPENDENCY_IGNORED_TOKENS = {
 }
 
 
+def infer_array_rank(value):
+    """Infer the internal rank of an array value that has no explicit dim
+    constraint.  Dict-form arrays use their shape, nested lists use their
+    nesting depth, flat lists are 1-D.  Returns None for non-array values."""
+    if isinstance(value, dict) and 'array' in value:
+        shape = value.get('shape') or value.get('original_shape')
+        return len(shape) if shape else 1
+    if isinstance(value, (list, tuple)):
+        depth = 0
+        for item in value:
+            if isinstance(item, (list, tuple)):
+                depth = max(depth, infer_array_rank(item))
+        return 1 + depth
+    return None
+
+
 def _strip_constraint_operands(expr):
     """Remove constraint clauses (' of <unit>', ' as <type>', ' dim <n>',
     ' not null') so dependency extraction doesn't treat unit/type names as
@@ -219,7 +235,7 @@ class GridLangExecutor:
         return dedup
 
     def _match_push_assignment(self, text):
-        return re.match(r'^\s*push\s+(\[[^\]]+\]|[\w_]+(?:\.[\w_]+)*(?:\([^)]+\)|\{[^}]+\})?)(?:\s*=\s*(.+))?\s*$', text, re.I)
+        return re.match(r'^\s*push\s+(\[[^\]]+\]|[\w_]+(?:\.[\w_]+)*(?:\([^)]+\)|\{[^}]+\}|!\[[^\]]+\])?)(?:\s*=\s*(.+))?\s*$', text, re.I)
 
     def _unpack_push_assignment(self, push_match):
         target, value_expr = push_match.groups()
@@ -4499,7 +4515,7 @@ class GridLangExecutor:
             self.array_handler.evaluate_line_with_assignment(
                 assignment_line, line_number, self.current_scope().get_evaluation_scope())
             return
-        if re.search(r'[\(\{]', target):
+        if re.search(r'[\(\{!]', target):
             self._assign_indexed_target(target, value_expr, line_number)
             return
         self._process_push_call(f"{target}.push({value_expr})", line_number)
@@ -4614,8 +4630,11 @@ class GridLangExecutor:
                     constraints = defining_scope.constraints.get(
                         actual_key, {})
                     if not constraints or not constraints.get('dim'):
-                        raise ValueError(
-                            f"Array variable '{indexed_var}' has no dimensions defined at line {line_number}")
+                        rank = infer_array_rank(
+                            defining_scope.variables.get(actual_key))
+                        if rank is not None and len(indices) != rank:
+                            raise ValueError(
+                                f"Expected {rank} indices for array variable '{indexed_var}', got {len(indices)} at line {line_number}")
                     for value in values:
                         arr = defining_scope.variables.get(actual_key)
                         if isinstance(arr, dict) and 'array' in arr:
@@ -4660,7 +4679,8 @@ class GridLangExecutor:
     def _assign_indexed_target(self, target, value_expr, line_number):
         paren_match = re.match(r'^([\w_]+)\s*\(([^)]+)\)$', target)
         brace_match = re.match(r'^([\w_]+)\s*\{([^}]+)\}$', target)
-        if not (paren_match or brace_match):
+        bang_match = re.match(r'^([\w_]+)\s*!\[([^\]]+)\]$', target)
+        if not (paren_match or brace_match or bang_match):
             raise SyntaxError(
                 f"Invalid indexed assignment target: '{target}' at line {line_number}")
         scope_dict = self.current_scope().get_evaluation_scope()
@@ -4671,6 +4691,17 @@ class GridLangExecutor:
             if isinstance(index_value, float) and index_value.is_integer():
                 index_value = int(index_value)
             indices = [index_value - 1]
+        elif bang_match:
+            var_name, index_expr = bang_match.groups()
+            try:
+                index_value = self.expr_evaluator.eval_expr(
+                    index_expr, scope_dict, line_number)
+                if isinstance(index_value, float) and index_value.is_integer():
+                    index_value = int(index_value)
+                indices = [index_value - 1]
+            except Exception:
+                indices = self.array_handler.cell_ref_to_indices(
+                    index_expr, line_number)
         else:
             var_name, indices_str = brace_match.groups()
             index_exprs = [idx.strip()
@@ -4692,8 +4723,10 @@ class GridLangExecutor:
             var_name, defining_scope.variables) or var_name
         constraints = defining_scope.constraints.get(actual_key, {})
         if not constraints or not constraints.get('dim'):
-            raise ValueError(
-                f"Array variable '{var_name}' has no dimensions defined at line {line_number}")
+            rank = infer_array_rank(defining_scope.variables.get(actual_key))
+            if rank is not None and len(indices) != rank:
+                raise ValueError(
+                    f"Expected {rank} indices for array variable '{var_name}', got {len(indices)} at line {line_number}")
         arr = defining_scope.variables.get(actual_key)
         if isinstance(arr, dict) and 'array' in arr:
             arr_value = arr['array']

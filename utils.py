@@ -303,7 +303,7 @@ def _format_nd(rows, sig_digits):
     nothing, so missing entries collapse into runs of commas and pipes."""
     rendered = []
     for row in rows:
-        parts = [format_display_value(v, sig_digits=sig_digits) for v in row]
+        parts = ["" if v is None else format_display_value(v, sig_digits=sig_digits) for v in row]
         r = " " + parts[0] if parts else ""
         for p in parts[1:]:
             r += ("," if p == "" else ", " + p)
