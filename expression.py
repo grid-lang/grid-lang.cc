@@ -93,6 +93,12 @@ class ExpressionEvaluator:
         if binary_op_match and not is_grid_dim:
             return self.eval_expr(expr, scope, line_number)
 
+        # Handle pipe expressions with arbitrary operands (u | v, (a|b)|(c|d))
+        if '|' in expr and not is_grid_dim:
+            segments = self._split_pipe_segments(expr, line_number)
+            if len(segments) > 1:
+                return self._evaluate_pipe_array(expr, scope, line_number)
+
         handled, value = self._try_eval_grid_dim_special_access(
             expr, scope, line_number, is_grid_dim)
         if handled:
@@ -534,25 +540,24 @@ class ExpressionEvaluator:
             return elements
         return elements[0] if elements else []
 
-    def _evaluate_pipe_array(self, expr, scope, line_number=None):
-        """
-        Evaluate piped arrays (e.g., {1,2} | {3,4}).
-        Stacks the operand arrays along a new dimension at index 1:
-        [d0, d1, ...] | [d0, d1, ...] ... -> [d0, N, d1, ...]
-        The result is a column-major dict-form array (flat buffer + shape).
-        :param expr: Piped array string.
-        :param scope: Scope.
-        :param line_number: Line number.
-        :return: Dict-form N-D array (or plain list for 1D results).
-        """
-        if not (expr.startswith('{') and expr.endswith('}')):
-            raise SyntaxError(
-                f"Invalid pipe array syntax: {expr} at line {line_number}")
+    def _split_pipe_segments(self, expr, line_number=None):
+        """Split a pipe expression on top-level '|' (outside braces/parens)."""
         arrays = []
         current = ""
         brace_level = 0
+        paren_level = 0
+        in_quotes = False
         for char in expr:
-            if char == '|' and brace_level == 0:
+            if in_quotes:
+                current += char
+                if char == '"':
+                    in_quotes = False
+                continue
+            if char == '"':
+                in_quotes = True
+                current += char
+                continue
+            if char == '|' and brace_level == 0 and paren_level == 0:
                 if current.strip():
                     arrays.append(current.strip())
                 current = ""
@@ -562,20 +567,47 @@ class ExpressionEvaluator:
                     brace_level += 1
                 elif char == '}':
                     brace_level -= 1
+                elif char == '(':
+                    paren_level += 1
+                elif char == ')':
+                    paren_level -= 1
         if current.strip():
             arrays.append(current.strip())
-        if brace_level != 0:
+        if brace_level != 0 or paren_level != 0 or in_quotes:
             raise SyntaxError(
-                f"Unmatched braces in pipe array: {expr} at line {line_number}")
-        if not arrays:
-            raise ValueError(f"Empty pipe expression at line {line_number}")
+                f"Unmatched brackets in pipe array: {expr} at line {line_number}")
+        return arrays
+
+    def _strip_pipe_operand_parens(self, segment):
+        seg = segment.strip()
+        while seg.startswith('(') and seg.endswith(')'):
+            seg = seg[1:-1].strip()
+        return seg
+
+    def _evaluate_pipe_array(self, expr, scope, line_number=None):
+        """
+        Evaluate piped arrays (e.g., {1,2} | {3,4}, u | v, (a | b) | (c | d)).
+        Stacks the operand arrays along a new dimension at index 1:
+        [d0, d1, ...] | [d0, d1, ...] ... -> [d0, N, d1, ...]
+        The result is a column-major dict-form array (flat buffer + shape).
+        :param expr: Piped array string.
+        :param scope: Scope.
+        :param line_number: Line number.
+        :return: Dict-form N-D array (or plain list for 1D results).
+        """
+        arrays = self._split_pipe_segments(expr, line_number)
+        if len(arrays) < 2:
+            raise SyntaxError(
+                f"Invalid pipe array syntax: {expr} at line {line_number}")
         operand_shapes = []
         operand_flats = []
         for array_expr in arrays:
-            if not (array_expr.startswith('{') and array_expr.endswith('}')):
-                raise SyntaxError(
-                    f"Invalid pipe array segment: {array_expr} at line {line_number}")
-            array = self._evaluate_array(array_expr, scope, line_number)
+            operand_expr = self._strip_pipe_operand_parens(array_expr)
+            if operand_expr.startswith('{') and operand_expr.endswith('}'):
+                array = self._evaluate_array(operand_expr, scope, line_number)
+            else:
+                array = self.eval_or_eval_array(
+                    operand_expr, scope, line_number)
             shape = self.compiler.array_handler.get_array_shape(
                 array, line_number)
             flat = self.compiler.array_handler.flatten_array(
@@ -1984,6 +2016,15 @@ class ExpressionEvaluator:
                                        or var_name.lower() == 'grid'):
                         return self.compiler.array_handler.resolve_cell_index(
                             var_name, index_expr, line_number)
+                    if bang_index and ':' in index_expr:
+                        range_match = re.match(
+                            rf'^({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})$', index_expr)
+                        if range_match:
+                            s_ref, e_ref = range_match.groups()
+                            array = scope.get(
+                                var_name, self.compiler.variables.get(var_name))
+                            return self.compiler.array_handler.read_array_range(
+                                array, s_ref, e_ref, line_number)
                     base = 0 if paren_index and paren_index.isdigit() else 1
                     return self._eval_array_element(
                         var_name, index_expr, scope, line_number, base=base)
@@ -2426,23 +2467,114 @@ class ExpressionEvaluator:
         return eval_expr
 
     def _replace_piped_array_literals(self, eval_expr, scope, line_number):
-        """Replace piped array literals ({...} | {...} ...) with python list
-        literals so builtins like Transpose can receive them as arrays.
+        """Replace pipe chains ({...}|{...}, u | v, (a|b)|(c|d), ...) anywhere
+        in the expression with python list literals so builtins like Transpose
+        can receive them as arrays.
 
-        A bare pipe literal is handled by _evaluate_array before reaching this
-        fallback; here we only need sub-expressions inside function calls.
+        A bare pipe expression is handled by _evaluate_pipe_array before
+        reaching this fallback; here we only need sub-expressions inside
+        function calls.  Outermost (shallowest) chains are replaced first and
+        nested pipes inside them are skipped: _evaluate_pipe_array evaluates
+        parenthesized operands recursively.
         """
-        pipe_chain_pattern = re.compile(
-            r'(\{[^{}]*\}(?:\s*\|\s*\{[^{}]*\})+)')
-        def replacer(m):
-            pipe_str = m.group(1)
+        spans = []
+        depth = 0
+        in_quotes = False
+        for i, ch in enumerate(eval_expr):
+            if in_quotes:
+                if ch == '"':
+                    in_quotes = False
+                continue
+            if ch == '"':
+                in_quotes = True
+                continue
+            if ch in '({[':
+                depth += 1
+            elif ch in ')}]':
+                depth -= 1
+            elif ch == '|':
+                spans.append((depth, i))
+        spans.sort(key=lambda p: (p[0], p[1]))
+
+        result = []
+        prev = 0
+        covered = []
+        for _, pipe_idx in spans:
+            if any(s <= pipe_idx < e for s, e in covered):
+                continue
+            start, end = self._find_pipe_chain_span(eval_expr, pipe_idx)
+            chain = eval_expr[start:end]
+            result.append(eval_expr[prev:start])
             try:
-                arr = self._evaluate_pipe_array(pipe_str, scope, line_number)
+                arr = self._evaluate_pipe_array(chain, scope, line_number)
                 display = self.compiler.array_handler.to_display_value(arr)
-                return repr(display)
+                result.append(repr(display))
             except Exception:
-                return m.group(0)
-        return pipe_chain_pattern.sub(replacer, eval_expr)
+                result.append(chain)
+            covered.append((start, end))
+            prev = end
+        result.append(eval_expr[prev:])
+        return ''.join(result)
+
+    def _find_pipe_chain_span(self, expr, pipe_idx):
+        """Return (start, end) of the maximal pipe chain containing pipe_idx."""
+        n = len(expr)
+
+        def left_operand_boundary(idx):
+            depth = 0
+            left = idx
+            while left > 0:
+                c = expr[left - 1]
+                if c.isspace():
+                    left -= 1
+                    continue
+                if c in '}])':
+                    depth += 1
+                    left -= 1
+                    continue
+                if c in '{[(':
+                    if depth == 0:
+                        break
+                    depth -= 1
+                    left -= 1
+                    continue
+                if depth == 0:
+                    if c in ',()=|':
+                        break
+                    left -= 1
+                    continue
+                left -= 1
+            return left
+
+        start = left_operand_boundary(pipe_idx)
+        end = pipe_idx + 1
+        depth = 0
+        while end < n:
+            c = expr[end]
+            if c.isspace():
+                end += 1
+                continue
+            if c in '{[(':
+                depth += 1
+                end += 1
+                continue
+            if c in '}])':
+                depth -= 1
+                end += 1
+                if depth < 0:
+                    return start, end - 1
+                continue
+            if depth == 0:
+                if c == '|':
+                    end += 1
+                    continue
+                if c in ',()':
+                    return start, end
+                end += 1
+                continue
+            end += 1
+        return start, end
+
 
     def _build_python_fallback_scope(self, scope, line_number):
         if hasattr(scope, 'get_evaluation_scope'):
@@ -2733,6 +2865,8 @@ class ExpressionEvaluator:
         return self._walk_ast_node(node, full_scope, globals_dict, line_number)
 
     def _apply_fallback_binop(self, op, left, right):
+        if self._is_array_operand(left) or self._is_array_operand(right):
+            return self._apply_elementwise_binop(op, left, right)
         if isinstance(op, ast.Add):
             return left + right
         if isinstance(op, ast.Sub):
@@ -2749,6 +2883,50 @@ class ExpressionEvaluator:
             return left ** right
         raise RuntimeError(
             f"Unsupported binary operator '{type(op).__name__}'")
+
+    def _is_array_operand(self, value):
+        """True for dict-form arrays ({'array'/'grid' + shape}) or lists."""
+        if isinstance(value, list):
+            return True
+        return isinstance(value, dict) and (
+            'array' in value or 'grid' in value)
+
+    def _apply_elementwise_binop(self, op, left, right):
+        """Element-wise (Hadamard) arithmetic over arrays.
+
+        Accepts dict-form arrays ({'array'/'grid' + shape}) and nested display
+        lists; a scalar operand is broadcast to every element.  The result
+        preserves dict-form flat storage (plain list for 1D results).
+        """
+        ah = self.compiler.array_handler
+        left_arr = self._is_array_operand(left)
+        right_arr = self._is_array_operand(right)
+
+        def _shape_of(v):
+            return ah.get_array_shape(v)
+
+        if left_arr and right_arr:
+            lshape = _shape_of(left)
+            rshape = _shape_of(right)
+            if lshape != rshape:
+                raise ValueError(
+                    f"Arrays must have the same shape for element-wise "
+                    f"operation: {lshape} vs {rshape}")
+            shape = lshape
+            lflat = ah.flatten_array(left)
+            rflat = ah.flatten_array(right)
+            values = [
+                self._apply_fallback_binop(op, a, b)
+                for a, b in zip(lflat, rflat)]
+        else:
+            arr, scalar = (left, right) if left_arr else (right, left)
+            shape = _shape_of(arr)
+            values = [
+                self._apply_fallback_binop(op, a, scalar)
+                for a in ah.flatten_array(arr)]
+        if shape and shape != [len(values)]:
+            return {'array': values, 'shape': shape, 'original_shape': shape}
+        return values
 
     def _apply_fallback_unop(self, op, operand):
         if isinstance(op, ast.USub):

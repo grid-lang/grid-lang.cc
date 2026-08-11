@@ -121,6 +121,55 @@ class ArrayHandler:
             raise ValueError(
                 f"Expected 2D array for cell-based indexing, got shape {shape} at line {line_number}")
 
+    def read_array_range(self, arr, s_addr, e_addr, line_number=None):
+        """Read a hyper-rectangle sub-block from an N-D array variable.
+
+        ``b![A1.1:A2.2]`` returns the sub-block in dict-form flat storage
+        ({'array': flat values, 'shape': sub-block shape}).  Works for arrays
+        of any rank stored as flat column-major buffers
+        ({'array'/'grid' + shape}) or as nested lists.
+        """
+        s_idx = parse_address(s_addr)
+        e_idx = parse_address(e_addr)
+        if len(s_idx) != len(e_idx):
+            raise ValueError(
+                f"Range addresses '{s_addr}' and '{e_addr}' must have the same rank at line {line_number}")
+        flat = None
+        nd_shape = None
+        if isinstance(arr, dict) and ('array' in arr or 'grid' in arr):
+            inner = arr.get('array', arr.get('grid'))
+            if isinstance(inner, list):
+                flat = inner
+            nd_shape = list(arr.get('shape') or arr.get('original_shape') or [])
+        shape = nd_shape if nd_shape is not None else self.get_array_shape(
+            arr, line_number)
+        if len(shape) != len(s_idx):
+            raise ValueError(
+                f"Address rank {len(s_idx)} does not match array rank {len(shape)} at line {line_number}")
+        starts = [min(a, b) for a, b in zip(s_idx, e_idx)]
+        rshape = [abs(a - b) + 1 for a, b in zip(s_idx, e_idx)]
+        if flat is not None:
+            strides = [1]
+            for s in shape[:-1]:
+                strides.append(strides[-1] * s)
+            values = []
+            for flat_i in range(prod(rshape)):
+                rem = flat_i
+                idxs = []
+                for dim_size in rshape:
+                    idxs.append(rem % dim_size)
+                    rem //= dim_size
+                pos = sum((starts[k] - 1 + idxs[k]) * strides[k]
+                          for k in range(len(rshape)))
+                values.append(flat[pos])
+            return {'array': values, 'shape': rshape, 'original_shape': rshape}
+        def rec(node, k):
+            if k == len(rshape) - 1:
+                return [node[starts[k] - 1 + d] for d in range(rshape[k])]
+            return [rec(node[starts[k] - 1 + d], k + 1)
+                    for d in range(rshape[k])]
+        return {'array': self.flatten_array(rec(arr, 0)), 'shape': rshape, 'original_shape': rshape}
+
     def cell_ref_to_indices(self, cell_ref, line_number=None):
         """
         Convert a cell reference (e.g., 'A1', 'B1') to array indices for setting values.

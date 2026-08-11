@@ -3975,6 +3975,9 @@ class GridLangExecutor:
                         raise NameError(
                             f"Variable '{data_var}' not defined at line {line_number}")
                     matrix_data = scope[data_var]
+                    if isinstance(matrix_data, dict) and 'array' in matrix_data:
+                        matrix_data = self._dict_array_to_matrix_data(
+                            matrix_data, line_number)
                 default_value = dim_constraints.get('value')
                 if default_value is None and expr and not isinstance(expr, list):
                     try:
@@ -4005,6 +4008,35 @@ class GridLangExecutor:
                         self.current_scope().define(
                             f"{var}.{field}", with_constraints[field], 'text')
         return True
+
+    def _dict_array_to_matrix_data(self, arr, line_number=None):
+        """Convert a pipe dict-form array back into a list of display matrices.
+
+        Pipe results (from _evaluate_pipe_array) have the new dim at index 1
+        with column-major storage, so flat[i0 + s0*i1 + s0*s1*i2] = arr[i0][i1][i2].
+        Grid DIM stacks the operand matrices along the last declared dim, so the
+        conversion extracts each matrix as its display-form nested list.
+        """
+        flat = arr.get('array', arr.get('grid'))
+        shape = list(arr.get('shape') or arr.get('original_shape') or [])
+        if not shape or not isinstance(flat, list):
+            raise ValueError(
+                f"Invalid array data for grid DIM at line {line_number}")
+        s0 = shape[0]
+        num_operands = shape[1]
+        col_size = 1
+        for s in shape[2:]:
+            col_size *= s
+        matrix_data = []
+        for k in range(num_operands):
+            matrix = []
+            for i0 in range(s0):
+                row = []
+                for i2 in range(col_size):
+                    row.append(flat[i0 + s0 * k + s0 * num_operands * i2])
+                matrix.append(row)
+            matrix_data.append(matrix)
+        return matrix_data
 
     def _handle_push_method_call(self, line, line_number):
         # Use the push processor to handle this properly

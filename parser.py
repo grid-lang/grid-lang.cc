@@ -146,7 +146,9 @@ class GridLangParser:
             elif keyword == '=':
                 self._check_comparison_series(parts, i, line_number)
                 if next_part.startswith('{'):
-                    if ';' in next_part or '|' in next_part:
+                    if '|' in next_part:
+                        expr = next_part
+                    elif ';' in next_part:
                         matrices = [m.strip()[1:-1] for m in next_part.split('|')]
                         matrix_data = []
                         for matrix in matrices:

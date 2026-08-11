@@ -2278,6 +2278,10 @@ class GridLangCompiler:
                         self.current_scope().define(
                             var, None, effective_type, constraints, is_uninitialized=True, line_number=line_number)
                         return
+                    if constraints.get('init') is not None:
+                        self.current_scope().define(
+                            var, None, effective_type, constraints, is_uninitialized=True, line_number=line_number)
+                        return
                     shape = []
                     for _, size_spec in constraints['dim']:
                         if isinstance(size_spec, tuple):
