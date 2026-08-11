@@ -293,8 +293,7 @@ def format_display_value(value, sig_digits=15):
     if isinstance(value, (list, tuple)):
         if value and any(isinstance(v, (list, tuple)) for v in value):
             return _format_nd([_flatten_scalars(v) for v in value], sig_digits)
-        return "[" + ", ".join(
-            format_display_value(v, sig_digits=sig_digits) for v in value) + "]"
+        return _format_nd([value], sig_digits)
     return str(value)
 
 
