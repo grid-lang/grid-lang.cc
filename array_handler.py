@@ -10,6 +10,7 @@ import copy
 from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, prod, public_type_fields, object_public_keys, public_object_view, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT, is_sparse_array
 from functools import reduce
 import operator
+import itertools
 from scope import GridLiveView
 from units import DIM_ERROR, NA_ERROR, REF_ERROR, TYPE_ERROR, ConstraintError, error_value, is_error_value
 
@@ -1569,7 +1570,26 @@ class ArrayHandler:
         if isinstance(value, dict):
             # Sparse unbounded (star-dim) array
             if value and all(isinstance(k, tuple) for k in value.keys()):
-                return [value[k] for k in sorted(value.keys())]
+                rank = len(next(iter(value.keys())))
+                if rank <= 1:
+                    return [value[k] for k in sorted(value.keys())]
+                if rank == 2:
+                    # Materialize as rows (first dim = row, second = column);
+                    # unset cells stay None so gaps render like sparse reads.
+                    rows_map = {}
+                    for k, v in value.items():
+                        rows_map.setdefault(k[0], {})[k[1]] = v
+                    result = []
+                    for r in range(max(rows_map) + 1):
+                        if r not in rows_map:
+                            result.append([])
+                            continue
+                        cols = rows_map[r]
+                        row_vals = [cols.get(c) for c in range(max(cols) + 1)]
+                        while row_vals and row_vals[-1] is None:
+                            row_vals.pop()
+                        result.append(row_vals)
+                    return result
             return value
         return value
 
@@ -2267,6 +2287,189 @@ class ArrayHandler:
                 arr, indices, line_number, return_struct, original_shape)
         except (IndexError, ConstraintError):
             return error_value(REF_ERROR)
+
+    def read_array_slice(self, arr, specs, line_number=None):
+        """Read a sub-array selected by ``*`` / ``n to m`` / scalar specs.
+
+        ``specs`` holds one selector per declared dimension, already adjusted
+        to storage (0-based) coordinates:
+          - ``'*'``                : take all values in that dimension
+          - ``(start, end)``       : inclusive range; ``end`` may be None
+                                     (open-ended)
+          - ``int``                : single index
+
+        Scalar dimensions are reduced (excluded from the result): the result
+        rank equals the number of ``*``/range selectors.  Invalid addresses
+        produce the sticky ``#REF`` error value, mirroring element reads.
+        """
+        if is_error_value(arr):
+            code = arr if isinstance(arr, str) else arr.error_code
+            return error_value(code)
+        if all(isinstance(s, int) for s in specs):
+            try:
+                return self.get_array_element(
+                    arr, specs, line_number)
+            except (IndexError, ConstraintError):
+                return error_value(REF_ERROR)
+        if isinstance(arr, GridLiveView):
+            raise ConstraintError(
+                REF_ERROR,
+                f"Cannot slice the grid at line {line_number}")
+
+        # Sparse unbounded (star-dim) arrays: dict keyed by index tuples.
+        if isinstance(arr, dict) and 'array' not in arr:
+            return self._read_sparse_slice(arr, specs, line_number)
+
+        original_shape = None
+        if isinstance(arr, dict) and 'array' in arr:
+            original_shape = arr.get('shape') or arr.get('original_shape')
+            original_shape = list(original_shape)
+            arr = arr['array']
+
+        shape = self.get_array_shape(arr, line_number)
+        indexing_shape = original_shape if original_shape is not None else getattr(
+            arr, 'original_shape', shape)
+
+        if arr and isinstance(arr[0], list):
+            return self._slice_nested_lists(arr, specs, line_number)
+
+        if len(specs) != len(indexing_shape):
+            raise ConstraintError(
+                REF_ERROR,
+                f"Expected {len(indexing_shape)} indices for array with shape "
+                f"{indexing_shape}, got {len(specs)} at line {line_number}")
+
+        ranges = []
+        kept = []
+        result_shape = []
+        for i, spec in enumerate(specs):
+            size = indexing_shape[i]
+            if isinstance(spec, int):
+                s = e = spec
+            elif spec == '*':
+                s, e = 0, size - 1
+            else:
+                s, e = spec
+                if e is None:
+                    e = size - 1
+            if s < 0 or e >= size or s > e:
+                raise ConstraintError(
+                    REF_ERROR,
+                    f"Index {spec} out of bounds for dimension {i} with size "
+                    f"{size} at line {line_number}")
+            ranges.append((s, e))
+            if not isinstance(spec, int):
+                kept.append(i)
+                result_shape.append(e - s + 1)
+
+        # Iterate full index combos with the first declared dim fastest, to
+        # match the flat storage order of get_array_element.
+        axes = [range(s, e + 1) for s, e in reversed(ranges)]
+        result = []
+        for combo in itertools.product(*axes):
+            idx = tuple(reversed(combo))
+            flat_idx = 0
+            stride = 1
+            for j, v in enumerate(idx):
+                flat_idx += v * stride
+                stride *= indexing_shape[j]
+            val = arr[flat_idx]
+            if isinstance(val, dict) and 'value' in val:
+                val = val['value']
+            result.append(val)
+        if len(result_shape) <= 1:
+            return result
+        return {'array': result, 'shape': result_shape,
+                'original_shape': result_shape}
+
+    def _read_sparse_slice(self, arr, specs, line_number=None):
+        first_key = next(iter(arr.keys()), None)
+        rank = len(first_key) if first_key is not None else len(specs)
+        if len(specs) != rank:
+            raise ConstraintError(
+                REF_ERROR,
+                f"Expected {rank} indices for array, got {len(specs)} at line {line_number}")
+        for spec in specs:
+            if isinstance(spec, int) and spec < 0:
+                raise ConstraintError(
+                    REF_ERROR,
+                    f"Negative index {spec} for sparse array at line {line_number}")
+            if isinstance(spec, tuple) and spec[0] < 0:
+                raise ConstraintError(
+                    REF_ERROR,
+                    f"Negative index {spec[0]} for sparse array at line {line_number}")
+
+        matched = []
+        for key, val in arr.items():
+            ok = True
+            for i, spec in enumerate(specs):
+                k = key[i]
+                if isinstance(spec, int):
+                    if k != spec:
+                        ok = False
+                        break
+                elif spec == '*':
+                    continue
+                else:
+                    s, e = spec
+                    if e is not None:
+                        if k < s or k > e:
+                            ok = False
+                            break
+                    elif k < s:
+                        ok = False
+                        break
+            if ok:
+                matched.append((key, val))
+
+        kept = [i for i, spec in enumerate(specs)
+                if not isinstance(spec, int)]
+        if not kept:
+            try:
+                return arr.get(tuple(int(s) for s in specs))
+            except (IndexError, ConstraintError):
+                return error_value(REF_ERROR)
+        # A slice of a sparse array stays sparse: keys are the kept storage
+        # coordinates re-based so each kept dimension starts at 0.
+        result = {}
+        for key, val in matched:
+            new_key = []
+            for i in kept:
+                spec = specs[i]
+                base = 0 if spec == '*' else spec[0]
+                new_key.append(key[i] - base)
+            result[tuple(new_key)] = val
+        return result
+
+    def _slice_nested_lists(self, arr, specs, line_number=None):
+        def walk(node, dim):
+            if isinstance(node, dict) and 'value' in node:
+                node = node['value']
+            if dim >= len(specs):
+                return node
+            spec = specs[dim]
+            if isinstance(spec, int):
+                if spec < 0 or spec >= len(node):
+                    raise ConstraintError(
+                        REF_ERROR,
+                        f"Index {spec} out of bounds for dimension {dim} "
+                        f"with size {len(node)} at line {line_number}")
+                return walk(node[spec], dim + 1)
+            size = len(node)
+            if spec == '*':
+                s, e = 0, size - 1
+            else:
+                s, e = spec
+                if e is None:
+                    e = size - 1
+            if s < 0 or e >= size or s > e:
+                raise ConstraintError(
+                    REF_ERROR,
+                    f"Index {spec} out of bounds for dimension {dim} with "
+                    f"size {size} at line {line_number}")
+            return [walk(node[k], dim + 1) for k in range(s, e + 1)]
+
+        return walk(arr, 0)
 
     def fill_array(self, array, value, line_number=None):
         """

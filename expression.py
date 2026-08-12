@@ -1411,17 +1411,31 @@ class ExpressionEvaluator:
         var_name = var_name.strip()
         indices_str = indices_str[:-1]  # Remove closing brace
 
-        # Parse indices
-        indices = []
+        # Parse each index element into a selector: '*' (all values),
+        # (start, end) range (end None for 'n to *'), or a scalar integer.
+        specs = []
         for index_expr in indices_str.split(','):
             index_expr = index_expr.strip()
+            if index_expr == '*':
+                specs.append('*')
+                continue
+            m = re.match(r'^(-?\d+)\s+to\s+(-?\d+)$', index_expr)
+            if m:
+                specs.append((int(m.group(1)), int(m.group(2))))
+                continue
+            m = re.match(r'^(-?\d+)\s+to\s+\*$', index_expr)
+            if m:
+                specs.append((int(m.group(1)), None))
+                continue
             try:
                 # Try to evaluate as a number first
-                indices.append(int(index_expr))
+                specs.append(int(index_expr))
             except ValueError:
                 # If not a number, evaluate as an expression
                 index_value = self.eval_expr(index_expr, scope, line_number)
-                indices.append(int(index_value))
+                if isinstance(index_value, float) and index_value.is_integer():
+                    index_value = int(index_value)
+                specs.append(int(index_value))
 
         # Get the array and evaluate the access
         if hasattr(scope, 'get_evaluation_scope'):
@@ -1438,7 +1452,7 @@ class ExpressionEvaluator:
                 # Not an array access; leave the original expression intact
                 return match.group(0)
 
-        # Adjust indices based on dimension metadata
+        # Adjust selectors based on dimension metadata
         dims = self.compiler.dimensions.get(var_name, [])
         # Also check constraints in scope for dimension-constrained arrays
         scope_constraints = None
@@ -1446,32 +1460,33 @@ class ExpressionEvaluator:
         if hasattr(current_scope, 'constraints') and var_name in current_scope.constraints:
             scope_constraints = current_scope.constraints[var_name].get('dim', [])
 
-        adjusted_indices = []
-        for i, idx in enumerate(indices):
+        adjusted_specs = []
+        for i, spec in enumerate(specs):
             # Prefer scope constraints (dimension-constrained arrays)
             if scope_constraints and i < len(scope_constraints):
                 constraint = scope_constraints[i]
                 if isinstance(constraint, tuple) and len(constraint) == 2 and isinstance(constraint[1], tuple):
                     base = constraint[1][0]
-                    adjusted_idx = idx - base
-                    adjusted_indices.append(adjusted_idx)
                 else:
-                    adjusted_idx = idx - 1
-                    adjusted_indices.append(adjusted_idx)
+                    base = 1
             # range, e.g., (0, 10)
             elif i < len(dims) and isinstance(dims[i][1], tuple):
                 base = dims[i][1][0]
-                adjusted_idx = idx - base
-                adjusted_indices.append(adjusted_idx)
             else:  # just a size, treat as 1-based
-                adjusted_idx = idx - 1
-                adjusted_indices.append(adjusted_idx)
-
+                base = 1
+            if isinstance(spec, tuple):
+                start, end = spec
+                adjusted_specs.append(
+                    (start - base, None if end is None else end - base))
+            elif spec == '*':
+                adjusted_specs.append(spec)
+            else:
+                adjusted_specs.append(spec - base)
 
         # Get the array element
         try:
-            result = self.compiler.array_handler.read_array_element(
-                arr, adjusted_indices, line_number)
+            result = self.compiler.array_handler.read_array_slice(
+                arr, adjusted_specs, line_number)
             curly_expr = f"{var_name}{{{indices_str}}}"
             return self._substitute_curly_result(
                 curly_expr, curly_expr, result, scope)
