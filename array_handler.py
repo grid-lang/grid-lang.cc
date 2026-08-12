@@ -992,9 +992,9 @@ class ArrayHandler:
             if len(dims) != 1:
                 continue
             size_spec = dims[0][1]
-            if isinstance(size_spec, tuple):
+            if isinstance(size_spec, tuple) and size_spec[1] is not None:
                 size = size_spec[1] - size_spec[0] + 1
-            elif size_spec is None:
+            elif self._is_unbounded_size_spec(size_spec):
                 size = row_offset + 1
             else:
                 size = int(size_spec)
@@ -1771,9 +1771,19 @@ class ArrayHandler:
         self.compiler.dim_labels[var_name][dim_name] = {
             lbl: i for i, lbl in enumerate(labels)}
 
+    def _is_unbounded_size_spec(self, size_spec):
+        """True for '*' (None) and 'n to *' ((start, None)) size specs."""
+        if size_spec is None:
+            return True
+        if isinstance(size_spec, tuple) and len(size_spec) == 2:
+            return size_spec[1] is None
+        return False
+
     def _dim_size(self, size_spec, star_size=1):
         if isinstance(size_spec, tuple):
             start, end = size_spec
+            if end is None:
+                return star_size
             return end - start + 1
         if size_spec is None:
             return star_size
@@ -1893,6 +1903,15 @@ class ArrayHandler:
                     f"Dimension constraint for '{var}' expects a scalar, received array value at line {line_number}")
             return value
 
+        # Unbounded multi-dimensional constraints ({*, *}, {0 to *, *}) have
+        # no inferable sizes; keep the value as a sparse array instead of
+        # reshaping a ragged literal into a dense buffer.
+        if len(dims) > 1 and all(
+                self._is_unbounded_size_spec(size_spec) for _, size_spec in dims):
+            if isinstance(value, list):
+                return self.materialize_list_array(value, line_number)
+            return value
+
         # Handle scalar broadcasting
         var_type = None
         scope = self.compiler.current_scope().get_defining_scope(var)
@@ -1945,7 +1964,7 @@ class ArrayHandler:
         # Compute expected shape
         expected_shape = []
         star_indices = [i for i, (_, size_spec) in enumerate(
-            dims) if size_spec is None]
+            dims) if self._is_unbounded_size_spec(size_spec)]
         known_product = 1
         for i, (_, size_spec) in enumerate(dims):
             dim_size = self._dim_size(size_spec, star_size=None)
@@ -2045,6 +2064,10 @@ class ArrayHandler:
             if not indices:
                 raise ValueError(
                     f"Expected at least one index at line {line_number}")
+            if any(idx < 0 for idx in indices):
+                raise ConstraintError(
+                    REF_ERROR,
+                    f"Negative index {indices} for sparse array at line {line_number}")
             array[tuple(indices)] = value
             return array
 
@@ -2093,7 +2116,8 @@ class ArrayHandler:
         flat = self.flatten_array(arr, line_number)
         shape = []
         for d in new_dims:
-            if d is None:
+            if d is None or (
+                    isinstance(d, tuple) and len(d) == 2 and d[1] is None):
                 shape.append(
                     len(flat) if not shape else len(flat) // shape[-1])
             else:

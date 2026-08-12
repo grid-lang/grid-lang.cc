@@ -2286,12 +2286,17 @@ class GridLangCompiler:
                     for _, size_spec in constraints['dim']:
                         if isinstance(size_spec, tuple):
                             start, end = size_spec
-                            size = end - start + 1
+                            size = None if end is None else end - start + 1
                         elif size_spec is None:
                             size = 1
                         else:
                             size = size_spec
                         shape.append(size)
+                    if any(size is None for size in shape):
+                        self.current_scope().define(
+                            var, {}, effective_type, constraints,
+                            is_uninitialized=False, line_number=line_number)
+                        return
                     if is_custom_type:
                         value = self.array_handler.create_object_array(
                             shape, None, line_number)
@@ -2575,7 +2580,8 @@ class GridLangCompiler:
                     _, size_spec = dims[dim_idx]
                     if isinstance(size_spec, tuple):
                         start, end = size_spec
-                        expected_size = end - start + 1
+                        if end is not None:
+                            expected_size = end - start + 1
                     elif isinstance(size_spec, int):
                         expected_size = size_spec
             labels = [lbl.strip().strip('"')

@@ -481,8 +481,11 @@ class GridLangParser:
 
         if size_str == '*':
             size_spec = None
-        elif re.match(r'^\d+\s+to\s+\d+$', size_str, re.I):
-            m = re.match(r'^(\d+)\s+to\s+(\d+)$', size_str, re.I)
+        elif re.match(r'^-?\d+\s+to\s+\*$', size_str, re.I):
+            start = int(size_str.split('to')[0].strip())
+            size_spec = (start, None)
+        elif re.match(r'^-?\d+\s+to\s+-?\d+$', size_str, re.I):
+            m = re.match(r'^(-?\d+)\s+to\s+(-?\d+)$', size_str, re.I)
             start, end = map(int, m.groups())
             if start > end:
                 raise SyntaxError(

@@ -260,14 +260,38 @@ class GridLangExecutor:
             return True
         return False
 
+    def _apply_dim_base_offsets(self, var_name, indices, line_number=None):
+        """Convert parsed (1-based) source indices to storage indices for a
+        declared dim, honoring a range lower bound ('n to *' / 'n to m').
+
+        Parsed indices are 0-based assuming a default base of 1; a range
+        base 'n' shifts them by -(n - 1), so source index n maps to storage
+        0 (mirrors the read path's 'idx - base' adjustment).
+        """
+        if not indices:
+            return indices
+        dims = getattr(self, 'dimensions', {}) or {}
+        dim_specs = dims.get(var_name, [])
+        adjusted = []
+        for i, idx in enumerate(indices):
+            base = 1
+            if i < len(dim_specs):
+                size_spec = dim_specs[i][1]
+                if isinstance(size_spec, tuple) and len(size_spec) == 2:
+                    base = size_spec[0]
+            adjusted.append(idx - (base - 1))
+        return adjusted
+
     def _has_star_dim(self, constraints):
         dim_spec = (constraints or {}).get('dim')
         if isinstance(dim_spec, dict) and 'dims' in dim_spec:
             dim_spec = dim_spec['dims']
         if isinstance(dim_spec, list):
-            return any(size_spec is None for _, size_spec in dim_spec)
+            for _, size_spec in dim_spec:
+                if self.array_handler._is_unbounded_size_spec(size_spec):
+                    return True
         if isinstance(dim_spec, str):
-            return '*' in dim_spec
+            return '*' in dim_spec or re.search(r'to\s+\*', dim_spec, re.I)
         return False
 
     def _has_when_dependency(self, var_name):
@@ -1293,6 +1317,8 @@ class GridLangExecutor:
             if defining_scope.is_uninitialized(actual_key) or arr is None:
                 raise ValueError(
                     f"Array variable '{var_name}' with dim * must be initialized with PUSH or INIT before LET at line {line_number}")
+        indices = self._apply_dim_base_offsets(
+            var_name, indices, line_number)
         updated_array = self.array_handler.set_array_element(
             arr, indices, value, line_number)
         defining_scope.variables[actual_key] = updated_array
@@ -1911,7 +1937,7 @@ class GridLangExecutor:
                 if dims:
                     shape = []
                     for _, size_spec in dims:
-                        if isinstance(size_spec, tuple):
+                        if isinstance(size_spec, tuple) and size_spec[1] is not None:
                             start, end = size_spec
                             size = end - start + 1
                         else:
@@ -1919,6 +1945,11 @@ class GridLangExecutor:
                         shape.append(size)
                     public_fields = public_type_fields(
                         self.types_defined[type_name.lower()])
+                    if any(size is None for size in shape):
+                        self.current_scope().define(
+                            var, {}, type_name.lower(), constraints,
+                            is_uninitialized=False, line_number=line_number)
+                        return i + 1
                     array = self.array_handler.create_array(
                         shape, None, 'number', line_number)
                     for i in range(shape[0]):
@@ -2018,6 +2049,12 @@ class GridLangExecutor:
         m = re.match(
             r'^\s*for\s+([\w_]+)\s+as\s+(\w+)\s+dim\s*(\{[^}]*\})', line, re.I)
         if m:
+            # Declarations carrying an initializer ('init'/'=') or any
+            # unbounded ('*'/named/empty) dimension are handled by the
+            # general For path, which materializes sparse arrays and
+            # applies the INIT values.
+            if re.search(r'\binit\b', line, re.I) or '=' in line:
+                return False, i
             var_name, type_name, dim_str = m.groups()
             is_custom_type = type_name.lower() in getattr(self, 'types_defined', {})
 
@@ -2029,12 +2066,17 @@ class GridLangExecutor:
                 dim_parts = [part.strip()
                              for part in dim_content.split(',')]
                 shape = []
+                bounded = True
                 for part in dim_parts:
                     try:
                         shape.append(int(part))
                     except ValueError:
-                        # Handle named dimensions or other formats
+                        # Named dimensions, '*' or empty parts denote
+                        # unbounded dimensions handled by the general path.
+                        bounded = False
                         shape.append(part)
+                if not bounded:
+                    return False, i
 
                 # Create the array with the specified shape
                 if is_custom_type:
@@ -4640,6 +4682,8 @@ class GridLangExecutor:
                         if rank is not None and len(indices) != rank:
                             raise ValueError(
                                 f"Expected {rank} indices for array variable '{indexed_var}', got {len(indices)} at line {line_number}")
+                    indices = self._apply_dim_base_offsets(
+                        indexed_var, indices, line_number)
                     for value in values:
                         arr = defining_scope.variables.get(actual_key)
                         updated_array = self.array_handler.set_array_element(
@@ -4724,6 +4768,8 @@ class GridLangExecutor:
             if rank is not None and len(indices) != rank:
                 raise ValueError(
                     f"Expected {rank} indices for array variable '{var_name}', got {len(indices)} at line {line_number}")
+        indices = self._apply_dim_base_offsets(
+            var_name, indices, line_number)
         arr = defining_scope.variables.get(actual_key)
         updated_array = self.array_handler.set_array_element(
             arr, indices, value, line_number)
@@ -4825,7 +4871,8 @@ class GridLangExecutor:
                                     "dimension size is not numeric")
                             size_spec = int(size_val)
                         resolved_dims.append((name, size_spec))
-                    if any(size_spec is None for _, size_spec in resolved_dims):
+                    if any(self.array_handler._is_unbounded_size_spec(size_spec)
+                           for _, size_spec in resolved_dims):
                         continue
                     shape = []
                     for _, size_spec in resolved_dims:

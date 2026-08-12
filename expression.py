@@ -365,7 +365,10 @@ class ExpressionEvaluator:
         size_str = size_str.strip()
         if size_str == '*':
             return None
-        m = re.match(r'^(\d+)\s+to\s+(\d+)$', size_str)
+        m = re.match(r'^(-?\d+)\s+to\s+\*$', size_str)
+        if m:
+            return (int(m.group(1)), None)
+        m = re.match(r'^(-?\d+)\s+to\s+(-?\d+)$', size_str)
         if m:
             start, end = map(int, m.groups())
             return (start, end)
@@ -2244,9 +2247,8 @@ class ExpressionEvaluator:
             for i, idx in enumerate(indices):
                 if i < len(dims) and isinstance(dims[i][1], tuple):
                     start, end = dims[i][1]
-                    dim_size = end - start + 1
                     adjusted_idx = idx - start
-                    if adjusted_idx < 0 or adjusted_idx >= dim_size:
+                    if adjusted_idx < 0 or (end is not None and adjusted_idx >= end - start + 1):
                         raise ValueError(
                             f"Index {idx} out of bounds for dimension {i} of '{var_name}' (range {start} to {end}) at line {line_number}")
                 else:
