@@ -262,6 +262,16 @@ def public_object_view(obj):
     return result
 
 
+def is_sparse_array(value):
+    """True for sparse no-dim array storage: a dict keyed by 0-based index
+    tuples (one key per populated cell, no empty entries)."""
+    return (
+        isinstance(value, dict)
+        and bool(value)
+        and all(isinstance(k, tuple) for k in value.keys())
+    )
+
+
 def format_display_value(value, sig_digits=15):
     """Format values for display by trimming floating-point artifacts."""
     if isinstance(value, float):
@@ -279,6 +289,8 @@ def format_display_value(value, sig_digits=15):
         return str(value)
     if value is None:
         return "None"
+    if is_sparse_array(value):
+        return _format_sparse_array(value, sig_digits)
     if isinstance(value, dict) and 'array' in value:
         flat = list(value['array'])
         shape = list(value.get('shape') or value.get('original_shape') or [])
@@ -295,6 +307,31 @@ def format_display_value(value, sig_digits=15):
             return _format_nd([_flatten_scalars(v) for v in value], sig_digits)
         return _format_nd([value], sig_digits)
     return str(value)
+
+
+def _format_sparse_array(value, sig_digits):
+    """Render a sparse no-dim array (dict keyed by 0-based index tuples) in
+    the ``{ ... }`` form.  Rows render at their actual length: trailing
+    empty cells are suppressed, interior gaps collapse into comma runs.
+    Empty rows between the first and last populated rows render as a pipe."""
+    rank = len(next(iter(value.keys())))
+    if rank <= 1:
+        items = [value[k] for k in sorted(value.keys())]
+        return _format_nd([items], sig_digits)
+    rows_map = {}
+    for k, v in value.items():
+        rows_map.setdefault(k[0], {})[k[1]] = v
+    grid_rows = []
+    for row in range(max(rows_map) + 1):
+        if row not in rows_map:
+            grid_rows.append([])
+            continue
+        cols = rows_map[row]
+        row_vals = [cols.get(c) for c in range(max(cols) + 1)]
+        while row_vals and row_vals[-1] is None:
+            row_vals.pop()
+        grid_rows.append(row_vals)
+    return _format_nd(grid_rows, sig_digits)
 
 
 def _format_nd(rows, sig_digits):

@@ -10,7 +10,7 @@ from units import (
     DIM_ERROR, NA_ERROR, NUM_ERROR, TYPE_ERROR, UNIT_ERROR, VALUE_ERROR,
     ConstraintError, UnitValue, error_value, is_error_value, strip_units,
 )
-from utils import num_to_col, split_cell, col_to_num, iter_interpolation_placeholders
+from utils import num_to_col, split_cell, col_to_num, iter_interpolation_placeholders, is_sparse_array
 
 # Stack of compiler run contexts: ``run()`` pushes the executing compiler and
 # pops it on exit. Used to detect writes that originate from a read-only
@@ -230,6 +230,9 @@ class Scope:
 
         if isinstance(adjusted_value, dict) and 'array' in adjusted_value and not adjusted_constraints.get('dim'):
             adjusted_value = list(adjusted_value['array'])
+        elif is_sparse_array(adjusted_value) and not adjusted_constraints.get('dim'):
+            adjusted_value = [adjusted_value[k]
+                              for k in sorted(adjusted_value.keys())]
         if isinstance(adjusted_value, list) and not adjusted_constraints.get('dim'):
             adjusted_value = self.compiler._convert_array_to_object(
                 type_name, adjusted_value, line_number)
@@ -244,6 +247,25 @@ class Scope:
             adjusted_constraints['constant'] = adjusted_value
 
         return adjusted_value, adjusted_constraints
+
+    def _materialize_no_dim_list(self, name, value, constraints, line_number=None):
+        """Convert a plain list value into sparse index-keyed dict storage
+        when the variable has no explicit dim constraint, so dim-less
+        literals, ragged arrays and object arrays share the sparse path."""
+        if (
+            value is not None
+            and not is_error_value(value)
+            and isinstance(value, list)
+            and not constraints.get('dim')
+            and hasattr(self, 'compiler')
+            and hasattr(self.compiler, 'array_handler')
+        ):
+            try:
+                return self.compiler.array_handler.materialize_list_array(
+                    value, line_number)
+            except Exception:
+                return value
+        return value
 
     def _strip_init_copy_immutability(self, value):
         if isinstance(value, dict):
@@ -292,6 +314,8 @@ class Scope:
             except ConstraintError as exc:
                 materialized = exc.code
                 runtime_unit = None
+        materialized = self._materialize_no_dim_list(
+            actual_key, materialized, constraints, line_number)
 
         self.variables[actual_key] = materialized
         self.value_units[actual_key.lower()] = runtime_unit
@@ -345,6 +369,8 @@ class Scope:
                 except ConstraintError as exc:
                     value = exc.code
                     runtime_unit = None
+        value = self._materialize_no_dim_list(
+            name, value, effective_constraints, line_number)
         self.variables[name] = value
         self.value_units[name.lower()] = runtime_unit
         self.types[name] = type
@@ -400,6 +426,8 @@ class Scope:
                     except ConstraintError as exc:
                         value = exc.code
                         runtime_unit = None
+                value = defining_scope._materialize_no_dim_list(
+                    actual_key, value, constraints, line_number)
                 defining_scope.variables[actual_key] = value
                 defining_scope.value_units[actual_key.lower()] = runtime_unit
                 defining_scope.uninitialized.discard(actual_key)
@@ -821,6 +849,9 @@ class Scope:
                         allowed_values = constraint_expr
                 if isinstance(allowed_values, dict) and 'array' in allowed_values:
                     allowed_values = list(allowed_values['array'])
+                elif is_sparse_array(allowed_values):
+                    allowed_values = [allowed_values[k]
+                                      for k in sorted(allowed_values.keys())]
                 if isinstance(allowed_values, str):
                     allowed_values = [allowed_values]
                 if isinstance(value, (list, tuple, set)):

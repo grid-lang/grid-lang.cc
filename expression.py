@@ -15,6 +15,8 @@ from utils import (
     get_case_insensitive_key,
     is_address,
     _ADDRESS_FRAGMENT,
+    format_display_value,
+    is_sparse_array,
 )
 from scope import GridLiveView
 from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, UnitValue, error_value, is_error_value
@@ -2345,6 +2347,14 @@ class ExpressionEvaluator:
         def _to_nested(arr):
             if isinstance(arr, list):
                 return arr
+            if is_sparse_array(arr):
+                rows_map = {}
+                for k, v in arr.items():
+                    rows_map.setdefault(k[0], {})[k[1]] = v
+                shape = self.compiler.array_handler.get_array_shape(
+                    arr, line_number)
+                return [[rows_map.get(r, {}).get(c) for c in range(shape[1])]
+                        for r in range(shape[0])]
             if isinstance(arr, dict) and 'array' in arr:
                 flat = list(arr['array'])
                 shape = arr.get('shape', [])
@@ -2587,6 +2597,11 @@ class ExpressionEvaluator:
             full_scope = CaseInsensitiveDict(full_scope)
 
         def rows(arr):
+            if is_sparse_array(arr):
+                return max((k[0] for k in arr.keys()), default=-1) + 1
+            if isinstance(arr, dict) and 'array' in arr:
+                shape = arr.get('shape') or arr.get('original_shape') or []
+                return shape[0] if shape else 0
             if hasattr(arr, '__len__'):
                 return len(arr)
             if isinstance(arr, (list, tuple)):
@@ -2594,6 +2609,12 @@ class ExpressionEvaluator:
             return 0
 
         def sum_func(*args):
+            if len(args) == 1 and is_sparse_array(args[0]):
+                return sum(args[0].values())
+            if len(args) == 1 and isinstance(args[0], dict) and 'array' in args[0]:
+                return sum(args[0]['array'])
+            if len(args) == 1 and isinstance(args[0], (list, tuple)):
+                return sum(args[0])
             if len(args) == 1 and isinstance(args[0], str):
                 if args[0].startswith('{') and args[0].endswith('}'):
                     return self._evaluate_sum_vars(f"sum{args[0]}", scope, line_number)
@@ -2885,11 +2906,12 @@ class ExpressionEvaluator:
             f"Unsupported binary operator '{type(op).__name__}'")
 
     def _is_array_operand(self, value):
-        """True for dict-form arrays ({'array'/'grid' + shape}) or lists."""
+        """True for dict-form arrays ({'array'/'grid' + shape}), sparse
+        no-dim arrays, or lists."""
         if isinstance(value, list):
             return True
         return isinstance(value, dict) and (
-            'array' in value or 'grid' in value)
+            'array' in value or 'grid' in value or is_sparse_array(value))
 
     def _apply_elementwise_binop(self, op, left, right):
         """Element-wise (Hadamard) arithmetic over arrays.
@@ -3053,7 +3075,11 @@ class ExpressionEvaluator:
                             sval = str(val) if not isinstance(
                                 val, int) else str(val)
                     else:
-                        sval = str(val if val is not None else "")
+                        if isinstance(val, dict) and (
+                                'array' in val or is_sparse_array(val)):
+                            sval = format_display_value(val)
+                        else:
+                            sval = str(val if val is not None else "")
                     if format_spec:
                         if format_spec == 'upper':
                             sval = sval.upper()
@@ -3119,6 +3145,11 @@ class ExpressionEvaluator:
         """
         def rows(arr):
             """Return the length of an array or list."""
+            if is_sparse_array(arr):
+                return max((k[0] for k in arr.keys()), default=-1) + 1
+            if isinstance(arr, dict) and 'array' in arr:
+                shape = arr.get('shape') or arr.get('original_shape') or []
+                return shape[0] if shape else 0
             if hasattr(arr, '__len__'):
                 return len(arr)
             elif isinstance(arr, (list, tuple)):
@@ -3129,7 +3160,9 @@ class ExpressionEvaluator:
         def Len(val):
             if isinstance(val, str):
                 return len(val)
-            if isinstance(val, dict) and 'array' in val:
+            if is_sparse_array(val):
+                items = [val[k] for k in sorted(val.keys())]
+            elif isinstance(val, dict) and 'array' in val:
                 items = list(val['array'])
             elif isinstance(val, (list, tuple)):
                 items = list(val)
@@ -3155,6 +3188,8 @@ class ExpressionEvaluator:
             return str(text).split(str(delimiter))
 
         def _to_list(val):
+            if is_sparse_array(val):
+                return [val[k] for k in sorted(val.keys())]
             if isinstance(val, dict) and 'array' in val:
                 return list(val['array'])
             if isinstance(val, (list, tuple, set)):
@@ -3192,12 +3227,18 @@ class ExpressionEvaluator:
         def Transpose(arr):
             """Return the transpose of an array (swaps the first two dims)."""
             ah = self.compiler.array_handler
-            if isinstance(arr, dict) and 'array' in arr:
-                shape = list(arr.get('shape') or arr.get('original_shape'))
-                flat = ah.flatten_array(arr, None)
-            else:
-                shape = ah.get_array_shape(arr, None)
-                flat = ah.flatten_array(arr, None)
+            if is_sparse_array(arr):
+                # No-dim sparse arrays stay sparse: swap the first two indices
+                # of each stored cell (a 1D array is its own transpose).
+                result = {}
+                for k, v in arr.items():
+                    if len(k) >= 2:
+                        result[(k[1], k[0]) + k[2:]] = v
+                    else:
+                        result[k] = v
+                return result
+            flat = ah.flatten_array(arr)
+            shape = list(ah.get_array_shape(arr))
             flat = [float(v) if isinstance(v, (int, float))
                     and not isinstance(v, bool) else v for v in flat]
             if len(shape) <= 1:

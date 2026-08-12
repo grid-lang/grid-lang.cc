@@ -168,7 +168,10 @@ class GridLangParser:
                                             parsed_row.append(v_clean)
                                 parsed_rows.append(parsed_row)
                             matrix_data.append(parsed_rows)
-                        expr = matrix_data
+                        # A single ';'-separated literal is one matrix; the
+                        # '|' case is handled above, so no multi-matrix form
+                        # reaches this branch.
+                        expr = matrix_data[0] if matrix_data else []
                     else:
                         values_str = next_part[1:-1].split(',')
                         values = []

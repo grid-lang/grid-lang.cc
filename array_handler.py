@@ -7,11 +7,11 @@
 import re
 import copy
 # Utilities for cell and column operations
-from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, prod, public_type_fields, object_public_keys, public_object_view, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT
+from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, prod, public_type_fields, object_public_keys, public_object_view, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT, is_sparse_array
 from functools import reduce
 import operator
 from scope import GridLiveView
-from units import DIM_ERROR, REF_ERROR, TYPE_ERROR, ConstraintError, error_value, is_error_value
+from units import DIM_ERROR, NA_ERROR, REF_ERROR, TYPE_ERROR, ConstraintError, error_value, is_error_value
 
 
 class ArrayHandler:
@@ -1055,6 +1055,21 @@ class ArrayHandler:
             for cell_ref, val in value._store.items():
                 self.compiler.grid[cell_ref] = val
             return
+        if isinstance(value, dict) and value and all(
+                isinstance(k, tuple) for k in value.keys()):
+            # Sparse (no-dim) array: dict keyed by 0-based index tuples with
+            # the first declared dim (grid row) first.  Each populated cell is
+            # spilled at its (row, col) offset from the target cell.
+            rank = len(next(iter(value.keys())))
+            if rank == 1:
+                for (i0,), val in value.items():
+                    cell_to_assign = offset_cell(target, i0, 0)
+                    self.compiler.grid[cell_to_assign] = val
+            else:
+                for (row, col), val in value.items():
+                    cell_to_assign = offset_cell(target, col, row)
+                    self.compiler.grid[cell_to_assign] = val
+            return
         if isinstance(value, dict) and 'array' in value:
             # N-D array (column-major flat buffer + declared shape).
             shape = value.get('shape') or value.get('original_shape')
@@ -1572,6 +1587,30 @@ class ArrayHandler:
             result.append(self._nested_from_flat(inner_flat, inner_shape))
         return result
 
+    def materialize_list_array(self, value, line_number=None):
+        """Convert a plain (possibly ragged) nested or flat list into sparse
+        index-keyed dict storage: {tuple(0-based cell indices): value}.
+
+        Each populated cell is stored under its 0-based indices with the
+        first declared dim (grid row) first: {1, 2; 3, 4} ->
+        {(0, 0): 1, (1, 0): 2, (0, 1): 3, (1, 1): 4}.  Empty cells have no
+        entry (sparse).  Already dict-form values and non-list values are
+        returned unchanged.
+        """
+        if isinstance(value, dict) or not isinstance(value, list):
+            return value
+        result = {}
+
+        def walk(node, indices):
+            for i, child in enumerate(node):
+                if isinstance(child, list):
+                    walk(child, indices + [i])
+                else:
+                    result[tuple(indices + [i])] = child
+
+        walk(value, [])
+        return result
+
     def infer_type(self, value, line_number=None):
         """
         Infer type of a value (array, number, text, object, etc.).
@@ -1882,8 +1921,10 @@ class ArrayHandler:
                 reshaped.append(row)
             return reshaped
 
+        is_sparse = is_sparse_array(value)
         is_nd_array = isinstance(value, dict) and 'array' in value
-        if not is_nd_array and (not isinstance(value, list) or isinstance(value, (int, float, str))):
+        if not is_nd_array and not is_sparse and (
+                not isinstance(value, list) or isinstance(value, (int, float, str))):
             shape = [self._dim_size(size_spec, star_size=1)
                      for _, size_spec in dims]
             var_type = self.compiler.types.get(var)
@@ -1989,7 +2030,7 @@ class ArrayHandler:
                 nd_shape = list(nd_shape)
             array = array['array']
 
-        # Allow dynamic list-backed arrays (nested object arrays, None init).
+        # Allow dynamic list-backed arrays (None init).
         # A flat list whose first element is not itself a list is treated as a
         # 1D flat array (bounded), which falls through to the flat path below.
         if array is None:
@@ -2007,29 +2048,6 @@ class ArrayHandler:
             array[tuple(indices)] = value
             return array
 
-        is_nested = isinstance(array, list) and (
-            not array or isinstance(array[0], list))
-        if is_nested:
-            if not indices:
-                raise ValueError(
-                    f"Expected at least one index at line {line_number}")
-            # Build/expand nested lists as needed
-            current = array
-            for depth, idx in enumerate(indices):
-                # Grow current list to fit index
-                while len(current) <= idx:
-                    current.append(None)
-                if depth == len(indices) - 1:
-                    current[idx] = value
-                else:
-                    if current[idx] is None:
-                        current[idx] = []
-                    if not isinstance(current[idx], list):
-                        raise TypeError(
-                            f"Expected list at depth {depth} for indices {indices} at line {line_number}")
-                    current = current[idx]
-            return array
-
         if not isinstance(array, list):
             raise TypeError(
                 f"Expected list for multi-dimensional arrays, got {type(array)} at line {line_number}")
@@ -2039,6 +2057,7 @@ class ArrayHandler:
         if len(indices) != len(shape):
             raise ValueError(
                 f"Expected {len(shape)} indices, got {len(indices)} at line {line_number}")
+
         for i, idx in enumerate(indices):
             if idx < 0 or idx >= shape[i]:
                 raise IndexError(
@@ -2057,7 +2076,8 @@ class ArrayHandler:
             value, (int, float)) else value
 
         if nd_shape is not None:
-            return {'array': flat_arr, 'shape': list(nd_shape), 'original_shape': list(nd_shape)}
+            return {'array': flat_arr, 'shape': list(nd_shape),
+                    'original_shape': list(nd_shape)}
         if len(shape) == 1:
             return flat_arr
         return {'array': flat_arr, 'shape': list(shape), 'original_shape': list(shape)}
@@ -2148,8 +2168,20 @@ class ArrayHandler:
             arr = arr['array']
 
         # Sparse unbounded (star-dim) arrays: dict keyed by index tuples.
+        # Any non-negative index is a valid address (no upper bound), so a
+        # key that was never set reads as #N/A, while a wrong number of
+        # indices or a negative index is an invalid address (#REF).
         if isinstance(arr, dict):
-            return arr.get(tuple(indices))
+            first_key = next(iter(arr.keys()), None)
+            rank = len(first_key) if first_key is not None else len(indices)
+            if len(indices) != rank or any(i < 0 for i in indices):
+                raise ConstraintError(
+                    REF_ERROR,
+                    f"Expected {rank} indices for array, got {len(indices)} at line {line_number}")
+            result = arr.get(tuple(indices))
+            if result is None:
+                return error_value(NA_ERROR)
+            return result
 
         # Get the shape to use for indexing - prefer the declared shape
         shape = self.get_array_shape(arr, line_number)
@@ -2256,6 +2288,18 @@ class ArrayHandler:
         """
         Get the dimensions of an array.
         """
+        if isinstance(arr, dict) and ('shape' in arr or 'original_shape' in arr):
+            return list(arr.get('shape') or arr.get('original_shape'))
+        if isinstance(arr, dict) and 'array' in arr:
+            return [len(arr['array'])]
+        if isinstance(arr, dict) and arr and all(
+                isinstance(k, tuple) for k in arr.keys()):
+            shape = [0] * len(next(iter(arr.keys())))
+            for k in arr.keys():
+                for i, idx in enumerate(k):
+                    if idx + 1 > shape[i]:
+                        shape[i] = idx + 1
+            return shape
         if not isinstance(arr, (list, tuple)):
             return []
 

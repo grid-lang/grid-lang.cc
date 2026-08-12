@@ -9,7 +9,7 @@ from control_flow import GridLangControlFlow
 from parser import GridLangParser
 from scope import GridLiveView
 from units import VALUE_ERROR, ConstraintError, error_value
-from utils import col_to_num, num_to_col, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address
+from utils import col_to_num, num_to_col, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array
 
 
 IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*')
@@ -1458,6 +1458,11 @@ class GridLangExecutor:
     def _let_values_match(self, a, b):
         """Compare two bound values, tolerating numeric vs. unit forms."""
         try:
+            if hasattr(self, 'array_handler'):
+                if isinstance(a, dict) and ('array' in a or is_sparse_array(a)):
+                    a = self.array_handler.flatten_array(a)
+                if isinstance(b, dict) and ('array' in b or is_sparse_array(b)):
+                    b = self.array_handler.flatten_array(b)
             result = (a == b)
         except Exception:
             return False
@@ -4637,17 +4642,9 @@ class GridLangExecutor:
                                 f"Expected {rank} indices for array variable '{indexed_var}', got {len(indices)} at line {line_number}")
                     for value in values:
                         arr = defining_scope.variables.get(actual_key)
-                        if isinstance(arr, dict) and 'array' in arr:
-                            arr_value = arr['array']
-                            updated_array = self.array_handler.set_array_element(
-                                arr_value, indices, value, line_number)
-                            arr['array'] = updated_array
-                            defining_scope.variables[actual_key] = arr
-                        else:
-                            arr_value = arr
-                            updated_array = self.array_handler.set_array_element(
-                                arr_value, indices, value, line_number)
-                            defining_scope.variables[actual_key] = updated_array
+                        updated_array = self.array_handler.set_array_element(
+                            arr, indices, value, line_number)
+                        defining_scope.variables[actual_key] = updated_array
                         defining_scope.uninitialized.discard(actual_key)
                         self._enqueue_push(indexed_var, value)
                     self._process_when_triggers()
@@ -4728,17 +4725,9 @@ class GridLangExecutor:
                 raise ValueError(
                     f"Expected {rank} indices for array variable '{var_name}', got {len(indices)} at line {line_number}")
         arr = defining_scope.variables.get(actual_key)
-        if isinstance(arr, dict) and 'array' in arr:
-            arr_value = arr['array']
-            updated_array = self.array_handler.set_array_element(
-                arr_value, indices, value, line_number)
-            arr['array'] = updated_array
-            defining_scope.variables[actual_key] = arr
-        else:
-            arr_value = arr
-            updated_array = self.array_handler.set_array_element(
-                arr_value, indices, value, line_number)
-            defining_scope.variables[actual_key] = updated_array
+        updated_array = self.array_handler.set_array_element(
+            arr, indices, value, line_number)
+        defining_scope.variables[actual_key] = updated_array
         defining_scope.uninitialized.discard(actual_key)
         return
 

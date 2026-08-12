@@ -4,7 +4,7 @@ Handles FOR loops, IF statements, LET statements, and block processing.
 """
 
 import re
-from utils import num_to_col, split_var_defs
+from utils import num_to_col, split_var_defs, is_sparse_array
 
 # Regex patterns for block parsing
 HEADER_IF = re.compile(r'^\s*if\b(.+?)\bthen\s*$', re.I)
@@ -1678,21 +1678,30 @@ class GridLangControlFlow:
                         type_key) or '').lower()
             return True, declared_type == type_name.lower()
         actual_type = self.compiler.array_handler.infer_type(var_value, line_number)
+        flat_value = self.compiler.array_handler.flatten_array(
+            var_value, line_number) if (
+                isinstance(var_value, dict) and ('array' in var_value
+                                                or is_sparse_array(var_value))
+            ) else var_value
         if type_name.lower() == 'text':
-            if not (actual_type == 'text' or (isinstance(var_value, (list, tuple)) and all(isinstance(item, str) for item in var_value))):
+            if not (actual_type == 'text' or (isinstance(flat_value, (list, tuple)) and all(isinstance(item, str) for item in flat_value))):
                 return True, False
         elif type_name.lower() == 'number':
-            if not (actual_type in ('number', 'int') or (isinstance(var_value, (list, tuple)) and all(isinstance(item, (int, float)) for item in var_value))):
+            if not (actual_type in ('number', 'int') or (isinstance(flat_value, (list, tuple)) and all(isinstance(item, (int, float)) for item in flat_value))):
                 return True, False
+        is_array = isinstance(var_value, (list, tuple)) or (
+            isinstance(var_value, dict) and 'array' in var_value) or (
+            isinstance(var_value, dict) and var_value
+            and all(isinstance(k, tuple) for k in var_value.keys()))
         if dim_constraint:
             if dim_constraint == '{}':
-                return True, not isinstance(var_value, (list, tuple)) or len(var_value) == 0
+                return True, not is_array
             if dim_constraint == '*':
-                return True, isinstance(var_value, (list, tuple)) and len(var_value) > 0
+                return True, is_array
             try:
                 dim_parts = dim_constraint[1:-1].split(',')
                 expected_dims = [int(d.strip()) for d in dim_parts]
-                if isinstance(var_value, (list, tuple)):
+                if is_array:
                     actual_dims = self.compiler.array_handler.get_array_dimensions(
                         var_value)
                     return True, actual_dims == expected_dims
@@ -1711,20 +1720,26 @@ class GridLangControlFlow:
             raise NameError(
                 f"Variable '{var_name}' not defined at line {line_number}")
         var_value = eval_scope[var_name]
+        is_array = isinstance(var_value, (list, tuple)) or (
+            isinstance(var_value, dict) and 'array' in var_value) or (
+            isinstance(var_value, dict) and var_value
+            and all(isinstance(k, tuple) for k in var_value.keys()))
         if dim_spec.strip() == '*':
-            return True, isinstance(var_value, (list, tuple)) and len(var_value) > 0
+            return True, is_array
         if dim_spec.strip() == '{}':
-            return True, not isinstance(var_value, (list, tuple)) or len(var_value) == 0
+            return True, not is_array
         if dim_spec.strip().isdigit():
             expected_dim = int(dim_spec.strip())
-            if isinstance(var_value, (list, tuple)):
-                return True, len(var_value) == expected_dim
+            if is_array:
+                actual_dims = self.compiler.array_handler.get_array_dimensions(
+                    var_value)
+                return True, bool(actual_dims) and actual_dims[0] == expected_dim
             return True, expected_dim == 0
         if dim_spec.strip().startswith('{') and dim_spec.strip().endswith('}'):
             try:
                 dim_str = dim_spec.strip()[1:-1]
                 expected_dims = [int(d.strip()) for d in dim_str.split(',')]
-                if isinstance(var_value, (list, tuple)):
+                if is_array:
                     actual_dims = self.compiler.array_handler.get_array_dimensions(
                         var_value)
                     while actual_dims and actual_dims[0] == 1:
