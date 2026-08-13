@@ -50,10 +50,13 @@ class ArrayHandler:
             return self.compiler.grid.get(cell_ref, 0)
         # Convert to Python list for indexing
         nd_shape = None
+        sparse_arr = False
         if isinstance(arr, dict) and 'array' in arr:
             nd_shape = list(arr.get('shape') or arr.get('original_shape') or [])
             arr = arr['array']
-        if isinstance(arr, list):
+        else:
+            sparse_arr = is_sparse_array(arr)
+        if isinstance(arr, list) or sparse_arr:
             arr_pylist = arr
         else:
             raise TypeError(
@@ -87,6 +90,14 @@ class ArrayHandler:
             col, row = split_cell(cell_ref)
             col_idx = col_to_num(col) - 1  # 0-based column index
             row_idx = int(row) - 1  # 0-based row index
+
+            # Sparse arrays are unbound: any cell is a valid address and an
+            # unset one reads as #N/A.
+            if sparse_arr:
+                value = arr.get((row_idx, col_idx))
+                if value is None:
+                    return error_value(NA_ERROR)
+                return value
 
             if row_idx < 0 or row_idx >= rows:
                 raise IndexError(
