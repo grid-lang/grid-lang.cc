@@ -19,7 +19,7 @@ from utils import (
     is_sparse_array,
 )
 from scope import GridLiveView
-from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, UnitValue, error_value, is_error_value
+from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, REF_ERROR, UnitValue, error_value, is_error_value
 
 
 class CaseInsensitiveDict(dict):
@@ -764,7 +764,9 @@ class ExpressionEvaluator:
         # This must happen before array access processing to avoid confusion
         if 'grid{' not in expr:
             return expr
-        grid_pattern = re.compile(r'grid\{([^}]+)\}')
+        # Only treat bare grid{...} as the grid; skip member accesses like
+        # obj.grid{...} which are handled by the array/member paths.
+        grid_pattern = re.compile(r'(?<![\w.])grid\{([^}]+)\}')
         grid_matches = grid_pattern.findall(expr)
         for indices_str in grid_matches:
             try:
@@ -1033,9 +1035,21 @@ class ExpressionEvaluator:
                 type_name = type_match.group(1) if type_match else None
                 with_assignments = self.compiler._parse_with_clause(
                     with_text, line_number)
-                return True, self.compiler._apply_with_constraints(
+                result = self.compiler._apply_with_constraints(
                     base_value, with_assignments, scope, line_number,
                     type_name=type_name)
+                # Run the type's constructor code after WITH values are
+                # applied, so the instance's grid (and any derived fields)
+                # are populated. _instantiate_type skipped it above.
+                if type_name and type_name.lower() in self.compiler.types_defined:
+                    type_def = self.compiler.types_defined[type_name.lower()]
+                    exec_lines = type_def.get('_executable_code', []) if isinstance(
+                        type_def, dict) else []
+                    if exec_lines:
+                        self.compiler._execute_type_code(
+                            exec_lines, type_name.lower(), result,
+                            line_number, {})
+                return True, result
 
         bare_new_match = re.match(r'^new\s+(\w+)\s*$', expr)
         if bare_new_match:
@@ -1452,6 +1466,17 @@ class ExpressionEvaluator:
                 # Not an array access; leave the original expression intact
                 return match.group(0)
 
+        # Structs/objects and scalars are not arrays: indexing them must not
+        # be mistaken for a sparse-array lookup (which would misread the dict
+        # keys as index tuples). Return a clean #REF instead.
+        if isinstance(arr, dict) and 'array' not in arr and (
+                '_type_name' in arr
+                or (arr and not isinstance(next(iter(arr.keys())), tuple))):
+            return self._substitute_curly_result(
+                f"{var_name}{{{indices_str}}}",
+                f"{var_name}{{{indices_str}}}",
+                error_value(REF_ERROR), scope)
+
         # Adjust selectors based on dimension metadata
         dims = self.compiler.dimensions.get(var_name, [])
         # Also check constraints in scope for dimension-constrained arrays
@@ -1493,6 +1518,84 @@ class ExpressionEvaluator:
         except (IndexError, ValueError) as e:
             raise IndexError(
                 f"Invalid indices {indices_str} for '{var_name}': {e} at line {line_number}")
+
+    def _member_access_replacer(self, match, scope, line_number):
+        """Replace ``obj.field{...}`` member-index accesses with their value.
+
+        Supports the same selectors as array access (``*``, ``n to m``,
+        ``n to *``, and scalars) against the member's array. Indices are
+        1-based like the rest of the language. Non-array members are left
+        untouched so the normal field/member path reports the error.
+        """
+        obj_name, field_name, indices_str = match.groups()
+        obj = None
+        try:
+            obj = self.compiler.current_scope().get(obj_name)
+        except Exception:
+            obj = None
+        if not isinstance(obj, dict):
+            return match.group(0)
+        actual_field = get_case_insensitive_key(obj, field_name) or field_name
+        if actual_field not in obj:
+            return match.group(0)
+        member = obj[actual_field]
+        if isinstance(member, GridLiveView) or not isinstance(member, (dict, list)):
+            return match.group(0)
+        if isinstance(member, dict) and 'array' not in member and not all(
+                isinstance(k, tuple) for k in member.keys()):
+            return match.group(0)
+
+        specs = []
+        for index_expr in indices_str.split(','):
+            index_expr = index_expr.strip()
+            if index_expr == '*':
+                specs.append('*')
+                continue
+            m = re.match(r'^(-?\d+)\s+to\s+(-?\d+)$', index_expr)
+            if m:
+                specs.append((int(m.group(1)), int(m.group(2))))
+                continue
+            m = re.match(r'^(-?\d+)\s+to\s+\*$', index_expr)
+            if m:
+                specs.append((int(m.group(1)), None))
+                continue
+            try:
+                specs.append(int(index_expr))
+            except ValueError:
+                index_value = self.eval_expr(index_expr, scope, line_number)
+                if isinstance(index_value, float) and index_value.is_integer():
+                    index_value = int(index_value)
+                specs.append(int(index_value))
+
+        # Member arrays are 1-based; storage is 0-based.
+        adjusted_specs = []
+        for spec in specs:
+            if isinstance(spec, tuple):
+                start, end = spec
+                adjusted_specs.append(
+                    (start - 1, None if end is None else end - 1))
+            elif spec == '*':
+                adjusted_specs.append(spec)
+            else:
+                adjusted_specs.append(spec - 1)
+
+        array_view = member
+        if isinstance(member, list):
+            original_shape = obj.get('original_shape')
+            if original_shape:
+                array_view = {'array': member,
+                              'shape': list(original_shape),
+                              'original_shape': list(original_shape)}
+
+        try:
+            result = self.compiler.array_handler.read_array_slice(
+                array_view, adjusted_specs, line_number)
+            curly_expr = f"{obj_name}.{field_name}{{{indices_str}}}"
+            return self._substitute_curly_result(
+                curly_expr, curly_expr, result, scope)
+        except (IndexError, ValueError) as e:
+            raise IndexError(
+                f"Invalid indices {indices_str} for '{obj_name}.{field_name}': {e} at line {line_number}")
 
     def _member_paren_access_replacer(self, match, scope, line_number):
         obj_name, field_name, index_expr = match.groups()
@@ -1861,6 +1964,13 @@ class ExpressionEvaluator:
             expr, scope, line_number, depth)
         if handled:
             return True, indexed_member_result, expr
+
+        # Evaluate instance member accesses (e.g., p.grid{1 to 2, 3, *})
+        # before the generic array-access replacer sees the bare field{...}.
+        expr = re.sub(
+            r'([A-Za-z_][\w_]*)\.([A-Za-z_][\w_]*)\{([^}]+)\}',
+            lambda m: self._member_access_replacer(m, scope, line_number),
+            expr)
 
         # Preprocess: evaluate all array accesses D{...} in the expression
         # But skip if this looks like object creation

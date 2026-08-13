@@ -761,7 +761,7 @@ class GridLangCompiler:
             hidden_fields = type_def.get('_hidden_fields', set())
             if hidden_fields:
                 value_dict['_hidden_fields'] = set(hidden_fields)
-            value_dict.setdefault('grid', GridLiveView())
+            self._init_instance_grid(value_dict, type_def, line_number)
             if exec_lines and execute_code:
                 self._execute_type_code(
                     exec_lines, var_name or type_name, value_dict, line_number, input_values)
@@ -803,7 +803,7 @@ class GridLangCompiler:
         hidden_fields = type_def.get('_hidden_fields', set())
         if hidden_fields:
             value_dict['_hidden_fields'] = set(hidden_fields)
-        value_dict.setdefault('grid', GridLiveView())
+        self._init_instance_grid(value_dict, type_def, line_number)
         if exec_lines and execute_code:
             # Track immutability for fields derived from inputs
             if inputs_list:
@@ -820,11 +820,48 @@ class GridLangCompiler:
 
         return value_dict
 
+    def _init_instance_grid(self, value_dict, type_def, line_number):
+        """Populate an instance's 'grid' field from the type's grid dims.
+
+        A type declared ``with (grid dim {3, 3, 3})`` gives each instance a
+        dense grid array of that shape (1-based). Without grid dims the field
+        stays a GridLiveView, matching the legacy 2D ``grid{a, b}`` behavior.
+        """
+        if not isinstance(value_dict, dict) or not isinstance(type_def, dict):
+            return
+        type_constraints = type_def.get('_constraints', {}) or {}
+        grid_dim = type_constraints.get('dim')
+        if isinstance(grid_dim, dict) and 'dims' in grid_dim:
+            shape = [end - start + 1 for start, end in grid_dim['dims']]
+            grid_store = self.array_handler.create_array(
+                shape, 0.0, 'number', line_number)
+            value_dict['grid'] = grid_store
+        else:
+            value_dict.setdefault('grid', GridLiveView())
+
+    def resolve_with_value(self, raw_value, line_number=None):
+        """Finalize a single WITH-clause value against the current scope.
+
+        Quoted strings become their literal, bare identifiers resolve as
+        variable references (falling back to the literal when the variable is
+        uninitialized), and non-strings pass through unchanged.
+        """
+        scope = self.current_scope().get_full_scope()
+        return self._evaluate_with_value(raw_value, scope, line_number)
+
     def _evaluate_with_value(self, raw_value, scope, line_number=None):
         """Evaluate a WITH clause value when it looks like an expression."""
         if isinstance(raw_value, str):
+            if raw_value.startswith('"') and raw_value.endswith('"'):
+                return self.expr_evaluator.eval_or_eval_array(
+                    raw_value, scope, line_number)
             if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', raw_value):
-                return scope.get(raw_value, raw_value)
+                resolved = scope.get(raw_value, None)
+                if resolved is None or (
+                        isinstance(resolved, UnitValue)
+                        and is_error_value(resolved.error_code)):
+                    return raw_value
+                return resolved
             try:
                 return self.expr_evaluator.eval_or_eval_array(
                     raw_value, scope, line_number)

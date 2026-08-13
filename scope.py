@@ -905,6 +905,9 @@ class Scope:
                         f"'{key_for_constraints}' must not be empty at line {line_number}")
             elif constraint_type == 'type':
                 expected_type = constraint_expr.lower()
+                if isinstance(value, dict) and '_type_name' in value:
+                    # Custom-type instances bypass scalar base-type checks.
+                    continue
                 actual_type = self.compiler.array_handler.infer_type(
                     value, line_number)
                 if expected_type == 'number' and actual_type not in ('number', 'float64', 'int', 'int64'):

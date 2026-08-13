@@ -526,9 +526,10 @@ class GridLangTypeProcessor:
                 # Parse indices
                 indices = [idx.strip() for idx in indices_str.split(',')]
 
-                # Ensure the instance carries a GridLiveView grid.
+                # Ensure the instance carries a grid store: a dense N-D array
+                # when the type declares grid dims, otherwise a GridLiveView.
                 grid_store = value_dict.get('grid')
-                if not isinstance(grid_store, GridLiveView):
+                if grid_store is None:
                     grid_store = GridLiveView()
                     value_dict['grid'] = grid_store
 
@@ -551,15 +552,16 @@ class GridLangTypeProcessor:
                     return idx_value
 
                 try:
-                    idx1 = _resolve_index(indices[0])
-                    idx2 = _resolve_index(indices[1])
+                    resolved = [_resolve_index(idx) for idx in indices]
 
-                    if idx1 is not None and idx2 is not None:
+                    if all(v is not None for v in resolved):
                         value = self.compiler.expr_evaluator.eval_expr(
                             value_expr, eval_scope, line_number)
 
-                        # Store in grid
-                        value_dict['grid'][(idx1, idx2)] = value
+                        # Store in grid (1-based user indices -> 0-based storage)
+                        value_dict['grid'] = self.compiler.array_handler.set_array_element(
+                            grid_store, [v - 1 for v in resolved], value,
+                            line_number)
 
                 except Exception as e:
                     raise

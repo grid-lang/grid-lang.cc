@@ -319,7 +319,10 @@ class GridLangParser:
             elif '=' in wc:
                 key, value = [s.strip() for s in wc.split('=', 1)]
                 if value.startswith('"') and value.endswith('"'):
-                    with_constraints[key] = value[1:-1]
+                    # Keep the quoted form: a quoted value is a string
+                    # literal, distinct from a bare identifier reference.
+                    # Consumers finalize it (strip quotes) when applied.
+                    with_constraints[key] = value
                 else:
                     try:
                         with_constraints[key] = self.compiler.expr_evaluator.eval_expr(
@@ -387,6 +390,11 @@ class GridLangParser:
         if isinstance(type_def, dict):
             type_constraints = type_def.get('_constraints', {}) or {}
             for key, val in type_constraints.items():
+                if key == 'dim' and isinstance(val, dict) and 'dims' in val:
+                    # Type-level grid dims belong to the instance's 'grid'
+                    # field, not to the variable itself, so never merge them
+                    # onto the variable (that would reshape the instance).
+                    continue
                 constraints.setdefault(key, val)
             base_type = type_def.get('_base_type')
             if base_type and 'type' not in constraints:

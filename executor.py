@@ -1955,8 +1955,10 @@ class GridLangExecutor:
                     for i in range(shape[0]):
                         for j in range(shape[1]):
                             for k in range(shape[2]):
-                                obj = {f: with_constraints.get(
-                                    f, None) for f in public_fields}
+                                obj = {f: (self.compiler.resolve_with_value(
+                                    with_constraints.get(f, None), line_number)
+                                    if with_constraints.get(f, None) is not None else None)
+                                    for f in public_fields}
                                 obj['value'] = float(
                                     value) if value else 1.0
                                 array = self.array_handler.set_array_element(
@@ -2248,10 +2250,10 @@ class GridLangExecutor:
             self.pop_scope()
 
     def _handle_for_and_syntax(self, lines, i, var_defs, is_block, line_number):
-        if ' AND ' not in var_defs:
+        if ' and ' not in var_defs.lower() or ' in ' not in var_defs.lower():
             return False, i
 
-        and_parts = var_defs.split(' AND ')
+        and_parts = re.split(r'\s+and\s+', var_defs, flags=re.I)
         and_loops = []
 
         for part in and_parts:
@@ -2419,6 +2421,9 @@ class GridLangExecutor:
                 break
             var_defs = m.group(1).strip()
             is_block = current_line.strip().lower().endswith('do')
+
+            if ' and ' in var_defs.lower():
+                break
 
             range_match = re.match(
                 r'^([\w_]+)\s+in\s+(.+?)(?:\s+step\s+(-?\d+))?(?:\s+index\s+([\w_]+))?$', var_defs, re.I)
@@ -2725,7 +2730,8 @@ class GridLangExecutor:
                 self.dimensions[var_name] = [(None, (start, end))]
                 return i + 1
 
-        if var_list[0][1] and 'with' in var_list[0][2]:
+        if (var_list[0][1] and 'with' in var_list[0][2]
+                and var_list[0][3] is None):
             var, type_name, constraints, value = var_list[0]
             if type_name.lower() in self.types_defined:
                 with_constraints = constraints.get('with', {})
@@ -2734,8 +2740,10 @@ class GridLangExecutor:
                     shape = [size_spec for _, size_spec in dims]
                     public_fields = public_type_fields(
                         self.types_defined[type_name.lower()])
-                    default_struct = {f.lower(): with_constraints.get(
-                        f) for f in public_fields}
+                    default_struct = {f.lower(): (self.compiler.resolve_with_value(
+                        with_constraints.get(f, None), line_number)
+                        if with_constraints.get(f, None) is not None else None)
+                        for f in public_fields}
                     default_struct['value'] = float(
                         value) if value else 1.0
                     array = self.array_handler.create_array(
@@ -2745,7 +2753,10 @@ class GridLangExecutor:
                     for field in public_fields:
                         if field in with_constraints:
                             self.current_scope().define(
-                                f"{var}.{field}", with_constraints[field], 'text')
+                                f"{var}.{field}",
+                                self.compiler.resolve_with_value(
+                                    with_constraints[field], line_number),
+                                'text')
                 return i + 1
 
         return None
@@ -4052,8 +4063,10 @@ class GridLangExecutor:
 
                 public_fields = public_type_fields(
                     self.types_defined[type_name])
-                tensor_struct = {f: with_constraints.get(
-                    f) for f in public_fields}
+                tensor_struct = {f: (self.compiler.resolve_with_value(
+                    with_constraints.get(f, None), line_number)
+                    if with_constraints.get(f, None) is not None else None)
+                    for f in public_fields}
                 tensor_struct['grid'] = grid_data['array']
                 tensor_struct['original_shape'] = grid_data['original_shape']
                 tensor_struct['constraints'] = constraints
@@ -4069,7 +4082,10 @@ class GridLangExecutor:
                 for field in public_fields:
                     if field in with_constraints:
                         self.current_scope().define(
-                            f"{var}.{field}", with_constraints[field], 'text')
+                            f"{var}.{field}",
+                            self.compiler.resolve_with_value(
+                                with_constraints[field], line_number),
+                            'text')
         return True
 
     def _dict_array_to_matrix_data(self, arr, line_number=None):
