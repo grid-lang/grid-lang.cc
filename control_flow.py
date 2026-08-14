@@ -1395,6 +1395,11 @@ class GridLangControlFlow:
             expr, scope_dict, line_number)
         defining_scope = self.compiler.current_scope().get_defining_scope(var_name)
         if defining_scope:
+            if (getattr(self.compiler, '_outer_scope_read_only', False)
+                    and self.compiler._is_outer_scope(defining_scope)):
+                raise RuntimeError(
+                    f"Cannot assign to '{var_name}': variables in an outer scope "
+                    f"are read-only inside a function at line {line_number}")
             actual_key = defining_scope._get_case_insensitive_key(
                 var_name, defining_scope.variables)
             if not actual_key:
@@ -1415,6 +1420,7 @@ class GridLangControlFlow:
                 arr, indices, value, line_number)
             defining_scope.variables[actual_key] = updated_array
             scope_dict[actual_key] = updated_array
+            self._mirror_grid_cell_write(var_name, indices, value, target=var, line_number=line_number, grid_array=updated_array)
             return True
         return True
 

@@ -7,7 +7,7 @@ import copy
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
 from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT, is_sparse_array
-from scope import Scope, GridLiveView, _ListenerGrid
+from scope import Scope, _ListenerGrid
 from units import (
     UNIT_ERROR, UnitValue, error_value, is_error_value, strip_units,
 )
@@ -63,8 +63,6 @@ class GridLangCompiler:
         self.scopes = [Scope(self)]
         # Predefine the 'grid' variable containing the current grid, like in a
         # type definition, so programs can read and write cells with grid{row, col}.
-        # Functions rebind this variable to the parent's grid (read-only) via
-        # _seed_grid_variable, so the caller sets _external_grid first.
         self._seed_grid_variable()
         self.variables = self.current_scope().variables
         self.types = self.scopes[0].types
@@ -267,7 +265,7 @@ class GridLangCompiler:
         hidden_fields = type_def.get('_hidden_fields', set())
         if hidden_fields:
             obj['_hidden_fields'] = set(hidden_fields)
-        obj.setdefault('grid', GridLiveView())
+        obj.setdefault('grid', {})
         try:
             self._recompute_computed_fields(obj, line_number=line_number)
         except Exception:
@@ -595,11 +593,11 @@ class GridLangCompiler:
         sub_compiler._allow_hidden_member_calls = True
         # Functions reference the caller's scope chain live but read-only:
         # reads resolve through the parent, writes to caller variables are
-        # rejected. The caller's grid is shared through a read-only live view.
+        # rejected. The caller's 'grid' is just another caller variable: it
+        # resolves through the same chain and is protected by the generic
+        # outer-scope read-only rule.
         sub_compiler._parent_scope = self.current_scope()
         sub_compiler._outer_scope_read_only = True
-        sub_compiler._external_grid = self.grid
-        sub_compiler._external_grid_read_only = True
         # Only compiler-level dimension metadata is copied.
         try:
             if getattr(self, 'scopes', None):
@@ -681,8 +679,8 @@ class GridLangCompiler:
                     continue
             elif isinstance(cell, tuple) and len(cell) == 2:
                 try:
-                    row_i = int(cell[0])
-                    col_i = int(cell[1])
+                    row_i = int(cell[0]) + 1
+                    col_i = int(cell[1]) + 1
                 except (TypeError, ValueError):
                     continue
             else:
@@ -825,7 +823,8 @@ class GridLangCompiler:
 
         A type declared ``with (grid dim {3, 3, 3})`` gives each instance a
         dense grid array of that shape (1-based). Without grid dims the field
-        stays a GridLiveView, matching the legacy 2D ``grid{a, b}`` behavior.
+        is a standard sparse array (dict keyed by 0-based index tuples), like
+        any other unbounded array.
         """
         if not isinstance(value_dict, dict) or not isinstance(type_def, dict):
             return
@@ -837,7 +836,7 @@ class GridLangCompiler:
                 shape, 0.0, 'number', line_number)
             value_dict['grid'] = grid_store
         else:
-            value_dict.setdefault('grid', GridLiveView())
+            value_dict.setdefault('grid', {})
 
     def resolve_with_value(self, raw_value, line_number=None):
         """Finalize a single WITH-clause value against the current scope.
@@ -908,7 +907,7 @@ class GridLangCompiler:
                 hidden_fields = self.types_defined.get(expected_type, {}).get('_hidden_fields', set())
                 if hidden_fields and '_hidden_fields' not in coerced:
                     coerced['_hidden_fields'] = set(hidden_fields)
-                coerced.setdefault('grid', GridLiveView())
+                coerced.setdefault('grid', {})
                 return coerced
         return field_value
 
@@ -1231,8 +1230,10 @@ class GridLangCompiler:
                 else:
                     normalized_outputs[k] = [v]
 
-        grid_source = sub_compiler.grid or sub_compiler.current_scope().variables.get(
-            'grid')
+        last_scope_vars = getattr(sub_compiler, '_last_scope_vars', {}) or {}
+        grid_source = (last_scope_vars.get('grid')
+                       or sub_compiler.current_scope().variables.get('grid')
+                       or sub_compiler.grid)
 
         def _normalize_grid(value):
             if value is None:
@@ -1846,18 +1847,47 @@ class GridLangCompiler:
         return False
 
     def _seed_grid_variable(self):
-        # Functions share the caller's grid through a read-only live view;
-        # other compilers (main, subprocess, type) get their own predefined grid.
-        external_grid = getattr(self, '_external_grid', None)
-        if external_grid is not None:
-            view = GridLiveView(
-                store=external_grid,
-                read_only=getattr(self, '_external_grid_read_only', False))
-        else:
-            view = GridLiveView(compiler=self)
-        self.scopes[0].variables['grid'] = view
+        # The predefined 'grid' variable is a standard sparse array keyed by
+        # 0-based (row, col) tuples; writes to it are mirrored into the sheet
+        # cell store (one unified store). Main, subprocess and type compilers
+        # each get their own fresh grid. Function call contexts do not seed a
+        # local 'grid': it resolves through the caller's scope chain like any
+        # other caller variable, so reads are live and writes are rejected by
+        # the generic outer-scope read-only rule.
+        if getattr(self, '_outer_scope_read_only', False):
+            return
+        self.scopes[0].variables['grid'] = {}
         self.scopes[0].constraints['grid'] = {
             'dim': [('row', None), ('col', None)]}
+
+    def _write_grid_array_cell(self, cell_ref, value, line_number=None):
+        """``[A1] := x`` is sugar for ``Let grid![A1] = x``: mirror a
+        single-cell write into the 'grid' array so grid{...} reads see it.
+
+        The array write must happen before the cell store is updated so
+        deferred recomputes observe the new value. In functions 'grid'
+        resolves to the caller's variable and is rejected by the generic
+        outer-scope read-only rule.
+        """
+        if not re.match(r'^[A-Za-z]+\d+$', cell_ref):
+            return
+        row, col = parse_address(cell_ref)
+        defining_scope = self.current_scope().get_defining_scope('grid')
+        if defining_scope is None:
+            return
+        if (getattr(self, '_outer_scope_read_only', False)
+                and self._is_outer_scope(defining_scope)):
+            raise RuntimeError(
+                "Cannot assign to 'grid': variables in an outer scope are "
+                f"read-only inside a function at line {line_number}")
+        actual_key = defining_scope._get_case_insensitive_key(
+            'grid', defining_scope.variables) or 'grid'
+        grid = defining_scope.variables.get(actual_key)
+        if isinstance(grid, dict) and 'array' in grid:
+            return
+        if isinstance(grid, dict):
+            self.array_handler.set_array_element(
+                grid, [row - 1, col - 1], value, line_number)
 
     def _reset_state(self):
         self.grid.clear()

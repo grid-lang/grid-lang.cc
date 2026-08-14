@@ -7,7 +7,6 @@ import copy
 import re
 import numbers
 from utils import get_case_insensitive_key, split_var_defs
-from scope import GridLiveView
 
 
 class GridLangTypeProcessor:
@@ -232,7 +231,7 @@ class GridLangTypeProcessor:
 
         # Add a 'grid' field only if constructor code references it
         if 'grid' not in value_dict and any('grid' in line.lower() for line in code_lines):
-            value_dict['grid'] = GridLiveView()
+            value_dict['grid'] = {}
 
         try:
             type_def = {}
@@ -380,10 +379,10 @@ class GridLangTypeProcessor:
             value = self.compiler.expr_evaluator.eval_expr(
                 value_expr, self.compiler.current_scope().get_full_scope(), line_number)
 
-            # Store in grid
+            # Store in grid (1-based cell ref -> 0-based sparse array key)
             if 'grid' not in value_dict:
-                value_dict['grid'] = GridLiveView()
-            value_dict['grid'][(row, col_num)] = value
+                value_dict['grid'] = {}
+            value_dict['grid'][(row - 1, col_num - 1)] = value
 
 
     def _process_type_for_loop(self, all_lines, start_index, value_dict, input_values, line_number):
@@ -527,16 +526,16 @@ class GridLangTypeProcessor:
                 indices = [idx.strip() for idx in indices_str.split(',')]
 
                 # Ensure the instance carries a grid store: a dense N-D array
-                # when the type declares grid dims, otherwise a GridLiveView.
+                # when the type declares grid dims, otherwise a sparse array.
                 grid_store = value_dict.get('grid')
                 if grid_store is None:
-                    grid_store = GridLiveView()
+                    grid_store = {}
                     value_dict['grid'] = grid_store
 
                 # Build a scope that includes the current loop variables, the
                 # instance fields, and the instance grid. grid{...} access in
                 # the value expression is handled by the generic array-access
-                # path via the GridLiveView in scope.
+                # path via the grid array in scope.
                 eval_scope = self._build_type_eval_scope(value_dict, {})
 
                 def _resolve_index(idx_expr):
@@ -747,8 +746,8 @@ class GridLangTypeProcessor:
                     continue
                 if key == 'grid' and isinstance(val, dict):
                     grid_store = value_dict.get('grid')
-                    if not isinstance(grid_store, GridLiveView):
-                        grid_store = GridLiveView()
+                    if not isinstance(grid_store, dict):
+                        grid_store = {}
                         value_dict['grid'] = grid_store
                     grid_store.update(val)
                     continue

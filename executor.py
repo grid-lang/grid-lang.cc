@@ -7,7 +7,6 @@ from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
 from control_flow import GridLangControlFlow
 from parser import GridLangParser
-from scope import GridLiveView
 from units import VALUE_ERROR, ConstraintError, error_value
 from utils import col_to_num, num_to_col, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array
 
@@ -1292,6 +1291,21 @@ class GridLangExecutor:
         scope_dict[obj_name] = obj_value
         return True
 
+    def _mirror_grid_cell_write(self, var_name, indices, value, target=None, line_number=None, grid_array=None):
+        """Unified store: every 2D write to the predefined 'grid' variable is
+        mirrored into the sheet cell store, so ``grid{2, 2}`` and ``grid![B2]``
+        both set cell B2 (and ``[B2] := x`` is their sugar). Type instances
+        keep private grids that never mirror into the sheet."""
+        if (var_name.lower() != 'grid' or len(indices) != 2
+                or not isinstance(indices[0], int) or not isinstance(indices[1], int)):
+            return
+        scopes = getattr(self.compiler, 'scopes', None)
+        predefined = scopes[0].variables.get('grid') if scopes else None
+        if grid_array is not None and grid_array is not predefined:
+            return
+        cell_ref = num_to_col(indices[1] + 1) + str(indices[0] + 1)
+        self.compiler.grid[cell_ref] = value
+
     def _try_handle_let_index_assignment(
             self, var, expr, scope_dict, line_number):
         var_name, indices = self.expr_evaluator._parse_index_target(
@@ -1305,6 +1319,11 @@ class GridLangExecutor:
         if not defining_scope:
             raise NameError(
                 f"Array variable '{var_name}' not defined at line {line_number}")
+        if (getattr(self.compiler, '_outer_scope_read_only', False)
+                and self.compiler._is_outer_scope(defining_scope)):
+            raise RuntimeError(
+                f"Cannot assign to '{var_name}': variables in an outer scope "
+                f"are read-only inside a function at line {line_number}")
 
         actual_key = defining_scope._get_case_insensitive_key(
             var_name, defining_scope.variables)
@@ -1323,6 +1342,7 @@ class GridLangExecutor:
             arr, indices, value, line_number)
         defining_scope.variables[actual_key] = updated_array
         scope_dict[actual_key] = updated_array
+        self._mirror_grid_cell_write(var_name, indices, value, target=var, line_number=line_number, grid_array=updated_array)
         return True
 
     def _infer_declared_type(self, expr, evaluated_value, line_number):
@@ -3911,38 +3931,23 @@ class GridLangExecutor:
                 is_grid_value = '.grid{' in value
                 evaluated_value = self.expr_evaluator.eval_or_eval_array(
                     value, scope_value, line_number, is_grid_dim=is_grid_value)
-                if isinstance(evaluated_value, GridLiveView):
-                    # A grid view's cells are keyed by absolute cell references;
-                    # spill them into the current grid without clobbering the
-                    # anchor cell.
-                    anchor_written = False
-                    for cell_ref, val in evaluated_value._store.items():
-                        self.grid[cell_ref] = val
-                        if cell_ref.upper() == array_cell_ref.upper():
-                            anchor_written = True
-                    if not anchor_written:
-                        # Dense-grid semantics: an anchor cell not present in the
-                        # spilled grid reads as 0.
-                        self.grid[array_cell_ref] = 0
-                elif isinstance(evaluated_value, dict):
+                if isinstance(evaluated_value, dict):
                     if all(isinstance(k, tuple) and len(k) == 2 for k in evaluated_value.keys()):
                         for (row, col), val in evaluated_value.items():
                             if isinstance(row, (int, float)) and isinstance(col, (int, float)):
-                                grid_row = int(row)
-                                grid_col = int(col)
+                                grid_row = int(row) + 1
+                                grid_col = int(col) + 1
                                 col_letter = num_to_col(grid_col)
                                 cell_ref = f"{col_letter}{grid_row}"
                                 self.grid[cell_ref] = val
-                        self.grid[array_cell_ref] = 0
                     elif 'grid' in evaluated_value:
                         grid_dict = evaluated_value['grid']
                         if isinstance(grid_dict, dict):
                             for (row, col), val in grid_dict.items():
                                 if isinstance(row, int) and isinstance(col, int):
-                                    col_letter = num_to_col(col)
-                                    cell_ref = f"{col_letter}{row}"
+                                    col_letter = num_to_col(col + 1)
+                                    cell_ref = f"{col_letter}{row + 1}"
                                     self.grid[cell_ref] = val
-                            self.grid[array_cell_ref] = 0
                         else:
                             self.array_handler._assign_horizontal_array(
                                 array_cell_ref, evaluated_value, value, line_number=line_number)
@@ -3958,12 +3963,24 @@ class GridLangExecutor:
                 is_grid_value = '.grid{' in value
                 evaluated_value = self.expr_evaluator.eval_or_eval_array(
                     value, scope_value, line_number, is_grid_dim=is_grid_value)
+                self._write_grid_array_cell(cell_ref, evaluated_value, line_number)
                 self.grid[cell_ref] = self.array_handler.to_display_value(
                     evaluated_value)
         except Exception as e:
             raise RuntimeError(
                 f"Error evaluating '{value}': {e} at line {line_number}")
         return True, i + 1
+
+    def _write_grid_array_cell(self, cell_ref, value, line_number=None):
+        """``[A1] := x`` is sugar for ``Let grid![A1] = x``: mirror a
+        single-cell write into the 'grid' array so grid{...} reads see it.
+
+        The array write happens before the cell store is updated so deferred
+        recomputes observe the new value. In functions 'grid' resolves to the
+        caller's variable and is rejected by the generic outer-scope read-only
+        rule.
+        """
+        self.compiler._write_grid_array_cell(cell_ref, value, line_number)
 
     def _handle_when_block(self, lines, i, line, line_number):
         when_match = re.match(
@@ -4776,6 +4793,11 @@ class GridLangExecutor:
         if not defining_scope:
             raise NameError(
                 f"Array variable '{var_name}' not defined at line {line_number}")
+        if (getattr(self.compiler, '_outer_scope_read_only', False)
+                and self.compiler._is_outer_scope(defining_scope)):
+            raise RuntimeError(
+                f"Cannot assign to '{var_name}': variables in an outer scope "
+                f"are read-only inside a function at line {line_number}")
         actual_key = defining_scope._get_case_insensitive_key(
             var_name, defining_scope.variables) or var_name
         constraints = defining_scope.constraints.get(actual_key, {})
@@ -4791,6 +4813,7 @@ class GridLangExecutor:
             arr, indices, value, line_number)
         defining_scope.variables[actual_key] = updated_array
         defining_scope.uninitialized.discard(actual_key)
+        self._mirror_grid_cell_write(var_name, indices, value, line_number=line_number, grid_array=updated_array)
         return
 
     def _print_outputs(self):

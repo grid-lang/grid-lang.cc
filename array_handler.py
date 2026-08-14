@@ -11,7 +11,6 @@ from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell
 from functools import reduce
 import operator
 import itertools
-from scope import GridLiveView
 from units import DIM_ERROR, NA_ERROR, REF_ERROR, TYPE_ERROR, ConstraintError, error_value, is_error_value
 
 
@@ -43,11 +42,16 @@ class ArrayHandler:
             raise NameError(
                 f"Variable '{var_name}' not defined at line {line_number}")
         if var_name.lower() == 'grid':
-            # grid![cell] reads a cell directly from the current grid;
-            # grid![A] reads a whole column of the current grid.
+            # grid![cell] reads a cell directly from the grid array;
+            # grid![A] reads a whole column of the grid array.
             if re.match(r'^[A-Za-z]+$', cell_ref):
-                return self.get_grid_column(cell_ref, line_number=line_number)
-            return self.compiler.grid.get(cell_ref, 0)
+                return self.get_grid_column(cell_ref, grid_source=arr, line_number=line_number)
+            if '.' in cell_ref:
+                # Extended addresses read the grid as N-D.
+                return self.lookup_cell(cell_ref, line_number)
+            row, col = parse_address(cell_ref)[:2]
+            return self.get_array_element(
+                arr, [row - 1, col - 1], line_number)
         # Convert to Python list for indexing
         nd_shape = None
         sparse_arr = False
@@ -549,6 +553,10 @@ class ArrayHandler:
                 implicit_expr, int(row), scope, line_number)
         if isinstance(value, dict) and 'array' in value:
             value = self.to_display_value(value)
+        # ``[A1] := x`` is sugar for ``Let grid![A1] = x``: mirror the write
+        # into the 'grid' array before the cell store is updated so deferred
+        # recomputes observe the new value.
+        self.compiler._write_grid_array_cell(target, value, line_number)
         if self._update_bound_array_cell(target, value, line_number):
             self.compiler.grid[target] = value
             return None
@@ -1061,12 +1069,6 @@ class ArrayHandler:
                 self._assign_extended_address(
                     target, value, line_number)
                 return
-        if isinstance(value, GridLiveView):
-            # Spill a grid's cells (keyed by absolute cell references) into
-            # the current grid.
-            for cell_ref, val in value._store.items():
-                self.compiler.grid[cell_ref] = val
-            return
         if isinstance(value, dict) and value and all(
                 isinstance(k, tuple) for k in value.keys()):
             # Sparse (no-dim) array: dict keyed by 0-based index tuples with
@@ -2060,16 +2062,6 @@ class ArrayHandler:
         :return: Updated array.
         """
 
-        # The 'grid' variable is a live view of the current grid; indexing it
-        # writes directly to the grid cells (indices are 0-based row, col).
-        if isinstance(array, GridLiveView):
-            if len(indices) != 2:
-                raise ValueError(
-                    f"Expected 2 indices for the grid, got {len(indices)}"
-                    + (f" at line {line_number}" if line_number else ""))
-            array[(int(indices[0]) + 1, int(indices[1]) + 1)] = value
-            return array
-
         # N-D arrays are stored as a flat Python list buffer wrapped in a dict
         # with the declared shape ({'array', 'shape', 'original_shape'}).  The
         # first declared dim is the fastest: flat = i0 + s0*i1 + s0*s1*i2 + ...
@@ -2164,32 +2156,81 @@ class ArrayHandler:
                     'shape': list(shape), 'original_shape': list(shape)}
         return list(resized)
 
+    def _grid_source_extent(self, grid_source):
+        """Return (max_row, max_col) of a grid source: a sparse array keyed
+        by 0-based (row, col) tuples, a dense dict-form array, or a cell-ref
+        dict. Coordinates are 1-based in the returned extent."""
+        if not grid_source:
+            return 0, 0
+        if isinstance(grid_source, dict) and 'array' in grid_source:
+            shape = grid_source.get('shape') or grid_source.get('original_shape') or []
+            return (shape[0] if len(shape) > 0 else 0,
+                    shape[1] if len(shape) > 1 else 0)
+        max_row = max_col = 0
+        for cell in grid_source:
+            if isinstance(cell, str):
+                try:
+                    col, row = split_cell(cell)
+                    row = int(row)
+                    col = col_to_num(col)
+                except ValueError:
+                    continue
+            elif isinstance(cell, tuple) and len(cell) == 2:
+                row = int(cell[0]) + 1
+                col = int(cell[1]) + 1
+            else:
+                continue
+            max_row = max(max_row, row)
+            max_col = max(max_col, col)
+        return max_row, max_col
+
     def get_grid_row(self, row_index, grid_source=None, line_number=None):
         """Return a dense list of values in the given (1-based) grid row.
 
-        Unset cells within the grid's used extent read as 0.
+        ``grid_source`` is the grid array (sparse or dense) or a cell-ref
+        dict. Unset cells within the grid's used extent read as 0.
         """
         grid_source = grid_source if grid_source is not None else self.compiler.grid
-        matrix = self.compiler._grid_to_matrix(grid_source)
-        if not matrix or row_index < 1 or row_index > len(matrix):
+        max_row, max_col = self._grid_source_extent(grid_source)
+        if row_index < 1 or row_index > max_row or max_col == 0:
             return []
-        return list(matrix[row_index - 1])
+        if isinstance(grid_source, dict) and 'array' in grid_source:
+            shape = list(grid_source.get('shape') or grid_source.get('original_shape') or [])
+            flat = grid_source['array']
+            rows = shape[0] if shape else 0
+            cols = shape[1] if len(shape) > 1 else 0
+            if row_index < 1 or row_index > rows:
+                return []
+            return [flat[row_index - 1 + rows * c] for c in range(cols)]
+        row = []
+        for col in range(1, max_col + 1):
+            row.append(grid_source.get((row_index - 1, col - 1), 0))
+        return row
 
     def get_grid_column(self, col_ref, grid_source=None, line_number=None):
         """Return a dense list of values in the given grid column.
 
-        ``col_ref`` is a column letter (e.g. 'A'); unset cells within the
-        grid's used extent read as 0.
+        ``col_ref`` is a column letter (e.g. 'A') or a 1-based column number;
+        unset cells within the grid's used extent read as 0.
         """
         grid_source = grid_source if grid_source is not None else self.compiler.grid
         if isinstance(col_ref, str) and re.match(r'^[A-Za-z]+$', col_ref):
             col_num = col_to_num(col_ref)
         else:
             col_num = int(col_ref)
-        matrix = self.compiler._grid_to_matrix(grid_source)
-        if not matrix or col_num < 1 or col_num > len(matrix[0]):
+        max_row, max_col = self._grid_source_extent(grid_source)
+        if col_num < 1 or col_num > max_col or max_row == 0:
             return []
-        return [row[col_num - 1] for row in matrix]
+        if isinstance(grid_source, dict) and 'array' in grid_source:
+            shape = list(grid_source.get('shape') or grid_source.get('original_shape') or [])
+            flat = grid_source['array']
+            rows = shape[0] if shape else 0
+            cols = shape[1] if len(shape) > 1 else 0
+            if col_num < 1 or col_num > cols:
+                return []
+            return [flat[r + rows * (col_num - 1)] for r in range(rows)]
+        return [grid_source.get((r, col_num - 1), 0)
+                for r in range(max_row)]
 
     def get_array_element(self, arr, indices, line_number=None, return_struct=False, original_shape=None):
         """
@@ -2201,20 +2242,6 @@ class ArrayHandler:
         :param original_shape: Original shape if provided.
         :return: Element value.
         """
-        # The 'grid' variable is a live view of the current grid; indexing it
-        # reads the grid cell directly (unset cells return 0), and a single
-        # index reads a whole row.
-        if isinstance(arr, GridLiveView):
-            if len(indices) == 1:
-                return self.get_grid_row(
-                    int(indices[0]) + 1, arr._store, line_number)
-            if len(indices) != 2:
-                raise ConstraintError(
-                    REF_ERROR,
-                    f"Expected 2 indices for the grid, got {len(indices)}"
-                    + (f" at line {line_number}" if line_number else ""))
-            return arr[(int(indices[0]) + 1, int(indices[1]) + 1)]
-
         # Handle dictionary with array (e.g., from grid DIM or N-D storage)
         if isinstance(arr, dict) and 'array' in arr:
             original_shape = arr.get(
@@ -2322,11 +2349,6 @@ class ArrayHandler:
                     arr, specs, line_number)
             except (IndexError, ConstraintError):
                 return error_value(REF_ERROR)
-        if isinstance(arr, GridLiveView):
-            raise ConstraintError(
-                REF_ERROR,
-                f"Cannot slice the grid at line {line_number}")
-
         # Sparse unbounded (star-dim) arrays: dict keyed by index tuples.
         if isinstance(arr, dict) and 'array' not in arr:
             return self._read_sparse_slice(arr, specs, line_number)

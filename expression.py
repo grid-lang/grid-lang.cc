@@ -18,7 +18,6 @@ from utils import (
     format_display_value,
     is_sparse_array,
 )
-from scope import GridLiveView
 from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, REF_ERROR, UnitValue, error_value, is_error_value
 
 
@@ -769,52 +768,13 @@ class ExpressionEvaluator:
         grid_pattern = re.compile(r'(?<![\w.])grid\{([^}]+)\}')
         grid_matches = grid_pattern.findall(expr)
         for indices_str in grid_matches:
-            try:
-                # Parse indices (e.g., "a-1, b-1" -> [a-1, b-1])
-                indices = []
-                for index_expr in indices_str.split(','):
-                    index_expr = index_expr.strip()
-                    try:
-                        # Evaluate the index expression (e.g., "a-1")
-                        index_value = self.eval_expr(
-                            index_expr, scope, line_number)
-                        indices.append(index_value)
-                    except Exception as e:
-                        raise SyntaxError(
-                            f"Invalid index expression '{index_expr}' in grid{{...}}: {e} at line {line_number}")
-
-                # Look for grid in the scope
-                if 'grid' in scope:
-                    grid = scope['grid']
-                    if isinstance(grid, GridLiveView):
-                        # The predefined 'grid' variable flows through the
-                        # generic array-access path below.
-                        return expr
-                    if isinstance(grid, dict):
-                        # Convert tuple indices to the format used in the grid
-                        if len(indices) == 2:
-                            key = (int(indices[0]), int(indices[1]))
-                            if key in grid:
-                                value = grid[key]
-                            else:
-                                # Return 0 for undefined grid positions
-                                value = 0
-                        else:
-                            raise SyntaxError(
-                                f"Grid indexing expects 2 indices, got {len(indices)} at line {line_number}")
-                    else:
-                        raise ValueError(
-                            f"Expected grid to be a dictionary, got {type(grid)} at line {line_number}")
-                else:
-                    # Return 0 if grid is not defined
-                    value = 0
-
-                # Replace the grid expression with the value
-                expr = expr.replace(f'grid{{{indices_str}}}', str(value))
-
-            except Exception as e:
-                raise RuntimeError(
-                    f"Invalid grid reference 'grid{{{indices_str}}}': {e} at line {line_number}")
+            # The predefined 'grid' variable is a standard array; bare
+            # grid{...} flows through the generic array-access path below,
+            # which handles ranges, '*' selectors and unset cells (#N/A).
+            if 'grid' in scope:
+                return expr
+            # Return 0 if grid is not defined.
+            expr = expr.replace(f'grid{{{indices_str}}}', '0')
         return expr
 
     def _try_eval_dimension_selector(self, expr, scope, line_number=None):
@@ -1539,7 +1499,7 @@ class ExpressionEvaluator:
         if actual_field not in obj:
             return match.group(0)
         member = obj[actual_field]
-        if isinstance(member, GridLiveView) or not isinstance(member, (dict, list)):
+        if not isinstance(member, (dict, list)):
             return match.group(0)
         if isinstance(member, dict) and 'array' not in member and not all(
                 isinstance(k, tuple) for k in member.keys()):
@@ -1764,6 +1724,12 @@ class ExpressionEvaluator:
             adjusted_index = index_value
         else:
             adjusted_index = index_value - 1
+
+        if var_name.lower() == 'grid':
+            result = self.compiler.array_handler.get_grid_row(
+                adjusted_index + 1, grid_source=arr, line_number=line_number)
+            return self._substitute_curly_result(
+                f"{var_name}({index_expr})", f"{var_name}({index_expr})", result, scope)
 
         try:
             result = self.compiler.array_handler.read_array_element(
@@ -2221,8 +2187,10 @@ class ExpressionEvaluator:
             index_value = int(index_value)
         array = scope.get(
             var_name, self.compiler.variables.get(var_name))
-        if isinstance(array, GridLiveView):
-            base = 1
+        if var_name.lower() == 'grid' and isinstance(index_value, int) and index_value >= 1:
+            # grid(1) reads a whole (1-based) row of the grid array.
+            return self.compiler.array_handler.get_grid_row(
+                index_value, grid_source=array, line_number=line_number)
         return self.compiler.array_handler.read_array_element(
             array, [index_value - base], line_number)
 
