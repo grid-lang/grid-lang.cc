@@ -6,8 +6,8 @@ import sys
 import copy
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
-from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT, is_sparse_array
-from scope import Scope, _ListenerGrid
+from utils import col_to_num, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT, is_sparse_array
+from scope import Scope, _GridStore
 from units import (
     UNIT_ERROR, UnitValue, error_value, is_error_value, strip_units,
 )
@@ -59,10 +59,10 @@ class SubprocessResult:
 
 class GridLangCompiler:
     def __init__(self):
-        self.grid = _ListenerGrid(self)
         self.scopes = [Scope(self)]
         # Predefine the 'grid' variable containing the current grid, like in a
         # type definition, so programs can read and write cells with grid{row, col}.
+        # ``self.grid`` aliases the seeded store (see _seed_grid_variable).
         self._seed_grid_variable()
         self.variables = self.current_scope().variables
         self.types = self.scopes[0].types
@@ -1127,7 +1127,7 @@ class GridLangCompiler:
                 if all_scalars:
                     # For scalar pushes, keep the last value only
                     simple_value = values[-1]
-                    self.grid[cell_ref] = simple_value
+                    self._set_grid_cell(cell_ref, simple_value)
                     return
             assign_value = values if isinstance(values, list) else [values]
             expr_hint = '{' + ','.join(['x'] * len(assign_value)) + '}'
@@ -1135,7 +1135,7 @@ class GridLangCompiler:
                 self.array_handler._assign_horizontal_array(
                     cell_ref, assign_value, expr_hint, line_number=line_number)
             else:
-                self.grid[cell_ref] = simple_value
+                self._set_grid_cell(cell_ref, simple_value)
             return
 
         try:
@@ -1275,7 +1275,7 @@ class GridLangCompiler:
         expr, assign_line, deps = assignment[:3]
         constraints = assignment[3] if len(assignment) > 3 else {}
         cell_refs = self._extract_cell_refs(str(expr))
-        if cell_refs and not all(ref in self.grid for ref in cell_refs):
+        if cell_refs and not self._grid_cells_set(cell_refs):
             return False
         scope = target_scope if target_scope is not None else self.current_scope()
         unresolved = any(
@@ -1350,7 +1350,7 @@ class GridLangCompiler:
                     cell_refs = set()
                     if not is_array_indexing:
                         cell_refs = self._extract_cell_refs(rhs)
-                    if cell_refs and not all(ref in self.grid for ref in cell_refs):
+                    if cell_refs and not self._grid_cells_set(cell_refs):
                         continue
                     try:
                         violations = []
@@ -1426,7 +1426,7 @@ class GridLangCompiler:
                 else:
                     constraints = assignment[3] if len(assignment) > 3 else {}
                     cell_refs = self._extract_cell_refs(expr)
-                    if cell_refs and not all(ref in self.grid for ref in cell_refs):
+                    if cell_refs and not self._grid_cells_set(cell_refs):
                         continue
                     unresolved = any(
                         self.has_unresolved_dependency(
@@ -1603,11 +1603,25 @@ class GridLangCompiler:
             filtered.add(tok)
         return filtered
 
+    def _to_index(self, cell_ref):
+        """Convert a cell reference (address string or index tuple) to a
+        0-based numeric index tuple for the grid store."""
+        if isinstance(cell_ref, (tuple, list)):
+            return tuple(int(i) for i in cell_ref)
+        return tuple(i - 1 for i in parse_address(cell_ref))
+
     def _extract_cell_refs(self, expr):
+        """Extract the grid cells an expression depends on.
+
+        Returns 0-based numeric index tuples (the grid store's key space),
+        converted from address strings: ``[A1]`` -> ``(0, 0)``,
+        ``[A1:A3]`` -> ``{(0, 0), (0, 1), (0, 2)}``,
+        ``grid{2, 2}`` -> ``(1, 1)``.
+        """
         cell_refs = set()
         single_matches = re.finditer(rf'\[({_ADDRESS_FRAGMENT})\]', expr)
         for match in single_matches:
-            cell_refs.add(match.group(1))
+            cell_refs.add(tuple(i - 1 for i in parse_address(match.group(1))))
         range_matches = re.finditer(rf'\[({_ADDRESS_FRAGMENT}):({_ADDRESS_FRAGMENT})\]', expr)
         for match in range_matches:
             start, end = match.group(1), match.group(2)
@@ -1631,8 +1645,8 @@ class GridLangCompiler:
                     for dim_size in shape:
                         idxs.append(rem % dim_size)
                         rem //= dim_size
-                    cell_refs.add(indices_to_address(
-                        [starts[i] + idxs[i] for i in range(len(shape))]))
+                    cell_refs.add(tuple(
+                        starts[i] + idxs[i] - 1 for i in range(len(shape))))
                 continue
             start_col, start_row = split_cell(start)
             end_col, end_row = split_cell(end)
@@ -1640,28 +1654,29 @@ class GridLangCompiler:
             end_col_num = col_to_num(end_col)
             for col_num in range(start_col_num, end_col_num + 1):
                 for row in range(int(start_row), int(end_row) + 1):
-                    cell_refs.add(f"{num_to_col(col_num)}{row}")
+                    cell_refs.add((row - 1, col_num - 1))
         # grid{row, col} references the current grid; treat literal indices
         # as cell dependencies so assignments wait until the cell is written.
         grid_matches = re.finditer(
             r'\bgrid\s*\{\s*(\d+)\s*,\s*(\d+)\s*\}', expr, re.I)
         for match in grid_matches:
             row, col = int(match.group(1)), int(match.group(2))
-            cell_refs.add(f"{num_to_col(col)}{row}")
+            cell_refs.add((row - 1, col - 1))
         if '$"' in expr:
             # Only scan placeholders inside interpolated strings ($"...{...}").
             # Naively scanning all '{...}' groups would also match array literal
             # braces and quoted text values that look like cell refs (e.g. a text
             # array like {"q6", "x7"}).
             for ph in iter_interpolation_placeholders(expr):
-                cell_refs.update(re.findall(r'\b[A-Za-z]+\d+\b', ph))
+                for ref in re.findall(r'\b[A-Za-z]+\d+\b', ph):
+                    cell_refs.add(tuple(i - 1 for i in parse_address(ref)))
         return cell_refs
 
     def _register_listeners(self, var_name, expr, scope):
         """Register var_name as a client listener on every cell/var its expr reads.
 
         Called during a client binding; the registry lives on this compiler so
-        notifications (reached via compiler references from scope/_ListenerGrid)
+        notifications (reached via compiler references from scope/_GridStore)
         always touch the same objects.
         """
         if not expr or scope is None:
@@ -1685,7 +1700,8 @@ class GridLangCompiler:
         cell_refs = self._extract_cell_refs(str(expr))
         keys = []
         for ref in sorted(cell_refs):
-            keys.append(('cell', ref.upper()))
+            ref_string = indices_to_address([i + 1 for i in ref])
+            keys.append(('cell', ref_string.upper()))
         for dep in deps:
             if re.match(r'^[A-Za-z]+\d+$', dep):
                 continue
@@ -1830,7 +1846,7 @@ class GridLangCompiler:
         # already contains the cell value, even though they are not tracked in
         # the variable scope dictionary.
         if re.match(r'^[A-Za-z]+\d+$', name):
-            if name in self.grid:
+            if self._grid_cell_is_set(name):
                 return False
         scope = scope or self.current_scope()
         # Treat entirely undefined names as unresolved so dependent lines are deferred
@@ -1847,47 +1863,66 @@ class GridLangCompiler:
         return False
 
     def _seed_grid_variable(self):
-        # The predefined 'grid' variable is a standard sparse array keyed by
-        # 0-based (row, col) tuples; writes to it are mirrored into the sheet
-        # cell store (one unified store). Main, subprocess and type compilers
-        # each get their own fresh grid. Function call contexts do not seed a
-        # local 'grid': it resolves through the caller's scope chain like any
-        # other caller variable, so reads are live and writes are rejected by
-        # the generic outer-scope read-only rule.
+        # The predefined 'grid' variable is the single grid backing store: a
+        # sparse array keyed by 0-based (row, col) tuples. ``self.grid`` always
+        # aliases this store, so cell-reference writes (``[A1] := x``) and
+        # array writes (``grid{row, col}``) land in the same object. Main,
+        # subprocess and type compilers each get their own store. Function call
+        # contexts do not seed a local 'grid': it resolves through the caller's
+        # scope chain like any other caller variable, so reads are live and
+        # writes are rejected by the generic outer-scope read-only rule.
         if getattr(self, '_outer_scope_read_only', False):
             return
-        self.scopes[0].variables['grid'] = {}
+        store = getattr(self, 'grid', None)
+        if not isinstance(store, _GridStore):
+            store = _GridStore(self)
+            self.grid = store
+        self.scopes[0].variables['grid'] = store
         self.scopes[0].constraints['grid'] = {
             'dim': [('row', None), ('col', None)]}
 
-    def _write_grid_array_cell(self, cell_ref, value, line_number=None):
-        """``[A1] := x`` is sugar for ``Let grid![A1] = x``: mirror a
-        single-cell write into the 'grid' array so grid{...} reads see it.
+    def _get_grid_store(self):
+        """Return the live grid store (the predefined 'grid' variable)."""
+        scopes = getattr(self, 'scopes', None)
+        if scopes and scopes[0].variables.get('grid') is not None:
+            return scopes[0].variables['grid']
+        store = getattr(self, 'grid', None)
+        if isinstance(store, _GridStore):
+            return store
+        store = _GridStore(self)
+        self.grid = store
+        return store
 
-        The array write must happen before the cell store is updated so
-        deferred recomputes observe the new value. In functions 'grid'
-        resolves to the caller's variable and is rejected by the generic
-        outer-scope read-only rule.
+    def _set_grid_cell(self, cell_ref, value):
+        """Write a single cell (address string or index tuple) into the grid
+        store."""
+        self._get_grid_store()[self._to_index(cell_ref)] = value
+
+    def _grid_cell_is_set(self, cell_ref):
+        """Whether a cell has been explicitly written (address string or index
+        tuple)."""
+        try:
+            return self._to_index(cell_ref) in self._get_grid_store()
+        except (TypeError, ValueError):
+            return False
+
+    def _grid_cells_set(self, cell_refs):
+        """Whether every cell reference has been explicitly written."""
+        return all(self._grid_cell_is_set(ref) for ref in cell_refs)
+
+    def _build_output_dict(self):
+        """Snapshot the grid store as a cell-ref keyed output dict.
+
+        Tuple keys are converted back to ``'A1'``-style references (extended
+        addresses stay dotted, e.g. ``'A1.B1'``) and each value is converted
+        to its display form, matching the shape of the previous sheet store
+        returned by ``run()``.
         """
-        if not re.match(r'^[A-Za-z]+\d+$', cell_ref):
-            return
-        row, col = parse_address(cell_ref)
-        defining_scope = self.current_scope().get_defining_scope('grid')
-        if defining_scope is None:
-            return
-        if (getattr(self, '_outer_scope_read_only', False)
-                and self._is_outer_scope(defining_scope)):
-            raise RuntimeError(
-                "Cannot assign to 'grid': variables in an outer scope are "
-                f"read-only inside a function at line {line_number}")
-        actual_key = defining_scope._get_case_insensitive_key(
-            'grid', defining_scope.variables) or 'grid'
-        grid = defining_scope.variables.get(actual_key)
-        if isinstance(grid, dict) and 'array' in grid:
-            return
-        if isinstance(grid, dict):
-            self.array_handler.set_array_element(
-                grid, [row - 1, col - 1], value, line_number)
+        result = {}
+        for key, value in self._get_grid_store().items():
+            result[indices_to_address([i + 1 for i in key])] = (
+                self.array_handler.to_display_value(value))
+        return result
 
     def _reset_state(self):
         self.grid.clear()
@@ -2709,8 +2744,8 @@ class GridLangCompiler:
         else:
             self.current_scope().define(
                 var, value, inferred_type, constraints, is_uninitialized=False, line_number=line_number)
-        self.grid[cell] = self.array_handler.flatten_array(
-            value, line_number) if isinstance(value, dict) and 'array' in value else value
+        self._set_grid_cell(cell, self.array_handler.flatten_array(
+            value, line_number) if isinstance(value, dict) and 'array' in value else value)
         self._cell_var_map[cell] = var
 
     def _process_cell_binding_declaration(self, line, line_number=None):
@@ -2777,7 +2812,7 @@ class GridLangCompiler:
             if current_value is not None:
                 converted = self.array_handler.flatten_array(
                     current_value, line_number) if isinstance(current_value, dict) and 'array' in current_value else current_value
-                self.grid[cell_ref] = converted
+                self._set_grid_cell(cell_ref, converted)
                 self._record_output_value(var, converted)
         except NameError:
             pass
@@ -2794,12 +2829,12 @@ class GridLangCompiler:
                     self.array_handler._assign_horizontal_array(
                         cell, value, "{}", line_number=None)
                 except Exception:
-                    self.grid[cell] = value
+                    self._set_grid_cell(cell, value)
         for cell, mapped_var in self._cell_var_map.items():
             if mapped_var.lower() == var_lower:
                 converted = self.array_handler.flatten_array(
                     value, None) if isinstance(value, dict) and 'array' in value else value
-                self.grid[cell] = converted
+                self._set_grid_cell(cell, converted)
 
     def _record_output_value(self, var_name, value):
         """Record values for declared output variables."""
@@ -2876,13 +2911,19 @@ class GridLangCompiler:
         max_row = 0
         max_col = 0
         for cell, value in (self.grid or {}).items():
-            cell_text = str(cell).upper()
-            try:
-                column_text, row_text = split_cell(cell_text)
-            except Exception:
+            if isinstance(cell, str):
+                cell_text = cell.upper()
+                try:
+                    column_text, row_text = split_cell(cell_text)
+                except Exception:
+                    continue
+                row_num = int(row_text)
+                col_num = col_to_num(column_text)
+            elif isinstance(cell, tuple) and len(cell) == 2:
+                row_num = int(cell[0]) + 1
+                col_num = int(cell[1]) + 1
+            else:
                 continue
-            row_num = int(row_text)
-            col_num = col_to_num(column_text)
             max_row = max(max_row, row_num)
             max_col = max(max_col, col_num)
             cell_values[(row_num, col_num)] = self._debug_export_value(value)

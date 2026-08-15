@@ -10,7 +10,9 @@ from units import (
     DIM_ERROR, NA_ERROR, NUM_ERROR, TYPE_ERROR, UNIT_ERROR, VALUE_ERROR,
     ConstraintError, UnitValue, error_value, is_error_value, strip_units,
 )
-from utils import num_to_col, split_cell, col_to_num, iter_interpolation_placeholders, is_sparse_array
+from utils import (
+    indices_to_address, iter_interpolation_placeholders, is_sparse_array,
+)
 
 # Stack of compiler run contexts: ``run()`` pushes the executing compiler and
 # pops it on exit. Used to detect writes that originate from a read-only
@@ -18,23 +20,56 @@ from utils import num_to_col, split_cell, col_to_num, iter_interpolation_placeho
 _ACTIVE_RUNNERS = []
 
 
-class _ListenerGrid(dict):
-    """Grid backing store that notifies the owning compiler on cell writes.
+class _GridStore(dict):
+    """The single grid backing store, held as the predefined ``grid`` variable.
 
-    Every ``self.grid[cell] = value`` write funnels through here so that
-    client variables listening on grid cells can be recomputed when a
-    publisher (push/init) updates one of their dependency cells.
+    Storage is a sparse dict keyed strictly by 0-based numeric index tuples
+    (``(row, col)`` or extended N-D tuples), matching how the grid array is
+    read and written with ``grid{row, col}``. Address-string keys (``'A1'``)
+    are NOT accepted here; the compiler's ``_to_index``/``_set_grid_cell``
+    helpers perform that conversion at the call sites.
+
+    Every write strips units and notifies the owning compiler so that client
+    variables listening on a grid cell are recomputed when a publisher
+    (push/init) updates one of their dependency cells.
     """
 
     def __init__(self, owner=None):
         super().__init__()
         self._grid_owner = owner
 
+    @staticmethod
+    def _normalize_key(key):
+        if isinstance(key, tuple):
+            return key
+        raise TypeError(
+            f"Grid store keys must be numeric index tuples, got {key!r}")
+
+    @staticmethod
+    def _cell_ref(key):
+        return indices_to_address([i + 1 for i in key])
+
     def __setitem__(self, key, value):
+        key = self._normalize_key(key)
         super().__setitem__(key, strip_units(value))
         owner = self._grid_owner
         if owner is not None and hasattr(owner, '_notify_cell_changed'):
-            owner._notify_cell_changed(key, value)
+            owner._notify_cell_changed(self._cell_ref(key), value)
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._normalize_key(key))
+
+    def __contains__(self, key):
+        try:
+            return super().__contains__(self._normalize_key(key))
+        except TypeError:
+            return False
+
+    def get(self, key, default=None):
+        try:
+            return super().get(self._normalize_key(key), default)
+        except TypeError:
+            return default
 
 
 class Scope:

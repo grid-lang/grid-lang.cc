@@ -1420,7 +1420,6 @@ class GridLangControlFlow:
                 arr, indices, value, line_number)
             defining_scope.variables[actual_key] = updated_array
             scope_dict[actual_key] = updated_array
-            self._mirror_grid_cell_write(var_name, indices, value, target=var, line_number=line_number, grid_array=updated_array)
             return True
         return True
 

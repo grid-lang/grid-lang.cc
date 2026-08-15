@@ -553,12 +553,10 @@ class ArrayHandler:
                 implicit_expr, int(row), scope, line_number)
         if isinstance(value, dict) and 'array' in value:
             value = self.to_display_value(value)
-        # ``[A1] := x`` is sugar for ``Let grid![A1] = x``: mirror the write
-        # into the 'grid' array before the cell store is updated so deferred
-        # recomputes observe the new value.
-        self.compiler._write_grid_array_cell(target, value, line_number)
+        # ``[A1] := x`` is sugar for ``Let grid![A1] = x``: the grid store is
+        # the single backing store, so the cell write below IS the grid write.
         if self._update_bound_array_cell(target, value, line_number):
-            self.compiler.grid[target] = value
+            self.compiler._set_grid_cell(target, value)
             return None
         bound_var = self.compiler._cell_var_map.get(target)
         if bound_var:
@@ -588,7 +586,7 @@ class ArrayHandler:
                 pass
         if isinstance(value, dict) and ('_type_name' in value or '_hidden_fields' in value):
             value = public_object_view(value)
-        self.compiler.grid[target] = self.to_display_value(value)
+        self.compiler._set_grid_cell(target, self.to_display_value(value))
         return None
 
     def _reshape_horizontal_two_field_object_array(self, value, expr_part, is_harr):
@@ -679,7 +677,7 @@ class ArrayHandler:
                 cell = num_to_col(c) + str(r)
                 value = self._evaluate_implicit_intersection(
                     expr, r, scope, line_number)
-                self.compiler.grid[cell] = value
+                self.compiler._set_grid_cell(cell, value)
 
     def evaluate_array_operation(self, expr, line_number=None):
         """
@@ -1078,11 +1076,11 @@ class ArrayHandler:
             if rank == 1:
                 for (i0,), val in value.items():
                     cell_to_assign = offset_cell(target, i0, 0)
-                    self.compiler.grid[cell_to_assign] = val
+                    self.compiler._set_grid_cell(cell_to_assign, val)
             else:
                 for (row, col), val in value.items():
                     cell_to_assign = offset_cell(target, col, row)
-                    self.compiler.grid[cell_to_assign] = val
+                    self.compiler._set_grid_cell(cell_to_assign, val)
             return
         if isinstance(value, dict) and 'array' in value:
             # N-D array (column-major flat buffer + declared shape).
@@ -1094,12 +1092,12 @@ class ArrayHandler:
                 for col_idx in range(shape[1]):
                     for row_idx in range(shape[0]):
                         cell_to_assign = offset_cell(target, col_idx, row_idx)
-                        self.compiler.grid[cell_to_assign] = flat_vals[row_idx +
-                                                                       shape[0] * col_idx]
+                        self.compiler._set_grid_cell(cell_to_assign, flat_vals[row_idx +
+                                                                       shape[0] * col_idx])
             else:
                 for i, val in enumerate(flat_vals):
                     cell_to_assign = offset_cell(target, i, 0)
-                    self.compiler.grid[cell_to_assign] = val
+                    self.compiler._set_grid_cell(cell_to_assign, val)
             return
         if isinstance(value, dict):
             # Special-case: spill an object's grid mapping when keys are (row, col) tuples
@@ -1109,12 +1107,12 @@ class ArrayHandler:
                 start_row = int(target[re.search(r'\d', target).start():])
                 for (row, col), val in value.items():
                     cell_to_assign = f"{num_to_col(start_col + (col - 1))}{start_row + (row - 1)}"
-                    self.compiler.grid[cell_to_assign] = val
+                    self.compiler._set_grid_cell(cell_to_assign, val)
                 return
             flattened_values = self.flatten_object_fields(value, line_number)
             for i, val in enumerate(flattened_values):
                 cell_to_assign = offset_cell(target, i, 0)
-                self.compiler.grid[cell_to_assign] = val
+                self.compiler._set_grid_cell(cell_to_assign, val)
             return
         elif isinstance(value, list):
             is_object_array = False
@@ -1133,7 +1131,7 @@ class ArrayHandler:
                         for col_idx, val in enumerate(flattened_values):
                             cell_to_assign = offset_cell(
                                 target, col_idx, row_idx)
-                            self.compiler.grid[cell_to_assign] = val
+                            self.compiler._set_grid_cell(cell_to_assign, val)
                     return
             if is_array_of_two_field_objects:
                 num_objects = len(value)
@@ -1144,15 +1142,15 @@ class ArrayHandler:
                     object_values = value[row_idx]
                     for col_idx in range(len(object_values)):
                         new_cell = f"{num_to_col(start_col + col_idx)}{start_row + row_idx}"
-                        self.compiler.grid[new_cell] = float(
-                            object_values[col_idx])
+                        self.compiler._set_grid_cell(new_cell, float(
+                            object_values[col_idx]))
                 return
             if value and all(isinstance(row, (list, tuple)) for row in value):
                 for row_idx, row in enumerate(value):
                     for col_idx, val in enumerate(row):
                         cell_to_assign = offset_cell(
                             target, col_idx, row_idx)
-                        self.compiler.grid[cell_to_assign] = val
+                        self.compiler._set_grid_cell(cell_to_assign, val)
                 return
             is_vertical = ';' in expr_part.strip(
             )[1:-1] and ',' not in expr_part.strip()[1:-1]
@@ -1160,7 +1158,7 @@ class ArrayHandler:
             for i, val in enumerate(flattened_values):
                 cell_to_assign = offset_cell(
                     target, 0, i) if is_vertical else offset_cell(target, i, 0)
-                self.compiler.grid[cell_to_assign] = val
+                self.compiler._set_grid_cell(cell_to_assign, val)
         elif isinstance(value, dict) and 'array' in value:
             is_vertical = ';' in expr_part.strip(
             )[1:-1] and ',' not in expr_part.strip()[1:-1]
@@ -1170,15 +1168,15 @@ class ArrayHandler:
                 for col_idx in range(shape[1]):
                     for row_idx in range(shape[0]):
                         cell_to_assign = offset_cell(target, col_idx, row_idx)
-                        self.compiler.grid[cell_to_assign] = flattened_values[row_idx +
-                                                                              shape[0] * col_idx]
+                        self.compiler._set_grid_cell(cell_to_assign, flattened_values[row_idx +
+                                                                              shape[0] * col_idx])
             else:
                 for i, val in enumerate(flattened_values):
                     cell_to_assign = offset_cell(
                         target, 0, i) if is_vertical else offset_cell(target, i, 0)
-                    self.compiler.grid[cell_to_assign] = val
+                    self.compiler._set_grid_cell(cell_to_assign, val)
         else:
-            self.compiler.grid[target] = value
+            self.compiler._set_grid_cell(target, value)
 
     def _assign_extended_address(self, target, value, line_number=None):
         """Write to an extended (N-D) address.
@@ -1199,8 +1197,8 @@ class ArrayHandler:
         for i, val in enumerate(flat):
             addr_indices = list(base)
             addr_indices[-1] = base[-1] + i
-            self.compiler.grid[indices_to_address(
-                addr_indices)] = self.to_display_value(val)
+            self.compiler._set_grid_cell(indices_to_address(
+                addr_indices), self.to_display_value(val))
 
     def assign_range(self, sr_ref, er_ref, vals, line_number=None):
         """
@@ -1241,26 +1239,26 @@ class ArrayHandler:
                     for i, r in enumerate(range(sr, er + 1)):
                         cell = num_to_col(sc) + str(r)
                         value = flat_vals[i % len(flat_vals)]
-                        self.compiler.grid[cell] = value
+                        self.compiler._set_grid_cell(cell, value)
                 elif num_cols > 1 and num_rows == 1:  # Horizontal assignment
                     for i, c in enumerate(range(sc, ec + 1)):
                         cell = num_to_col(c) + str(sr)
                         value = flat_vals[i % len(flat_vals)]
-                        self.compiler.grid[cell] = value
+                        self.compiler._set_grid_cell(cell, value)
                 elif array_length == num_cols:  # Repeat across rows (broadcast over first dim)
                     for r in range(sr, er + 1):
                         for c in range(sc, ec + 1):
                             col_idx = c - sc
                             cell = num_to_col(c) + str(r)
                             value = flat_vals[col_idx]
-                            self.compiler.grid[cell] = value
+                            self.compiler._set_grid_cell(cell, value)
                 else:  # Cycle over the range
                     idx = 0
                     for r in range(sr, er + 1):
                         for c in range(sc, ec + 1):
                             cell = num_to_col(c) + str(r)
                             value = flat_vals[idx % len(flat_vals)]
-                            self.compiler.grid[cell] = value
+                            self.compiler._set_grid_cell(cell, value)
                             idx += 1
             elif len(effective_shape) > 1:
                 if effective_shape[0] == num_rows and effective_shape[1] == num_cols:
@@ -1269,7 +1267,7 @@ class ArrayHandler:
                         for r in range(num_rows):
                             cell = num_to_col(sc + c) + str(sr + r)
                             value = flat_vals[r + effective_shape[0] * c]
-                            self.compiler.grid[cell] = value
+                            self.compiler._set_grid_cell(cell, value)
                 elif effective_shape[0] == num_cols and effective_shape[1] == num_rows and num_cols == 1:
                     reshaped = [[flat_vals[i]] for i in range(len(flat_vals))]
                     idx = 0
@@ -1277,14 +1275,14 @@ class ArrayHandler:
                         for c in range(sc, sc + num_cols):
                             cell = num_to_col(c) + str(r)
                             value = reshaped[idx][0]
-                            self.compiler.grid[cell] = value
+                            self.compiler._set_grid_cell(cell, value)
                             idx += 1
                 elif effective_shape[0] == num_rows and effective_shape[1] == num_cols == 1:
                     idx = 0
                     for r in range(sr, sr + effective_shape[0]):
                         cell = num_to_col(sc) + str(r)
                         value = flat_vals[idx]
-                        self.compiler.grid[cell] = value
+                        self.compiler._set_grid_cell(cell, value)
                         idx += 1
                 else:
                     raise ValueError(
@@ -1294,7 +1292,7 @@ class ArrayHandler:
                 for c in range(sc, ec + 1):
                     cell = num_to_col(c) + str(r)
                     value = flat_vals[0]
-                    self.compiler.grid[cell] = value
+                    self.compiler._set_grid_cell(cell, value)
 
     def _assign_extended_range(self, sr_ref, er_ref, vals, line_number=None):
         """Assign values to an extended (N-D) range.
@@ -1325,8 +1323,8 @@ class ArrayHandler:
                 rem //= dim_size
             addr = indices_to_address(
                 [starts[i] + idxs[i] for i in range(len(shape))])
-            self.compiler.grid[addr] = self.to_display_value(
-                flat_vals[flat_i % len(flat_vals)])
+            self.compiler._set_grid_cell(addr, self.to_display_value(
+                flat_vals[flat_i % len(flat_vals)]))
 
     def get_range_values(self, s_cell, e_cell, line_number=None):
         """
@@ -1395,11 +1393,15 @@ class ArrayHandler:
         :param line_number: Line number.
         :return: Cell value.
         """
-        # Case-insensitive lookup
-        cell_ref_upper = cell_ref.upper()
-        for key, value in self.compiler.grid.items():
-            if isinstance(key, str) and key.upper() == cell_ref_upper:
-                return value
+        # The grid store is keyed by 0-based numeric index tuples; convert the
+        # cell reference (case-insensitive) before looking it up.
+        store = self.compiler.grid
+        try:
+            key = tuple(i - 1 for i in parse_address(cell_ref))
+        except ValueError:
+            key = None
+        if key is not None and key in store:
+            return store[key]
         if '.' in cell_ref:
             # Extended addresses fall back to any matching grid DIM tensor.
             value = self._lookup_extended_address(cell_ref, line_number)

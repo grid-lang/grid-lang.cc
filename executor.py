@@ -8,7 +8,7 @@ from array_handler import ArrayHandler
 from control_flow import GridLangControlFlow
 from parser import GridLangParser
 from units import VALUE_ERROR, ConstraintError, error_value
-from utils import col_to_num, num_to_col, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array
+from utils import col_to_num, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array
 
 
 IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*')
@@ -1291,21 +1291,6 @@ class GridLangExecutor:
         scope_dict[obj_name] = obj_value
         return True
 
-    def _mirror_grid_cell_write(self, var_name, indices, value, target=None, line_number=None, grid_array=None):
-        """Unified store: every 2D write to the predefined 'grid' variable is
-        mirrored into the sheet cell store, so ``grid{2, 2}`` and ``grid![B2]``
-        both set cell B2 (and ``[B2] := x`` is their sugar). Type instances
-        keep private grids that never mirror into the sheet."""
-        if (var_name.lower() != 'grid' or len(indices) != 2
-                or not isinstance(indices[0], int) or not isinstance(indices[1], int)):
-            return
-        scopes = getattr(self.compiler, 'scopes', None)
-        predefined = scopes[0].variables.get('grid') if scopes else None
-        if grid_array is not None and grid_array is not predefined:
-            return
-        cell_ref = num_to_col(indices[1] + 1) + str(indices[0] + 1)
-        self.compiler.grid[cell_ref] = value
-
     def _try_handle_let_index_assignment(
             self, var, expr, scope_dict, line_number):
         var_name, indices = self.expr_evaluator._parse_index_target(
@@ -1342,7 +1327,6 @@ class GridLangExecutor:
             arr, indices, value, line_number)
         defining_scope.variables[actual_key] = updated_array
         scope_dict[actual_key] = updated_array
-        self._mirror_grid_cell_write(var_name, indices, value, target=var, line_number=line_number, grid_array=updated_array)
         return True
 
     def _infer_declared_type(self, expr, evaluated_value, line_number):
@@ -1994,7 +1978,7 @@ class GridLangExecutor:
         guard_entries = self._run_prepare_execution(
             lines, label_lines, dim_lines, args)
         if guard_entries is None:
-            return self.grid
+            return self._build_output_dict()
         guard_conditions = {entry['line_number']: entry['condition']
                             for entry in guard_entries}
         self._run_main_loop(lines, guard_conditions)
@@ -2004,7 +1988,7 @@ class GridLangExecutor:
                 self.global_guard_allows_execution = False
                 self.grid.clear()
                 self.output_values.clear()
-                return self.grid
+                return self._build_output_dict()
 
         self._resolve_pending_assignments()
 
@@ -2017,7 +2001,7 @@ class GridLangExecutor:
 
         if return_output:
             return self.output_values
-        return self.grid
+        return self._build_output_dict()
 
     def _run_main_loop(self, lines, guard_conditions):
         """Thin orchestrator for main execution loop."""
@@ -3935,19 +3919,13 @@ class GridLangExecutor:
                     if all(isinstance(k, tuple) and len(k) == 2 for k in evaluated_value.keys()):
                         for (row, col), val in evaluated_value.items():
                             if isinstance(row, (int, float)) and isinstance(col, (int, float)):
-                                grid_row = int(row) + 1
-                                grid_col = int(col) + 1
-                                col_letter = num_to_col(grid_col)
-                                cell_ref = f"{col_letter}{grid_row}"
-                                self.grid[cell_ref] = val
+                                self.grid[(int(row), int(col))] = val
                     elif 'grid' in evaluated_value:
                         grid_dict = evaluated_value['grid']
                         if isinstance(grid_dict, dict):
                             for (row, col), val in grid_dict.items():
                                 if isinstance(row, int) and isinstance(col, int):
-                                    col_letter = num_to_col(col + 1)
-                                    cell_ref = f"{col_letter}{row + 1}"
-                                    self.grid[cell_ref] = val
+                                    self.grid[(row, col)] = val
                         else:
                             self.array_handler._assign_horizontal_array(
                                 array_cell_ref, evaluated_value, value, line_number=line_number)
@@ -3963,24 +3941,14 @@ class GridLangExecutor:
                 is_grid_value = '.grid{' in value
                 evaluated_value = self.expr_evaluator.eval_or_eval_array(
                     value, scope_value, line_number, is_grid_dim=is_grid_value)
-                self._write_grid_array_cell(cell_ref, evaluated_value, line_number)
-                self.grid[cell_ref] = self.array_handler.to_display_value(
-                    evaluated_value)
+                # ``[A1] := x`` is sugar for ``Let grid![A1] = x``: the grid
+                # store is the single backing store for both forms.
+                self._set_grid_cell(cell_ref, self.array_handler.to_display_value(
+                    evaluated_value))
         except Exception as e:
             raise RuntimeError(
                 f"Error evaluating '{value}': {e} at line {line_number}")
         return True, i + 1
-
-    def _write_grid_array_cell(self, cell_ref, value, line_number=None):
-        """``[A1] := x`` is sugar for ``Let grid![A1] = x``: mirror a
-        single-cell write into the 'grid' array so grid{...} reads see it.
-
-        The array write happens before the cell store is updated so deferred
-        recomputes observe the new value. In functions 'grid' resolves to the
-        caller's variable and is rejected by the generic outer-scope read-only
-        rule.
-        """
-        self.compiler._write_grid_array_cell(cell_ref, value, line_number)
 
     def _handle_when_block(self, lines, i, line, line_number):
         when_match = re.match(
@@ -4813,7 +4781,6 @@ class GridLangExecutor:
             arr, indices, value, line_number)
         defining_scope.variables[actual_key] = updated_array
         defining_scope.uninitialized.discard(actual_key)
-        self._mirror_grid_cell_write(var_name, indices, value, line_number=line_number, grid_array=updated_array)
         return
 
     def _print_outputs(self):
@@ -4958,7 +4925,7 @@ class GridLangExecutor:
         if not dep:
             return False
         if re.match(r'^[A-Za-z]+\d+$', dep):
-            return dep not in self.grid
+            return not self._grid_cell_is_set(dep)
         if dep.lower() in (self.functions or {}):
             return False
         if dep.lower() in self.undefined_dependencies:
