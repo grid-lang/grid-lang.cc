@@ -1,6 +1,18 @@
 import re
 
+from units import UNIVERSAL_ZERO
+
 _DEFINITION_AND_SPLIT = re.compile(r'\s+and\s+(?![<>=]|not\b)', re.I)
+
+_ARRAY_CELL_INDEX = re.compile(
+    r'\b([A-Za-z_][A-Za-z0-9_]*)\s*!\s*\[[^\]\[]*\]')
+
+
+def strip_array_cell_indices(expr):
+    """Rewrite 'var![...]' array-cell index expressions to the bare variable
+    name so cell addresses inside them are not mistaken for standalone grid
+    cells when extracting dependencies."""
+    return _ARRAY_CELL_INDEX.sub(r'\1', expr)
 
 
 def iter_interpolation_placeholders(text):
@@ -274,6 +286,8 @@ def is_sparse_array(value):
 
 def format_display_value(value, sig_digits=15):
     """Format values for display by trimming floating-point artifacts."""
+    if value is UNIVERSAL_ZERO:
+        return "{ }"
     if isinstance(value, float):
         if value != value:
             return "nan"

@@ -69,7 +69,7 @@ class GridLangParser:
                 i += 1
                 continue
             if keyword == 'not':
-                if next_part.lower() == 'null':
+                if next_part.lower() in ('null'):
                     constraints['not_null'] = True
                     i += 2
                     continue
@@ -143,6 +143,16 @@ class GridLangParser:
                 constraints['init'] = next_part
             elif keyword == 'index':
                 constraints['index'] = next_part
+            elif keyword == 'or':
+                # 'or = <expr>' gives a null-default: null (#N/A) values read
+                # as the evaluated default on access.
+                if i + 1 < len(parts) and parts[i + 1] == '=':
+                    constraints['default'] = (
+                        parts[i + 2].strip() if i + 2 < len(parts) else '')
+                    i += 3
+                    continue
+                i += 1
+                continue
             elif keyword == '=':
                 self._check_comparison_series(parts, i, line_number)
                 if next_part.startswith('{'):
@@ -402,7 +412,7 @@ class GridLangParser:
 
     def _split_on_keywords(self, text):
         """Split a variable definition on keywords, skipping quoted sections."""
-        keywords = ['<=', '>=', '<>', '<', '>', '=', 'as', 'of', 'dim', 'in', 'init', 'index', 'and', 'not']
+        keywords = ['<=', '>=', '<>', '<', '>', '=', 'as', 'of', 'dim', 'in', 'init', 'index', 'and', 'not', 'or']
         parts = []
         current = ""
         in_quote = False
@@ -447,6 +457,17 @@ class GridLangParser:
                                        ] if i + len(kw) < len(text) else ' '
                             if prev.isalnum() or prev == '_' or nxt.isalnum() or nxt == '_':
                                 continue
+                        if kw == 'or':
+                            # 'or' only separates the 'or = <default>'
+                            # null-default clause; 'or' used as a union
+                            # (type/dim) stays part of the current token.
+                            j = i + len(kw)
+                            while j < len(text) and text[j] == ' ':
+                                j += 1
+                            if j >= len(text) or text[j] != '=':
+                                continue
+                            matched = kw
+                            break
                         matched = kw
                         break
 

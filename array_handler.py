@@ -11,7 +11,7 @@ from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell
 from functools import reduce
 import operator
 import itertools
-from units import DIM_ERROR, NA_ERROR, REF_ERROR, TYPE_ERROR, ConstraintError, error_value, is_error_value
+from units import DIM_ERROR, NA_ERROR, REF_ERROR, TYPE_ERROR, UNIVERSAL_ZERO, ConstraintError, error_value, is_error_value
 
 
 class ArrayHandler:
@@ -51,7 +51,7 @@ class ArrayHandler:
                 return self.lookup_cell(cell_ref, line_number)
             row, col = parse_address(cell_ref)[:2]
             return self.get_array_element(
-                arr, [row - 1, col - 1], line_number)
+                arr, [row - 1, col - 1], line_number, var_name=var_name)
         # Convert to Python list for indexing
         nd_shape = None
         sparse_arr = False
@@ -59,7 +59,8 @@ class ArrayHandler:
             nd_shape = list(arr.get('shape') or arr.get('original_shape') or [])
             arr = arr['array']
         else:
-            sparse_arr = is_sparse_array(arr)
+            sparse_arr = is_sparse_array(arr) or (
+                isinstance(arr, dict) and not arr)
         if isinstance(arr, list) or sparse_arr:
             arr_pylist = arr
         else:
@@ -71,15 +72,23 @@ class ArrayHandler:
             indices = parse_address(cell_ref)
             return self.get_array_element(
                 arr, [i - 1 for i in indices], line_number,
-                original_shape=nd_shape)
+                original_shape=nd_shape, var_name=var_name)
 
         # Validate and parse cell reference
         parse_address(cell_ref)
         col, _ = split_cell(cell_ref)
         col_num = col_to_num(col)  # 1-based column number (A=1, B=2, etc.)
 
-        # Assume 0-based index for the second dimension (e.g., Quarter)
-        quarter_index = col_num - 1
+        # Sparse arrays are unbound: any cell is a valid address and an
+        # unset one reads as #N/A (or the declared default).
+        if sparse_arr:
+            col, row = split_cell(cell_ref)
+            col_idx = col_to_num(col) - 1  # 0-based column index
+            row_idx = int(row) - 1  # 0-based row index
+            value = arr.get((row_idx, col_idx))
+            if value is None:
+                return self._array_unset_value(var_name, line_number)
+            return value
 
         # Get array dimensions
         dims = self.compiler.dimensions.get(var_name, [])
@@ -94,14 +103,6 @@ class ArrayHandler:
             col, row = split_cell(cell_ref)
             col_idx = col_to_num(col) - 1  # 0-based column index
             row_idx = int(row) - 1  # 0-based row index
-
-            # Sparse arrays are unbound: any cell is a valid address and an
-            # unset one reads as #N/A.
-            if sparse_arr:
-                value = arr.get((row_idx, col_idx))
-                if value is None:
-                    return error_value(NA_ERROR)
-                return value
 
             if row_idx < 0 or row_idx >= rows:
                 raise IndexError(
@@ -826,7 +827,7 @@ class ArrayHandler:
 
             if value is None:  # Read
                 return self.get_array_element(
-                    arr, [row_idx, col_idx], line_number)
+                    arr, [row_idx, col_idx], line_number, var_name=var_name)
             else:  # Write
                 flat_value = self.flatten_array(value, line_number)
                 if isinstance(arr, list):
@@ -896,7 +897,7 @@ class ArrayHandler:
                     idx_list.append(idx_val)
                 if value is None:  # Read
                     return self.get_array_element(
-                        arr, idx_list, line_number)
+                        arr, idx_list, line_number, var_name=var_name)
                 updated = self.set_array_element(
                     arr, idx_list, flat_value[0] if flat_value else 0, line_number)
                 self.compiler.current_scope().update(var_name, updated, line_number)
@@ -1386,9 +1387,48 @@ class ArrayHandler:
             flat_values.append(self.lookup_cell(addr, line_number))
         return self._nested_from_flat(flat_values, shape)
 
+    def _array_unset_value(self, var_name, line_number=None):
+        """Value read back for an unset item of an array variable.
+
+        Without a 'default' constraint, unset items read as #N/A. With a
+        constraint like ``Let grid not null or = None`` (or ``Let x as
+        number dim * not null or = None``), unset (#N/A) items read as the
+        evaluated default instead. The grid is just an array whose variable
+        is 'grid'.
+        """
+        constraints = {}
+        scope = None
+        try:
+            scope = self.compiler.scopes[0]
+        except (AttributeError, IndexError):
+            pass
+        try:
+            defining_scope = self.compiler.current_scope().get_defining_scope(
+                var_name)
+            if defining_scope is not None:
+                key = defining_scope._get_case_insensitive_key(
+                    var_name, defining_scope.constraints)
+                if key:
+                    constraints = defining_scope.constraints[key]
+        except Exception:
+            pass
+        if not constraints and scope is not None:
+            key = scope._get_case_insensitive_key(var_name, scope.constraints)
+            if key:
+                constraints = scope.constraints[key]
+        default_expr = constraints.get('default')
+        if default_expr is not None:
+            try:
+                return self.compiler.expr_evaluator.eval_expr(
+                    str(default_expr), scope.get_evaluation_scope())
+            except Exception:
+                pass
+        return error_value(NA_ERROR)
+
     def lookup_cell(self, cell_ref, line_number=None):
         """
-        Lookup value in a grid cell, default to 0 if unset.
+        Lookup value in a grid cell, default to #N/A (or the grid's null
+        default) if unset.
         :param cell_ref: Cell reference.
         :param line_number: Line number.
         :return: Cell value.
@@ -1407,7 +1447,7 @@ class ArrayHandler:
             value = self._lookup_extended_address(cell_ref, line_number)
             if value is not None:
                 return value
-        return 0
+        return self._array_unset_value('grid', line_number)
 
     def _iter_scopes(self):
         scope = self.compiler.current_scope()
@@ -1837,7 +1877,7 @@ class ArrayHandler:
         """
         flat = self.flatten_array(value, line_number)
         for element in flat:
-            if element is None or is_error_value(element):
+            if element is None or element is UNIVERSAL_ZERO or is_error_value(element):
                 continue
             if isinstance(element, (list, dict)):
                 continue
@@ -1927,6 +1967,13 @@ class ArrayHandler:
             resolved_dims.append((name, size_spec))
         dims = resolved_dims
         self.compiler.dimensions[var] = dims
+        if isinstance(value, dict) and not value and any(
+                self._is_unbounded_size_spec(size_spec)
+                for _, size_spec in dims):
+            # Fresh sparse array from a declaration without a value
+            # expression; it grows on write and unset items read the
+            # default (#N/A) on access.
+            return value
         if dims == []:
             if isinstance(value, (list, tuple)) or (
                     isinstance(value, dict) and 'array' in value):
@@ -2190,7 +2237,8 @@ class ArrayHandler:
         """Return a dense list of values in the given (1-based) grid row.
 
         ``grid_source`` is the grid array (sparse or dense) or a cell-ref
-        dict. Unset cells within the grid's used extent read as 0.
+        dict. Unset cells within the grid's used extent read as the unset
+        value (#N/A, or the declared default).
         """
         grid_source = grid_source if grid_source is not None else self.compiler.grid
         max_row, max_col = self._grid_source_extent(grid_source)
@@ -2204,16 +2252,22 @@ class ArrayHandler:
             if row_index < 1 or row_index > rows:
                 return []
             return [flat[row_index - 1 + rows * c] for c in range(cols)]
+        unset = object()
         row = []
         for col in range(1, max_col + 1):
-            row.append(grid_source.get((row_index - 1, col - 1), 0))
+            key = (row_index - 1, col - 1)
+            value = grid_source.get(key, unset)
+            if value is unset:
+                value = self._array_unset_value('grid', line_number)
+            row.append(value)
         return row
 
     def get_grid_column(self, col_ref, grid_source=None, line_number=None):
         """Return a dense list of values in the given grid column.
 
         ``col_ref`` is a column letter (e.g. 'A') or a 1-based column number;
-        unset cells within the grid's used extent read as 0.
+        unset cells within the grid's used extent read as the unset value
+        (#N/A, or the declared default).
         """
         grid_source = grid_source if grid_source is not None else self.compiler.grid
         if isinstance(col_ref, str) and re.match(r'^[A-Za-z]+$', col_ref):
@@ -2231,10 +2285,17 @@ class ArrayHandler:
             if col_num < 1 or col_num > cols:
                 return []
             return [flat[r + rows * (col_num - 1)] for r in range(rows)]
-        return [grid_source.get((r, col_num - 1), 0)
-                for r in range(max_row)]
+        unset = object()
+        values = []
+        for r in range(max_row):
+            key = (r, col_num - 1)
+            value = grid_source.get(key, unset)
+            if value is unset:
+                value = self._array_unset_value('grid', line_number)
+            values.append(value)
+        return values
 
-    def get_array_element(self, arr, indices, line_number=None, return_struct=False, original_shape=None):
+    def get_array_element(self, arr, indices, line_number=None, return_struct=False, original_shape=None, var_name=None):
         """
         Get an element from an array using indices.
         :param arr: Array or dict with 'array' key.
@@ -2242,6 +2303,8 @@ class ArrayHandler:
         :param line_number: Line number.
         :param return_struct: Return struct if True.
         :param original_shape: Original shape if provided.
+        :param var_name: Array variable name, used to apply a 'default'
+            constraint to unset items.
         :return: Element value.
         """
         # Handle dictionary with array (e.g., from grid DIM or N-D storage)
@@ -2264,6 +2327,8 @@ class ArrayHandler:
                     f"Expected {rank} indices for array, got {len(indices)} at line {line_number}")
             result = arr.get(tuple(indices))
             if result is None:
+                if var_name:
+                    return self._array_unset_value(var_name, line_number)
                 return error_value(NA_ERROR)
             return result
 
@@ -2316,7 +2381,7 @@ class ArrayHandler:
             raise TypeError(
                 f"Cannot index non-array type {type(arr)} at line {line_number}")
 
-    def read_array_element(self, arr, indices, line_number=None, return_struct=False, original_shape=None):
+    def read_array_element(self, arr, indices, line_number=None, return_struct=False, original_shape=None, var_name=None):
         """Read an element from an array; an invalid address produces the
         sticky ``#REF`` error value instead of raising."""
         if is_error_value(arr):
@@ -2324,11 +2389,12 @@ class ArrayHandler:
             return error_value(code)
         try:
             return self.get_array_element(
-                arr, indices, line_number, return_struct, original_shape)
+                arr, indices, line_number, return_struct, original_shape,
+                var_name)
         except (IndexError, ConstraintError):
             return error_value(REF_ERROR)
 
-    def read_array_slice(self, arr, specs, line_number=None):
+    def read_array_slice(self, arr, specs, line_number=None, var_name=None):
         """Read a sub-array selected by ``*`` / ``n to m`` / scalar specs.
 
         ``specs`` holds one selector per declared dimension, already adjusted
@@ -2348,7 +2414,7 @@ class ArrayHandler:
         if all(isinstance(s, int) for s in specs):
             try:
                 return self.get_array_element(
-                    arr, specs, line_number)
+                    arr, specs, line_number, var_name=var_name)
             except (IndexError, ConstraintError):
                 return error_value(REF_ERROR)
         # Sparse unbounded (star-dim) arrays: dict keyed by index tuples.

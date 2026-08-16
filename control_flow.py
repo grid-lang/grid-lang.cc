@@ -4,6 +4,7 @@ Handles FOR loops, IF statements, LET statements, and block processing.
 """
 
 import re
+from units import UNIVERSAL_ZERO
 from utils import num_to_col, split_var_defs, is_sparse_array
 
 # Regex patterns for block parsing
@@ -1069,7 +1070,6 @@ class GridLangControlFlow:
         current_scope = self.compiler.current_scope()
         unresolved = any(
             self.compiler.has_unresolved_dependency(dep, scope=current_scope)
-            or not current_scope.get_defining_scope(dep)
             for dep in deps
         )
         if unresolved:
@@ -1308,6 +1308,10 @@ class GridLangControlFlow:
                 defining_scope = None
             if defining_scope:
                 if constraints:
+                    if var in defining_scope.constraints:
+                        merged = dict(defining_scope.constraints[var])
+                        merged.update(constraints)
+                        constraints = merged
                     defining_scope.constraints[var] = constraints
                 if expr is None and var in defining_scope.variables and defining_scope.variables[var] is not None:
                     continue
@@ -1577,7 +1581,7 @@ class GridLangControlFlow:
         scope = current_scope.get_evaluation_scope()
         scope.setdefault('true', True)
         scope.setdefault('false', False)
-        scope.setdefault('none', None)
+        scope.setdefault('none', UNIVERSAL_ZERO)
         if left_expr.strip() in current_scope.variables:
             scope[left_expr.strip()] = current_scope._wrap_for_eval(
                 left_expr.strip(), current_scope.variables[left_expr.strip()])

@@ -8,7 +8,7 @@ from array_handler import ArrayHandler
 from control_flow import GridLangControlFlow
 from parser import GridLangParser
 from units import VALUE_ERROR, ConstraintError, error_value
-from utils import col_to_num, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array
+from utils import col_to_num, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array, strip_array_cell_indices
 
 
 IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*')
@@ -153,7 +153,7 @@ class GridLangExecutor:
         """Return identifiers referenced in an expression string."""
         if not expr:
             return set()
-        cleaned = _strip_constraint_operands(expr)
+        cleaned = strip_array_cell_indices(_strip_constraint_operands(expr))
         tokens = IDENTIFIER_TOKEN_PATTERN.findall(cleaned)
         dependencies = set()
         for token in tokens:
@@ -1425,6 +1425,41 @@ class GridLangExecutor:
                 define_scope.mark_implicit_let(var)
             defining_scope = define_scope
 
+        # A declaration like `Let d not null dim {*,*} or = none` has no value
+        # expression, but the dim constraint still materializes the array;
+        # unset items then read the default (or #N/A without one).
+        if expr is None and constraints.get('dim'):
+            dim_value = self._create_declared_dim_array(
+                var, type_name, constraints, line_number)
+            if dim_value is not None:
+                search_scope.update(var, dim_value, line_number)
+                if scope_dict is not None:
+                    scope_dict[var] = dim_value
+                return 'bound'
+
+        if expr is None and constraints.get('default') is not None:
+            # A declaration like `Let x not null or = None` binds the
+            # evaluated default so the value behaves like 0 / False in
+            # boolean and equality contexts (None evaluates to the universal
+            # zero sentinel, not plain Python None).
+            try:
+                default_value = self.expr_evaluator.eval_expr(
+                    str(constraints['default']),
+                    search_scope.get_evaluation_scope(),
+                    line_number)
+                if type_name:
+                    default_value, constraints = defining_scope._coerce_custom_type_value(
+                        type_name, default_value, constraints, line_number)
+                    actual_constraint_key = defining_scope._get_case_insensitive_key(
+                        var, defining_scope.constraints) or var
+                    defining_scope.constraints[actual_constraint_key] = constraints
+                search_scope.update(var, default_value, line_number)
+                if scope_dict is not None:
+                    scope_dict[var] = default_value
+                return 'bound'
+            except Exception:
+                return None
+
         if expr is None:
             return None
 
@@ -1484,6 +1519,40 @@ class GridLangExecutor:
             self.pending_assignments[var] = (
                 expr, line_number, set(missing), constraints)
             return 'deferred'
+
+    def _create_declared_dim_array(self, var, type_name, constraints, line_number):
+        """Materialize an array for a declaration that carries a 'dim'
+        constraint but no value expression (e.g. ``Let d not null dim {*,*}
+        or = none``). Unbounded (star) dims give a sparse array keyed by index
+        tuples; bounded dims give a dense buffer filled with the type default.
+        Returns None when the dim constraint is not materializable here.
+        """
+        dim_spec = constraints.get('dim')
+        if isinstance(dim_spec, dict) and 'dims' in dim_spec:
+            dims = dim_spec['dims']
+        elif isinstance(dim_spec, list):
+            dims = dim_spec
+        else:
+            return None
+        if not dims:
+            return None
+        if any(self.array_handler._is_unbounded_size_spec(size_spec)
+               for _, size_spec in dims):
+            return {}
+        shape = []
+        for _, size_spec in dims:
+            if not isinstance(size_spec, int):
+                return None
+            shape.append(size_spec)
+        if type_name and type_name.lower() in self.types_defined:
+            return self.array_handler.create_object_array(
+                shape, None, line_number)
+        pa_type = (type_name or '').lower()
+        if pa_type not in ('number', 'text', 'logical'):
+            pa_type = 'number'
+        default_value = 0 if pa_type == 'number' else None
+        return self.array_handler.create_array(
+            shape, default_value, pa_type, line_number)
 
     def _let_values_match(self, a, b):
         """Compare two bound values, tolerating numeric vs. unit forms."""
@@ -4925,7 +4994,11 @@ class GridLangExecutor:
         if not dep:
             return False
         if re.match(r'^[A-Za-z]+\d+$', dep):
-            return not self._grid_cell_is_set(dep)
+            if self._grid_cell_is_set(dep):
+                return False
+            # Unset cells only stay pending while they are truly missing; with
+            # a grid default they are readable and never block.
+            return not self._grid_has_default()
         if dep.lower() in (self.functions or {}):
             return False
         if dep.lower() in self.undefined_dependencies:

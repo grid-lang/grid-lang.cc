@@ -7,8 +7,9 @@ import copy
 import re
 
 from units import (
-    DIM_ERROR, NA_ERROR, NUM_ERROR, TYPE_ERROR, UNIT_ERROR, VALUE_ERROR,
-    ConstraintError, UnitValue, error_value, is_error_value, strip_units,
+    DIM_ERROR, NA_ERROR, NUM_ERROR, TYPE_ERROR, UNIT_ERROR, UNIVERSAL_ZERO,
+    VALUE_ERROR, ConstraintError, UnitValue, error_value, is_error_value,
+    strip_units,
 )
 from utils import (
     indices_to_address, iter_interpolation_placeholders, is_sparse_array,
@@ -237,6 +238,44 @@ class Scope:
             return tuple(self._strip_init_copy_immutability(item) for item in value)
         return value
 
+    def _coerce_universal_zero(self, value, var_type):
+        """Turn the `None` sentinel into the declared base type's zero.
+
+        Applied to typed values: a ``number`` variable stores 0, a ``logical``
+        variable stores ``False``, a ``text`` variable stores ``""``. For typed
+        arrays, every element is coerced. Untyped variables keep the sentinel
+        so operators/functions can coerce it contextually.
+        """
+        if value is UNIVERSAL_ZERO:
+            if var_type == 'number':
+                return 0
+            if var_type == 'logical':
+                return False
+            if var_type == 'text':
+                return ""
+            return value
+        if isinstance(value, dict) and 'array' in value:
+            inner = value.get('array')
+            if isinstance(inner, list):
+                result = dict(value)
+                result['array'] = [
+                    self._coerce_universal_zero(item, var_type)
+                    for item in inner]
+                return result
+            return value
+        if isinstance(value, dict) and value and all(
+                isinstance(k, tuple) for k in value.keys()):
+            return {
+                k: self._coerce_universal_zero(v, var_type)
+                for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._coerce_universal_zero(item, var_type)
+                    for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._coerce_universal_zero(item, var_type)
+                         for item in value)
+        return value
+
     def _materialize_lazy_init_value(self, name, value, line_number=None):
         actual_key = self._get_case_insensitive_key(name, self.variables) or name
         try:
@@ -253,6 +292,7 @@ class Scope:
 
         materialized, runtime_unit = self._unit_convert(
             actual_key, materialized, constraints, line_number)
+        materialized = self._coerce_universal_zero(materialized, var_type)
         if materialized is not None and not is_error_value(materialized) and var_type and hasattr(self, 'compiler'):
             materialized, constraints = self._coerce_custom_type_value(
                 var_type, materialized, constraints, line_number)
@@ -308,6 +348,7 @@ class Scope:
                 f"Variable '{name}' conflicts with existing variable '{existing_key}' in this scope")
         value, runtime_unit = self._unit_convert(
             name, value, effective_constraints, line_number)
+        value = self._coerce_universal_zero(value, type)
         if value is not None and not is_error_value(value) and type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
             value, effective_constraints = self._coerce_custom_type_value(
                 type, value, effective_constraints, line_number)
@@ -361,6 +402,7 @@ class Scope:
                 constraints = defining_scope.constraints.get(actual_key, {})
                 value, runtime_unit = self._unit_convert(
                     name, value, constraints, line_number)
+                value = self._coerce_universal_zero(value, var_type)
                 if value is not None and not is_error_value(value) and var_type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
                     value, constraints = defining_scope._coerce_custom_type_value(
                         var_type, value, constraints, line_number)
@@ -402,6 +444,8 @@ class Scope:
                 # Variable exists in types or constraints but not variables
                 value, runtime_unit = self._unit_convert(
                     name, value, defining_scope.constraints.get(name, {}), line_number)
+                value = self._coerce_universal_zero(
+                    value, defining_scope.types.get(name))
                 if not is_error_value(value):
                     try:
                         defining_scope._check_constraints(name, value, line_number)

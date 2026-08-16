@@ -6,10 +6,11 @@ import sys
 import copy
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
-from utils import col_to_num, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT, is_sparse_array
+from utils import col_to_num, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT, is_sparse_array, strip_array_cell_indices
 from scope import Scope, _GridStore
 from units import (
-    UNIT_ERROR, UnitValue, error_value, is_error_value, strip_units,
+    UNIT_ERROR, UNIVERSAL_ZERO, UnitValue, error_value, is_error_value,
+    strip_units,
 )
 from control_flow import GridLangControlFlow
 from type_processor import GridLangTypeProcessor
@@ -1682,7 +1683,7 @@ class GridLangCompiler:
         if not expr or scope is None:
             return
         deps = set()
-        cleaned = _strip_constraint_operands(expr)
+        cleaned = strip_array_cell_indices(_strip_constraint_operands(expr))
         for token in _IDENTIFIER_TOKEN_PATTERN.findall(cleaned):
             if not token:
                 continue
@@ -1848,6 +1849,11 @@ class GridLangCompiler:
         if re.match(r'^[A-Za-z]+\d+$', name):
             if self._grid_cell_is_set(name):
                 return False
+            if self._grid_has_default():
+                # With a grid default (``Let grid not null or = None``) unset
+                # cells are readable (they yield the default), so they never
+                # block dependent lines.
+                return False
         scope = scope or self.current_scope()
         # Treat entirely undefined names as unresolved so dependent lines are deferred
         if not scope.get_defining_scope(name):
@@ -1905,6 +1911,19 @@ class GridLangCompiler:
             return self._to_index(cell_ref) in self._get_grid_store()
         except (TypeError, ValueError):
             return False
+
+    def _grid_has_default(self):
+        """Whether the 'grid' variable carries a default constraint (e.g.
+        ``Let grid not null or = None``), so unset cells read the default
+        instead of #N/A."""
+        try:
+            scope = self.scopes[0]
+            key = scope._get_case_insensitive_key('grid', scope.constraints)
+            if key:
+                return scope.constraints[key].get('default') is not None
+        except Exception:
+            pass
+        return False
 
     def _grid_cells_set(self, cell_refs):
         """Whether every cell reference has been explicitly written."""
@@ -2594,7 +2613,7 @@ class GridLangCompiler:
                     built_in_functions = {
                         'sum', 'rows', 'sqrt', 'min', 'max', 'abs', 'int', 'float', 'str', 'len',
                         'to', 'step', 'by', 'mod', 'div', 'and', 'or', 'not', 'new',
-                        'true', 'false'}
+                        'true', 'false', 'none', 'nan', 'inf'}
                     known_funcs = set(getattr(self, 'functions', {}).keys())
                     known_subs = set(getattr(self, 'subprocesses', {}).keys())
                     known_types = set(getattr(self, 'types_defined', {}).keys())

@@ -62,6 +62,136 @@ def error_value(error_code):
     return UnitValue(None, None, error_code=error_code)
 
 
+class UniversalZero:
+    """The GridLang `None` value: a distinct contextual zero.
+
+    ``None`` is neither Python ``None`` nor an empty array. It is a singleton
+    sentinel that behaves as:
+    - 0 when a number is expected (arithmetic, numeric coercion)
+    - ``""`` when a text is expected (string conversion, concatenation)
+    - ``False`` when a logical value is expected (truthiness, comparisons)
+    - ``{}`` when an array is expected (len 0, empty iteration)
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __bool__(self):
+        return False
+
+    def __str__(self):
+        return ""
+
+    def __repr__(self):
+        return "None"
+
+    def __float__(self):
+        return 0.0
+
+    def __int__(self):
+        return 0
+
+    def __index__(self):
+        return 0
+
+    def __len__(self):
+        return 0
+
+    def __iter__(self):
+        return iter(())
+
+    def __eq__(self, other):
+        if other is self:
+            return True
+        if isinstance(other, str):
+            return other == ""
+        if isinstance(other, (int, float)):
+            return other == 0
+        return False
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return 0
+
+    def __add__(self, other):
+        return 0 + other
+
+    def __radd__(self, other):
+        return other + 0
+
+    def __sub__(self, other):
+        return 0 - other
+
+    def __rsub__(self, other):
+        return other - 0
+
+    def __mul__(self, other):
+        return 0 * other
+
+    def __rmul__(self, other):
+        return other * 0
+
+    def __truediv__(self, other):
+        return 0 / other
+
+    def __rtruediv__(self, other):
+        return other / 0
+
+    def __floordiv__(self, other):
+        return 0 // other
+
+    def __rfloordiv__(self, other):
+        return other // 0
+
+    def __mod__(self, other):
+        return 0 % other
+
+    def __rmod__(self, other):
+        return other % 0
+
+    def __pow__(self, other):
+        return 0 ** other
+
+    def __rpow__(self, other):
+        return other ** 0
+
+    def __neg__(self):
+        return 0
+
+    def __pos__(self):
+        return 0
+
+    def __abs__(self):
+        return 0
+
+    def __lt__(self, other):
+        return 0 < other
+
+    def __le__(self, other):
+        return 0 <= other
+
+    def __gt__(self, other):
+        return 0 > other
+
+    def __ge__(self, other):
+        return 0 >= other
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+UNIVERSAL_ZERO = UniversalZero()
+
+
 class ConstraintError(ValueError):
     """Raised internally when an assignment violates a value/type/dim/unit
     constraint. ``code`` names the sticky error value that should be stored."""

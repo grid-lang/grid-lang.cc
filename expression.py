@@ -18,7 +18,7 @@ from utils import (
     format_display_value,
     is_sparse_array,
 )
-from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, REF_ERROR, UnitValue, error_value, is_error_value
+from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, REF_ERROR, UNIVERSAL_ZERO, UnitValue, error_value, is_error_value
 
 
 class CaseInsensitiveDict(dict):
@@ -265,7 +265,7 @@ class ExpressionEvaluator:
                 adjusted_indices = [idx - 1 for idx in indices]
                 try:
                     result = self.compiler.array_handler.read_array_element(
-                        array, adjusted_indices, line_number, original_shape=original_shape)
+                        array, adjusted_indices, line_number, original_shape=original_shape, var_name=var_name)
                     return True, result
                 except (IndexError, ValueError) as e:
                     raise IndexError(
@@ -1300,7 +1300,7 @@ class ExpressionEvaluator:
             indices.append(idx_value)
 
         element = self.compiler.array_handler.get_array_element(
-            array_value, indices, line_number)
+            array_value, indices, line_number, var_name=array_name)
         element_type = None
         if isinstance(element, dict):
             element_type = element.get('_type_name')
@@ -1471,7 +1471,7 @@ class ExpressionEvaluator:
         # Get the array element
         try:
             result = self.compiler.array_handler.read_array_slice(
-                arr, adjusted_specs, line_number)
+                arr, adjusted_specs, line_number, var_name=var_name)
             curly_expr = f"{var_name}{{{indices_str}}}"
             return self._substitute_curly_result(
                 curly_expr, curly_expr, result, scope)
@@ -1733,7 +1733,7 @@ class ExpressionEvaluator:
 
         try:
             result = self.compiler.array_handler.read_array_element(
-                arr, [adjusted_index], line_number)
+                arr, [adjusted_index], line_number, var_name=var_name)
             return self._substitute_curly_result(
                 f"{var_name}({index_expr})", f"{var_name}({index_expr})", result, scope)
         except (IndexError, ValueError) as e:
@@ -2008,7 +2008,7 @@ class ExpressionEvaluator:
         if expr.lower() in ('true', 'false'):
             return expr.lower() == 'true'
         if expr.lower() == 'none':
-            return self.eval_or_eval_array('{}', scope, line_number)
+            return UNIVERSAL_ZERO
         if expr.startswith('?'):
             logical_expr = expr[1:].strip()
             if not logical_expr:
@@ -2090,10 +2090,10 @@ class ExpressionEvaluator:
                 try:
                     if isinstance(value, dict) and 'grid' in value:
                         result = self.compiler.array_handler.read_array_element(
-                            value['grid'], indices, line_number, original_shape=value.get('original_shape'))
+                            value['grid'], indices, line_number, original_shape=value.get('original_shape'), var_name=var_name)
                     else:
                         result = self.compiler.array_handler.read_array_element(
-                            value, indices, line_number)
+                            value, indices, line_number, var_name=var_name)
                     return result
                 except (IndexError, ValueError) as e:
                     raise IndexError(
@@ -2192,7 +2192,7 @@ class ExpressionEvaluator:
             return self.compiler.array_handler.get_grid_row(
                 index_value, grid_source=array, line_number=line_number)
         return self.compiler.array_handler.read_array_element(
-            array, [index_value - base], line_number)
+            array, [index_value - base], line_number, var_name=var_name)
 
     def _parse_index_target(self, target, scope, line_number):
         """Parse an indexed assignment target (e.g., var{...}, var![...], var(...)).
@@ -2292,7 +2292,7 @@ class ExpressionEvaluator:
 
                 try:
                     result = self.compiler.array_handler.read_array_element(
-                        array, adjusted_indices, line_number)
+                        array, adjusted_indices, line_number, var_name=var_name)
                     return True, result
                 except (IndexError, ValueError) as e:
                     raise IndexError(
@@ -2562,7 +2562,7 @@ class ExpressionEvaluator:
                     adjusted_indices.append(adjusted_idx)
             try:
                 result = self.compiler.array_handler.read_array_element(
-                    array, adjusted_indices, line_number)
+                    array, adjusted_indices, line_number, var_name=var_name)
                 curly_expr = f"{var_name}{{{indices_str}}}"
                 eval_expr = self._substitute_curly_result(
                     eval_expr, curly_expr, result, scope)
@@ -2879,6 +2879,8 @@ class ExpressionEvaluator:
         """
         node_type = type(node)
         if node_type is ast.Constant:
+            if node.value is None:
+                return UNIVERSAL_ZERO
             return node.value
         if node_type is ast.Name:
             return self._resolve_fallback_name(node.id, full_scope, globals_dict)

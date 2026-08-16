@@ -79,6 +79,9 @@ class GridLangTypeProcessor:
                 names_part = input_body[:m_default.start()].strip()
                 input_default = m_default.group(1).strip()
 
+        # 'not null' is a constraint, not part of the variable name
+        names_part = re.sub(r'\s+not\s+null\s*$', '', names_part, flags=re.I)
+
         name_list = [n.strip() for n in names_part.split(',') if n.strip()]
         if not name_list:
             raise SyntaxError(
