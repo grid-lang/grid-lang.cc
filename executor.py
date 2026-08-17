@@ -1550,9 +1550,8 @@ class GridLangExecutor:
         pa_type = (type_name or '').lower()
         if pa_type not in ('number', 'text', 'logical'):
             pa_type = 'number'
-        default_value = 0 if pa_type == 'number' else None
         return self.array_handler.create_array(
-            shape, default_value, pa_type, line_number)
+            shape, None, pa_type, line_number, template=True)
 
     def _let_values_match(self, a, b):
         """Compare two bound values, tolerating numeric vs. unit forms."""
@@ -2122,13 +2121,18 @@ class GridLangExecutor:
 
         # Handle For var as type dim {dimensions} syntax
         m = re.match(
-            r'^\s*for\s+([\w_]+)\s+as\s+(\w+)\s+dim\s*(\{[^}]*\})', line, re.I)
+            r'^\s*for\s+([\w_]+)\s+(?:not\s+null\s+)?as\s+(\w+)\s+dim\s*(\{[^}]*\})', line, re.I)
         if m:
             # Declarations carrying an initializer ('init'/'=') or any
             # unbounded ('*'/named/empty) dimension are handled by the
             # general For path, which materializes sparse arrays and
             # applies the INIT values.
-            if re.search(r'\binit\b', line, re.I) or '=' in line:
+            if re.search(r'\binit\b', line, re.I):
+                return False, i
+            # 'or = <expr>' is a default constraint, not an initializer.
+            # Strip it before checking for standalone '='.
+            line_no_or_eq = re.sub(r'\bor\s*=\s*.+', '', line, flags=re.I).strip()
+            if '=' in line_no_or_eq:
                 return False, i
             var_name, type_name, dim_str = m.groups()
             is_custom_type = type_name.lower() in getattr(self, 'types_defined', {})
@@ -2158,13 +2162,16 @@ class GridLangExecutor:
                     array_data = self.array_handler.create_object_array(
                         shape, None, line_number)
                 else:
-                    default_value = 0 if type_name.lower() == 'number' else None
                     array_data = self.array_handler.create_array(
-                        shape, default_value, type_name.lower() if type_name.lower() in ('number', 'text', 'logical') else 'number', line_number)
+                        shape, None, type_name.lower() if type_name.lower() in ('number', 'text', 'logical') else 'number', line_number, template=True)
 
                 # Define the variable with the created array
+                constraints = {'dim': dim_str}
+                or_eq_match = re.search(r'\bor\s*=\s*(.+?)\s*$', line, re.I)
+                if or_eq_match:
+                    constraints['default'] = or_eq_match.group(1).strip()
                 self.current_scope().define(var_name, array_data,
-                                            type_name.lower(), {'dim': dim_str}, False)
+                                            type_name.lower(), constraints, False)
             else:
                 constraints = {}
                 self.current_scope().define(var_name, None, type_name.lower(), constraints, True)
@@ -4966,10 +4973,8 @@ class GridLangExecutor:
                     else:
                         pa_type = 'number' if var_type in (
                             'number', 'array') else 'text'
-                        default_value = 0 if var_type in (
-                            'number', 'array') else ''
                         value = self.array_handler.create_array(
-                            shape, default_value, pa_type, None)
+                            shape, None, pa_type, None, template=True)
                     self.dimensions[var_name] = resolved_dims
                     if actual_key in scope.constraints:
                         scope.constraints[actual_key]['dim'] = resolved_dims

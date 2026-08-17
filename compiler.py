@@ -2427,7 +2427,7 @@ class GridLangCompiler:
                         pa_type = 'number' if effective_type in (
                             'number', 'array') else 'text'
                         value = self.array_handler.create_array(
-                            shape, 0 if effective_type in ('number', 'array') else '', pa_type, line_number)
+                            shape, None, pa_type, line_number, template=True)
                         self.current_scope().define(
                             var, value, effective_type, constraints, is_uninitialized=False, line_number=line_number)
                 else:

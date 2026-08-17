@@ -1066,7 +1066,7 @@ class ArrayHandler:
                 indices = None
             if indices is not None:
                 self._assign_extended_address(
-                    target, value, line_number)
+                    target, value, line_number, expr_part)
                 return
         if isinstance(value, dict) and value and all(
                 isinstance(k, tuple) for k in value.keys()):
@@ -1088,6 +1088,7 @@ class ArrayHandler:
             shape = value.get('shape') or value.get('original_shape')
             shape = list(shape)
             flat_vals = self.flatten_array(value, line_number)
+            flat_vals = self._resolve_spill_unset(flat_vals, expr_part, line_number)
             if len(shape) >= 2:
                 # Grid rows = first dim (fastest), grid cols = last dim
                 for col_idx in range(shape[1]):
@@ -1156,6 +1157,7 @@ class ArrayHandler:
             is_vertical = ';' in expr_part.strip(
             )[1:-1] and ',' not in expr_part.strip()[1:-1]
             flattened_values = self.flatten_array(value, line_number)
+            flattened_values = self._resolve_spill_unset(flattened_values, expr_part, line_number)
             for i, val in enumerate(flattened_values):
                 cell_to_assign = offset_cell(
                     target, 0, i) if is_vertical else offset_cell(target, i, 0)
@@ -1165,6 +1167,7 @@ class ArrayHandler:
             )[1:-1] and ',' not in expr_part.strip()[1:-1]
             shape = self.get_array_shape(value, line_number)
             flattened_values = self.flatten_array(value, line_number)
+            flattened_values = self._resolve_spill_unset(flattened_values, expr_part, line_number)
             if len(shape) > 1:
                 for col_idx in range(shape[1]):
                     for row_idx in range(shape[0]):
@@ -1179,7 +1182,7 @@ class ArrayHandler:
         else:
             self.compiler._set_grid_cell(target, value)
 
-    def _assign_extended_address(self, target, value, line_number=None):
+    def _assign_extended_address(self, target, value, line_number=None, expr_part=None):
         """Write to an extended (N-D) address.
 
         A matching grid DIM tensor receives the value at the addressed flat
@@ -1192,6 +1195,7 @@ class ArrayHandler:
         if (isinstance(value, list)
                 or (isinstance(value, dict) and 'array' in value)):
             flat = self.flatten_array(value, line_number)
+            flat = self._resolve_spill_unset(flat, expr_part, line_number)
         else:
             flat = [value]
         base = list(indices)
@@ -1424,6 +1428,24 @@ class ArrayHandler:
             except Exception:
                 pass
         return error_value(NA_ERROR)
+
+    def _resolve_spill_unset(self, flat_values, expr_part, line_number=None):
+        """Replace None sentinel values in a flat list before spilling to grid.
+
+        Uses the RHS expression's variable default if available, otherwise
+        returns the global #N/A error value.
+        """
+        has_none = any(v is None for v in flat_values)
+        if not has_none:
+            return flat_values
+        rhs_var = None
+        if expr_part and re.match(r'^[A-Za-z_]\w*$', expr_part.strip()):
+            rhs_var = expr_part.strip()
+        if rhs_var:
+            unset_default = self._array_unset_value(rhs_var, line_number)
+        else:
+            unset_default = error_value(NA_ERROR)
+        return [unset_default if v is None else v for v in flat_values]
 
     def lookup_cell(self, cell_ref, line_number=None):
         """
@@ -1748,11 +1770,11 @@ class ArrayHandler:
         else:
             return [1]
 
-    def create_array(self, shape, default_value, pa_type, line_number=None, matrix_data=None, is_grid_dim=False):
+    def create_array(self, shape, default_value, pa_type, line_number=None, matrix_data=None, is_grid_dim=False, template=False):
 
         # Handle 0D array (scalar)
         if not shape:
-            return [default_value]
+            return [None if template else default_value]
 
         # Calculate flat size
         flat_size = 1
@@ -1760,7 +1782,12 @@ class ArrayHandler:
             flat_size *= dim
 
         # Initialize values
-        if is_grid_dim and matrix_data:
+        if template:
+            # Template arrays (declared without a value) store None for every
+            # element so that reads yield #N/A (or the variable's declared
+            # default) until each cell is explicitly written.
+            values = [None] * flat_size
+        elif is_grid_dim and matrix_data:
             # Grid DIM matrices stack along the LAST declared dim (depth).
             # Each matrix is a 2D display: rows span the first dim, columns
             # span the remaining dims flattened column-major.  Storage is
@@ -2376,6 +2403,10 @@ class ArrayHandler:
             result = flat_arr[flat_idx]
             if isinstance(result, dict) and 'value' in result:
                 return result['value']
+            if result is None:
+                if var_name:
+                    return self._array_unset_value(var_name, line_number)
+                return error_value(NA_ERROR)
             return result
         else:
             raise TypeError(
