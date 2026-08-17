@@ -168,31 +168,31 @@ evaluation.
 - Also `CaseInsensitiveDict` (24): case-insensitive dict used for
   eval scopes.
 
-### `array_handler.py` (2639 lines) — grid/array/tensor operations
+### `array_handler.py` (2680 lines) — grid/array/tensor operations
 `class ArrayHandler` centralizes all array knowledge:
 - Cell addressing & lookup: `resolve_cell_index` (30), `cell_ref_to_indices`
-  (129), `lookup_cell` (1412), `get_range_values` (1253/1286),
-  `_lookup_extended_address` (131367, `_write_extended_tensor` (1488).
+  (129), `lookup_cell` (1453), `get_range_values` (1253/1286),
+  `_lookup_extended_address` (131367, `_write_extended_tensor` (1529).
 - Assignment: `evaluate_line_with_assignment` (205),
   `_parse_assignment_target_details` (26257, `_perform_assignment_write` (482),
-  `_assign_horizontal_array` (98984, `assign_range` (1170),
-  `_assign_extended_range` (121221, `_assign_index_selector` (777),
-  `_assign_dim_selector` (85837, `_update_bound_array_cell` (972),
+  `_assign_horizontal_array` (98984, `assign_range` (1211),
+  `_assign_extended_range` (121221, `_assign_index_selector` (818),
+  `_assign_dim_selector` (85837, `_update_bound_array_cell` (1013),
   `assign_implicit_intersection_range` (60597, implicit-intersection rewrite
   (`_rewrite_implicit_intersection` 597).
-- Spilling helpers: `_resolve_spill_unset` (1394) replaces `None` sentinels
+- Spilling helpers: `_resolve_spill_unset` (1435) replaces `None` sentinels
   in flat arrays before writing to grid (uses variable default or `#N/A`);
-  `flatten_array` (1547) column-major flattens any array to 1D;
-  `flatten_object_fields` (1505) flattens object fields for grid spills.
+  `flatten_array` (1588) column-major flattens any array to 1D;
+  `flatten_object_fields` (1546) flattens object fields for grid spills.
 - Array construction/shape: `create_array` (1773, accepts `template=True` to
-  fill with `None` sentinels), `create_object_array` (1804),
-  `get_array_shape` (1702), `reshape_array` (2169), `infer_type` (1673),
-  `fill_array` (2568), `flatten_object_fields` (1505), `flatten_array`
-  (1443), `_nested_from_flat` (1635), `to_display_value` (1592).
-- Constraints/dims: `set_labels` (1819), `check_dimension_constraints` (1883),
+  fill with `None` sentinels), `create_object_array` (1845),
+  `get_array_shape` (1743), `reshape_array` (2210), `infer_type` (1714),
+  `fill_array` (2609), `flatten_object_fields` (1546), `flatten_array`
+  (1443), `_nested_from_flat` (1676), `to_display_value` (1633).
+- Constraints/dims: `set_labels` (1860), `check_dimension_constraints` (1924),
   `validate_array_element_types` (161694 — element-level base-type checking
-  (`as number`/`as text` arrays reject mismatched scalars), `_dim_size` (1846).
-- Grid-as-array: `get_grid_row` (2225), `get_grid_column` (2254), plus
+  (`as number`/`as text` arrays reject mismatched scalars), `_dim_size` (1887).
+- Grid-as-array: `get_grid_row` (2266), `get_grid_column` (2295), plus
   `GridLiveView` branches in `get_array_element`/`set_array_element`.
 
 ### `control_flow.py` (2201 lines) — blocks: For / If / Let / When
@@ -221,7 +221,7 @@ evaluation.
     `_validate_base_type` (700) — validates scalars AND, since the pyarrow
     removal, element-by-element base types of `dim` arrays (via
     `array_handler.validate_array_element_types`), `_expression_depends_on`
-    (651). `_array_unset_value` (array_handler.py:1356) resolves `None`
+    (651). `_array_unset_value` (array_handler.py:1397) resolves `None`
     sentinels for unset template array cells: checks the variable's
     `constraints['default']` (from `or = <expr>`) and evaluates it; falls back
     to `error_value(NA_ERROR)` (`#N/A`).
@@ -307,13 +307,14 @@ is a stale backup — ignore.
   paths (`_resolve_spill_unset`) replace `None` in flat lists with the
   variable's default or `#N/A` before writing to grid.
 - **Spilling semantics**: arrays always spill into grid cells — the `^` notation
-  is NOT required for arrays (only for objects). Spilling fills from fastest
-  dimension (first declared dim = grid rows) to slowest (last dim = grid
-  columns) in column-major order. An array of objects spills one object per row,
-  fields across columns. The `^` notation on objects makes them spill along the
-  fastest dimension (1D object array → along second-fastest dim). The core
-  spilling function is `_assign_horizontal_array` (`array_handler.py:1050`);
-  `_assign_extended_address` (`array_handler.py:1147`) handles dotted targets
+  is NOT required for arrays. Spilling fills from fastest dimension (first
+  declared dim = grid rows) to slowest (last dim = grid columns) in
+  column-major order. An array of objects WITHOUT `^` places one object per
+  cell (horizontally). With `^`, object fields are expanded: one object per
+  row, fields across columns. A single object WITHOUT `^` writes as a single
+  cell value; with `^` it spills fields. The core spilling function is
+  `_assign_horizontal_array` (`array_handler.py:1091`);
+  `_assign_extended_address` (`array_handler.py:1188`) handles dotted targets
   like `A1.B1.3`.
 - **Variables**: `: x = expr` (client binding — deferred until deps resolve),
   `Let x init val`/`= val`, `For x init val`. `Push x = expr` updates x and

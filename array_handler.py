@@ -551,7 +551,36 @@ class ArrayHandler:
             value = self._evaluate_implicit_intersection(
                 implicit_expr, int(row), scope, line_number)
         if isinstance(value, dict) and 'array' in value:
+            if not is_harr and is_address(target):
+                self._assign_horizontal_array(
+                    target, value, expr_part, line_number)
+                return None
             value = self.to_display_value(value)
+        elif isinstance(value, list) and is_address(target):
+            if is_harr:
+                self._assign_horizontal_array(
+                    target, value, expr_part, line_number)
+                return None
+            is_obj_array = (
+                value
+                and all(isinstance(item, dict) for item in value)
+                and self._find_object_array_type(value) is not None
+            )
+            if is_obj_array:
+                type_name = self._find_object_array_type(value)
+                for i, item in enumerate(value):
+                    self.compiler._set_grid_cell(
+                        offset_cell(target, i, 0),
+                        public_object_view(item))
+                return None
+            self._assign_horizontal_array(
+                target, value, expr_part, line_number)
+            return None
+        elif isinstance(value, dict) and value and all(isinstance(k, tuple) for k in value.keys()):
+            if is_address(target):
+                self._assign_horizontal_array(
+                    target, value, expr_part, line_number)
+                return None
         # ``[A1] := x`` is sugar for ``Let grid![A1] = x``: the grid store is
         # the single backing store, so the cell write below IS the grid write.
         if self._update_bound_array_cell(target, value, line_number):
@@ -636,6 +665,18 @@ class ArrayHandler:
         for type_name, fields in self.compiler.types_defined.items():
             field_defs = public_type_fields(fields)
             if len(field_defs) == 2 and value_keys == set(field_defs.keys()):
+                return type_name
+        return None
+
+    def _find_object_array_type(self, value):
+        if not isinstance(value, list) or not value:
+            return None
+        if not all(isinstance(item, dict) for item in value):
+            return None
+        for type_name, fields in self.compiler.types_defined.items():
+            public_fields = set(public_type_fields(fields).keys())
+            if public_fields and all(
+                    object_public_keys(item) == public_fields for item in value):
                 return type_name
         return None
 
