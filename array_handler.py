@@ -306,7 +306,6 @@ class ArrayHandler:
             scope=scope,
             line_number=line_number,
             reshaped_value=reshaped_value,
-            is_array_of_two_field_objects=is_array_of_two_field_objects,
         )
 
     def _prepare_horizontal_reshape_value(self, implicit_expr, value, expr_part, is_harr):
@@ -499,8 +498,7 @@ class ArrayHandler:
             implicit_expr,
             scope,
             line_number,
-            reshaped_value,
-            is_array_of_two_field_objects):
+            reshaped_value):
         if is_index_selector:
             result = self._assign_index_selector(
                 var_name, indices, value, line_number)
@@ -520,7 +518,7 @@ class ArrayHandler:
                 raise SyntaxError(
                     f"Implicit intersection '@' is not supported for horizontal array targets at line {line_number}")
             self._assign_horizontal_array(
-                target, reshaped_value, expr_part, is_array_of_two_field_objects, line_number)
+                target, reshaped_value, expr_part, line_number)
             if (assignment_op == ':=' and
                     re.match(r'^[A-Za-z_][\w_]*$', expr_part) and
                     not getattr(self.compiler.current_scope(), 'is_private', False)):
@@ -1049,14 +1047,13 @@ class ArrayHandler:
             return True
         return False
 
-    def _assign_horizontal_array(self, target, value, expr_part, is_array_of_two_field_objects=False, line_number=None):
+    def _assign_horizontal_array(self, target, value, expr_part, line_number=None):
         """
         Assign an array horizontally (or vertically) to the grid starting at target cell.
         Handles objects, lists, arrays, and reshaping for two-field objects.
         :param target: Starting cell (e.g., 'A1').
         :param value: Array or list to assign.
         :param expr_part: Original expression for orientation check.
-        :param is_array_of_two_field_objects: Flag for special reshaping.
         :param line_number: Line number.
         """
         if isinstance(target, str) and '.' in target:
@@ -1078,10 +1075,13 @@ class ArrayHandler:
                 for (i0,), val in value.items():
                     cell_to_assign = offset_cell(target, i0, 0)
                     self.compiler._set_grid_cell(cell_to_assign, val)
-            else:
+            elif rank == 2:
                 for (row, col), val in value.items():
                     cell_to_assign = offset_cell(target, col, row)
                     self.compiler._set_grid_cell(cell_to_assign, val)
+            else:
+                raise ValueError(
+                    f"Dim not supported: rank {rank} at line {line_number}")
             return
         if isinstance(value, dict) and 'array' in value:
             # N-D array (column-major flat buffer + declared shape).
@@ -1102,21 +1102,12 @@ class ArrayHandler:
                     self.compiler._set_grid_cell(cell_to_assign, val)
             return
         if isinstance(value, dict):
-            # Special-case: spill an object's grid mapping when keys are (row, col) tuples
-            if value and all(isinstance(k, tuple) and len(k) == 2 for k in value.keys()):
-                start_col = col_to_num(
-                    target[0:re.search(r'\d', target).start()])
-                start_row = int(target[re.search(r'\d', target).start():])
-                for (row, col), val in value.items():
-                    cell_to_assign = f"{num_to_col(start_col + (col - 1))}{start_row + (row - 1)}"
-                    self.compiler._set_grid_cell(cell_to_assign, val)
-                return
             flattened_values = self.flatten_object_fields(value, line_number)
             for i, val in enumerate(flattened_values):
                 cell_to_assign = offset_cell(target, i, 0)
                 self.compiler._set_grid_cell(cell_to_assign, val)
             return
-        elif isinstance(value, list):
+        if isinstance(value, list):
             is_object_array = False
             type_name = None
             if all(isinstance(item, dict) for item in value):
@@ -1135,18 +1126,6 @@ class ArrayHandler:
                                 target, col_idx, row_idx)
                             self.compiler._set_grid_cell(cell_to_assign, val)
                     return
-            if is_array_of_two_field_objects:
-                num_objects = len(value)
-                start_col = col_to_num(
-                    target[0:re.search(r'\d', target).start()])
-                start_row = int(target[re.search(r'\d', target).start():])
-                for row_idx in range(num_objects):
-                    object_values = value[row_idx]
-                    for col_idx in range(len(object_values)):
-                        new_cell = f"{num_to_col(start_col + col_idx)}{start_row + row_idx}"
-                        self.compiler._set_grid_cell(new_cell, float(
-                            object_values[col_idx]))
-                return
             if value and all(isinstance(row, (list, tuple)) for row in value):
                 for row_idx, row in enumerate(value):
                     for col_idx, val in enumerate(row):
@@ -1162,23 +1141,6 @@ class ArrayHandler:
                 cell_to_assign = offset_cell(
                     target, 0, i) if is_vertical else offset_cell(target, i, 0)
                 self.compiler._set_grid_cell(cell_to_assign, val)
-        elif isinstance(value, dict) and 'array' in value:
-            is_vertical = ';' in expr_part.strip(
-            )[1:-1] and ',' not in expr_part.strip()[1:-1]
-            shape = self.get_array_shape(value, line_number)
-            flattened_values = self.flatten_array(value, line_number)
-            flattened_values = self._resolve_spill_unset(flattened_values, expr_part, line_number)
-            if len(shape) > 1:
-                for col_idx in range(shape[1]):
-                    for row_idx in range(shape[0]):
-                        cell_to_assign = offset_cell(target, col_idx, row_idx)
-                        self.compiler._set_grid_cell(cell_to_assign, flattened_values[row_idx +
-                                                                              shape[0] * col_idx])
-            else:
-                for i, val in enumerate(flattened_values):
-                    cell_to_assign = offset_cell(
-                        target, 0, i) if is_vertical else offset_cell(target, i, 0)
-                    self.compiler._set_grid_cell(cell_to_assign, val)
         else:
             self.compiler._set_grid_cell(target, value)
 

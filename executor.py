@@ -3768,9 +3768,8 @@ class GridLangExecutor:
             var_def, expr = map(str.strip, line[1:].split("=", 1))
             var, type_name, constraints, value = self._parse_variable_def(
                 var_def, line_number)
-            deps = set(re.findall(r'\b[\w_]+\b', expr))
-            deps = {d for d in deps
-                    if d.lower() not in DEPENDENCY_IGNORED_TOKENS}
+            deps = _filter_var_tokens(
+                set(re.findall(r'\b[\w_]+\b', expr)))
             if not deps:
                 try:
                     evaluated_value = self.expr_evaluator.eval_expr(
@@ -3905,7 +3904,7 @@ class GridLangExecutor:
                     line, line_number, rhs_vars | target_vars)
             else:
                 violations = []
-                for var in rhs_vars:
+                for var in target_vars:
                     defining_scope = self.current_scope().get_defining_scope(var)
                     if defining_scope and var in defining_scope.constraints:
                         try:
@@ -3992,16 +3991,12 @@ class GridLangExecutor:
                 evaluated_value = self.expr_evaluator.eval_or_eval_array(
                     value, scope_value, line_number, is_grid_dim=is_grid_value)
                 if isinstance(evaluated_value, dict):
-                    if all(isinstance(k, tuple) and len(k) == 2 for k in evaluated_value.keys()):
-                        for (row, col), val in evaluated_value.items():
-                            if isinstance(row, (int, float)) and isinstance(col, (int, float)):
-                                self.grid[(int(row), int(col))] = val
-                    elif 'grid' in evaluated_value:
+                    if 'grid' in evaluated_value:
                         grid_dict = evaluated_value['grid']
                         if isinstance(grid_dict, dict):
                             for (row, col), val in grid_dict.items():
-                                if isinstance(row, int) and isinstance(col, int):
-                                    self.grid[(row, col)] = val
+                                if isinstance(row, (int, float)) and isinstance(col, (int, float)):
+                                    self.grid[(int(row), int(col))] = val
                         else:
                             self.array_handler._assign_horizontal_array(
                                 array_cell_ref, evaluated_value, value, line_number=line_number)
