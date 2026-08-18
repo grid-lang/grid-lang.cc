@@ -1904,6 +1904,33 @@ class GridLangCompiler:
         store."""
         self._get_grid_store()[self._to_index(cell_ref)] = value
 
+    def _spill_value_to_cells(self, cell_ref, value, line_number=None):
+        """Auto-spill an array value into the grid starting at cell_ref.
+
+        A list of typed objects places one object per cell (horizontally);
+        any other array value is spilled through the horizontal array
+        assigner. A single object or scalar is written into one cell only.
+        """
+        if isinstance(value, dict) and 'array' in value:
+            self.array_handler._assign_horizontal_array(
+                cell_ref, value, "{}", line_number)
+            return
+        if isinstance(value, list):
+            is_obj_array = (
+                value
+                and all(isinstance(item, dict) for item in value)
+                and self.array_handler._find_object_array_type(value) is not None
+            )
+            if is_obj_array:
+                for i, item in enumerate(value):
+                    self._set_grid_cell(
+                        offset_cell(cell_ref, i, 0), public_object_view(item))
+                return
+            self.array_handler._assign_horizontal_array(
+                cell_ref, value, "{}", line_number)
+            return
+        self._set_grid_cell(cell_ref, value)
+
     def _grid_cell_is_set(self, cell_ref):
         """Whether a cell has been explicitly written (address string or index
         tuple)."""
@@ -2763,8 +2790,7 @@ class GridLangCompiler:
         else:
             self.current_scope().define(
                 var, value, inferred_type, constraints, is_uninitialized=False, line_number=line_number)
-        self._set_grid_cell(cell, self.array_handler.flatten_array(
-            value, line_number) if isinstance(value, dict) and 'array' in value else value)
+        self._spill_value_to_cells(cell, value, line_number)
         self._cell_var_map[cell] = var
 
     def _process_cell_binding_declaration(self, line, line_number=None):
@@ -2829,10 +2855,8 @@ class GridLangCompiler:
         try:
             current_value = self.current_scope().get(var)
             if current_value is not None:
-                converted = self.array_handler.flatten_array(
-                    current_value, line_number) if isinstance(current_value, dict) and 'array' in current_value else current_value
-                self._set_grid_cell(cell_ref, converted)
-                self._record_output_value(var, converted)
+                self._spill_value_to_cells(cell_ref, current_value, line_number)
+                self._record_output_value(var, current_value)
         except NameError:
             pass
         return True
@@ -2851,9 +2875,7 @@ class GridLangCompiler:
                     self._set_grid_cell(cell, value)
         for cell, mapped_var in self._cell_var_map.items():
             if mapped_var.lower() == var_lower:
-                converted = self.array_handler.flatten_array(
-                    value, None) if isinstance(value, dict) and 'array' in value else value
-                self._set_grid_cell(cell, converted)
+                self._spill_value_to_cells(cell, value, None)
 
     def _record_output_value(self, var_name, value):
         """Record values for declared output variables."""

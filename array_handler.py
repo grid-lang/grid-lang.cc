@@ -1348,23 +1348,12 @@ class ArrayHandler:
         sc, ec = col_to_num(scs), col_to_num(ecs)
         sr, er = int(sro), int(ero)
         values = []
-        if sc == ec:  # Single column
-            for r in range(min(sr, er), max(sr, er) + 1):
-                cell_ref = num_to_col(sc) + str(r)
-                values.append([self.lookup_cell(cell_ref, line_number)])
-        elif sr == er:  # Single row
+        for r in range(min(sr, er), max(sr, er) + 1):
             row_values = []
             for c in range(min(sc, ec), max(sc, ec) + 1):
-                cell_ref = num_to_col(c) + str(sr)
+                cell_ref = num_to_col(c) + str(r)
                 row_values.append(self.lookup_cell(cell_ref, line_number))
-            values = row_values
-        else:  # 2D range
-            for r in range(min(sr, er), max(sr, er) + 1):
-                row_values = []
-                for c in range(min(sc, ec), max(sc, ec) + 1):
-                    cell_ref = num_to_col(c) + str(r)
-                    row_values.append(self.lookup_cell(cell_ref, line_number))
-                values.append(row_values)
+            values.append(row_values)
         return values
 
     def get_range_values_address(self, s_cell, e_cell, line_number=None):
@@ -1604,7 +1593,7 @@ class ArrayHandler:
                 return [arr[k] for k in sorted(arr.keys())]
             return [arr]
         if isinstance(arr, list):
-            if not arr or not isinstance(arr[0], list):
+            if not arr or not all(isinstance(v, list) for v in arr):
                 return list(arr)
             # Nested lists are the display form: the outermost index is the
             # first declared dim (fastest). Column-major flatten:

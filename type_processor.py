@@ -96,13 +96,17 @@ class GridLangTypeProcessor:
         ]
 
     def _extract_type_field_line(self, stripped, lowered):
-        """Return the declaration body for a type field line, if any."""
+        """Return the declaration body for a type field line, if any.
+
+        Public fields are declared with ``[addr] : var`` where the
+        ``[addr]`` part is optional.  ``For``/``Let`` lines are executable
+        code, never field declarations.
+        """
+        m = re.match(r'^\[\s*\^?[A-Za-z]+\d+\s*\]\s*:\s*(?!\=)(.+)$', stripped)
+        if m:
+            return m.group(1).strip()
         if stripped.startswith(':'):
             return stripped[1:].strip()
-        if lowered.startswith('for ') and ' do' not in lowered:
-            return stripped[4:].strip()
-        if lowered.startswith('let ') and '=' not in stripped:
-            return stripped[4:].strip()
         return None
 
     def _split_type_field_initializer(self, field_line):
@@ -575,12 +579,15 @@ class GridLangTypeProcessor:
             field_name, value_expr = match.groups()
             if field_name.startswith('$'):
                 field_name = field_name[1:]
-            actual_field = get_case_insensitive_key(
-                value_dict, field_name) or field_name
             scope = self._build_type_eval_scope(value_dict, {})
             value = self.compiler.expr_evaluator.eval_expr(
                 value_expr.strip(), scope, line_number)
-            value_dict[actual_field] = value
+            # ``Let x = expr`` is executable code: it defines (or updates) a
+            # local variable in the current scope, not a public field.
+            self.compiler.current_scope().define(
+                field_name, value,
+                self.compiler.array_handler.infer_type(value, line_number),
+                {}, is_uninitialized=False)
 
     def _process_type_assignment(self, line, value_dict, input_values, line_number, init_fields=None):
         """Handle assignments inside type definitions (e.g., x = in_x)."""
@@ -692,7 +699,7 @@ class GridLangTypeProcessor:
         actual_field = get_case_insensitive_key(
             value_dict, field_name) or field_name
         scope = self._build_type_eval_scope(value_dict, input_values)
-        value = self.compiler.expr_evaluator.eval_expr(
+        value = self.compiler.expr_evaluator.eval_or_eval_array(
             value_expr.strip(), scope, line_number)
         if actual_field.lower() in init_fields:
             try:
