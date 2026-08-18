@@ -1,6 +1,6 @@
 import re
 
-from units import UNIVERSAL_ZERO
+from units import UNIVERSAL_ZERO, NA_ERROR
 
 _DEFINITION_AND_SPLIT = re.compile(r'\s+and\s+(?![<>=]|not\b)', re.I)
 
@@ -302,7 +302,7 @@ def format_display_value(value, sig_digits=15):
     if isinstance(value, (int, bool)):
         return str(value)
     if value is None:
-        return "None"
+        return NA_ERROR
     if is_sparse_array(value):
         return _format_sparse_array(value, sig_digits)
     if isinstance(value, dict) and 'array' in value:

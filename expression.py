@@ -153,8 +153,8 @@ class ExpressionEvaluator:
                 parse_address(e_ref)
                 values = self.compiler.array_handler.get_range_values(
                     s_ref, e_ref, line_number)
-                flat_values = self.compiler.array_handler.flatten_array(
-                        values, line_number)
+                flat_values = [v for row in values for v in (
+                    row if isinstance(row, list) else [row])]
                 if hasattr(self.compiler, 'last_dim_var') and self.compiler.last_dim_var:
                     var_name = self.compiler.last_dim_var
                     self.compiler.current_scope().update(var_name, flat_values)
@@ -402,8 +402,8 @@ class ExpressionEvaluator:
                 parse_address(end_ref)
                 values = self.compiler.array_handler.get_range_values(
                     start_ref, end_ref, line_number)
-                flat_values = self.compiler.array_handler.flatten_array(
-                        values, line_number)
+                flat_values = [v for row in values for v in (
+                    row if isinstance(row, list) else [row])]
             numeric_values = [
                 float(v) for v in flat_values if isinstance(v, (int, float))]
             return sum(numeric_values)
@@ -2042,8 +2042,8 @@ class ExpressionEvaluator:
                 parse_address(e_ref)
                 values = self.compiler.array_handler.get_range_values(
                     s_ref, e_ref, line_number)
-                flat_values = self.compiler.array_handler.flatten_array(
-                        values, line_number)
+                flat_values = [v for row in values for v in (
+                    row if isinstance(row, list) else [row])]
                 if all(v == 0.0 for v in flat_values) and line_number is not None:
                     raise RuntimeError(
                         f"Range '{s_ref}:{e_ref}' may depend on unassigned grid cells at line {line_number}; defer initialization")
