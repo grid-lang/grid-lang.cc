@@ -32,7 +32,8 @@ class ArrayHandler:
         Resolve an array index using a cell reference (e.g., Results[B1]).
         Maps column letters to indices for dimensioned arrays.
         :param var_name: Variable name of the array.
-        :param cell_ref: Cell reference (e.g., 'B1').
+        :param cell_ref: Cell reference as a 0-based index tuple (e.g. (0, 0));
+            a (None, col) tuple selects a whole grid column.
         :param line_number: Optional line number for error reporting.
         :return: Value at the resolved index.
         """
@@ -43,9 +44,20 @@ class ArrayHandler:
                 f"Variable '{var_name}' not defined at line {line_number}")
         if var_name.lower() == 'grid':
             # grid![cell] reads a cell directly from the grid array;
-            # grid![A] reads a whole column of the grid array.
-            if re.match(r'^[A-Za-z]+$', cell_ref):
-                return self.get_grid_column(cell_ref, grid_source=arr, line_number=line_number)
+            # grid![A] reads a whole column (a (None, col) index tuple
+            # where None selects every row of the column).
+            if (isinstance(cell_ref, (tuple, list))
+                    and len(cell_ref) == 2 and cell_ref[0] is None):
+                return self.get_grid_column(
+                    cell_ref[1], grid_source=arr, line_number=line_number)
+            if isinstance(cell_ref, (tuple, list)):
+                key = tuple(int(i) for i in cell_ref)
+                if len(key) > 2:
+                    # Extended addresses read the grid as N-D.
+                    return self.lookup_cell(key, line_number)
+                row, col = key
+                return self.get_array_element(
+                    arr, [row, col], line_number, var_name=var_name)
             if '.' in cell_ref:
                 # Extended addresses read the grid as N-D.
                 return self.lookup_cell(cell_ref, line_number)
@@ -68,20 +80,28 @@ class ArrayHandler:
                 f"Variable '{var_name}' is not an array at line {line_number}")
 
         # Extended (N-D) addresses resolve directly to array indices.
-        if '.' in cell_ref:
-            indices = parse_address(cell_ref)
+        if isinstance(cell_ref, (tuple, list)) and len(cell_ref) > 2:
+            indices = [i + 1 for i in cell_ref]
             return self.get_array_element(
                 arr, [i - 1 for i in indices], line_number,
                 original_shape=nd_shape, var_name=var_name)
 
-        # Validate and parse cell reference
-        parse_address(cell_ref)
-        col, _ = split_cell(cell_ref)
-        col_num = col_to_num(col)  # 1-based column number (A=1, B=2, etc.)
-
         # Sparse arrays are unbound: any cell is a valid address and an
         # unset one reads as #N/A (or the declared default).
-        if sparse_arr:
+        if isinstance(cell_ref, (tuple, list)):
+            row_idx, col_idx = cell_ref
+            if sparse_arr:
+                value = arr.get((row_idx, col_idx))
+                if value is None:
+                    return self._array_unset_value(var_name, line_number)
+                return value
+        else:
+            # Validate and parse cell reference
+            parse_address(cell_ref)
+            col, _ = split_cell(cell_ref)
+            col_to_num(col)  # 1-based column number (A=1, B=2, etc.)
+
+        if isinstance(cell_ref, str) and sparse_arr:
             col, row = split_cell(cell_ref)
             col_idx = col_to_num(col) - 1  # 0-based column index
             row_idx = int(row) - 1  # 0-based row index
@@ -100,9 +120,12 @@ class ArrayHandler:
         if len(shape) == 2:
             rows, cols = shape
             # Convert cell reference to row and column indices
-            col, row = split_cell(cell_ref)
-            col_idx = col_to_num(col) - 1  # 0-based column index
-            row_idx = int(row) - 1  # 0-based row index
+            if isinstance(cell_ref, (tuple, list)):
+                row_idx, col_idx = cell_ref
+            else:
+                col, row = split_cell(cell_ref)
+                col_idx = col_to_num(col) - 1  # 0-based column index
+                row_idx = int(row) - 1  # 0-based row index
 
             if row_idx < 0 or row_idx >= rows:
                 raise IndexError(
@@ -145,9 +168,10 @@ class ArrayHandler:
         ({'array': flat values, 'shape': sub-block shape}).  Works for arrays
         of any rank stored as flat column-major buffers
         ({'array'/'grid' + shape}) or as nested lists.
+        ``s_addr``/``e_addr`` are 0-based index tuples.
         """
-        s_idx = parse_address(s_addr)
-        e_idx = parse_address(e_addr)
+        s_idx = [i + 1 for i in s_addr]
+        e_idx = [i + 1 for i in e_addr]
         if len(s_idx) != len(e_idx):
             raise ValueError(
                 f"Range addresses '{s_addr}' and '{e_addr}' must have the same rank at line {line_number}")
@@ -465,6 +489,13 @@ class ArrayHandler:
                 f"Invalid assignment target: '{target_part}' at line {line_number}. "
                 "Use [address] := value.")
 
+        if target is not None and isinstance(target, str):
+            target = self.compiler._to_index(target)
+        if sr is not None and isinstance(sr, str):
+            sr = self.compiler._to_index(sr)
+        if er is not None and isinstance(er, str):
+            er = self.compiler._to_index(er)
+
         return {
             'target': target,
             'is_range': is_range,
@@ -499,6 +530,8 @@ class ArrayHandler:
             scope,
             line_number,
             reshaped_value):
+        target_disp = indices_to_address(
+            [i + 1 for i in target]) if isinstance(target, tuple) else str(target)
         if is_index_selector:
             result = self._assign_index_selector(
                 var_name, indices, value, line_number)
@@ -528,11 +561,11 @@ class ArrayHandler:
                     existing = self.compiler._cell_array_map.get(target)
                     if existing and existing.lower() != source_var.lower():
                         raise SyntaxError(
-                            f"Cell '{target}' already mapped to '{existing}' at line {line_number}")
+                            f"Cell '{target_disp}' already mapped to '{existing}' at line {line_number}")
                     conflict = self.compiler._cell_var_map.get(target)
                     if conflict and conflict.lower() != source_var.lower():
                         raise SyntaxError(
-                            f"Cell '{target}' already mapped to '{conflict}' at line {line_number}")
+                            f"Cell '{target_disp}' already mapped to '{conflict}' at line {line_number}")
                     self.compiler._cell_array_map[target] = source_var
                 except Exception:
                     pass
@@ -547,16 +580,16 @@ class ArrayHandler:
             return None
 
         if implicit_expr is not None:
-            col, row = split_cell(target)
+            row, col = target
             value = self._evaluate_implicit_intersection(
-                implicit_expr, int(row), scope, line_number)
+                implicit_expr, row + 1, scope, line_number)
         if isinstance(value, dict) and 'array' in value:
-            if not is_harr and is_address(target):
+            if not is_harr and isinstance(target, tuple):
                 self._assign_horizontal_array(
                     target, value, expr_part, line_number)
                 return None
             value = self.to_display_value(value)
-        elif isinstance(value, list) and is_address(target):
+        elif isinstance(value, list) and isinstance(target, tuple):
             if is_harr:
                 self._assign_horizontal_array(
                     target, value, expr_part, line_number)
@@ -577,7 +610,7 @@ class ArrayHandler:
                 target, value, expr_part, line_number)
             return None
         elif isinstance(value, dict) and value and all(isinstance(k, tuple) for k in value.keys()):
-            if is_address(target):
+            if isinstance(target, tuple):
                 self._assign_horizontal_array(
                     target, value, expr_part, line_number)
                 return None
@@ -608,7 +641,7 @@ class ArrayHandler:
                 existing = self.compiler._cell_var_map.get(target)
                 if existing and existing.lower() != source_var.lower():
                     raise SyntaxError(
-                        f"Cell '{target}' already mapped to '{existing}' at line {line_number}")
+                        f"Cell '{target_disp}' already mapped to '{existing}' at line {line_number}")
                 self.compiler._cell_var_map[target] = source_var
             except Exception:
                 pass
@@ -702,10 +735,8 @@ class ArrayHandler:
             rewritten, scope, line_number)
 
     def assign_implicit_intersection_range(self, sr_ref, er_ref, expr, scope, line_number=None):
-        scs, sro = split_cell(sr_ref)
-        ecs, ero = split_cell(er_ref)
-        sc, ec = col_to_num(scs), col_to_num(ecs)
-        sr, er = int(sro), int(ero)
+        sr, sc = sr_ref
+        er, ec = er_ref
         num_cols = ec - sc + 1
         num_rows = er - sr + 1
         if num_cols < 1 or num_rows < 1:
@@ -714,9 +745,9 @@ class ArrayHandler:
 
         for r in range(sr, er + 1):
             for c in range(sc, ec + 1):
-                cell = num_to_col(c) + str(r)
+                cell = (r, c)
                 value = self._evaluate_implicit_intersection(
-                    expr, r, scope, line_number)
+                    expr, r + 1, scope, line_number)
                 self.compiler._set_grid_cell(cell, value)
 
     def evaluate_array_operation(self, expr, line_number=None):
@@ -1016,22 +1047,22 @@ class ArrayHandler:
         if not bindings:
             return False
         try:
-            target_col, target_row = split_cell(target)
+            if not (isinstance(target, (tuple, list)) and len(target) == 2):
+                return False
+            target_row, target_col = target
         except Exception:
             return False
-        target_col_idx = col_to_num(target_col)
-        target_row_idx = int(target_row)
         for start_cell, var_name in bindings.items():
             try:
-                start_col, start_row = split_cell(start_cell)
-                start_col_idx = col_to_num(start_col)
-                start_row_idx = int(start_row)
+                if not (isinstance(start_cell, (tuple, list)) and len(start_cell) == 2):
+                    continue
+                start_row, start_col = start_cell
             except Exception:
                 continue
-            if target_row_idx < start_row_idx or target_col_idx < start_col_idx:
+            if target_row < start_row or target_col < start_col:
                 continue
-            row_offset = target_row_idx - start_row_idx
-            col_offset = target_col_idx - start_col_idx
+            row_offset = target_row - start_row
+            col_offset = target_col - start_col
             defining_scope = self.compiler.current_scope().get_defining_scope(
                 var_name)
             if not defining_scope:
@@ -1092,14 +1123,14 @@ class ArrayHandler:
         """
         Assign an array horizontally (or vertically) to the grid starting at target cell.
         Handles objects, lists, arrays, and reshaping for two-field objects.
-        :param target: Starting cell (e.g., 'A1').
+        :param target: Starting cell as a 0-based index tuple (e.g. (0, 0)).
         :param value: Array or list to assign.
         :param expr_part: Original expression for orientation check.
         :param line_number: Line number.
         """
-        if isinstance(target, str) and '.' in target:
+        if isinstance(target, (tuple, list)) and len(target) > 2:
             try:
-                indices = parse_address(target)
+                indices = [i + 1 for i in target]
             except ValueError:
                 indices = None
             if indices is not None:
@@ -1191,8 +1222,9 @@ class ArrayHandler:
         A matching grid DIM tensor receives the value at the addressed flat
         position; otherwise the value is stored under the dotted key in the
         current grid. Arrays spill along the last dimension of the address.
+        ``target`` is a 0-based index tuple.
         """
-        indices = parse_address(target)
+        indices = [i + 1 for i in target]
         if self._write_extended_tensor(indices, value, line_number):
             return
         if (isinstance(value, list)
@@ -1201,29 +1233,27 @@ class ArrayHandler:
             flat = self._resolve_spill_unset(flat, expr_part, line_number)
         else:
             flat = [value]
-        base = list(indices)
+        base = list(target)
         for i, val in enumerate(flat):
             addr_indices = list(base)
             addr_indices[-1] = base[-1] + i
-            self.compiler._set_grid_cell(indices_to_address(
-                addr_indices), self.to_display_value(val))
+            self.compiler._set_grid_cell(
+                tuple(addr_indices), self.to_display_value(val))
 
     def assign_range(self, sr_ref, er_ref, vals, line_number=None):
         """
         Assign values to a range of cells (e.g., A1:B2 := {1,2;3,4}).
         Handles scalars, 1D/2D arrays, repeating, and cycling.
-        :param sr_ref: Start cell (e.g., 'A1').
-        :param er_ref: End cell (e.g., 'B2').
+        :param sr_ref: Start cell as a 0-based index tuple (e.g. (0, 0)).
+        :param er_ref: End cell as a 0-based index tuple (e.g. (1, 1)).
         :param vals: Values to assign (scalar, list, array).
         :param line_number: Line number.
         """
-        if '.' in sr_ref or '.' in er_ref:
+        if len(sr_ref) > 2 or len(er_ref) > 2:
             self._assign_extended_range(sr_ref, er_ref, vals, line_number)
             return
-        scs, sro = split_cell(sr_ref)
-        ecs, ero = split_cell(er_ref)
-        sc, ec = col_to_num(scs), col_to_num(ecs)
-        sr, er = int(sro), int(ero)
+        sr, sc = sr_ref
+        er, ec = er_ref
         num_cols = ec - sc + 1
         num_rows = er - sr + 1
         if num_cols < 1 or num_rows < 1:
@@ -1245,26 +1275,26 @@ class ArrayHandler:
                 array_length = effective_shape[0]
                 if num_rows > 1 and num_cols == 1:  # Vertical assignment
                     for i, r in enumerate(range(sr, er + 1)):
-                        cell = num_to_col(sc) + str(r)
+                        cell = (r, sc)
                         value = flat_vals[i % len(flat_vals)]
                         self.compiler._set_grid_cell(cell, value)
                 elif num_cols > 1 and num_rows == 1:  # Horizontal assignment
                     for i, c in enumerate(range(sc, ec + 1)):
-                        cell = num_to_col(c) + str(sr)
+                        cell = (sr, c)
                         value = flat_vals[i % len(flat_vals)]
                         self.compiler._set_grid_cell(cell, value)
                 elif array_length == num_cols:  # Repeat across rows (broadcast over first dim)
                     for r in range(sr, er + 1):
                         for c in range(sc, ec + 1):
                             col_idx = c - sc
-                            cell = num_to_col(c) + str(r)
+                            cell = (r, c)
                             value = flat_vals[col_idx]
                             self.compiler._set_grid_cell(cell, value)
                 else:  # Cycle over the range
                     idx = 0
                     for r in range(sr, er + 1):
                         for c in range(sc, ec + 1):
-                            cell = num_to_col(c) + str(r)
+                            cell = (r, c)
                             value = flat_vals[idx % len(flat_vals)]
                             self.compiler._set_grid_cell(cell, value)
                             idx += 1
@@ -1273,7 +1303,7 @@ class ArrayHandler:
                     # Column-major: first dim is the fastest (grid row)
                     for c in range(num_cols):
                         for r in range(num_rows):
-                            cell = num_to_col(sc + c) + str(sr + r)
+                            cell = (sr + r, sc + c)
                             value = flat_vals[r + effective_shape[0] * c]
                             self.compiler._set_grid_cell(cell, value)
                 elif effective_shape[0] == num_cols and effective_shape[1] == num_rows and num_cols == 1:
@@ -1281,14 +1311,14 @@ class ArrayHandler:
                     idx = 0
                     for r in range(sr, sr + num_rows):
                         for c in range(sc, sc + num_cols):
-                            cell = num_to_col(c) + str(r)
+                            cell = (r, c)
                             value = reshaped[idx][0]
                             self.compiler._set_grid_cell(cell, value)
                             idx += 1
                 elif effective_shape[0] == num_rows and effective_shape[1] == num_cols == 1:
                     idx = 0
                     for r in range(sr, sr + effective_shape[0]):
-                        cell = num_to_col(sc) + str(r)
+                        cell = (r, sc)
                         value = flat_vals[idx]
                         self.compiler._set_grid_cell(cell, value)
                         idx += 1
@@ -1298,7 +1328,7 @@ class ArrayHandler:
         else:  # Scalar assignment to range
             for r in range(sr, er + 1):
                 for c in range(sc, ec + 1):
-                    cell = num_to_col(c) + str(r)
+                    cell = (r, c)
                     value = flat_vals[0]
                     self.compiler._set_grid_cell(cell, value)
 
@@ -1307,13 +1337,13 @@ class ArrayHandler:
 
         The hyper-rectangle between the two addresses is filled in column-major
         order (first index fastest). Scalars fill every cell; arrays repeat and
-        cycle over the flat buffer.
+        cycle over the flat buffer. ``sr_ref``/``er_ref`` are 0-based tuples.
         """
-        s_idx = parse_address(sr_ref)
-        e_idx = parse_address(er_ref)
+        s_idx = [i + 1 for i in sr_ref]
+        e_idx = [i + 1 for i in er_ref]
         if len(s_idx) != len(e_idx):
             raise ValueError(
-                f"Range addresses '{sr_ref}' and '{er_ref}' must have the same rank at line {line_number}")
+                f"Range addresses '{indices_to_address([i for i in s_idx])}' and '{indices_to_address([i for i in e_idx])}' must have the same rank at line {line_number}")
         starts = [min(a, b) for a, b in zip(s_idx, e_idx)]
         shape = [abs(a - b) + 1 for a, b in zip(s_idx, e_idx)]
         is_array = isinstance(
@@ -1329,8 +1359,7 @@ class ArrayHandler:
             for dim_size in shape:
                 idxs.append(rem % dim_size)
                 rem //= dim_size
-            addr = indices_to_address(
-                [starts[i] + idxs[i] for i in range(len(shape))])
+            addr = tuple(starts[i] + idxs[i] - 1 for i in range(len(shape)))
             self.compiler._set_grid_cell(addr, self.to_display_value(
                 flat_vals[flat_i % len(flat_vals)]))
 
@@ -1338,21 +1367,18 @@ class ArrayHandler:
         """
         Retrieve values from a grid range (e.g., A1:B2).
         Returns 1D list for single row/column, 2D list otherwise.
-        :param s_cell: Start cell.
-        :param e_cell: End cell.
+        :param s_cell: Start cell as a 0-based index tuple (e.g. (0, 0)).
+        :param e_cell: End cell as a 0-based index tuple (e.g. (1, 1)).
         :param line_number: Line number.
         :return: List of values.
         """
-        scs, sro = split_cell(s_cell)
-        ecs, ero = split_cell(e_cell)
-        sc, ec = col_to_num(scs), col_to_num(ecs)
-        sr, er = int(sro), int(ero)
+        sr, sc = s_cell
+        er, ec = e_cell
         values = []
         for r in range(min(sr, er), max(sr, er) + 1):
             row_values = []
             for c in range(min(sc, ec), max(sc, ec) + 1):
-                cell_ref = num_to_col(c) + str(r)
-                row_values.append(self.lookup_cell(cell_ref, line_number))
+                row_values.append(self.lookup_cell((r, c), line_number))
             values.append(row_values)
         return values
 
@@ -1364,11 +1390,11 @@ class ArrayHandler:
         column-major order (first index fastest) and returned as nested lists
         in declared-dim order. Both endpoints must have the same rank.
         """
-        s_idx = parse_address(s_cell)
-        e_idx = parse_address(e_cell)
+        s_idx = [i + 1 for i in s_cell]
+        e_idx = [i + 1 for i in e_cell]
         if len(s_idx) != len(e_idx):
             raise ValueError(
-                f"Range addresses '{s_cell}' and '{e_cell}' must have the same rank at line {line_number}")
+                f"Range addresses '{indices_to_address([i for i in s_idx])}' and '{indices_to_address([i for i in e_idx])}' must have the same rank at line {line_number}")
         starts = [min(a, b) for a, b in zip(s_idx, e_idx)]
         shape = [abs(a - b) + 1 for a, b in zip(s_idx, e_idx)]
         flat_values = []
@@ -1378,8 +1404,7 @@ class ArrayHandler:
             for dim_size in shape:
                 idxs.append(rem % dim_size)
                 rem //= dim_size
-            addr = indices_to_address(
-                [starts[i] + idxs[i] for i in range(len(shape))])
+            addr = tuple(starts[i] + idxs[i] - 1 for i in range(len(shape)))
             flat_values.append(self.lookup_cell(addr, line_number))
         return self._nested_from_flat(flat_values, shape)
 
@@ -1443,22 +1468,26 @@ class ArrayHandler:
         """
         Lookup value in a grid cell, default to #N/A (or the grid's null
         default) if unset.
-        :param cell_ref: Cell reference.
+        :param cell_ref: Cell reference as a 0-based index tuple (or, for
+            compatibility with python-fallback scope, an address string).
         :param line_number: Line number.
         :return: Cell value.
         """
         # The grid store is keyed by 0-based numeric index tuples; convert the
         # cell reference (case-insensitive) before looking it up.
         store = self.compiler.grid
-        try:
-            key = tuple(i - 1 for i in parse_address(cell_ref))
-        except ValueError:
-            key = None
+        if isinstance(cell_ref, (tuple, list)):
+            key = tuple(int(i) for i in cell_ref)
+        else:
+            try:
+                key = tuple(i - 1 for i in parse_address(cell_ref))
+            except ValueError:
+                key = None
         if key is not None and key in store:
             return store[key]
-        if '.' in cell_ref:
+        if key is not None and len(key) > 2:
             # Extended addresses fall back to any matching grid DIM tensor.
-            value = self._lookup_extended_address(cell_ref, line_number)
+            value = self._lookup_extended_address(key, line_number)
             if value is not None:
                 return value
         return self._array_unset_value('grid', line_number)
@@ -1501,7 +1530,10 @@ class ArrayHandler:
     def _lookup_extended_address(self, cell_ref, line_number=None):
         """Resolve a dotted address against grid DIM tensor stores."""
         try:
-            indices = parse_address(cell_ref)
+            if isinstance(cell_ref, (tuple, list)):
+                indices = [i + 1 for i in cell_ref]
+            else:
+                indices = parse_address(cell_ref)
         except ValueError:
             return None
         for tensor in self._iter_tensor_grid_vars():
@@ -2284,15 +2316,16 @@ class ArrayHandler:
     def get_grid_column(self, col_ref, grid_source=None, line_number=None):
         """Return a dense list of values in the given grid column.
 
-        ``col_ref`` is a column letter (e.g. 'A') or a 1-based column number;
-        unset cells within the grid's used extent read as the unset value
-        (#N/A, or the declared default).
+        ``col_ref`` is a 0-based column index (e.g. 0 for column A) or a
+        column letter (e.g. 'A') for compatibility; unset cells within the
+        grid's used extent read as the unset value (#N/A, or the declared
+        default).
         """
         grid_source = grid_source if grid_source is not None else self.compiler.grid
         if isinstance(col_ref, str) and re.match(r'^[A-Za-z]+$', col_ref):
             col_num = col_to_num(col_ref)
         else:
-            col_num = int(col_ref)
+            col_num = int(col_ref) + 1
         max_row, max_col = self._grid_source_extent(grid_source)
         if col_num < 1 or col_num > max_col or max_row == 0:
             return []

@@ -12,7 +12,7 @@ from units import (
     strip_units,
 )
 from utils import (
-    indices_to_address, iter_interpolation_placeholders, is_sparse_array,
+    iter_interpolation_placeholders, is_sparse_array,
 )
 
 # Stack of compiler run contexts: ``run()`` pushes the executing compiler and
@@ -46,16 +46,12 @@ class _GridStore(dict):
         raise TypeError(
             f"Grid store keys must be numeric index tuples, got {key!r}")
 
-    @staticmethod
-    def _cell_ref(key):
-        return indices_to_address([i + 1 for i in key])
-
     def __setitem__(self, key, value):
         key = self._normalize_key(key)
         super().__setitem__(key, strip_units(value))
         owner = self._grid_owner
         if owner is not None and hasattr(owner, '_notify_cell_changed'):
-            owner._notify_cell_changed(self._cell_ref(key), value)
+            owner._notify_cell_changed(key, value)
 
     def __getitem__(self, key):
         return super().__getitem__(self._normalize_key(key))

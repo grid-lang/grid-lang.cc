@@ -1122,21 +1122,22 @@ class GridLangCompiler:
             cell_ref = self.expr_evaluator._resolve_column_interpolated_cell(
                 inner, scope.get_evaluation_scope(), line_number) or inner
             validate_cell_ref(cell_ref)
+            cell_key = self._to_index(cell_ref)
             if isinstance(values, list):
                 all_scalars = all(not isinstance(v, (list, dict))
                                   for v in values)
                 if all_scalars:
                     # For scalar pushes, keep the last value only
                     simple_value = values[-1]
-                    self._set_grid_cell(cell_ref, simple_value)
+                    self._set_grid_cell(cell_key, simple_value)
                     return
             assign_value = values if isinstance(values, list) else [values]
             expr_hint = '{' + ','.join(['x'] * len(assign_value)) + '}'
             if is_horizontal or len(assign_value) > 1:
                 self.array_handler._assign_horizontal_array(
-                    cell_ref, assign_value, expr_hint, line_number=line_number)
+                    cell_key, assign_value, expr_hint, line_number=line_number)
             else:
-                self._set_grid_cell(cell_ref, simple_value)
+                self._set_grid_cell(cell_key, simple_value)
             return
 
         try:
@@ -1701,8 +1702,7 @@ class GridLangCompiler:
         cell_refs = self._extract_cell_refs(str(expr))
         keys = []
         for ref in sorted(cell_refs):
-            ref_string = indices_to_address([i + 1 for i in ref])
-            keys.append(('cell', ref_string.upper()))
+            keys.append(('cell', ref))
         for dep in deps:
             if re.match(r'^[A-Za-z]+\d+$', dep):
                 continue
@@ -1719,7 +1719,7 @@ class GridLangCompiler:
         self._propagate(('var', name.lower()), value)
 
     def _notify_cell_changed(self, cell_ref, value):
-        self._propagate(('cell', cell_ref.upper()), value)
+        self._propagate(('cell', cell_ref), value)
 
     def _propagate(self, dep_key, value):
         """Recompute every client listener that depends on dep_key."""
@@ -2759,11 +2759,12 @@ class GridLangCompiler:
         if not re.match(r'^[\w_]+$', var):
             raise SyntaxError(
                 f"Invalid variable name: '{var}' at line {line_number}")
-        if cell in self._cell_var_map and self._cell_var_map[cell] != var:
+        cell_key = self._to_index(cell)
+        if cell_key in self._cell_var_map and self._cell_var_map[cell_key] != var:
             raise SyntaxError(
-                f"Cell '{cell}' already mapped to '{self._cell_var_map[cell]}' at line {line_number}")
+                f"Cell '{cell}' already mapped to '{self._cell_var_map[cell_key]}' at line {line_number}")
         for c, v in self._cell_var_map.items():
-            if v == var and c != cell:
+            if v == var and c != cell_key:
                 raise SyntaxError(
                     f"Variable '{var}' already mapped to cell '{c}' at line {line_number}")
 
@@ -2790,8 +2791,8 @@ class GridLangCompiler:
         else:
             self.current_scope().define(
                 var, value, inferred_type, constraints, is_uninitialized=False, line_number=line_number)
-        self._spill_value_to_cells(cell, value, line_number)
-        self._cell_var_map[cell] = var
+        self._spill_value_to_cells(cell_key, value, line_number)
+        self._cell_var_map[cell_key] = var
 
     def _process_cell_binding_declaration(self, line, line_number=None):
         """Process lines like [A1]: width as number to bind variables to cells."""
@@ -2830,32 +2831,33 @@ class GridLangCompiler:
                 defining_scope.types[type_key] = type_name
 
         # Prevent conflicting mappings.
+        cell_key = self._to_index(cell_ref)
         if caret_flag:
-            existing = self._cell_array_map.get(cell_ref)
+            existing = self._cell_array_map.get(cell_key)
             if existing and existing.lower() != var.lower():
                 raise SyntaxError(
                     f"Cell '{cell_ref}' already mapped to '{existing}' at line {line_number}")
             for mapped_cell, mapped_var in self._cell_array_map.items():
-                if mapped_var.lower() == var.lower() and mapped_cell != cell_ref:
+                if mapped_var.lower() == var.lower() and mapped_cell != cell_key:
                     raise SyntaxError(
                         f"Variable '{var}' already mapped to cell '{mapped_cell}' at line {line_number}")
-            self._cell_array_map[cell_ref] = var
+            self._cell_array_map[cell_key] = var
         else:
-            existing = self._cell_var_map.get(cell_ref)
+            existing = self._cell_var_map.get(cell_key)
             if existing and existing.lower() != var.lower():
                 raise SyntaxError(
                     f"Cell '{cell_ref}' already mapped to '{existing}' at line {line_number}")
             for mapped_cell, mapped_var in self._cell_var_map.items():
-                if mapped_var.lower() == var.lower() and mapped_cell != cell_ref:
+                if mapped_var.lower() == var.lower() and mapped_cell != cell_key:
                     raise SyntaxError(
                         f"Variable '{var}' already mapped to cell '{mapped_cell}' at line {line_number}")
-            self._cell_var_map[cell_ref] = var
+            self._cell_var_map[cell_key] = var
 
         # If the variable already has a value, reflect it in the grid immediately.
         try:
             current_value = self.current_scope().get(var)
             if current_value is not None:
-                self._spill_value_to_cells(cell_ref, current_value, line_number)
+                self._spill_value_to_cells(cell_key, current_value, line_number)
                 self._record_output_value(var, current_value)
         except NameError:
             pass

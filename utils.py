@@ -134,16 +134,18 @@ def num_to_col(num):
     return col
 
 
-def offset_cell(cell_ref, col_offset, row_offset):
-    col, row = split_cell(cell_ref)
-    col_num = col_to_num(col)
-    new_col_num = col_num + col_offset
-    if new_col_num < 1:
+def offset_cell(index, col_offset, row_offset):
+    """Return the 0-based index tuple offset from ``index`` (row, col) by
+    ``(col_offset, row_offset)``.  The canonical internal form is a 0-based
+    index tuple; offsets are applied to the 0-based coordinates."""
+    row, col = index
+    new_col = col + col_offset
+    if new_col < 0:
         raise ValueError("Column offset results in invalid column")
-    new_row = int(row) + row_offset
-    if new_row < 1:
+    new_row = row + row_offset
+    if new_row < 0:
         raise ValueError("Row offset results in invalid row")
-    return f"{num_to_col(new_col_num)}{new_row}"
+    return (new_row, new_col)
 
 
 # An N-D address is a dot-separated sequence of segments. Each segment is

@@ -3986,6 +3986,7 @@ class GridLangExecutor:
             if cell_ref.startswith('^'):
                 array_cell_ref = cell_ref[1:].strip()
                 parse_address(array_cell_ref)
+                array_cell_key = self.compiler._to_index(array_cell_ref)
                 scope_value = self.current_scope().get_evaluation_scope()
                 is_grid_value = '.grid{' in value
                 evaluated_value = self.expr_evaluator.eval_or_eval_array(
@@ -3999,22 +4000,23 @@ class GridLangExecutor:
                                     self.grid[(int(row), int(col))] = val
                         else:
                             self.array_handler._assign_horizontal_array(
-                                array_cell_ref, evaluated_value, value, line_number=line_number)
+                                array_cell_key, evaluated_value, value, line_number=line_number)
                     else:
                         self.array_handler._assign_horizontal_array(
-                            array_cell_ref, evaluated_value, value, line_number=line_number)
+                            array_cell_key, evaluated_value, value, line_number=line_number)
                 else:
                     self.array_handler._assign_horizontal_array(
-                        array_cell_ref, evaluated_value, value, line_number=line_number)
+                        array_cell_key, evaluated_value, value, line_number=line_number)
             else:
                 parse_address(cell_ref)
+                cell_key = self.compiler._to_index(cell_ref)
                 scope_value = self.current_scope().get_evaluation_scope()
                 is_grid_value = '.grid{' in value
                 evaluated_value = self.expr_evaluator.eval_or_eval_array(
                     value, scope_value, line_number, is_grid_dim=is_grid_value)
                 # ``[A1] := x`` is sugar for ``Let grid![A1] = x``: the grid
                 # store is the single backing store for both forms.
-                self._set_grid_cell(cell_ref, self.array_handler.to_display_value(
+                self._set_grid_cell(cell_key, self.array_handler.to_display_value(
                     evaluated_value))
         except Exception as e:
             raise RuntimeError(

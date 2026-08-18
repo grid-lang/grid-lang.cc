@@ -136,7 +136,8 @@ class ExpressionEvaluator:
             if '.' in s_ref or '.' in e_ref:
                 try:
                     values = self.compiler.array_handler.get_range_values_address(
-                        s_ref, e_ref, line_number)
+                        self.compiler._to_index(s_ref),
+                        self.compiler._to_index(e_ref), line_number)
                     flat_values = self.compiler.array_handler.flatten_array(
                         values, line_number)
                     if hasattr(self.compiler, 'last_dim_var') and self.compiler.last_dim_var:
@@ -149,10 +150,9 @@ class ExpressionEvaluator:
                     raise RuntimeError(
                         f"Error evaluating range '{s_ref}:{e_ref}': {e} at line {line_number}")
             try:
-                parse_address(s_ref)
-                parse_address(e_ref)
                 values = self.compiler.array_handler.get_range_values(
-                    s_ref, e_ref, line_number)
+                    self.compiler._to_index(s_ref),
+                    self.compiler._to_index(e_ref), line_number)
                 flat_values = [v for row in values for v in (
                     row if isinstance(row, list) else [row])]
                 if hasattr(self.compiler, 'last_dim_var') and self.compiler.last_dim_var:
@@ -394,14 +394,14 @@ class ExpressionEvaluator:
         try:
             if '.' in start_ref or '.' in end_ref:
                 values = self.compiler.array_handler.get_range_values_address(
-                    start_ref, end_ref, line_number)
+                    self.compiler._to_index(start_ref),
+                    self.compiler._to_index(end_ref), line_number)
                 flat_values = self.compiler.array_handler.flatten_array(
                     values, line_number)
             else:
-                parse_address(start_ref)
-                parse_address(end_ref)
                 values = self.compiler.array_handler.get_range_values(
-                    start_ref, end_ref, line_number)
+                    self.compiler._to_index(start_ref),
+                    self.compiler._to_index(end_ref), line_number)
                 flat_values = [v for row in values for v in (
                     row if isinstance(row, list) else [row])]
             numeric_values = [
@@ -1236,7 +1236,8 @@ class ExpressionEvaluator:
         if not is_address(cell_ref):
             return False, None
         try:
-            value = self.compiler.array_handler.lookup_cell(cell_ref, line_number)
+            value = self.compiler.array_handler.lookup_cell(
+                self.compiler._to_index(cell_ref), line_number)
             return True, value
         except ValueError as e:
             raise RuntimeError(
@@ -1260,7 +1261,7 @@ class ExpressionEvaluator:
             return False, None
         try:
             return True, self.compiler.array_handler.resolve_cell_index(
-                var_name, index_expr, line_number)
+                var_name, self.compiler._to_index(index_expr), line_number)
         except (NameError, TypeError):
             return False, None
         except (IndexError, ValueError) as e:
@@ -1345,7 +1346,7 @@ class ExpressionEvaluator:
             cell_ref = self._resolve_column_interpolated_cell(
                 inside, scope, line_number)
             value = self.compiler.array_handler.lookup_cell(
-                cell_ref, line_number)
+                self.compiler._to_index(cell_ref), line_number)
             if isinstance(value, (int, float)):
                 return str(value)
             return f'"{value}"'
@@ -1365,9 +1366,8 @@ class ExpressionEvaluator:
                         f"Invalid cell reference index '{index_value}' must be a positive integer at line {line_number}")
 
                 cell_ref = f"{col}{index_value}"
-                parse_address(cell_ref)
                 value = self.compiler.array_handler.lookup_cell(
-                    cell_ref, line_number)
+                    self.compiler._to_index(cell_ref), line_number)
                 if isinstance(value, (int, float)):
                     expr = expr.replace(f'[{col}{{{index_expr}}}]', str(value))
                 else:
@@ -2036,12 +2036,12 @@ class ExpressionEvaluator:
                 if '.' in s_ref or '.' in e_ref:
                     # Extended (N-D) range: return the nested block.
                     values = self.compiler.array_handler.get_range_values_address(
-                        s_ref, e_ref, line_number)
+                        self.compiler._to_index(s_ref),
+                        self.compiler._to_index(e_ref), line_number)
                     return values
-                parse_address(s_ref)
-                parse_address(e_ref)
                 values = self.compiler.array_handler.get_range_values(
-                    s_ref, e_ref, line_number)
+                    self.compiler._to_index(s_ref),
+                    self.compiler._to_index(e_ref), line_number)
                 flat_values = [v for row in values for v in (
                     row if isinstance(row, list) else [row])]
                 if all(v == 0.0 for v in flat_values) and line_number is not None:
@@ -2110,8 +2110,14 @@ class ExpressionEvaluator:
                 try:
                     if bang_index and (is_address(index_expr)
                                        or var_name.lower() == 'grid'):
+                        if is_address(index_expr):
+                            cell_index = self.compiler._to_index(index_expr)
+                        elif re.match(r'^[A-Za-z]+$', index_expr):
+                            cell_index = (None, col_to_num(index_expr) - 1)
+                        else:
+                            cell_index = index_expr
                         return self.compiler.array_handler.resolve_cell_index(
-                            var_name, index_expr, line_number)
+                            var_name, cell_index, line_number)
                     if bang_index and ':' in index_expr:
                         range_match = re.match(
                             rf'^({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})$', index_expr)
@@ -2120,7 +2126,9 @@ class ExpressionEvaluator:
                             array = scope.get(
                                 var_name, self.compiler.variables.get(var_name))
                             return self.compiler.array_handler.read_array_range(
-                                array, s_ref, e_ref, line_number)
+                                array,
+                                self.compiler._to_index(s_ref),
+                                self.compiler._to_index(e_ref), line_number)
                     base = 0 if paren_index and paren_index.isdigit() else 1
                     return self._eval_array_element(
                         var_name, index_expr, scope, line_number, base=base)
@@ -2412,7 +2420,7 @@ class ExpressionEvaluator:
             caret, cell_ref = m.group(1), m.group(2)
             try:
                 value = self.compiler.array_handler.lookup_cell(
-                    cell_ref, line_number)
+                    self.compiler._to_index(cell_ref), line_number)
             except ValueError as e:
                 raise RuntimeError(
                     f"Invalid cell reference '{cell_ref}': {e} at line {line_number}")
