@@ -14,11 +14,12 @@ from utils import (
     parse_address,
     get_case_insensitive_key,
     is_address,
+    is_wildcard_address,
     _ADDRESS_FRAGMENT,
     format_display_value,
     is_sparse_array,
 )
-from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, REF_ERROR, UNIVERSAL_ZERO, UnitValue, error_value, is_error_value
+from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, REF_ERROR, UNIVERSAL_ZERO, UnitValue, ConstraintError, error_value, is_error_value
 
 
 class CaseInsensitiveDict(dict):
@@ -1233,6 +1234,14 @@ class ExpressionEvaluator:
         cell_ref = expr[1:-1].strip()
         if cell_ref.startswith('^'):
             cell_ref = cell_ref[1:].strip()
+        if is_wildcard_address(cell_ref):
+            try:
+                value = self.compiler.array_handler.read_grid_wildcard(
+                    cell_ref, line_number)
+            except (ConstraintError, ValueError) as e:
+                raise RuntimeError(
+                    f"Invalid wildcard cell reference '{cell_ref}': {e} at line {line_number}")
+            return True, value
         if not is_address(cell_ref):
             return False, None
         try:
@@ -1391,7 +1400,7 @@ class ExpressionEvaluator:
         for index_expr in indices_str.split(','):
             index_expr = index_expr.strip()
             if index_expr == '*':
-                specs.append('*')
+                specs.append(None)
                 continue
             m = re.match(r'^(-?\d+)\s+to\s+(-?\d+)$', index_expr)
             if m:
@@ -1463,7 +1472,7 @@ class ExpressionEvaluator:
                 start, end = spec
                 adjusted_specs.append(
                     (start - base, None if end is None else end - base))
-            elif spec == '*':
+            elif spec is None:
                 adjusted_specs.append(spec)
             else:
                 adjusted_specs.append(spec - base)
@@ -1509,7 +1518,7 @@ class ExpressionEvaluator:
         for index_expr in indices_str.split(','):
             index_expr = index_expr.strip()
             if index_expr == '*':
-                specs.append('*')
+                specs.append(None)
                 continue
             m = re.match(r'^(-?\d+)\s+to\s+(-?\d+)$', index_expr)
             if m:
@@ -1534,7 +1543,7 @@ class ExpressionEvaluator:
                 start, end = spec
                 adjusted_specs.append(
                     (start - 1, None if end is None else end - 1))
-            elif spec == '*':
+            elif spec is None:
                 adjusted_specs.append(spec)
             else:
                 adjusted_specs.append(spec - 1)
@@ -2109,6 +2118,7 @@ class ExpressionEvaluator:
             if var_name in scope or var_name in self.compiler.variables:
                 try:
                     if bang_index and (is_address(index_expr)
+                                       or is_wildcard_address(index_expr)
                                        or var_name.lower() == 'grid'):
                         if is_address(index_expr):
                             cell_index = self.compiler._to_index(index_expr)

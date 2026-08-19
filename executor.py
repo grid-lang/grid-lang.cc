@@ -8,7 +8,7 @@ from array_handler import ArrayHandler
 from control_flow import GridLangControlFlow
 from parser import GridLangParser
 from units import VALUE_ERROR, ConstraintError, error_value
-from utils import col_to_num, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array, strip_array_cell_indices
+from utils import col_to_num, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array, strip_array_cell_indices, is_wildcard_address
 
 
 IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*')
@@ -63,9 +63,9 @@ def _strip_cell_address_tokens(line, var_set):
     for group in re.findall(r'\[([^\[\]]*)\]', line):
         for piece in group.split(':'):
             piece = piece.strip().lstrip('^')
-            if is_address(piece):
+            if is_address(piece) or is_wildcard_address(piece):
                 for seg in piece.split('.'):
-                    if re.match(r'^[A-Za-z]+\d+$', seg):
+                    if re.match(r'^[A-Za-z]+\d*$', seg):
                         stripped.add(seg)
     return var_set - stripped
 

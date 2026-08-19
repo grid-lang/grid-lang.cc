@@ -6,7 +6,11 @@ Handles type definitions, type code execution, and type-related operations.
 import copy
 import re
 import numbers
-from utils import get_case_insensitive_key, split_var_defs
+from utils import (
+    get_case_insensitive_key,
+    is_wildcard_address,
+    split_var_defs,
+)
 
 
 class GridLangTypeProcessor:
@@ -370,10 +374,19 @@ class GridLangTypeProcessor:
     def _process_grid_assignment(self, line, var_name, value_dict, line_number):
         """Process grid assignment like [B1] := 1"""
         # Extract cell reference and value
-        match = re.match(r'\[([A-Z]+\d+)\]\s*:=\s*(.+)$', line)
+        match = re.match(r'\[([^\]]+)\]\s*:=\s*(.+)$', line)
         if match:
             cell_ref, value_expr = match.groups()
+            cell_ref = cell_ref.strip()
             # Convert cell reference to grid coordinates
+            value = self.compiler.expr_evaluator.eval_expr(
+                value_expr, self.compiler.current_scope().get_full_scope(), line_number)
+            if is_wildcard_address(cell_ref):
+                # A wildcarded N-D address targets the tensor's grid field in
+                # tensor scope (the value_dict carried by 'this').
+                self.compiler.array_handler._assign_wildcard_range(
+                    cell_ref, value, expr_part=value_expr, line_number=line_number)
+                return
             col = re.match(r'([A-Z]+)', cell_ref).group(1)
             row = int(re.match(r'[A-Z]+(\d+)', cell_ref).group(1))
 
@@ -381,10 +394,6 @@ class GridLangTypeProcessor:
             col_num = 0
             for char in col:
                 col_num = col_num * 26 + (ord(char.upper()) - ord('A') + 1)
-
-            # Evaluate the value
-            value = self.compiler.expr_evaluator.eval_expr(
-                value_expr, self.compiler.current_scope().get_full_scope(), line_number)
 
             # Store in grid (1-based cell ref -> 0-based sparse array key)
             if 'grid' not in value_dict:
@@ -531,6 +540,19 @@ class GridLangTypeProcessor:
             if field_name.lower() == 'grid':
                 # Parse indices
                 indices = [idx.strip() for idx in indices_str.split(',')]
+
+                if is_wildcard_address(indices_str):
+                    # A wildcarded N-D address targets the tensor's grid
+                    # field in tensor scope (the value_dict carried by
+                    # 'this').
+                    value = self.compiler.expr_evaluator.eval_expr(
+                        value_expr,
+                        self._build_type_eval_scope(value_dict, {}),
+                        line_number)
+                    self.compiler.array_handler._assign_wildcard_range(
+                        indices_str, value, expr_part=value_expr,
+                        line_number=line_number)
+                    return
 
                 # Ensure the instance carries a grid store: a dense N-D array
                 # when the type declares grid dims, otherwise a sparse array.

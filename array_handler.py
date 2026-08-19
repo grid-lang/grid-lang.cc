@@ -7,7 +7,7 @@
 import re
 import copy
 # Utilities for cell and column operations
-from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, prod, public_type_fields, object_public_keys, public_object_view, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT, is_sparse_array
+from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell_ref, prod, public_type_fields, object_public_keys, public_object_view, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT, is_sparse_array, is_wildcard_address, parse_wildcard_address
 from functools import reduce
 import operator
 import itertools
@@ -42,6 +42,11 @@ class ArrayHandler:
         except NameError:
             raise NameError(
                 f"Variable '{var_name}' not defined at line {line_number}")
+        if isinstance(cell_ref, str) and is_wildcard_address(cell_ref):
+            if var_name.lower() == 'grid':
+                return self.read_grid_wildcard(cell_ref, line_number)
+            return self.read_array_wildcard(
+                arr, cell_ref, line_number, var_name=var_name)
         if var_name.lower() == 'grid':
             # grid![cell] reads a cell directly from the grid array;
             # grid![A] reads a whole column (a (None, col) index tuple
@@ -269,6 +274,7 @@ class ArrayHandler:
         is_harr = target_info['is_harr']
         is_dim_selector = target_info['is_dim_selector']
         is_index_selector = target_info['is_index_selector']
+        is_wildcard = target_info['is_wildcard']
         sr = target_info['sr']
         er = target_info['er']
         var_name = target_info['var_name']
@@ -318,6 +324,7 @@ class ArrayHandler:
             is_harr=is_harr,
             is_dim_selector=is_dim_selector,
             is_index_selector=is_index_selector,
+            is_wildcard=is_wildcard,
             sr=sr,
             er=er,
             var_name=var_name,
@@ -345,6 +352,7 @@ class ArrayHandler:
 
     def _parse_assignment_target_details(self, target_part, scope, line_number):
         target, is_range, is_harr, is_dim_selector, is_index_selector = None, False, False, False, False
+        is_wildcard = False
         sr, er = None, None
         var_name, dim_name, dim_index = None, None, None
         indices = None
@@ -428,6 +436,10 @@ class ArrayHandler:
             elif is_address(inside):
                 # Extended (dotted) single-cell target, e.g. [A1.B1].
                 target = inside
+            elif is_wildcard_address(inside):
+                # Wildcarded (slice) target, e.g. [C3.*.4].
+                target = inside
+                is_wildcard = True
             else:
                 resolved = self.compiler.expr_evaluator._resolve_column_interpolated_cell(
                     inside, scope, line_number)
@@ -471,6 +483,9 @@ class ArrayHandler:
                             target = final_inside
                         elif is_address(final_inside):
                             target = final_inside
+                        elif is_wildcard_address(final_inside):
+                            target = final_inside
+                            is_wildcard = True
                         elif final_inside.startswith('^'):
                             target = final_inside[1:].strip()
                             if is_address(target):
@@ -489,7 +504,7 @@ class ArrayHandler:
                 f"Invalid assignment target: '{target_part}' at line {line_number}. "
                 "Use [address] := value.")
 
-        if target is not None and isinstance(target, str):
+        if target is not None and isinstance(target, str) and not is_wildcard:
             target = self.compiler._to_index(target)
         if sr is not None and isinstance(sr, str):
             sr = self.compiler._to_index(sr)
@@ -502,6 +517,7 @@ class ArrayHandler:
             'is_harr': is_harr,
             'is_dim_selector': is_dim_selector,
             'is_index_selector': is_index_selector,
+            'is_wildcard': is_wildcard,
             'sr': sr,
             'er': er,
             'var_name': var_name,
@@ -518,6 +534,7 @@ class ArrayHandler:
             is_harr,
             is_dim_selector,
             is_index_selector,
+            is_wildcard,
             sr,
             er,
             var_name,
@@ -532,6 +549,9 @@ class ArrayHandler:
             reshaped_value):
         target_disp = indices_to_address(
             [i + 1 for i in target]) if isinstance(target, tuple) else str(target)
+        if is_wildcard:
+            return self._assign_wildcard_range(
+                target, value, expr_part, line_number)
         if is_index_selector:
             result = self._assign_index_selector(
                 var_name, indices, value, line_number)
@@ -1515,8 +1535,8 @@ class ArrayHandler:
                     yield val
 
     def _tensor_index_for_indices(self, tensor, indices):
-        shape = list(tensor.get('original_shape') or tensor.get('shape') or [])
-        if len(shape) != len(indices):
+        _, shape = self._tensor_flat_shape(tensor)
+        if not shape or len(shape) != len(indices):
             return None, None
         if not all(1 <= indices[i] <= shape[i] for i in range(len(shape))):
             return None, None
@@ -1563,6 +1583,200 @@ class ArrayHandler:
             tensor['grid'] = flat
             return True
         return False
+
+    def wildcard_specs(self, address, rank=None, line_number=None):
+        """Expand a wildcarded N-D address into one internal spec per dim.
+
+        Returns a list where each entry is a 0-based int, None (wildcard), or
+        an (n-1, m-1) range pair, padded with trailing None up to ``rank``.
+        When ``rank`` is None the address's own specs are returned unpadded.
+        """
+        specs = parse_wildcard_address(address)
+        if rank is None:
+            return specs
+        if len(specs) > rank:
+            raise ConstraintError(
+                REF_ERROR,
+                f"Address '{address}' has {len(specs)} indices but the array "
+                f"has rank {rank} at line {line_number}")
+        return specs + [None] * (rank - len(specs))
+
+    def read_array_wildcard(self, arr, address, line_number=None, var_name=None):
+        """Read the sub-array selected by a wildcarded N-D address from an
+        array variable (e.g. ``v![C3.*.4]``)."""
+        dims = self.get_array_dimensions(arr)
+        rank = len(dims) if dims else 1
+        specs = self.wildcard_specs(address, rank=rank, line_number=line_number)
+        try:
+            return self.read_array_slice(
+                arr, specs, line_number,
+                var_name=var_name)
+        except (IndexError, ConstraintError):
+            return error_value(REF_ERROR)
+
+    def _tensor_flat_shape(self, store):
+        """Extract (flat buffer, shape) from a tensor store dict.
+
+        Accepts both the grid-DIM form (``grid``: flat list plus
+        ``original_shape``) and the ``create_array`` form (``grid``:
+        ``{'array': [...], 'original_shape': [...]}``).
+        """
+        grid = store.get('grid')
+        shape =  store.get('shape') or store.get('original_shape')
+        if isinstance(grid, list):
+            return grid, list(shape) if shape else None
+        if isinstance(grid, dict):
+            arr = grid.get('array')
+            shape = shape or grid.get('shape') or grid.get('original_shape')
+            if isinstance(arr, list) and shape:
+                return arr, list(shape)
+        return None, None
+
+    def _tensor_scope_store(self):
+        """Return the current tensor's store dict while executing inside the
+        tensor's own constructor or a private helper, where the scope carries
+        a 'this' whose 'grid' field is the flat tensor buffer. Returns None
+        outside tensor scope, so a naked address targets the global 2D grid.
+        """
+        for scope in self._iter_scopes():
+            val = getattr(scope, 'variables', {}).get('this')
+            if (isinstance(val, dict)
+                    and self._tensor_flat_shape(val)[0] is not None):
+                return val
+        return None
+
+    def read_grid_wildcard(self, address, line_number=None):
+        """Read the sub-block selected by a wildcarded N-D address.
+
+        Inside the tensor's own scope (constructor or private helper, where
+        'this' carries the tensor's grid field) the address reads that tensor's
+        grid. Outside the tensor scope the naked address targets the global
+        grid, which is 2D, so an address spanning more than two indices yields
+        a #REF error value. The result is a scalar for a fully-indexed
+        address, a flat list for a 1-D slice, or a dict-form array otherwise.
+        """
+        tensor = self._tensor_scope_store()
+        if tensor is not None:
+            flat, shape = self._tensor_flat_shape(tensor)
+            if not shape:
+                return error_value(REF_ERROR)
+            specs = self.wildcard_specs(
+                address, rank=len(shape), line_number=line_number)
+            view = {'array': flat, 'shape': list(shape),
+                    'original_shape': list(shape)}
+            try:
+                return self.read_array_slice(
+                    view, specs, line_number,
+                    var_name='grid')
+            except (IndexError, ConstraintError):
+                return error_value(REF_ERROR)
+        store = self.compiler.grid
+        keys = [k for k in store.keys() if isinstance(k, tuple)]
+        rank = max(len(k) for k in keys) if keys else 2
+        try:
+            specs = self.wildcard_specs(
+                address, rank=rank, line_number=line_number)
+        except ConstraintError:
+            return error_value(REF_ERROR)
+        if all(isinstance(s, int) for s in specs):
+            return self.lookup_cell(tuple(s for s in specs), line_number)
+        store = {k: v for k, v in store.items()
+                 if isinstance(k, tuple) and len(k) == rank}
+        return self._read_sparse_slice(store, specs, line_number)
+
+    def _wildcard_block(self, address, line_number=None):
+        """Resolve a wildcarded N-D address to (specs, shape, tensor).
+
+        ``specs`` holds one internal spec per dim (0-based ints, None
+        wildcards, or range pairs), ``shape`` the per-dim sizes of the matched
+        array, and ``tensor`` the matched tensor store (None when the target
+        is the global grid store). Inside the tensor's own scope the address
+        targets the tensor's grid field; outside it targets the global grid,
+        which is 2D, so addresses spanning more than two indices raise a #REF
+        constraint error.
+        """
+        tensor = self._tensor_scope_store()
+        if tensor is not None:
+            _, shape = self._tensor_flat_shape(tensor)
+            specs = self.wildcard_specs(
+                address, rank=len(shape), line_number=line_number)
+            return specs, shape, tensor
+        store = self.compiler.grid
+        keys = [k for k in store.keys() if isinstance(k, tuple)]
+        if keys:
+            rank = max(len(k) for k in keys)
+            shape = [max(k[i] for k in keys if len(k) == rank) + 1
+                     for i in range(rank)]
+        else:
+            rank = 2
+            shape = [0] * rank
+        specs = self.wildcard_specs(address, rank=rank, line_number=line_number)
+        return specs, shape, None
+
+    def _assign_wildcard_range(self, address, value, expr_part=None, line_number=None):
+        """Write into every cell selected by a wildcarded N-D address.
+
+        The value fills the selected sub-block in column-major order (first
+        dim fastest): a scalar fills every cell, an array/list flattens and
+        cycles over the block. Both the grid store and a matching grid DIM
+        tensor are updated.
+        """
+        specs, shape, tensor = self._wildcard_block(
+            address, line_number=line_number)
+        if len(shape) != len(specs):
+            raise ConstraintError(
+                REF_ERROR,
+                f"Address '{address}' has rank {len(specs)} but the array "
+                f"has rank {len(shape)} at line {line_number}")
+        ranges = []
+        for i, spec in enumerate(specs):
+            if isinstance(spec, int):
+                if spec < 0 or spec >= shape[i]:
+                    raise ConstraintError(
+                        REF_ERROR,
+                        f"Index {spec + 1} out of bounds for dimension {i + 1} "
+                        f"with size {shape[i]} at line {line_number}")
+                ranges.append((spec, spec))
+            elif isinstance(spec, tuple):
+                lo, hi = spec
+                if hi is None:
+                    hi = shape[i] - 1
+                if lo < 0 or hi >= shape[i]:
+                    raise ConstraintError(
+                        REF_ERROR,
+                        f"Range {lo + 1} to {hi + 1} out of bounds for "
+                        f"dimension {i + 1} with size {shape[i]} at line {line_number}")
+                ranges.append((lo, hi))
+            else:
+                ranges.append((0, shape[i] - 1))
+        if any(hi < lo for lo, hi in ranges):
+            return
+        is_array = isinstance(value, list) or (
+            isinstance(value, dict) and 'array' in value)
+        flat_vals = self.flatten_array(
+            value, line_number) if is_array else [value]
+        flat_vals = self._resolve_spill_unset(
+            flat_vals, expr_part, line_number)
+        if not flat_vals:
+            return
+        total = prod(hi - lo + 1 for lo, hi in ranges)
+        for flat_i in range(total):
+            rem = flat_i
+            idxs = []
+            for lo, hi in ranges:
+                size = hi - lo + 1
+                idxs.append(lo + (rem % size))
+                rem //= size
+            val = self.to_display_value(flat_vals[flat_i % len(flat_vals)])
+            if tensor is not None:
+                flat, _ = self._tensor_flat_shape(tensor)
+                flat_idx, _ = self._tensor_index_for_indices(
+                    tensor, [i + 1 for i in idxs])
+                if (flat is not None and flat_idx is not None
+                        and 0 <= flat_idx < len(flat)):
+                    flat[flat_idx] = val
+            else:
+                self.compiler._set_grid_cell(tuple(idxs), val)
 
     def flatten_object_fields(self, obj, line_number=None):
         """
@@ -2455,10 +2669,10 @@ class ArrayHandler:
 
         ``specs`` holds one selector per declared dimension, already adjusted
         to storage (0-based) coordinates:
-          - ``'*'``                : take all values in that dimension
-          - ``(start, end)``       : inclusive range; ``end`` may be None
-                                     (open-ended)
-          - ``int``                : single index
+          - ``None`` (a ``*`` selector) : take all values in that dimension
+          - ``(start, end)``            : inclusive range; ``end`` may be None
+                                         (open-ended)
+          - ``int``                     : single index
 
         Scalar dimensions are reduced (excluded from the result): the result
         rank equals the number of ``*``/range selectors.  Invalid addresses
@@ -2503,7 +2717,7 @@ class ArrayHandler:
             size = indexing_shape[i]
             if isinstance(spec, int):
                 s = e = spec
-            elif spec == '*':
+            elif spec is None:
                 s, e = 0, size - 1
             else:
                 s, e = spec
@@ -2565,7 +2779,7 @@ class ArrayHandler:
                     if k != spec:
                         ok = False
                         break
-                elif spec == '*':
+                elif spec is None:
                     continue
                 else:
                     s, e = spec
@@ -2593,7 +2807,7 @@ class ArrayHandler:
             new_key = []
             for i in kept:
                 spec = specs[i]
-                base = 0 if spec == '*' else spec[0]
+                base = 0 if spec is None else spec[0]
                 new_key.append(key[i] - base)
             result[tuple(new_key)] = val
         return result
@@ -2613,7 +2827,7 @@ class ArrayHandler:
                         f"with size {len(node)} at line {line_number}")
                 return walk(node[spec], dim + 1)
             size = len(node)
-            if spec == '*':
+            if spec is None:
                 s, e = 0, size - 1
             else:
                 s, e = spec

@@ -203,6 +203,70 @@ def indices_to_address(indices):
     return '.'.join(parts)
 
 
+# Wildcard addresses add '*' as a segment. Addresses work in pairs: a cell
+# segment like 'C3' contributes the pair (row, col) = [3, 3], '*' contributes
+# a wildcard pair ['*', '*'] and a bare number contributes a single index.
+# The number may be missing from a pair: a bare letter like 'A' in '[C2.A]'
+# contributes a pair with a wildcarded row, so on a 4D array that address
+# selects {2, 3, *, 1}. Missing trailing positions are padded with '*' up to
+# the array's rank, so on a 6D array '[C3.*.4]' selects {3, 3, *, *, 4, *}.
+# Specs are internal 0-based indices: ints are 0-based, '*' is Python-None
+# and a range 'n to m' is a pair (n-1, m-1).
+_ADDRESS_FRAGMENT_WILDCARD = r'(?:[A-Za-z]+\d*|\*)(?:\.[A-Za-z]+\d*|\.[0-9]+|\.\*)*'
+_ADDRESS_PATTERN_WILDCARD = re.compile(r'^' + _ADDRESS_FRAGMENT_WILDCARD + r'$')
+
+
+def _has_bare_letter_segment(value):
+    """True when any dot-separated segment is letters only (number missing)."""
+    return any(re.fullmatch(r'[A-Za-z]+', part) for part in value.split('.'))
+
+
+def is_wildcard_address(value):
+    """Return True if value is a dotted N-D address with wildcarding.
+
+    Wildcarding comes from '*' segments or from a pair whose number is
+    missing (a bare-letter segment inside a dotted address).
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if not _ADDRESS_PATTERN_WILDCARD.match(value):
+        return False
+    if '*' in value:
+        return True
+    return '.' in value and _has_bare_letter_segment(value)
+
+
+def parse_wildcard_address(address):
+    """Parse a wildcarded N-D address into internal 0-based index specs.
+
+    Segments are read in pairs: a cell segment like 'C3' contributes the pair
+    (row, col) -> [2, 2] (0-based); '*' contributes a wildcard pair [None,
+    None]; a bare number contributes a single index; a bare letter like 'A'
+    contributes a pair whose row is wildcarded -> [None, col]. Returns a list
+    whose entries are 0-based ints, None (wildcard), or (n-1, m-1) range pairs.
+    """
+    if not isinstance(address, str) or not address:
+        raise ValueError(f"Invalid address: '{address}'")
+    if not _ADDRESS_PATTERN_WILDCARD.match(address):
+        raise ValueError(f"Invalid wildcard address: '{address}'")
+    specs = []
+    for part in address.split('.'):
+        if part == '*':
+            specs.extend([None, None])
+        elif re.match(r'^[A-Za-z]+\d+$', part):
+            col, row = split_cell(part)
+            specs.extend([int(row) - 1, col_to_num(col) - 1])
+        elif re.match(r'^[A-Za-z]+$', part):
+            specs.extend([None, col_to_num(part) - 1])
+        elif re.match(r'^\d+$', part):
+            specs.append(int(part) - 1)
+        else:
+            raise ValueError(f"Invalid address segment: '{part}'")
+    if not specs:
+        raise ValueError(f"Invalid address: '{address}'")
+    return specs
+
+
 def prod(iterable):
     result = 1
     for x in iterable:
