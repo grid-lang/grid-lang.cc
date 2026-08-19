@@ -1915,6 +1915,10 @@ class GridLangCompiler:
             self.array_handler._assign_horizontal_array(
                 cell_ref, value, "{}", line_number)
             return
+        if isinstance(value, dict) and value and all(isinstance(k, tuple) for k in value.keys()):
+            self.array_handler._assign_horizontal_array(
+                cell_ref, value, "{}", line_number)
+            return
         if isinstance(value, list):
             is_obj_array = (
                 value

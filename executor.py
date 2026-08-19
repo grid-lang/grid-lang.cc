@@ -4016,8 +4016,8 @@ class GridLangExecutor:
                     value, scope_value, line_number, is_grid_dim=is_grid_value)
                 # ``[A1] := x`` is sugar for ``Let grid![A1] = x``: the grid
                 # store is the single backing store for both forms.
-                self._set_grid_cell(cell_key, self.array_handler.to_display_value(
-                    evaluated_value))
+                self.compiler._spill_value_to_cells(
+                    cell_key, evaluated_value, line_number)
         except Exception as e:
             raise RuntimeError(
                 f"Error evaluating '{value}': {e} at line {line_number}")
