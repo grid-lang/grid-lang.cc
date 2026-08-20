@@ -780,6 +780,12 @@ class Scope:
                             key_for_constraints, constraint_val, line_number)
                     except Exception:
                         pass
+                if isinstance(value, (list, dict)):
+                    if not is_error_value(value):
+                        flat = self.compiler.array_handler.flatten_array(
+                            value, line_number)
+                        if any(is_error_value(e) for e in flat):
+                            continue
                 if value != constraint_val:
                     raise ConstraintError(
                         VALUE_ERROR,

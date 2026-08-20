@@ -2133,28 +2133,55 @@ class ArrayHandler:
         """Validate that every scalar element of a dim array matches the declared base type.
 
         None (uninitialized), error values, and nested objects are left
-        untouched.  A mismatched scalar raises a type error so the whole
-        array assignment is rejected (mirrors scalar base-type checking).
+        untouched.  A mismatched scalar is replaced with #TYPE/I in-place
+        so valid elements remain accessible.
         :param var: Variable name.
         :param value: Array value (any supported storage form).
         :param var_type: Declared base type ('number', 'text').
         :param line_number: Line number for error reporting.
         """
-        flat = self.flatten_array(value, line_number)
-        for element in flat:
+        if isinstance(value, list):
+            self._validate_and_replace_list(var, value, var_type, line_number)
+        elif isinstance(value, dict):
+            if 'array' in value:
+                inner = value['array']
+                if isinstance(inner, list):
+                    self._validate_and_replace_list(var, inner, var_type, line_number)
+            elif all(isinstance(k, tuple) for k in value.keys()):
+                for k in list(value.keys()):
+                    v = value[k]
+                    if v is None or v is UNIVERSAL_ZERO or is_error_value(v):
+                        continue
+                    if isinstance(v, (list, dict)):
+                        continue
+                    actual_type = self.infer_type(v, line_number)
+                    if var_type == 'number' and actual_type not in ('number', 'float64', 'int', 'int64'):
+                        value[k] = error_value(TYPE_ERROR)
+                    elif var_type == 'text' and actual_type not in ('string', 'text'):
+                        value[k] = error_value(TYPE_ERROR)
+                    elif var_type == 'logical' and actual_type not in ('bool', 'logical'):
+                        value[k] = error_value(TYPE_ERROR)
+
+    def _validate_and_replace_list(self, var, lst, var_type, line_number):
+        for i, element in enumerate(lst):
             if element is None or element is UNIVERSAL_ZERO or is_error_value(element):
                 continue
             if isinstance(element, (list, dict)):
+                if isinstance(element, list):
+                    self._validate_and_replace_list(var, element, var_type, line_number)
                 continue
             actual_type = self.infer_type(element, line_number)
-            if var_type == 'number' and actual_type not in ('number', 'float64', 'int', 'int64'):
-                raise ConstraintError(
-                    TYPE_ERROR,
-                    f"'{var}' must be a number array, got a {actual_type} element at line {line_number}")
-            if var_type == 'text' and actual_type not in ('string', 'text'):
-                raise ConstraintError(
-                    TYPE_ERROR,
-                    f"'{var}' must be a text array, got a {actual_type} element at line {line_number}")
+            if var_type == 'number':
+                if isinstance(element, bool):
+                    lst[i] = 1 if element else 0
+                elif actual_type not in ('number', 'float64', 'int', 'int64'):
+                    lst[i] = error_value(TYPE_ERROR)
+            elif var_type == 'text':
+                if actual_type not in ('string', 'text'):
+                    lst[i] = error_value(TYPE_ERROR)
+            elif var_type == 'logical':
+                if actual_type not in ('bool', 'logical'):
+                    lst[i] = error_value(TYPE_ERROR)
 
     def check_dimension_constraints(self, var, value, line_number=None):
         """

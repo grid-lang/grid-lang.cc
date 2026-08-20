@@ -1751,13 +1751,13 @@ class ExpressionEvaluator:
 
     def _paren_access_replacer_with_check(self, match, scope, line_number):
         var_name, index_expr = match.groups()
-        callable_names = {'SQRT', 'ABS', 'SIN', 'COS',
-                          'TAN', 'LOG', 'EXP', 'LEN', 'MID', 'TEXTSPLIT', 'TRANSPOSE'}
+        callable_names = {'sqrt', 'abs', 'sin', 'cos',
+                          'tan', 'log', 'exp', 'len', 'mid', 'textsplit', 'transpose'}
         if hasattr(self.compiler, 'functions'):
-            callable_names.update({n.upper() for n in self.compiler.functions.keys()})
+            callable_names.update({n.lower() for n in self.compiler.functions.keys()})
         if hasattr(self.compiler, 'subprocesses'):
-            callable_names.update({n.upper() for n in self.compiler.subprocesses.keys()})
-        if var_name.upper() in callable_names:
+            callable_names.update({n.lower() for n in self.compiler.subprocesses.keys()})
+        if var_name.lower() in callable_names:
             return match.group(0)
         if '!' in var_name:
             return match.group(0)
