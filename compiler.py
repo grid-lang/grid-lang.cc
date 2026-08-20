@@ -2795,7 +2795,7 @@ class GridLangCompiler:
             defining_scope.update(var, value, line_number)
         else:
             self.current_scope().define(
-                var, value, inferred_type, constraints, is_uninitialized=False, line_number=line_number)
+                var, value, inferred_type, constraints, is_uninitialized=False, line_number=line_number, internal=True)
         self._spill_value_to_cells(cell_key, value, line_number)
         self._cell_var_map[cell_key] = var
 

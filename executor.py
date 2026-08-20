@@ -4008,10 +4008,9 @@ class GridLangExecutor:
                 if len(indices) > max_rank:
                     raise ValueError(
                         f"Cell address '{cell_ref}' has rank {len(indices)} but grid has rank {max_rank} at line {line_number}")
-                auto_var = f'cell{cell_ref}'
-                binding_line = f'[{cell_ref}] : {auto_var} = {value}'
-                self.compiler._evaluate_cell_var_definition(
-                    binding_line, line_number)
+                scope = self.current_scope()
+                self.array_handler.evaluate_line_with_assignment(
+                    line, line_number, scope.get_evaluation_scope())
         except Exception as e:
             raise RuntimeError(
                 f"Error evaluating '{value}': {e} at line {line_number}")

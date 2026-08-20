@@ -316,15 +316,16 @@ class Scope:
             self.compiler.mark_dependency_resolved(actual_key)
         return materialized
 
-    def _validate_variable_name(self, name, line_number=None):
+    def _validate_variable_name(self, name, line_number=None, internal=False):
         """Reject names that are not valid GridLang variable identifiers.
 
         A variable name must start with a letter and may contain letters,
         digits, '_' and '.' (never in the last position).
+        Names starting with '_' are reserved for internal use.
         """
         valid = (
             name
-            and name[0].isalpha()
+            and (name[0].isalpha() or (internal and name[0] == '_'))
             and not name.endswith('.')
             and all(ch.isalnum() or ch in '._' for ch in name)
         )
@@ -334,9 +335,9 @@ class Scope:
         raise SyntaxError(
             f"Invalid variable name '{name}'{at}.")
 
-    def define(self, name, value=None, type=None, constraints=None, is_uninitialized=False, line_number=None):
+    def define(self, name, value=None, type=None, constraints=None, is_uninitialized=False, line_number=None, internal=False):
         effective_constraints = constraints or {}
-        self._validate_variable_name(name, line_number)
+        self._validate_variable_name(name, line_number, internal=internal)
         # Check for case-insensitive conflicts
         existing_key = self._get_case_insensitive_key(name, self.variables)
         if existing_key and not is_uninitialized:
