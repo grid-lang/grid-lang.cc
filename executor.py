@@ -1319,8 +1319,8 @@ class GridLangExecutor:
         constraints = defining_scope.constraints.get(actual_key, {})
         if constraints and self._has_star_dim(constraints):
             if defining_scope.is_uninitialized(actual_key) or arr is None:
-                raise ValueError(
-                    f"Array variable '{var_name}' with dim * must be initialized with PUSH or INIT before LET at line {line_number}")
+                arr = {}
+                defining_scope.variables[actual_key] = arr
         indices = self._apply_dim_base_offsets(
             var_name, indices, line_number)
         updated_array = self.array_handler.set_array_element(

@@ -864,12 +864,8 @@ class GridLangControlFlow:
                 pass
             return True, i + 1, False
         if line.strip().lower().startswith('let '):
-            try:
-                self._process_let_statement_inline(
-                    line, line_number)
-            except Exception as e:
-                if "dim * must be initialized with PUSH or INIT before LET" in str(e):
-                    raise
+            self._process_let_statement_inline(
+                line, line_number)
             return True, i + 1, False
         if line.strip() == 'exit for':
             self.executor.exit_loop = True
@@ -1418,8 +1414,8 @@ class GridLangControlFlow:
             elif isinstance(dim_spec, str):
                 has_star = '*' in dim_spec
             if has_star and (defining_scope.is_uninitialized(actual_key) or arr is None):
-                raise ValueError(
-                    f"Array variable '{var_name}' with dim * must be initialized with PUSH or INIT before LET at line {line_number}")
+                arr = {}
+                defining_scope.variables[actual_key] = arr
             updated_array = self.compiler.array_handler.set_array_element(
                 arr, indices, value, line_number)
             defining_scope.variables[actual_key] = updated_array
