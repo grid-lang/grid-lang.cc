@@ -833,8 +833,9 @@ class GridLangCompiler:
         grid_dim = type_constraints.get('dim')
         if isinstance(grid_dim, dict) and 'dims' in grid_dim:
             shape = [end - start + 1 for start, end in grid_dim['dims']]
+            grid_type = grid_dim.get('grid_type', 'number')
             grid_store = self.array_handler.create_array(
-                shape, 0.0, 'number', line_number)
+                shape, 0.0, grid_type, line_number)
             value_dict['grid'] = grid_store
         else:
             value_dict.setdefault('grid', {})

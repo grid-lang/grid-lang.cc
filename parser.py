@@ -292,23 +292,26 @@ class GridLangParser:
 
         for wc in wc_parts:
             wc = wc.strip()
-            if wc.lower().startswith('grid dim'):
+            if re.match(r'grid\s+(?:as\s+\w+\s+)?dim\s*\{', wc, re.I):
                 if dim_constraint is not None:
                     raise SyntaxError(
                         f"Multiple grid DIM statements not allowed in with clause at line {line_number}")
                 dim_match = re.match(
-                    r'grid\s+dim\s*\{([^}]+)\}\s*(?:=\s*({.+?}(?:\s*\|\s*{.+?})*|[\d.]+|\w+))?',
+                    r'grid\s+(?:as\s+(\w+)\s+)?dim\s*\{([^}]+)\}\s*(?:=\s*({.+?}(?:\s*\|\s*{.+?})*|[\d.]+|\w+))?',
                     wc,
                     re.I,
                 )
                 if not dim_match:
                     raise SyntaxError(
                         f"Invalid dimension syntax: '{wc}' at line {line_number}")
-                dim_str = dim_match.group(1)
-                grid_data = dim_match.group(2)
+                grid_type = dim_match.group(1)
+                dim_str = dim_match.group(2)
+                grid_data = dim_match.group(3)
                 dim_parts = [p.strip() for p in dim_str.split(',')]
                 dim_constraint = {
                     'dims': [(1, int(p.strip())) for p in dim_parts]}
+                if grid_type:
+                    dim_constraint['grid_type'] = grid_type
                 if grid_data:
                     if re.match(r'^{.+?}(?:\s*\|\s*{.+?})*$', grid_data):
                         matrices = [m.strip()[1:-1] for m in grid_data.split('|')]
