@@ -3975,12 +3975,12 @@ class GridLangExecutor:
         target, value = line.split(':=')
         target = target.strip()
         value = value.strip()
-        if not re.match(r'^\[\^?[A-Za-z]+', target):
+        if not re.match(r'^\[\^?[A-Za-z{]', target):
             return False, i
         if not target.endswith(']'):
             return False, i
         cell_ref = target[1:-1].strip()
-        if not re.match(r'^\^?[A-Za-z]+', cell_ref):
+        if not re.match(r'^\^?[A-Za-z{]', cell_ref):
             return False, i
         if '{' in cell_ref or ':' in cell_ref:
             scope = self.current_scope()
@@ -3996,46 +3996,22 @@ class GridLangExecutor:
                 is_grid_value = '.grid{' in value
                 evaluated_value = self.expr_evaluator.eval_or_eval_array(
                     value, scope_value, line_number, is_grid_dim=is_grid_value)
-                if isinstance(evaluated_value, dict):
-                    if 'grid' in evaluated_value:
-                        grid_dict = evaluated_value['grid']
-                        if isinstance(grid_dict, dict):
-                            for (row, col), val in grid_dict.items():
-                                if isinstance(row, (int, float)) and isinstance(col, (int, float)):
-                                    self.grid[(int(row), int(col))] = val
-                        else:
-                            self.array_handler._assign_horizontal_array(
-                                array_cell_key, evaluated_value, value, line_number=line_number)
-                    else:
-                        self.array_handler._assign_horizontal_array(
-                            array_cell_key, evaluated_value, value, line_number=line_number)
-                else:
-                    self.array_handler._assign_horizontal_array(
-                        array_cell_key, evaluated_value, value, line_number=line_number)
+                self.array_handler._assign_horizontal_array(
+                    array_cell_key, evaluated_value, value, line_number=line_number)
             else:
                 indices = parse_address(cell_ref)
-                grid_constraints = self.current_scope().get_full_scope().get('grid', {})
-                if isinstance(grid_constraints, dict):
-                    dim_info = grid_constraints
-                else:
-                    dim_info = getattr(grid_constraints, '_constraints', {}).get('dim', None)
                 grid_dims = self.current_scope().constraints.get('grid', {}).get('dim')
-                if isinstance(grid_dims, list) and all(isinstance(d, (list, tuple)) for d in grid_dims):
-                    max_rank = len(grid_dims)
-                elif isinstance(grid_dims, list):
+                if isinstance(grid_dims, list):
                     max_rank = len(grid_dims)
                 else:
                     max_rank = 2
                 if len(indices) > max_rank:
                     raise ValueError(
                         f"Cell address '{cell_ref}' has rank {len(indices)} but grid has rank {max_rank} at line {line_number}")
-                cell_key = self.compiler._to_index(cell_ref)
-                scope_value = self.current_scope().get_evaluation_scope()
-                is_grid_value = '.grid{' in value
-                evaluated_value = self.expr_evaluator.eval_or_eval_array(
-                    value, scope_value, line_number, is_grid_dim=is_grid_value)
-                self.compiler._spill_value_to_cells(
-                    cell_key, evaluated_value, line_number)
+                auto_var = f'cell{cell_ref}'
+                binding_line = f'[{cell_ref}] : {auto_var} = {value}'
+                self.compiler._evaluate_cell_var_definition(
+                    binding_line, line_number)
         except Exception as e:
             raise RuntimeError(
                 f"Error evaluating '{value}': {e} at line {line_number}")
