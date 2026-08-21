@@ -244,6 +244,14 @@ class GridLangTypeProcessor:
         if 'grid' not in value_dict and any('grid' in line.lower() for line in code_lines):
             value_dict['grid'] = {}
 
+        # Push instance grid as context so cell references inside the type body
+        # resolve against the instance grid rather than the global grid.
+        instance_grid = value_dict.get('grid') if isinstance(value_dict, dict) else None
+        if isinstance(instance_grid, dict):
+            if not hasattr(self.compiler, '_context_grid_stack'):
+                self.compiler._context_grid_stack = []
+            self.compiler._context_grid_stack.append(instance_grid)
+
         try:
             type_def = {}
             if inferred_type:
@@ -255,6 +263,8 @@ class GridLangTypeProcessor:
         except Exception as e:
             raise
         finally:
+            if isinstance(instance_grid, dict) and hasattr(self.compiler, '_context_grid_stack') and self.compiler._context_grid_stack:
+                self.compiler._context_grid_stack.pop()
             self.compiler._allow_hidden_field_access = prev_hidden_access
             self.compiler._allow_hidden_member_calls = prev_hidden_member_calls
             self.compiler.pop_scope()
@@ -372,21 +382,68 @@ class GridLangTypeProcessor:
             i += 1
 
     def _process_grid_assignment(self, line, var_name, value_dict, line_number):
-        """Process grid assignment like [B1] := 1"""
+        """Process grid assignment like [B1] := 1 or [A1.B1:A2.B2] := 7"""
         # Extract cell reference and value
         match = re.match(r'\[([^\]]+)\]\s*:=\s*(.+)$', line)
         if match:
             cell_ref, value_expr = match.groups()
             cell_ref = cell_ref.strip()
+            # Strip leading ^ for spill prefix
+            if cell_ref.startswith('^'):
+                cell_ref = cell_ref[1:].strip()
             # Convert cell reference to grid coordinates
             value = self.compiler.expr_evaluator.eval_expr(
                 value_expr, self.compiler.current_scope().get_full_scope(), line_number)
             if is_wildcard_address(cell_ref):
-                # A wildcarded N-D address targets the tensor's grid field in
-                # tensor scope (the value_dict carried by 'this').
                 self.compiler.array_handler._assign_wildcard_range(
                     cell_ref, value, expr_part=value_expr, line_number=line_number)
                 return
+            # Range address (e.g. A1.B1:A2.B2)
+            if ':' in cell_ref:
+                from utils import parse_address
+                from math import prod as _prod
+                range_parts = cell_ref.split(':')
+                if len(range_parts) == 2:
+                    start_addr, end_addr = range_parts[0].strip(), range_parts[1].strip()
+                    try:
+                        start_idx = tuple(i - 1 for i in parse_address(start_addr))
+                        end_idx = tuple(i - 1 for i in parse_address(end_addr))
+                        # Ensure value_dict has a grid
+                        if 'grid' not in value_dict:
+                            value_dict['grid'] = {}
+                        inst_grid = value_dict['grid']
+                        # Expand the range and write directly to the instance grid
+                        starts = [min(a, b) for a, b in zip(start_idx, end_idx)]
+                        shape = [abs(a - b) + 1 for a, b in zip(start_idx, end_idx)]
+                        is_array = isinstance(value, list) or (isinstance(value, dict) and 'array' in value)
+                        if is_array:
+                            flat_vals = self.compiler.array_handler.flatten_array(value, line_number)
+                        else:
+                            flat_vals = [value]
+                        if flat_vals:
+                            for flat_i in range(_prod(shape)):
+                                rem = flat_i
+                                idxs = []
+                                for dim_size in shape:
+                                    idxs.append(rem % dim_size)
+                                    rem //= dim_size
+                                addr = tuple(starts[d] + idxs[d] for d in range(len(shape)))
+                                inst_grid[addr] = flat_vals[flat_i % len(flat_vals)]
+                        return
+                    except (ValueError, KeyError):
+                        pass
+            # Single extended (N-D) address
+            if '.' in cell_ref:
+                from utils import parse_address
+                try:
+                    indices = parse_address(cell_ref)
+                    zero_idx = tuple(i - 1 for i in indices)
+                    if 'grid' not in value_dict:
+                        value_dict['grid'] = {}
+                    value_dict['grid'][zero_idx] = value
+                    return
+                except (ValueError, KeyError):
+                    pass
             col = re.match(r'([A-Z]+)', cell_ref).group(1)
             row = int(re.match(r'[A-Z]+(\d+)', cell_ref).group(1))
 

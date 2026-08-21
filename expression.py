@@ -1253,17 +1253,42 @@ class ExpressionEvaluator:
                 f"Invalid cell reference '{cell_ref}': {e} at line {line_number}")
 
     def _try_eval_address_indexed_access(self, expr, scope, line_number):
-        """Evaluate v![A3.B4.8] (and v![A1]) as array element access via a cell
-        address. Non-bang v[...] falls through to the python-fallback guard,
-        which raises a syntax error for arrays; bracket calls are allowed for
-        functions (e.g. sum[...], handled before this fallback).
+        """Evaluate v![A3.B4.8], v![A1], and v.field![addr] as array element
+        access via a cell address.  Non-bang v[...] falls through to the
+        python-fallback guard, which raises a syntax error for arrays; bracket
+        calls are allowed for functions (e.g. sum[...], handled before this
+        fallback).
         """
-        m = re.match(r'^([\w_]+)!\[([^\]]+)\]$', expr)
+        m = re.match(r'^([\w_]+)(?:\.([\w_]+))?!?\[([^\]]+)\]$', expr)
         if not m:
             return False, None
-        var_name, index_expr = m.groups()
+        var_name, field_name, index_expr = m.groups()
+        if field_name is None and '!' not in expr.split('[')[0]:
+            return False, None
         if not is_address(index_expr):
             return False, None
+        if field_name:
+            try:
+                obj = self.compiler.current_scope().get(var_name)
+            except NameError:
+                return False, None
+            if not isinstance(obj, dict):
+                return False, None
+            actual_key = get_case_insensitive_key(obj, field_name) or field_name
+            if actual_key not in obj:
+                return False, None
+            field_val = obj[actual_key]
+            if not isinstance(field_val, (list, tuple, dict)):
+                return False, None
+            indices = self.compiler._to_index(index_expr)
+            original_shape = obj.get('original_shape') if isinstance(obj, dict) else None
+            try:
+                result = self.compiler.array_handler.read_array_element(
+                    field_val, indices, line_number, original_shape=original_shape, var_name=f"{var_name}.{field_name}")
+                return True, result
+            except (IndexError, ValueError) as e:
+                raise IndexError(
+                    f"Invalid index '{index_expr}' for '{var_name}.{field_name}': {e} at line {line_number}")
         try:
             self.compiler.current_scope().get(var_name)
         except NameError:
@@ -2084,11 +2109,11 @@ class ExpressionEvaluator:
         if expr.startswith('sum{') and expr.endswith('}'):
             return self._evaluate_sum_vars(expr, scope, line_number)
 
-        # Handle grid indexing (e.g., var.grid{1,2})
+        # Handle member indexing (e.g., var.field{1,2})
         grid_index_match = re.match(
-            r'^([\w_]+)\.grid\{([\d,\s]+)\}$', expr, re.I)
+            r'^([\w_]+)\.([\w_]+)\{([\d,\s]+)\}$', expr, re.I)
         if grid_index_match:
-            var_name, indices_str = grid_index_match.groups()
+            var_name, field_name, indices_str = grid_index_match.groups()
             indices = [int(i.strip()) - 1 for i in indices_str.split(',')]
             full_scope = self.compiler.current_scope().get_full_scope()
             if var_name in full_scope:
@@ -2097,16 +2122,21 @@ class ExpressionEvaluator:
                     raise ValueError(
                         f"Variable '{var_name}' is uninitialized at line {line_number}")
                 try:
-                    if isinstance(value, dict) and 'grid' in value:
-                        result = self.compiler.array_handler.read_array_element(
-                            value['grid'], indices, line_number, original_shape=value.get('original_shape'), var_name=var_name)
-                    else:
-                        result = self.compiler.array_handler.read_array_element(
-                            value, indices, line_number, var_name=var_name)
+                    if isinstance(value, dict):
+                        actual_field = get_case_insensitive_key(value, field_name) or field_name
+                        if actual_field in value:
+                            field_val = value[actual_field]
+                            if isinstance(field_val, dict) and 'array' in field_val:
+                                field_val = field_val['array']
+                            result = self.compiler.array_handler.read_array_element(
+                                field_val, indices, line_number, original_shape=value.get('original_shape'), var_name=f"{var_name}.{field_name}")
+                            return result
+                    result = self.compiler.array_handler.read_array_element(
+                        value, indices, line_number, var_name=var_name)
                     return result
                 except (IndexError, ValueError) as e:
                     raise IndexError(
-                        f"Invalid indices {indices_str} for '{var_name}': {e} at line {line_number}")
+                        f"Invalid indices {indices_str} for '{var_name}.{field_name}': {e} at line {line_number}")
 
         # Handle indexed array access (e.g., var![3], var![A1], var(0), var(k+1)).
         # '!' makes array element access unambiguous; parens are kept for

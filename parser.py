@@ -320,7 +320,7 @@ class GridLangParser:
                 rest = rest[end + 1:].strip()
                 dim_parts = [p.strip() for p in dim_str.split(',')]
                 dim_constraint = {
-                    'dims': [(1, int(p.strip())) for p in dim_parts]}
+                    'dims': [(1, None if p.strip() == '*' else int(p.strip())) for p in dim_parts]}
                 if grid_type:
                     dim_constraint['grid_type'] = grid_type
                 if not_null:
@@ -344,6 +344,11 @@ class GridLangParser:
                         raise SyntaxError(
                             f"Invalid grid data: '{grid_data}' at line {line_number}")
                     rest = ''
+                elif rest.lower().startswith('init'):
+                    rest = rest[4:].strip()
+                    if re.match(r'^\w+$', rest):
+                        dim_constraint['data_var'] = rest
+                        rest = ''
                 or_match = re.match(r'\s*or\s*=\s*(.+)$', rest, re.I)
                 if or_match:
                     dim_constraint['default'] = or_match.group(1).strip()

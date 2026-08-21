@@ -75,6 +75,21 @@ class ArrayHandler:
         if isinstance(arr, dict) and 'array' in arr:
             nd_shape = list(arr.get('shape') or arr.get('original_shape') or [])
             arr = arr['array']
+        elif isinstance(arr, dict) and 'grid' in arr:
+            # Tensor object with grid field — read from its grid
+            tensor_grid = arr['grid']
+            original_shape = arr.get('original_shape')
+            if isinstance(cell_ref, str) and '.' in cell_ref:
+                indices = self.compiler._to_index(cell_ref)
+                return self.read_array_element(
+                    tensor_grid, indices, line_number,
+                    original_shape=original_shape, var_name=var_name)
+            if isinstance(cell_ref, (tuple, list)):
+                return self.read_array_element(
+                    tensor_grid, cell_ref, line_number,
+                    original_shape=original_shape, var_name=var_name)
+            raise TypeError(
+                f"Variable '{var_name}' is not an array at line {line_number}")
         else:
             sparse_arr = is_sparse_array(arr) or (
                 isinstance(arr, dict) and not arr)
@@ -1496,6 +1511,11 @@ class ArrayHandler:
         # The grid store is keyed by 0-based numeric index tuples; convert the
         # cell reference (case-insensitive) before looking it up.
         store = self.compiler.grid
+        # If a type body is executing, cell references resolve against the
+        # instance's grid first.
+        ctx_stack = getattr(self.compiler, '_context_grid_stack', None)
+        if ctx_stack and ctx_stack[-1] is not None:
+            store = ctx_stack[-1]
         if isinstance(cell_ref, (tuple, list)):
             key = tuple(int(i) for i in cell_ref)
         else:
@@ -1506,10 +1526,7 @@ class ArrayHandler:
         if key is not None and key in store:
             return store[key]
         if key is not None and len(key) > 2:
-            # Extended addresses fall back to any matching grid DIM tensor.
-            value = self._lookup_extended_address(key, line_number)
-            if value is not None:
-                return value
+            return error_value(REF_ERROR)
         return self._array_unset_value('grid', line_number)
 
     def _iter_scopes(self):
@@ -2612,7 +2629,7 @@ class ArrayHandler:
         # key that was never set reads as #N/A, while a wrong number of
         # indices or a negative index is an invalid address (#REF).
         if isinstance(arr, dict):
-            first_key = next(iter(arr.keys()), None)
+            first_key = next((k for k in arr.keys() if isinstance(k, tuple)), None)
             rank = len(first_key) if first_key is not None else len(indices)
             if len(indices) != rank or any(i < 0 for i in indices):
                 raise ConstraintError(
@@ -2620,6 +2637,9 @@ class ArrayHandler:
                     f"Expected {rank} indices for array, got {len(indices)} at line {line_number}")
             result = arr.get(tuple(indices))
             if result is None:
+                default_val = arr.get('_default')
+                if default_val is not None:
+                    return default_val
                 if var_name:
                     return self._array_unset_value(var_name, line_number)
                 return error_value(NA_ERROR)

@@ -348,7 +348,8 @@ class GridLangCompiler:
                      'dependency_graph', 'global_guard_entries', 'global_for_line_numbers',
                      'executed_global_for_lines', 'output_values', 'functions', 'subprocesses',
                      'prompt_missing_inputs', '_allow_hidden_field_access', '_allow_hidden_member_calls',
-                     '_parent_scope', '_outer_scope_read_only']:
+                     '_parent_scope', '_outer_scope_read_only',
+                     '_context_grid_stack']:
             if hasattr(self, attr):
                 setattr(extracted, attr, getattr(self, attr))
 
@@ -832,7 +833,8 @@ class GridLangCompiler:
         type_constraints = type_def.get('_constraints', {}) or {}
         grid_dim = type_constraints.get('dim')
         if isinstance(grid_dim, dict) and 'dims' in grid_dim:
-            shape = [end - start + 1 for start, end in grid_dim['dims']]
+            raw_dims = grid_dim['dims']
+            has_unbounded = any(end is None for _, end in raw_dims)
             grid_type = grid_dim.get('grid_type', 'number')
             default_key = grid_dim.get('default')
             if default_key is not None:
@@ -845,10 +847,32 @@ class GridLangCompiler:
                         fill_value = None
             else:
                 fill_value = None
-            grid_store = self.array_handler.create_array(
-                shape, fill_value, grid_type, line_number,
-                template=(fill_value is None))
-            value_dict['grid'] = grid_store
+            if has_unbounded:
+                grid_store = {}
+                if fill_value is not None:
+                    grid_store['_default'] = fill_value
+                else:
+                    exec_code = type_def.get('_executable_code', [])
+                    for code_line in exec_code:
+                        or_match = re.match(
+                            r'^Let\s+grid\b.*\bor\s*=\s*(.+)$', code_line, re.I)
+                        if or_match:
+                            or_val = or_match.group(1).strip()
+                            if or_val.lower() == 'none':
+                                grid_store['_default'] = UNIVERSAL_ZERO
+                            else:
+                                try:
+                                    grid_store['_default'] = float(or_val)
+                                except (ValueError, TypeError):
+                                    pass
+                            break
+                value_dict['grid'] = grid_store
+            else:
+                shape = [end - start + 1 for start, end in raw_dims]
+                grid_store = self.array_handler.create_array(
+                    shape, fill_value, grid_type, line_number,
+                    template=(fill_value is None))
+                value_dict['grid'] = grid_store
         else:
             value_dict.setdefault('grid', {})
 
@@ -1902,6 +1926,10 @@ class GridLangCompiler:
 
     def _get_grid_store(self):
         """Return the live grid store (the predefined 'grid' variable)."""
+        # Inside a type body, grid operations target the instance grid.
+        ctx_stack = getattr(self, '_context_grid_stack', None)
+        if ctx_stack and ctx_stack[-1] is not None:
+            return ctx_stack[-1]
         scopes = getattr(self, 'scopes', None)
         if scopes and scopes[0].variables.get('grid') is not None:
             return scopes[0].variables['grid']

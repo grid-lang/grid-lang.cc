@@ -4084,7 +4084,7 @@ class GridLangExecutor:
             if ctor_match:
                 type_name = ctor_match.group(1).lower()
 
-        if type_name and 'with' in constraints and type_name in self.types_defined:
+        if type_name and ('with' in constraints or 'dim' in constraints) and type_name in self.types_defined:
             current_tensor = var
             with_constraints = constraints.get('with', {})
             dim_constraints = constraints.get('dim', {})
@@ -4808,8 +4808,11 @@ class GridLangExecutor:
                     index_value = int(index_value)
                 indices = [index_value - 1]
             except Exception:
-                indices = self.array_handler.cell_ref_to_indices(
-                    index_expr, line_number)
+                try:
+                    indices = [i - 1 for i in parse_address(index_expr)]
+                except Exception:
+                    indices = self.array_handler.cell_ref_to_indices(
+                        index_expr, line_number)
         else:
             var_name, indices_str = brace_match.groups()
             index_exprs = [idx.strip()
@@ -4843,9 +4846,27 @@ class GridLangExecutor:
         indices = self._apply_dim_base_offsets(
             var_name, indices, line_number)
         arr = defining_scope.variables.get(actual_key)
-        updated_array = self.array_handler.set_array_element(
-            arr, indices, value, line_number)
-        defining_scope.variables[actual_key] = updated_array
+        if isinstance(arr, dict) and 'grid' in arr:
+            grid_source = arr['grid']
+            original_shape = arr.get('original_shape')
+            indices_0 = list(indices)
+            if isinstance(grid_source, list) and original_shape:
+                flat_idx = 0
+                stride = 1
+                for i in range(len(indices_0) - 1, -1, -1):
+                    flat_idx += indices_0[i] * stride
+                    stride *= original_shape[i]
+                grid_source[flat_idx] = value
+            elif isinstance(grid_source, dict) and 'array' not in grid_source:
+                grid_source[tuple(indices_0)] = value
+            else:
+                updated_grid = self.array_handler.set_array_element(
+                    grid_source, indices_0, value, line_number)
+                arr['grid'] = updated_grid
+        else:
+            updated_array = self.array_handler.set_array_element(
+                arr, indices, value, line_number)
+            defining_scope.variables[actual_key] = updated_array
         defining_scope.uninitialized.discard(actual_key)
         return
 
