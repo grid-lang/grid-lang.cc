@@ -541,19 +541,6 @@ class GridLangTypeProcessor:
                 # Parse indices
                 indices = [idx.strip() for idx in indices_str.split(',')]
 
-                if is_wildcard_address(indices_str):
-                    # A wildcarded N-D address targets the tensor's grid
-                    # field in tensor scope (the value_dict carried by
-                    # 'this').
-                    value = self.compiler.expr_evaluator.eval_expr(
-                        value_expr,
-                        self._build_type_eval_scope(value_dict, {}),
-                        line_number)
-                    self.compiler.array_handler._assign_wildcard_range(
-                        indices_str, value, expr_part=value_expr,
-                        line_number=line_number)
-                    return
-
                 # Ensure the instance carries a grid store: a dense N-D array
                 # when the type declares grid dims, otherwise a sparse array.
                 grid_store = value_dict.get('grid')
@@ -582,14 +569,18 @@ class GridLangTypeProcessor:
                 try:
                     resolved = [_resolve_index(idx) for idx in indices]
 
-                    if all(v is not None for v in resolved):
-                        value = self.compiler.expr_evaluator.eval_expr(
-                            value_expr, eval_scope, line_number)
+                    if any(v is None for v in resolved):
+                        bad = [idx for idx, v in zip(indices, resolved) if v is None]
+                        raise NameError(
+                            f"Name '{bad[0]}' is not defined at line {line_number}")
 
-                        # Store in grid (1-based user indices -> 0-based storage)
-                        value_dict['grid'] = self.compiler.array_handler.set_array_element(
-                            grid_store, [v - 1 for v in resolved], value,
-                            line_number)
+                    value = self.compiler.expr_evaluator.eval_expr(
+                        value_expr, eval_scope, line_number)
+
+                    # Store in grid (1-based user indices -> 0-based storage)
+                    value_dict['grid'] = self.compiler.array_handler.set_array_element(
+                        grid_store, [v - 1 for v in resolved], value,
+                        line_number)
 
                 except Exception as e:
                     raise
