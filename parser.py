@@ -292,27 +292,41 @@ class GridLangParser:
 
         for wc in wc_parts:
             wc = wc.strip()
-            if re.match(r'grid\s+(?:as\s+\w+\s+)?dim\s*\{', wc, re.I):
+            if re.match(r'grid\s+', wc, re.I):
                 if dim_constraint is not None:
                     raise SyntaxError(
                         f"Multiple grid DIM statements not allowed in with clause at line {line_number}")
-                dim_match = re.match(
-                    r'grid\s+(?:as\s+(\w+)\s+)?dim\s*\{([^}]+)\}\s*(?:=\s*({.+?}(?:\s*\|\s*{.+?})*|[\d.]+|\w+))?',
-                    wc,
-                    re.I,
-                )
-                if not dim_match:
+                rest = wc[len('grid'):].strip()
+                not_null = False
+                if rest.lower().startswith('not null'):
+                    not_null = True
+                    rest = rest[len('not null'):].strip()
+                grid_type = None
+                if rest.lower().startswith('as '):
+                    rest = rest[3:].strip()
+                    m_type = re.match(r'(\w+)', rest)
+                    if m_type:
+                        grid_type = m_type.group(1)
+                        rest = rest[m_type.end():].strip()
+                if not rest.lower().startswith('dim'):
                     raise SyntaxError(
-                        f"Invalid dimension syntax: '{wc}' at line {line_number}")
-                grid_type = dim_match.group(1)
-                dim_str = dim_match.group(2)
-                grid_data = dim_match.group(3)
+                        f"Expected 'dim' after grid definition at line {line_number}")
+                rest = rest[3:].strip()
+                if not rest.startswith('{'):
+                    raise SyntaxError(
+                        f"Expected '{{' to start dimension sizes at line {line_number}")
+                end = rest.index('}')
+                dim_str = rest[1:end]
+                rest = rest[end + 1:].strip()
                 dim_parts = [p.strip() for p in dim_str.split(',')]
                 dim_constraint = {
                     'dims': [(1, int(p.strip())) for p in dim_parts]}
                 if grid_type:
                     dim_constraint['grid_type'] = grid_type
-                if grid_data:
+                if not_null:
+                    dim_constraint['not_null'] = True
+                if rest.startswith('='):
+                    grid_data = rest[1:].strip()
                     if re.match(r'^{.+?}(?:\s*\|\s*{.+?})*$', grid_data):
                         matrices = [m.strip()[1:-1] for m in grid_data.split('|')]
                         matrix_data = []
@@ -329,6 +343,10 @@ class GridLangParser:
                     else:
                         raise SyntaxError(
                             f"Invalid grid data: '{grid_data}' at line {line_number}")
+                    rest = ''
+                or_match = re.match(r'\s*or\s*=\s*(.+)$', rest, re.I)
+                if or_match:
+                    dim_constraint['default'] = or_match.group(1).strip()
             elif '=' in wc:
                 key, value = [s.strip() for s in wc.split('=', 1)]
                 if value.startswith('"') and value.endswith('"'):

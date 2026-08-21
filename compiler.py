@@ -834,8 +834,20 @@ class GridLangCompiler:
         if isinstance(grid_dim, dict) and 'dims' in grid_dim:
             shape = [end - start + 1 for start, end in grid_dim['dims']]
             grid_type = grid_dim.get('grid_type', 'number')
+            default_key = grid_dim.get('default')
+            if default_key is not None:
+                if default_key.lower() == 'none':
+                    fill_value = UNIVERSAL_ZERO
+                else:
+                    try:
+                        fill_value = float(default_key)
+                    except (ValueError, TypeError):
+                        fill_value = None
+            else:
+                fill_value = None
             grid_store = self.array_handler.create_array(
-                shape, 0.0, grid_type, line_number)
+                shape, fill_value, grid_type, line_number,
+                template=(fill_value is None))
             value_dict['grid'] = grid_store
         else:
             value_dict.setdefault('grid', {})
