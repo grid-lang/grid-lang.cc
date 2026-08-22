@@ -56,7 +56,7 @@ are prompted (`compiler.prompt_missing_inputs`).
    control_flow.py.
 5. Results: `Return x` appends to `output_values` (printed by
    `_print_outputs`); grid writes land in `compiler.grid` (a dict keyed by
-   cell refs like `'A1'`). `--debug` → `compiler.export_to_csv` (`compiler.py:3054`).
+   cell refs like `'A1'`). `--debug` → `compiler.export_to_csv` (`compiler.py:3085`).
 
 The single most important design fact: **`GridLangCompiler` (state holder) and
 `GridLangExecutor` (loop) share one object during execution.** Many helpers
@@ -76,7 +76,7 @@ handling) — check both before adding a feature so you extend the live path.
 - Console script `grid=main:main`; declares the 10 top-level modules as
   `py_modules`; **no `install_requires`** (`pyarrow` was removed); LGPLv3.
 
-### `compiler.py` (3238 lines) — state + orchestration
+### `compiler.py` (3269 lines) — state + orchestration
 `class GridLangCompiler` is the **persistent brain** and holds nearly all state
 created in `__init__`:
 - Grid & scoping: `grid` (`_ListenerGrid`), `scopes` (stack of `Scope`),
@@ -101,7 +101,7 @@ Notable methods (all copied onto the executor during a run):
 - `_instantiate_type` (70702, `_evaluate_with_value` (889), `_apply_with_clause`
   parsing (958+): type/`with` object construction.
 - `call_subprocess` (111128: runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (202080, `_process_declarations_and_labels` (2295),
+- `_process_grid_assignment` (202080, `_process_declarations_and_labels` (2326),
   `_collect_global_declarations` (212168: top-level statement handling.
 - `export_to_csv` (282817: `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
@@ -112,12 +112,12 @@ Notable methods (all copied onto the executor during a run):
 Also defines `SubprocessResult` (46): result container exposing `grid`,
 `variables`, `outputs`.
 
-### `executor.py` (5141 lines) — the interpreter
+### `executor.py` (5156 lines) — the interpreter
 `class GridLangExecutor` contains the main dispatch loop. This is where most
 runtime behavior lives. Key methods:
 - `run` (191918: top-level sequence (see Architecture).
-- `_run_setup` (424220, `_run_prepare_execution` (4417), `_print_outputs`
-  (4680), `_materialize_inits` (4882), `_process_deferred_assignments` (5021).
+- `_run_setup` (424220, `_run_prepare_execution` (4432), `_print_outputs`
+  (4680), `_materialize_inits` (4897), `_process_deferred_assignments` (5036).
 - Main loop: `_run_main_loop` (2074) → `_run_main_loop_impl` (2600) →
   `_run_main_loop_impl_body` (242455. `_handle_main_loop_*` methods dispatch
   statement kinds: quick statements (1113), `Let` (1147/1494/1515), `For`
@@ -138,8 +138,8 @@ runtime behavior lives. Key methods:
   dimension spec. `or = <expr>` is stored as `constraints['default']` so
   `_array_unset_value` can find it. The bounded-dim handler creates template
   arrays (`template=True`) when no `init`/standalone `=` is present.
-- `Push` semantics: `_handle_push_assignment` (4626), `_evaluate_push_expression`
-  (4286), `_process_push_call` (4692), `_assign_indexed_target` (4787),
+- `Push` semantics: `_handle_push_assignment` (4641), `_evaluate_push_expression`
+  (4286), `_process_push_call` (4707), `_assign_indexed_target` (4802),
   `_update_member_path_target` (444475.
 - `When` blocks: `_register_when_block` (308), `_process_when_triggers` (340),
   `_run_when_block` (31317.

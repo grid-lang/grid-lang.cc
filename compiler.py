@@ -1761,6 +1761,23 @@ class GridLangCompiler:
         if var_name:
             self._set_by[('var', var_name.lower())] = 'client'
 
+    def _register_cell_spill_listener(self, line, rhs_var, line_number, scope):
+        """Register a cell-spill := line as a listener on rhs_var.
+
+        When rhs_var changes (e.g. via push from a subprocess), the
+        entire ``:=`` line is re-evaluated so the cell write sees the
+        updated value.
+        """
+        if not rhs_var or scope is None:
+            return
+        cell_refs = self._extract_cell_refs(str(line))
+        record = {'var': None, 'expr': rhs_var, 'scope': scope,
+                  'line': line, 'line_number': line_number,
+                  'deps': {rhs_var}, 'cell_refs': cell_refs}
+        key = ('var', rhs_var.lower())
+        holder = self._listeners.setdefault(key[0], {}).setdefault(key[1], {})
+        holder[('__cell_spill_' + line, id(scope))] = record
+
     def _notify_var_changed(self, name, value):
         self._propagate(('var', name.lower()), value)
 
@@ -1786,6 +1803,20 @@ class GridLangCompiler:
 
     def _recompute_client(self, record):
         """Recompute a client variable from its stored expression."""
+        line = record.get('line')
+        if line:
+            scope = record.get('scope')
+            if scope is None:
+                return
+            for dep in record.get('deps', ()):
+                if self.has_unresolved_dependency(dep, scope=scope):
+                    return
+            try:
+                self.array_handler.evaluate_line_with_assignment(
+                    line, record.get('line_number'), scope.get_evaluation_scope())
+            except Exception:
+                pass
+            return
         var_name = record.get('var')
         expr = record.get('expr')
         scope = record.get('scope')

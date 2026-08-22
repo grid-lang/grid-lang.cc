@@ -3936,6 +3936,15 @@ class GridLangExecutor:
                         else:
                             self.array_handler.evaluate_line_with_assignment(
                                 line, line_number, scope.get_evaluation_scope())
+                            rhs_simple = re.match(
+                                r'^[A-Za-z_]\w*$', rhs.strip())
+                            if rhs_simple and rhs_vars:
+                                for rv in rhs_vars:
+                                    if rv.lower() not in (
+                                            self.functions or {}) and rv.lower() not in (
+                                            self.subprocesses or {}):
+                                        self._register_cell_spill_listener(
+                                            line, rv, line_number, scope)
                     except Exception as e:
                         missing = self.extract_missing_dependencies(e)
                         if missing:
@@ -4014,6 +4023,12 @@ class GridLangExecutor:
         except Exception as e:
             raise RuntimeError(
                 f"Error evaluating '{value}': {e} at line {line_number}")
+        if re.match(r'^[A-Za-z_]\w*$', value.strip()):
+            rhs_var = value.strip()
+            if rhs_var.lower() not in (self.functions or {}) and rhs_var.lower() not in (self.subprocesses or {}):
+                scope = self.current_scope()
+                self._register_cell_spill_listener(
+                    line, rhs_var, line_number, scope)
         return True, i + 1
 
     def _handle_when_block(self, lines, i, line, line_number):
