@@ -282,7 +282,8 @@ class GridLangTypeProcessor:
 
 
             if (re.match(r'^(for|let)\b', stripped_line, re.I) and
-                    '=' not in stripped_line and not re.search(r'\bdo\b', stripped_line, re.I)):
+                    '=' not in stripped_line and not re.search(r'\bdo\b', stripped_line, re.I)
+                    and not re.search(r'\bthen\b', stripped_line, re.I)):
                 # Skip field declarations that slipped into executable code.
                 i += 1
                 continue
@@ -360,10 +361,20 @@ class GridLangTypeProcessor:
                 i += 1
                 continue
             if re.match(r'^for\b', stripped_line, re.I) and re.search(r'\bdo\b', stripped_line, re.I):
+                # For var = expr do — define var and run body once
+                if '=' in stripped_line and not re.search(r'\bin\b', stripped_line, re.I):
+                    i = self._process_type_for_assignment_block(
+                        code_lines, i, value_dict, input_values, line_number)
+                    continue
                 i = self._process_type_for_loop(
                     code_lines, i, value_dict, input_values, line_number)
                 continue
             if re.match(r'^let\b', stripped_line, re.I):
+                # Let ... then block inside type constructor
+                if re.search(r'\bthen\b', stripped_line, re.I):
+                    i = self._process_type_let_then_block(
+                        code_lines, i, value_dict, input_values, line_number)
+                    continue
                 # Let statement: Let grid{a, b} = grid{a-1, b-1} + grid{a-1, b}
                 self._process_type_let_statement(
                     stripped_line, 'this', value_dict, line_number)
@@ -587,77 +598,139 @@ class GridLangTypeProcessor:
         _execute_loop()
         return end_index + 1
 
+    def _process_type_for_assignment_block(self, code_lines, i, value_dict, input_values, line_number):
+        """Handle ``For var = expr do ... End`` inside type constructors.
+
+        Defines *var* = *expr*, then executes the body lines once.
+        """
+        header = code_lines[i].strip()
+        header = re.sub(r'\s+do\s*$', '', header, flags=re.I).strip()
+        header = re.sub(r'^For\s+', '', header, count=1, flags=re.I)
+        eval_scope = self._build_type_eval_scope(value_dict, input_values)
+        var, type_name, constraints, expr = self.compiler._parse_variable_def(
+            header, line_number)
+        init_expr = (constraints or {}).get('init')
+        if expr is None and init_expr is not None:
+            expr = init_expr
+        if expr is not None:
+            value = self.compiler.expr_evaluator.eval_or_eval_array(
+                str(expr), eval_scope, line_number)
+            scope = self.compiler.current_scope()
+            defining_scope = scope.get_defining_scope(var)
+            inferred = type_name or self.compiler.array_handler.infer_type(
+                value, line_number)
+            if inferred == 'int':
+                inferred = 'number'
+            if defining_scope:
+                defining_scope.update(var, value, line_number)
+            else:
+                scope.define(var, value, inferred,
+                             constraints or {}, is_uninitialized=False)
+        # Collect and execute body
+        depth = 1
+        scan_i = i + 1
+        body = []
+        while scan_i < len(code_lines) and depth > 0:
+            line = code_lines[scan_i].strip()
+            if re.match(r'^for\b', line, re.I) and re.search(r'\bdo\b', line, re.I):
+                depth += 1
+            elif re.match(r'^let\b', line, re.I) and re.search(r'\bthen\b', line, re.I):
+                depth += 1
+            elif re.match(r'^end\b', line, re.I):
+                depth -= 1
+                if depth == 0:
+                    break
+            body.append(code_lines[scan_i])
+            scan_i += 1
+        self._execute_type_block(body, value_dict, input_values, line_number)
+        return scan_i + 1
+
     def _process_type_let_statement(self, line, var_name, value_dict, line_number):
-        """Process let statement inside type definition"""
-        # Let grid{a, b} = grid{a-1, b-1} + grid{a-1, b}
-        match = re.match(r'Let\s+(\w+)\{([^}]+)\}\s*=\s*(.+)$', line, re.I)
-        if match:
-            field_name, indices_str, value_expr = match.groups()
+        """Process let statement inside type definition.
 
-            if field_name.lower() == 'grid':
-                # Parse indices
-                indices = [idx.strip() for idx in indices_str.split(',')]
+        Routes to the shared compiler utilities for all forms:
+        ``Let grid{a,b} = expr``, ``Let grid![addr] = expr``,
+        ``Let x as T = expr``, ``Let x not null or = 0``, etc.
+        """
+        body = re.sub(r'^Let\s+', '', line.strip(), count=1, flags=re.I)
+        eval_scope = self._build_type_eval_scope(value_dict, {})
 
-                # Ensure the instance carries a grid store: a dense N-D array
-                # when the type declares grid dims, otherwise a sparse array.
-                grid_store = value_dict.get('grid')
-                if grid_store is None:
-                    grid_store = {}
-                    value_dict['grid'] = grid_store
-
-                # Build a scope that includes the current loop variables, the
-                # instance fields, and the instance grid. grid{...} access in
-                # the value expression is handled by the generic array-access
-                # path via the grid array in scope.
-                eval_scope = self._build_type_eval_scope(value_dict, {})
-
-                def _resolve_index(idx_expr):
-                    idx_value = eval_scope.get(idx_expr)
-                    if idx_value is None:
-                        try:
-                            idx_value = self.compiler.expr_evaluator.eval_expr(
-                                idx_expr, eval_scope, line_number)
-                        except Exception:
-                            idx_value = None
-                    if isinstance(idx_value, numbers.Real):
-                        idx_value = int(round(idx_value))
-                    return idx_value
-
-                try:
-                    resolved = [_resolve_index(idx) for idx in indices]
-
-                    if any(v is None for v in resolved):
-                        bad = [idx for idx, v in zip(indices, resolved) if v is None]
-                        raise NameError(
-                            f"Name '{bad[0]}' is not defined at line {line_number}")
-
-                    value = self.compiler.expr_evaluator.eval_expr(
-                        value_expr, eval_scope, line_number)
-
-                    # Store in grid (1-based user indices -> 0-based storage)
-                    value_dict['grid'] = self.compiler.array_handler.set_array_element(
-                        grid_store, [v - 1 for v in resolved], value,
-                        line_number)
-
-                except Exception as e:
-                    raise
-        else:
-            # Let field = expr
-            match = re.match(r'Let\s+(\$?[\w_]+)\s*=\s*(.+)$', line, re.I)
-            if not match:
-                return
-            field_name, value_expr = match.groups()
+        # 1) Wildcard bang-assign: Let grid![C2.A] = 0.6
+        #    Handle before _try_let_index_assignment because extended
+        #    addresses like C2.A are not valid index targets.
+        bang_match = re.match(
+            r'^(\$?[\w_]+)!\[([^\]]+)\]\s*=\s*(.+)$', body)
+        if bang_match:
+            field_name, address, value_expr = bang_match.groups()
             if field_name.startswith('$'):
                 field_name = field_name[1:]
-            scope = self._build_type_eval_scope(value_dict, {})
             value = self.compiler.expr_evaluator.eval_expr(
-                value_expr.strip(), scope, line_number)
-            # ``Let x = expr`` is executable code: it defines (or updates) a
-            # local variable in the current scope, not a public field.
-            self.compiler.current_scope().define(
-                field_name, value,
-                self.compiler.array_handler.infer_type(value, line_number),
-                {}, is_uninitialized=False)
+                value_expr.strip(), eval_scope, line_number)
+            self.compiler.array_handler._assign_wildcard_range(
+                address, value, expr_part=value_expr.strip(),
+                line_number=line_number)
+            return
+
+        # 2) Indexed write via shared utility: grid{a,b}=expr, x(1)=5
+        if '=' in body:
+            target, rhs = body.split('=', 1)
+            target = target.strip()
+            rhs = rhs.strip()
+            if '{' in target or '(' in target:
+                try:
+                    if self.compiler._try_let_index_assignment(
+                            target, rhs, eval_scope, line_number,
+                            local_vars=value_dict):
+                        return
+                except (NameError, ValueError, SyntaxError):
+                    raise
+                except Exception:
+                    pass
+
+        # 3) General variable declaration/binding: Let x as T = expr, etc.
+        var, type_name, constraints, expr = self.compiler._parse_variable_def(
+            body, line_number)
+        self.compiler._process_let_binding(
+            var, type_name, constraints, expr, line_number,
+            scope_dict=eval_scope, shadow_keyword='LET')
+
+    def _process_type_let_then_block(self, code_lines, i, value_dict, input_values, line_number):
+        """Handle ``Let cond then ... End`` blocks inside type constructors."""
+        header = code_lines[i].strip()
+        header = re.sub(r'\s+then\s*$', '', header, flags=re.I).strip()
+        header = re.sub(r'^Let\s+', '', header, count=1, flags=re.I)
+        eval_scope = self._build_type_eval_scope(value_dict, {})
+        var, type_name, constraints, expr = self.compiler._parse_variable_def(
+            header, line_number)
+        # Collect block body
+        block_lines = []
+        depth = 1
+        scan_i = i + 1
+        while scan_i < len(code_lines) and depth > 0:
+            next_line = code_lines[scan_i].strip()
+            if next_line.lower() == 'end':
+                depth -= 1
+                if depth == 0:
+                    break
+            elif re.match(r'^for\b', next_line, re.I) and re.search(r'\bdo\b', next_line, re.I):
+                depth += 1
+            elif re.match(r'^let\b', next_line, re.I) and re.search(r'\bthen\b', next_line, re.I):
+                depth += 1
+            block_lines.append(next_line)
+            scan_i += 1
+        # Evaluate condition
+        condition_passed = True
+        if expr is not None:
+            try:
+                val = self.compiler.expr_evaluator.eval_or_eval_array(
+                    str(expr), eval_scope, line_number)
+                condition_passed = bool(val)
+            except Exception:
+                condition_passed = False
+        if condition_passed:
+            self._execute_type_block(
+                block_lines, value_dict, input_values, line_number)
+        return scan_i + 1
 
     def _process_type_assignment(self, line, value_dict, input_values, line_number, init_fields=None):
         """Handle assignments inside type definitions (e.g., x = in_x)."""
@@ -734,13 +807,17 @@ class GridLangTypeProcessor:
             field_name, indices_str, value_expr = brace_match.groups()
             if field_name.startswith('$'):
                 field_name = field_name[1:]
+            scope = self._build_type_eval_scope(value_dict, input_values)
+            if ',' in indices_str:
+                # Multi-dimensional: route to the shared index-assignment utility
+                target = f"{field_name}{{{indices_str}}}"
+                if self.compiler._try_let_index_assignment(
+                        target, value_expr.strip(), scope, line_number,
+                        local_vars=value_dict):
+                    return
             actual_field = get_case_insensitive_key(
                 value_dict, field_name) or field_name
-            scope = self._build_type_eval_scope(value_dict, input_values)
             indices = [idx.strip() for idx in indices_str.split(',') if idx.strip()]
-            if len(indices) != 1:
-                raise ValueError(
-                    f"Expected 1 index for '{field_name}', got {len(indices)} at line {line_number}")
             index_val = self.compiler.expr_evaluator.eval_expr(
                 indices[0], scope, line_number)
             if isinstance(index_val, numbers.Real):

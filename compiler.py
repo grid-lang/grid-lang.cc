@@ -1620,6 +1620,304 @@ class GridLangCompiler:
         """Delegate to parser."""
         return self.parser._parse_variable_def(def_str, line_number)
 
+    def _has_star_dim(self, constraints):
+        """Return True if *constraints* contain an unbounded (star) dim spec."""
+        dim_spec = (constraints or {}).get('dim')
+        if isinstance(dim_spec, dict) and 'dims' in dim_spec:
+            dim_spec = dim_spec['dims']
+        if isinstance(dim_spec, list):
+            for _, size_spec in dim_spec:
+                if self.array_handler._is_unbounded_size_spec(size_spec):
+                    return True
+        if isinstance(dim_spec, str):
+            return '*' in dim_spec or re.search(r'to\s+\*', dim_spec, re.I)
+        return False
+
+    def _apply_dim_base_offsets(self, var_name, indices, line_number=None):
+        """Convert parsed (1-based) source indices to storage indices for a
+        declared dim, honoring a range lower bound ('n to *' / 'n to m').
+        """
+        if not indices:
+            return indices
+        dims = getattr(self, 'dimensions', {}) or {}
+        dim_specs = dims.get(var_name, [])
+        adjusted = []
+        for i, idx in enumerate(indices):
+            base = 1
+            if i < len(dim_specs):
+                size_spec = dim_specs[i][1]
+                if isinstance(size_spec, tuple) and len(size_spec) == 2:
+                    base = size_spec[0]
+            adjusted.append(idx - (base - 1))
+        return adjusted
+
+    def _try_let_index_assignment(self, var, expr, scope_dict, line_number,
+                                  local_vars=None):
+        """Shared indexed-write: ``var{a,b} = expr``, ``var![addr] = expr``,
+        ``var(1) = expr``. Returns True when the target was an index target.
+
+        When *local_vars* is provided (e.g. the type-constructor ``value_dict``),
+        the variable is looked up / written back there instead of the scope
+        chain.
+        """
+        var_name, indices = self.expr_evaluator._parse_index_target(
+            var, scope_dict, line_number)
+        if var_name is None:
+            return False
+
+        value = self.expr_evaluator.eval_or_eval_array(
+            expr, scope_dict, line_number)
+
+        # In a type constructor the variable may live in value_dict, not the
+        # compiler scope chain.  Always prefer local_vars when provided so
+        # writes go to the correct store.
+        if local_vars is not None:
+            local_key = None
+            for k in local_vars:
+                if str(k).lower() == var_name.lower():
+                    local_key = k
+                    break
+            if local_key is not None:
+                arr = local_vars[local_key]
+                if arr is None:
+                    arr = {}
+                    local_vars[local_key] = arr
+                indices = self._apply_dim_base_offsets(
+                    var_name, indices, line_number)
+                updated_array = self.array_handler.set_array_element(
+                    arr, indices, value, line_number)
+                local_vars[local_key] = updated_array
+                scope_dict[local_key] = updated_array
+                return True
+            raise NameError(
+                f"Array variable '{var_name}' not defined at line {line_number}")
+
+        defining_scope = self.current_scope().get_defining_scope(var_name)
+        if not defining_scope:
+            raise NameError(
+                f"Array variable '{var_name}' not defined at line {line_number}")
+        if (getattr(self, '_outer_scope_read_only', False)
+                and self._is_outer_scope(defining_scope)):
+            raise RuntimeError(
+                f"Cannot assign to '{var_name}': variables in an outer scope "
+                f"are read-only inside a function at line {line_number}")
+
+        actual_key = defining_scope._get_case_insensitive_key(
+            var_name, defining_scope.variables)
+        if not actual_key:
+            raise NameError(
+                f"Array variable '{var_name}' not defined at line {line_number}")
+        arr = defining_scope.variables[actual_key]
+        constraints = defining_scope.constraints.get(actual_key, {})
+        if constraints and self._has_star_dim(constraints):
+            if defining_scope.is_uninitialized(actual_key) or arr is None:
+                arr = {}
+                defining_scope.variables[actual_key] = arr
+        indices = self._apply_dim_base_offsets(
+            var_name, indices, line_number)
+        updated_array = self.array_handler.set_array_element(
+            arr, indices, value, line_number)
+        defining_scope.variables[actual_key] = updated_array
+        scope_dict[actual_key] = updated_array
+        return True
+
+    def _infer_declared_type(self, expr, evaluated_value, line_number):
+        """Infer a declared variable's type from a constructor or its value."""
+        constructor_match = None
+        try:
+            constructor_match = re.match(
+                r'new\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', str(expr), re.I)
+        except Exception:
+            constructor_match = None
+        inferred_type = (
+            constructor_match.group(1) if constructor_match
+            else self.array_handler.infer_type(evaluated_value, line_number))
+        if inferred_type == 'int':
+            return 'number'
+        return inferred_type
+
+    def _let_values_match(self, a, b):
+        """Compare two bound values, tolerating numeric vs. unit forms."""
+        try:
+            if isinstance(a, dict) and ('array' in a or is_sparse_array(a)):
+                a = self.array_handler.flatten_array(a)
+            if isinstance(b, dict) and ('array' in b or is_sparse_array(b)):
+                b = self.array_handler.flatten_array(b)
+            result = (a == b)
+        except Exception:
+            return False
+        if isinstance(result, (list, tuple)):
+            items = list(result)
+            return bool(items) and all(bool(item) for item in items)
+        return bool(result)
+
+    def _create_declared_dim_array(self, var, type_name, constraints, line_number):
+        """Materialize an array from a ``dim`` constraint with no value."""
+        dim_spec = constraints.get('dim')
+        if isinstance(dim_spec, dict) and 'dims' in dim_spec:
+            dims = dim_spec['dims']
+        elif isinstance(dim_spec, list):
+            dims = dim_spec
+        else:
+            return None
+        if not dims:
+            return None
+        if any(self.array_handler._is_unbounded_size_spec(size_spec)
+               for _, size_spec in dims):
+            return {}
+        shape = []
+        for _, size_spec in dims:
+            if not isinstance(size_spec, int):
+                return None
+            shape.append(size_spec)
+        if type_name and type_name.lower() in self.types_defined:
+            return self.array_handler.create_object_array(
+                shape, None, line_number)
+        pa_type = (type_name or '').lower()
+        if pa_type not in ('number', 'text', 'logical'):
+            pa_type = 'number'
+        return self.array_handler.create_array(
+            shape, None, pa_type, line_number, template=True)
+
+    def _process_let_binding(
+            self,
+            var,
+            type_name,
+            constraints,
+            expr,
+            line_number,
+            search_scope=None,
+            define_scope=None,
+            scope_dict=None,
+            shadow_keyword=None):
+        """Shared logic for LET / FOR variable binding.
+
+        Handles constraint parsing, dim/default materialization, expression
+        evaluation and type coercion. Returns ``'bound'`` or ``None``.
+        """
+        constraints = dict(constraints or {})
+        if (
+            expr is not None
+            and isinstance(expr, str)
+            and expr.strip()
+            and 'constant' not in constraints
+            and 'init' not in constraints
+        ):
+            constraints['constant'] = expr.strip()
+        elif (
+            expr is not None
+            and type_name
+            and type_name.lower() in self.types_defined
+            and isinstance(expr, list)
+            and 'constant' not in constraints
+            and 'init' not in constraints
+        ):
+            constraints['constant'] = expr
+
+        search_scope = search_scope or self.current_scope()
+        define_scope = define_scope or search_scope
+        defining_scope = search_scope.get_defining_scope(var)
+        if defining_scope and self._is_outer_scope(defining_scope):
+            defining_scope = None
+        old_constant = None
+        old_value = None
+        if defining_scope:
+            old_key = defining_scope._get_case_insensitive_key(
+                var, defining_scope.variables)
+            old_constraints_key = defining_scope._get_case_insensitive_key(
+                var, defining_scope.constraints)
+            if old_constraints_key:
+                old_constant = defining_scope.constraints[old_constraints_key].get(
+                    'constant')
+            if old_key:
+                old_value = defining_scope.variables[old_key]
+            if var in defining_scope.constraints:
+                merged = dict(defining_scope.constraints[var])
+                merged.update(constraints)
+                constraints = merged
+            if constraints:
+                defining_scope.constraints[var] = constraints
+            if expr is None and var in defining_scope.variables and defining_scope.variables[var] is not None:
+                return None
+        else:
+            if shadow_keyword and self.current_scope().is_shadowed(var):
+                print(
+                    f"Warning: {shadow_keyword} defines '{var}' which shadows a variable in an outer scope at line {line_number}")
+            define_scope.define(
+                var, None, type_name, constraints, is_uninitialized=True,
+                line_number=line_number)
+            defining_scope = define_scope
+
+        if expr is None and constraints.get('dim'):
+            dim_value = self._create_declared_dim_array(
+                var, type_name, constraints, line_number)
+            if dim_value is not None:
+                search_scope.update(var, dim_value, line_number)
+                if scope_dict is not None:
+                    scope_dict[var] = dim_value
+                return 'bound'
+
+        if expr is None and constraints.get('default') is not None:
+            try:
+                default_value = self.expr_evaluator.eval_expr(
+                    str(constraints['default']),
+                    search_scope.get_evaluation_scope(),
+                    line_number)
+                if type_name:
+                    default_value, constraints = defining_scope._coerce_custom_type_value(
+                        type_name, default_value, constraints, line_number)
+                    actual_constraint_key = defining_scope._get_case_insensitive_key(
+                        var, defining_scope.constraints) or var
+                    defining_scope.constraints[actual_constraint_key] = constraints
+                search_scope.update(var, default_value, line_number)
+                if scope_dict is not None:
+                    scope_dict[var] = default_value
+                return 'bound'
+            except Exception:
+                return None
+
+        if expr is None:
+            return None
+
+        if 'init' not in constraints and expr is not None:
+            self._register_listeners(var, expr, search_scope)
+
+        evaluated_value = self.expr_evaluator.eval_or_eval_array(
+            expr, scope_dict or search_scope.get_evaluation_scope(),
+            line_number)
+        if constraints.get('with'):
+            evaluated_value = self._apply_with_constraints(
+                evaluated_value,
+                constraints.get('with', {}),
+                search_scope.get_full_scope(),
+                line_number,
+                type_name=type_name)
+        if type_name:
+            evaluated_value, constraints = defining_scope._coerce_custom_type_value(
+                type_name, evaluated_value, constraints, line_number)
+            actual_constraint_key = defining_scope._get_case_insensitive_key(
+                var, defining_scope.constraints) or var
+            defining_scope.constraints[actual_constraint_key] = constraints
+        elif not type_name:
+            inferred_type = self._infer_declared_type(
+                expr, evaluated_value, line_number)
+            actual_type_key = defining_scope._get_case_insensitive_key(
+                var, defining_scope.types) or var
+            defining_scope.types[actual_type_key] = inferred_type
+        if (
+            old_constant is not None
+            and constraints.get('constant') is not None
+            and old_value is not None
+            and not self._let_values_match(old_value, evaluated_value)
+        ):
+            search_scope.update(
+                var, error_value(VALUE_ERROR), line_number)
+            return 'bound'
+        search_scope.update(var, evaluated_value, line_number)
+        if scope_dict is not None:
+            scope_dict[var] = evaluated_value
+        return 'bound'
+
     def _extract_identifier_tokens(self, expr):
         """Extract identifier-like tokens ignoring string literals and numeric literals."""
         if not expr:

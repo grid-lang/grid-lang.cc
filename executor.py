@@ -259,39 +259,11 @@ class GridLangExecutor:
             return True
         return False
 
-    def _apply_dim_base_offsets(self, var_name, indices, line_number=None):
-        """Convert parsed (1-based) source indices to storage indices for a
-        declared dim, honoring a range lower bound ('n to *' / 'n to m').
-
-        Parsed indices are 0-based assuming a default base of 1; a range
-        base 'n' shifts them by -(n - 1), so source index n maps to storage
-        0 (mirrors the read path's 'idx - base' adjustment).
-        """
-        if not indices:
-            return indices
-        dims = getattr(self, 'dimensions', {}) or {}
-        dim_specs = dims.get(var_name, [])
-        adjusted = []
-        for i, idx in enumerate(indices):
-            base = 1
-            if i < len(dim_specs):
-                size_spec = dim_specs[i][1]
-                if isinstance(size_spec, tuple) and len(size_spec) == 2:
-                    base = size_spec[0]
-            adjusted.append(idx - (base - 1))
-        return adjusted
-
     def _has_star_dim(self, constraints):
-        dim_spec = (constraints or {}).get('dim')
-        if isinstance(dim_spec, dict) and 'dims' in dim_spec:
-            dim_spec = dim_spec['dims']
-        if isinstance(dim_spec, list):
-            for _, size_spec in dim_spec:
-                if self.array_handler._is_unbounded_size_spec(size_spec):
-                    return True
-        if isinstance(dim_spec, str):
-            return '*' in dim_spec or re.search(r'to\s+\*', dim_spec, re.I)
-        return False
+        return self.compiler._has_star_dim(constraints) if hasattr(self, 'compiler') else False
+
+    def _apply_dim_base_offsets(self, var_name, indices, line_number=None):
+        return self.compiler._apply_dim_base_offsets(var_name, indices, line_number) if hasattr(self, 'compiler') else indices
 
     def _has_when_dependency(self, var_name):
         var_lower = var_name.lower()
@@ -1293,41 +1265,7 @@ class GridLangExecutor:
 
     def _try_handle_let_index_assignment(
             self, var, expr, scope_dict, line_number):
-        var_name, indices = self.expr_evaluator._parse_index_target(
-            var, scope_dict, line_number)
-        if var_name is None:
-            return False
-
-        value = self.expr_evaluator.eval_or_eval_array(
-            expr, scope_dict, line_number)
-        defining_scope = self.current_scope().get_defining_scope(var_name)
-        if not defining_scope:
-            raise NameError(
-                f"Array variable '{var_name}' not defined at line {line_number}")
-        if (getattr(self.compiler, '_outer_scope_read_only', False)
-                and self.compiler._is_outer_scope(defining_scope)):
-            raise RuntimeError(
-                f"Cannot assign to '{var_name}': variables in an outer scope "
-                f"are read-only inside a function at line {line_number}")
-
-        actual_key = defining_scope._get_case_insensitive_key(
-            var_name, defining_scope.variables)
-        if not actual_key:
-            raise NameError(
-                f"Array variable '{var_name}' not defined at line {line_number}")
-        arr = defining_scope.variables[actual_key]
-        constraints = defining_scope.constraints.get(actual_key, {})
-        if constraints and self._has_star_dim(constraints):
-            if defining_scope.is_uninitialized(actual_key) or arr is None:
-                arr = {}
-                defining_scope.variables[actual_key] = arr
-        indices = self._apply_dim_base_offsets(
-            var_name, indices, line_number)
-        updated_array = self.array_handler.set_array_element(
-            arr, indices, value, line_number)
-        defining_scope.variables[actual_key] = updated_array
-        scope_dict[actual_key] = updated_array
-        return True
+        return self._try_let_index_assignment(var, expr, scope_dict, line_number)
 
     def _infer_declared_type(self, expr, evaluated_value, line_number):
         """Infer a declared variable's type from a constructor or its value."""
@@ -1520,55 +1458,6 @@ class GridLangExecutor:
                 expr, line_number, set(missing), constraints)
             return 'deferred'
 
-    def _create_declared_dim_array(self, var, type_name, constraints, line_number):
-        """Materialize an array for a declaration that carries a 'dim'
-        constraint but no value expression (e.g. ``Let d not null dim {*,*}
-        or = none``). Unbounded (star) dims give a sparse array keyed by index
-        tuples; bounded dims give a dense buffer filled with the type default.
-        Returns None when the dim constraint is not materializable here.
-        """
-        dim_spec = constraints.get('dim')
-        if isinstance(dim_spec, dict) and 'dims' in dim_spec:
-            dims = dim_spec['dims']
-        elif isinstance(dim_spec, list):
-            dims = dim_spec
-        else:
-            return None
-        if not dims:
-            return None
-        if any(self.array_handler._is_unbounded_size_spec(size_spec)
-               for _, size_spec in dims):
-            return {}
-        shape = []
-        for _, size_spec in dims:
-            if not isinstance(size_spec, int):
-                return None
-            shape.append(size_spec)
-        if type_name and type_name.lower() in self.types_defined:
-            return self.array_handler.create_object_array(
-                shape, None, line_number)
-        pa_type = (type_name or '').lower()
-        if pa_type not in ('number', 'text', 'logical'):
-            pa_type = 'number'
-        return self.array_handler.create_array(
-            shape, None, pa_type, line_number, template=True)
-
-    def _let_values_match(self, a, b):
-        """Compare two bound values, tolerating numeric vs. unit forms."""
-        try:
-            if hasattr(self, 'array_handler'):
-                if isinstance(a, dict) and ('array' in a or is_sparse_array(a)):
-                    a = self.array_handler.flatten_array(a)
-                if isinstance(b, dict) and ('array' in b or is_sparse_array(b)):
-                    b = self.array_handler.flatten_array(b)
-            result = (a == b)
-        except Exception:
-            return False
-        if isinstance(result, (list, tuple)):
-            items = list(result)
-            return bool(items) and all(bool(item) for item in items)
-        return bool(result)
-
     def _process_let_standard_assignment(
             self,
             var,
@@ -1679,9 +1568,49 @@ class GridLangExecutor:
                     except ValueError as e:
                         self.pop_scope()
                         return block_end_i + 1
+        # Collect Let-defined variable names so we can exclude them from
+        # promotion.  For and : define in the enclosing scope; only Let
+        # is truly local to the block.
+        let_var_names = set()
+        for bl, _ in block_lines:
+            bl_stripped = bl.strip()
+            if re.match(r'^let\b', bl_stripped, re.I) and re.search(r'\binit\b', bl_stripped, re.I):
+                m_let = re.match(r'^let\s+(\w+)', bl_stripped, re.I)
+                if m_let:
+                    let_var_names.add(m_let.group(1).lower())
+
         block_pending = self.control_flow._process_block(block_lines)
         if block_pending:
             self.scopes[0].pending_assignments.update(block_pending)
+
+        # Promote For- and :-defined variables to the enclosing scope so
+        # they persist after the Let block ends (mirrors type-constructor
+        # behaviour).  Let-defined variables stay block-local.
+        parent_scope = self.current_scope().parent
+        if parent_scope is not None:
+            block_scope = self.current_scope()
+            for key in list(block_scope.variables.keys()):
+                if key.startswith('_'):
+                    continue
+                if key.lower() in let_var_names:
+                    continue
+                existing = parent_scope.get_defining_scope(key)
+                if existing:
+                    try:
+                        existing.update(key, block_scope.variables[key], line_number)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        parent_scope.define(
+                            key, block_scope.variables[key],
+                            block_scope.types.get(key, ''),
+                            block_scope.constraints.get(key, {}),
+                            is_uninitialized=False,
+                            line_number=line_number)
+                    except Exception:
+                        pass
+
         self.pop_scope()
         return block_end_i + 1
 
