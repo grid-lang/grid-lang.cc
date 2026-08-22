@@ -4118,7 +4118,7 @@ class GridLangExecutor:
                     with_constraints.get(f, None), line_number)
                     if with_constraints.get(f, None) is not None else None)
                     for f in public_fields}
-                tensor_struct['grid'] = grid_data['array']
+                tensor_struct['grid'] = grid_data
                 tensor_struct['original_shape'] = grid_data['original_shape']
                 tensor_struct['constraints'] = constraints
                 tensor_struct['_type_name'] = type_name.lower()
@@ -4847,22 +4847,9 @@ class GridLangExecutor:
             var_name, indices, line_number)
         arr = defining_scope.variables.get(actual_key)
         if isinstance(arr, dict) and 'grid' in arr:
-            grid_source = arr['grid']
-            original_shape = arr.get('original_shape')
-            indices_0 = list(indices)
-            if isinstance(grid_source, list) and original_shape:
-                flat_idx = 0
-                stride = 1
-                for i in range(len(indices_0) - 1, -1, -1):
-                    flat_idx += indices_0[i] * stride
-                    stride *= original_shape[i]
-                grid_source[flat_idx] = value
-            elif isinstance(grid_source, dict) and 'array' not in grid_source:
-                grid_source[tuple(indices_0)] = value
-            else:
-                updated_grid = self.array_handler.set_array_element(
-                    grid_source, indices_0, value, line_number)
-                arr['grid'] = updated_grid
+            updated_grid = self.array_handler.set_array_element(
+                arr['grid'], indices, value, line_number)
+            arr['grid'] = updated_grid
         else:
             updated_array = self.array_handler.set_array_element(
                 arr, indices, value, line_number)
