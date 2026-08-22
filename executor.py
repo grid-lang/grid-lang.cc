@@ -4885,6 +4885,8 @@ class GridLangExecutor:
             scope = self.current_scope()
         except Exception:
             return
+        deferred = getattr(self, '_deferred_output_inits', None) or getattr(
+            getattr(self, 'compiler', None), '_deferred_output_inits', None) or {}
         seen_scopes = set()
         while scope and id(scope) not in seen_scopes:
             seen_scopes.add(id(scope))
@@ -4892,6 +4894,8 @@ class GridLangExecutor:
                 if not constraints or 'init' not in constraints:
                     continue
                 if not scope.is_uninitialized(var_name):
+                    continue
+                if var_name.lower() in deferred:
                     continue
                 init_expr = constraints.get('init')
                 deps = self._extract_dependencies_from_expression(

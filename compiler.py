@@ -376,7 +376,7 @@ class GridLangCompiler:
                      'dependency_graph', 'global_guard_entries', 'global_for_line_numbers',
                      'executed_global_for_lines', 'output_values', 'functions', 'subprocesses',
                      'prompt_missing_inputs', '_allow_hidden_field_access', '_allow_hidden_member_calls',
-                     '_parent_scope', '_outer_scope_read_only']:
+                     '_parent_scope', '_outer_scope_read_only', '_deferred_output_inits']:
             if hasattr(extracted, attr):
                 setattr(self, attr, getattr(extracted, attr))
 
@@ -1237,6 +1237,7 @@ class GridLangCompiler:
             # _reset_state (a compiler-bound method), so fall back to the
             # pre-clobber capture of the subprocess's final variables.
             last_scope_vars = getattr(sub_compiler, '_last_scope_vars', {}) or {}
+            deferred_inits = getattr(sub_compiler, '_deferred_output_inits', {}) or {}
             for out_name in sp_def.get('outputs', []) or []:
                 out_key = out_name.lower()
                 if out_key in merged_outputs:
@@ -1250,6 +1251,14 @@ class GridLangCompiler:
                         if key.lower() == out_key:
                             merged_val = value
                             break
+                if merged_val is None and out_key in deferred_inits:
+                    init_expr, init_constraints = deferred_inits[out_key]
+                    try:
+                        scope_dict = dict(last_scope_vars)
+                        merged_val = self.expr_evaluator.eval_or_eval_array(
+                            str(init_expr), scope_dict, line_number)
+                    except Exception:
+                        merged_val = None
                 if merged_val is not None:
                     merged_outputs[out_key] = merged_val
         except Exception:
@@ -2037,6 +2046,7 @@ class GridLangCompiler:
         self.variables = self.scopes[0].variables
         self.types = self.scopes[0].types
         self.pending_assignments = {}
+        self._deferred_output_inits = {}
         self.dimensions.clear()
         self.dim_names.clear()
         self.dim_labels.clear()
@@ -2429,6 +2439,14 @@ class GridLangCompiler:
                     if unresolved:
                         self.pending_assignments[var_name] = (
                             init_expr, line_number, deps, constraints)
+                    elif getattr(self, '_parent_scope', None) is not None:
+                        # In subprocess context, defer OUTPUT init to output
+                        # collection time so body statements (For/Let) can
+                        # shadow variables first.
+                        if not hasattr(self, '_deferred_output_inits'):
+                            self._deferred_output_inits = {}
+                        self._deferred_output_inits[var_name.lower()] = (
+                            init_expr, constraints)
                     else:
                         eval_scope = self.current_scope().get_full_scope()
                         import copy
@@ -2451,6 +2469,15 @@ class GridLangCompiler:
                     a, line_number)
             except Exception:
                 var = None
+            if var and not type_name and not constraints and expr is None:
+                existing_scope = self.current_scope().get_defining_scope(var)
+                if self._is_outer_scope(existing_scope):
+                    existing_scope = None
+                if (not existing_scope) or (var not in existing_scope.variables):
+                    self.current_scope().define(
+                        var, None, 'unknown', {},
+                        is_uninitialized=True, line_number=line_number)
+                return
             if var and (type_name or constraints):
                 constraints = constraints or {}
                 is_custom_type = type_name and type_name.lower() in self.types_defined

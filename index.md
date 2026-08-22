@@ -56,7 +56,7 @@ are prompted (`compiler.prompt_missing_inputs`).
    control_flow.py.
 5. Results: `Return x` appends to `output_values` (printed by
    `_print_outputs`); grid writes land in `compiler.grid` (a dict keyed by
-   cell refs like `'A1'`). `--debug` → `compiler.export_to_csv` (`compiler.py:2982`).
+   cell refs like `'A1'`). `--debug` → `compiler.export_to_csv` (`compiler.py:3054`).
 
 The single most important design fact: **`GridLangCompiler` (state holder) and
 `GridLangExecutor` (loop) share one object during execution.** Many helpers
@@ -76,7 +76,7 @@ handling) — check both before adding a feature so you extend the live path.
 - Console script `grid=main:main`; declares the 10 top-level modules as
   `py_modules`; **no `install_requires`** (`pyarrow` was removed); LGPLv3.
 
-### `compiler.py` (3166 lines) — state + orchestration
+### `compiler.py` (3238 lines) — state + orchestration
 `class GridLangCompiler` is the **persistent brain** and holds nearly all state
 created in `__init__`:
 - Grid & scoping: `grid` (`_ListenerGrid`), `scopes` (stack of `Scope`),
@@ -98,10 +98,10 @@ Notable methods (all copied onto the executor during a run):
   `GridLiveView`, so `grid{row, col}` works at top level.
 - `_extract_functions` (38389: pulls `Function`/`Subprocess` defs out of the
   main code and registers them.
-- `_instantiate_type` (70702, `_evaluate_with_value` (852), `_apply_with_clause`
+- `_instantiate_type` (70702, `_evaluate_with_value` (889), `_apply_with_clause`
   parsing (958+): type/`with` object construction.
 - `call_subprocess` (111128: runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (202080, `_process_declarations_and_labels` (2240),
+- `_process_grid_assignment` (202080, `_process_declarations_and_labels` (2295),
   `_collect_global_declarations` (212168: top-level statement handling.
 - `export_to_csv` (282817: `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
@@ -112,12 +112,12 @@ Notable methods (all copied onto the executor during a run):
 Also defines `SubprocessResult` (46): result container exposing `grid`,
 `variables`, `outputs`.
 
-### `executor.py` (5136 lines) — the interpreter
+### `executor.py` (5141 lines) — the interpreter
 `class GridLangExecutor` contains the main dispatch loop. This is where most
 runtime behavior lives. Key methods:
 - `run` (191918: top-level sequence (see Architecture).
-- `_run_setup` (424220, `_run_prepare_execution` (4424), `_print_outputs`
-  (4680), `_materialize_inits` (4881), `_process_deferred_assignments` (5016).
+- `_run_setup` (424220, `_run_prepare_execution` (4417), `_print_outputs`
+  (4680), `_materialize_inits` (4882), `_process_deferred_assignments` (5021).
 - Main loop: `_run_main_loop` (2074) → `_run_main_loop_impl` (2600) →
   `_run_main_loop_impl_body` (242455. `_handle_main_loop_*` methods dispatch
   statement kinds: quick statements (1113), `Let` (1147/1494/1515), `For`
@@ -138,95 +138,95 @@ runtime behavior lives. Key methods:
   dimension spec. `or = <expr>` is stored as `constraints['default']` so
   `_array_unset_value` can find it. The bounded-dim handler creates template
   arrays (`template=True`) when no `init`/standalone `=` is present.
-- `Push` semantics: `_handle_push_assignment` (4633), `_evaluate_push_expression`
-  (4286), `_process_push_call` (4699), `_assign_indexed_target` (4794),
+- `Push` semantics: `_handle_push_assignment` (4626), `_evaluate_push_expression`
+  (4286), `_process_push_call` (4692), `_assign_indexed_target` (4787),
   `_update_member_path_target` (444475.
 - `When` blocks: `_register_when_block` (308), `_process_when_triggers` (340),
   `_run_when_block` (31317.
 - Shared with compiler.py: `_strip_constraint_operands` (module-level, 26) and
   `DEPENDENCY_IGNORED_TOKENS` (1717 — duplicate of compiler's. Keep in sync.
 
-### `expression.py` (3415 lines) — expression evaluation
+### `expression.py` (3455 lines) — expression evaluation
 `class ExpressionEvaluator` evaluates RHS expressions, arrays, ranges, sums,
 dimension selectors, interpolations, member/field access, and Python-fallback
 evaluation.
-- Entry points: `eval_or_eval_array` (73), `eval_expr` (1993), and for
-  assignments `_evaluate_array` (444).
+- Entry points: `eval_or_eval_array` (74), `eval_expr` (2027), and for
+  assignments `_evaluate_array` (445).
 - `eval_expr` is the big recursive dispatcher: array literals `{}`, pipes `|`,
   interpolated cell refs, paren/curly indexing, member calls, user function
   calls, object creation, field access, address-indexed access, then scalar
   constructs, then simple variables.
-- Python fallback: `_evaluate_with_python_fallback` (2378) builds a scope and
+- Python fallback: `_evaluate_with_python_fallback` (2418) builds a scope and
   `eval()`s complex arithmetic (`_build_fallback_cell_scope` 2254,
   `_eval_python_fallback_result` 2501, `_get_eval_globals` 2937).
-- Interpolation: `_process_interpolation` (3104). Operators:
+- Interpolation: `_process_interpolation` (3144). Operators:
   `_replace_operators` (292923.
-- Grid indexing: `_replace_grid_indexing` (761) — only still needed for legacy
+- Grid indexing: `_replace_grid_indexing` (762) — only still needed for legacy
   dict-based object grids; it early-returns for `GridLiveView` (which flows
   through the generic array path). `_eval_array_element` uses `base=1` for
   `GridLiveView`.
-- Also `CaseInsensitiveDict` (24): case-insensitive dict used for
+- Also `CaseInsensitiveDict` (25): case-insensitive dict used for
   eval scopes.
 
-### `array_handler.py` (2702 lines) — grid/array/tensor operations
+### `array_handler.py` (2963 lines) — grid/array/tensor operations
 `class ArrayHandler` centralizes all array knowledge:
 - Cell addressing & lookup: `resolve_cell_index` (30), `cell_ref_to_indices`
-  (129), `lookup_cell` (1467), `get_range_values` (1253/1286),
-  `_lookup_extended_address` (131367, `_write_extended_tensor` (1550).
-- Assignment: `evaluate_line_with_assignment` (229),
-  `_parse_assignment_target_details` (26257, `_perform_assignment_write` (513),
-  `_assign_horizontal_array` (98984, `assign_range` (1243),
-  `_assign_extended_range` (121221, `_assign_index_selector` (849),
-  `_assign_dim_selector` (85837, `_update_bound_array_cell` (1044),
+  (129), `lookup_cell` (1502), `get_range_values` (1253/1286),
+  `_lookup_extended_address` (131367, `_write_extended_tensor` (1587).
+- Assignment: `evaluate_line_with_assignment` (249),
+  `_parse_assignment_target_details` (26257, `_perform_assignment_write` (544),
+  `_assign_horizontal_array` (98984, `assign_range` (1278),
+  `_assign_extended_range` (121221, `_assign_index_selector` (884),
+  `_assign_dim_selector` (85837, `_update_bound_array_cell` (1079),
   `assign_implicit_intersection_range` (60597, implicit-intersection rewrite
   (`_rewrite_implicit_intersection` 597).
-- Spilling helpers: `_resolve_spill_unset` (1449) replaces `None` sentinels
+- Spilling helpers: `_resolve_spill_unset` (1484) replaces `None` sentinels
   in flat arrays before writing to grid (uses variable default or `#N/A`);
-  `flatten_array` (1609) column-major flattens any array to 1D;
-  `flatten_object_fields` (1567) flattens object fields for grid spills.
+  `flatten_array` (1840) column-major flattens any array to 1D;
+  `flatten_object_fields` (1798) flattens object fields for grid spills.
 - Array construction/shape: `create_array` (1773, accepts `template=True` to
-  fill with `None` sentinels), `create_object_array` (1866),
-  `get_array_shape` (1764), `reshape_array` (2231), `infer_type` (1735),
-  `fill_array` (2631), `flatten_object_fields` (1567), `flatten_array`
-  (1443), `_nested_from_flat` (1697), `to_display_value` (1654).
-- Constraints/dims: `set_labels` (1881), `check_dimension_constraints` (1945),
+  fill with `None` sentinels), `create_object_array` (2097),
+  `get_array_shape` (1995), `reshape_array` (2489), `infer_type` (1966),
+  `fill_array` (2892), `flatten_object_fields` (1798), `flatten_array`
+  (1443), `_nested_from_flat` (1928), `to_display_value` (1885).
+- Constraints/dims: `set_labels` (2112), `check_dimension_constraints` (2203),
   `validate_array_element_types` (161694 — element-level base-type checking
-  (`as number`/`as text` arrays reject mismatched scalars), `_dim_size` (1908).
-- Grid-as-array: `get_grid_row` (2287), `get_grid_column` (2316), plus
+  (`as number`/`as text` arrays reject mismatched scalars), `_dim_size` (2139).
+- Grid-as-array: `get_grid_row` (2545), `get_grid_column` (2574), plus
   `GridLiveView` branches in `get_array_element`/`set_array_element`.
 
-### `control_flow.py` (2201 lines) — blocks: For / If / Let / When
+### `control_flow.py` (2197 lines) — blocks: For / If / Let / When
 `class GridLangControlFlow` executes block constructs. Module-level regexes
 (9–16) define `if...then`, `elseif...then`, `else`, `for...do`, `while...do`,
 `when...do`, `end`.
 - `process_for_statement` (11118: For-loop handling (ranges, init, arrays).
-- Block engine: `_process_block` (960), `_extract_block_body` (308),
+- Block engine: `_process_block` (956), `_extract_block_body` (308),
   `pre_scan_blocks` (181833, `_prepare_block_line` (338).
-- If: `_process_if_statement` (1015) and the "new"/"rich" variants (2011,
-  2113), `_parse_if_header` (1048), `_collect_if_blocks` (1086),
-  `_execute_if_block_choice` (111186, `_process_if_elseif_else_block` (1967);
-  condition evaluation helpers `_evaluate_if_*` (1430–1785).
-- Let: `_process_let_statement_inline` (1271), field/index assignment helpers
+- If: `_process_if_statement` (1011) and the "new"/"rich" variants (2011,
+  2113), `_parse_if_header` (1044), `_collect_if_blocks` (1082),
+  `_execute_if_block_choice` (111186, `_process_if_elseif_else_block` (1963);
+  condition evaluation helpers `_evaluate_if_*` (1426–1781).
+- Let: `_process_let_statement_inline` (1267), field/index assignment helpers
   (1339, 1390).
 - `_handle_block_*` methods (343–960): per-statement handling inside blocks.
 
-### `scope.py` (955 lines) — scope + variable semantics
+### `scope.py` (965 lines) — scope + variable semantics
 - `class Scope` (11119: variable storage with constraints.
-  - `define` (337), `update` (378), `get` (471), `is_uninitialized` (492),
-    `get_defining_scope` (507).
-  - Inputs/outputs: `define_input` (520), `define_output` (535),
-    `is_input`/`is_output` (518/527), `connect_pipe` (560), `push_value`
-    (555), `_propagate_wave` (602) — the publish/listen ripple.
-  - Constraints: `_re_evaluate_constraints` (655), `_check_constraints` (738),
-    `_validate_base_type` (696) — validates scalars AND, since the pyarrow
+  - `define` (338), `update` (379), `get` (472), `is_uninitialized` (493),
+    `get_defining_scope` (508).
+  - Inputs/outputs: `define_input` (521), `define_output` (536),
+    `is_input`/`is_output` (518/527), `connect_pipe` (561), `push_value`
+    (555), `_propagate_wave` (603) — the publish/listen ripple.
+  - Constraints: `_re_evaluate_constraints` (656), `_check_constraints` (739),
+    `_validate_base_type` (697) — validates scalars AND, since the pyarrow
     removal, element-by-element base types of `dim` arrays (via
     `array_handler.validate_array_element_types`), `_expression_depends_on`
-    (651). `_array_unset_value` (array_handler.py:1411) resolves `None`
+    (651). `_array_unset_value` (array_handler.py:1446) resolves `None`
     sentinels for unset template array cells: checks the variable's
     `constraints['default']` (from `or = <expr>`) and evaluates it; falls back
     to `error_value(NA_ERROR)` (`#N/A`).
-  - Scoping: `is_shadowed` (616), `get_evaluation_scope` (624),
-    `get_full_scope` (948), `_coerce_custom_type_value` (172).
+  - Scoping: `is_shadowed` (617), `get_evaluation_scope` (625),
+    `get_full_scope` (955), `_coerce_custom_type_value` (172).
 - `class _ListenerGrid` (2121: dict backing `compiler.grid`; every cell write
   calls `compiler._notify_cell_changed`.
 - `class GridLiveView` (4040: `(row, col)`-keyed live view of a grid
@@ -235,46 +235,46 @@ evaluation.
 - `_ACTIVE_RUNNERS` (1618: stack of executing compilers; used to reject writes
   from read-only function sub-compilers to outer scopes.
 
-### `type_processor.py` (797 lines) — `Define X as Type` handling
+### `type_processor.py` (884 lines) — `Define X as Type` handling
 `class GridLangTypeProcessor`:
-- Type-def parsing: `_parse_type_def` (30), `_parse_type_def_line` (38),
-  `_extract_type_field_line` (9696, `_parse_type_field_constraints` (125),
+- Type-def parsing: `_parse_type_def` (34), `_parse_type_def_line` (42),
+  `_extract_type_field_line` (9696, `_parse_type_field_constraints` (129),
   `_record_type_field_definition` (15157, `_collect_type_computed_fields`
-  (178), `_finalize_type_def_state` (196).
-- Executing type body code against an instance: `_execute_type_code` (213),
-  `_execute_type_block` (25252, `_process_grid_assignment` (370),
-  `_process_type_for_loop` (38389, `_process_type_let_statement` (524),
+  (178), `_finalize_type_def_state` (200).
+- Executing type body code against an instance: `_execute_type_code` (217),
+  `_execute_type_block` (25252, `_process_grid_assignment` (384),
+  `_process_type_for_loop` (38389, `_process_type_let_statement` (590),
   `_process_type_assignment` (58581.
-- `_build_type_eval_scope` (70708, `_execute_private_helper` (732).
+- `_build_type_eval_scope` (70708, `_execute_private_helper` (819).
 
-### `parser.py` (531 lines) — variable-definition parsing
+### `parser.py` (557 lines) — variable-definition parsing
 `class GridLangParser`:
 - `_parse_variable_def` (1616: the central parser for `: name [as type] [of
   unit] [dim ...] [constraints] = expr` / `Input`/`Output` lines. Returns
   (parsed_var, parsed_type, constraints, expression).
 - Constraint handling: `_check_comparison_series` (226),
   `_match_direct_assignment_patterns` (22225, `_apply_with_clause` (263),
-  `_apply_dimension_constraints` (33334, `_merge_custom_type_constraints` (396),
-  `_split_on_keywords` (39390, `_parse_dim_size` (497). The `or` keyword in
+  `_apply_dimension_constraints` (33334, `_merge_custom_type_constraints` (422),
+  `_split_on_keywords` (39390, `_parse_dim_size` (523). The `or` keyword in
   `_split_on_keywords` extracts `or = <expr>` as `constraints['default']`;
   `not null` sets `constraints['nullable'] = True`. The default value is used
   by `_array_unset_value` when reading unset template array cells.
 
-### `utils.py` (374 lines) — shared pure helpers
+### `utils.py` (438 lines) — shared pure helpers
 - Address math: `split_cell` (113), `col_to_num` (122), `num_to_col` (129),
   `offset_cell` (12125, `parse_address` (151, N-D dotted addresses like
   `A3.B4.8` → `[3,1,4,2,8]`), `indices_to_address` (188), `is_address` (158),
-  `validate_cell_ref` (8585, `prod` (206).
-- Case-insensitive dict access: `get_case_insensitive_key` (244),
+  `validate_cell_ref` (8585, `prod` (270).
+- Case-insensitive dict access: `get_case_insensitive_key` (308),
   `get_case_insensitive_value` (24241.
-- Object/type metadata filtering: `public_type_fields` (213),
-  `object_public_keys` (21213, `public_object_view` (263) — strip `_hidden`
+- Object/type metadata filtering: `public_type_fields` (277),
+  `object_public_keys` (21213, `public_object_view` (327) — strip `_hidden`
   fields and keys starting with `_`/`$`/`grid`.
 - Text parsing: `iter_interpolation_placeholders` (18), `split_var_defs` (48).
 - `format_display_value` (26265: display formatting with float-trimming and
   list/dict-form array support.
 
-### `test_runner.py` (865 lines) — inline test suite
+### `test_runner.py` (897 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — a huge method
 containing 263 hardcoded test cases (name, code, expected grid dict). At the
 bottom of the file (~830) it runs itself when executed directly:
@@ -313,8 +313,8 @@ is a stale backup — ignore.
   cell (horizontally). With `^`, object fields are expanded: one object per
   row, fields across columns. A single object WITHOUT `^` writes as a single
   cell value; with `^` it spills fields. The core spilling function is
-  `_assign_horizontal_array` (`array_handler.py:1122`);
-  `_assign_extended_address` (`array_handler.py:1219`) handles dotted targets
+  `_assign_horizontal_array` (`array_handler.py:1157`);
+  `_assign_extended_address` (`array_handler.py:1254`) handles dotted targets
   like `A1.B1.3`.
 - **Variables**: `: x = expr` (client binding — deferred until deps resolve),
   `Let x init val`/`= val`, `For x init val`. `Push x = expr` updates x and
