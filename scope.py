@@ -954,9 +954,12 @@ class Scope:
 
     def get_full_scope(self):
         full_scope = {}
+        chain = []
         current = self
         while current and not current.is_private:
-            for var_name, var_value in current.variables.items():
-                full_scope[var_name] = current._wrap_for_eval(var_name, var_value)
+            chain.append(current)
             current = current.parent
+        for scope in reversed(chain):
+            for var_name, var_value in scope.variables.items():
+                full_scope[var_name] = scope._wrap_for_eval(var_name, var_value)
         return full_scope
