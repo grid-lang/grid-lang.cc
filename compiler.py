@@ -599,7 +599,8 @@ class GridLangCompiler:
         # rejected. The caller's 'grid' is just another caller variable: it
         # resolves through the same chain and is protected by the generic
         # outer-scope read-only rule.
-        sub_compiler._parent_scope = self.current_scope()
+        defining_scope = func_def.get('defining_scope')
+        sub_compiler._parent_scope = defining_scope if defining_scope is not None else self.current_scope()
         sub_compiler._outer_scope_read_only = True
         # Only compiler-level dimension metadata is copied.
         try:
