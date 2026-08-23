@@ -249,8 +249,6 @@ class GridLangExecutor:
         if not text:
             return False
         lowered = text.lower()
-        if '.push(' in lowered:
-            return True
         if re.search(r'\bpush\s*\(', text, re.I):
             return True
         if self._match_push_assignment(text):
@@ -1141,12 +1139,9 @@ class GridLangExecutor:
             handled, next_i = self._handle_for_push_loop(lines, i, line, line_number)
             if handled:
                 return True, next_i
-        elif re.search(r'\.push\(', line, re.I) and not line.strip().lower().startswith("if "):
-            self._handle_push_method_call(line, line_number)
-            return True, i + 1
-        elif re.search(r'\bpush\s*\(', line, re.I) and not line.strip().lower().startswith("if "):
-            self._handle_push_function_line(line, line_number)
-            return True, i + 1
+        elif re.search(r'\.push\s*\(', line, re.I):
+            raise SyntaxError(
+                f"'.push()' syntax is not supported. Use 'Push var = value' instead at line {line_number}")
         # Array access like names(0) and names[3] will be handled by the expression evaluator
         # No need for special handling here
         elif re.search(r'([\w_]+)!(\w+)\.Label\s*\{([^}]+)\}', line):
@@ -2235,7 +2230,8 @@ class GridLangExecutor:
                 target, value_expr = self._unpack_push_assignment(push_match)
                 self._handle_push_assignment(target, value_expr, line_number)
             else:
-                self._process_push_call(executable_part, line_number)
+                raise SyntaxError(
+                    f"Unsupported push syntax in For loop at line {line_number}. Use 'Push var = value' syntax instead.")
             self.pop_scope()
 
         return True, i + 1
@@ -3239,8 +3235,8 @@ class GridLangExecutor:
                     self._handle_push_assignment(
                         target, value_expr, next_executable_line_number)
                 else:
-                    self._process_push_call(
-                        next_executable_line, next_executable_line_number)
+                    raise SyntaxError(
+                        f"Unsupported push syntax in For loop at line {next_executable_line_number}. Use 'Push var = value' syntax instead.")
             self.pop_scope()
         return j + 1
 
@@ -3394,8 +3390,8 @@ class GridLangExecutor:
                         self._handle_push_assignment(
                             target, value_expr, next_executable_line_number)
                     else:
-                        self._process_push_call(
-                            next_executable_line, next_executable_line_number)
+                        raise SyntaxError(
+                            f"Unsupported push syntax in For loop at line {next_executable_line_number}. Use 'Push var = value' syntax instead.")
                     self.pop_scope()
                 return i + skip_lines + 1
         return i + 1
@@ -4117,10 +4113,6 @@ class GridLangExecutor:
             matrix_data.append(matrix)
         return matrix_data
 
-    def _handle_push_method_call(self, line, line_number):
-        # Use the push processor to handle this properly
-        self._process_push_call(line, line_number)
-
     def _handle_push_function_line(self, line, line_number):
         # Handle push() function calls (e.g., push(mid))
         m = re.match(
@@ -4324,8 +4316,8 @@ class GridLangExecutor:
             self._handle_push_assignment(
                 target, value_expr, line_number)
         else:
-            self._process_push_call(
-                executable_part, line_number)
+            raise SyntaxError(
+                f"Unsupported push syntax in For loop at line {line_number}. Use 'Push var = value' syntax instead.")
         self.pop_scope()
 
     def _run_setup(self, code, args):
@@ -4581,7 +4573,34 @@ class GridLangExecutor:
         if re.search(r'[\(\{!]', target):
             self._assign_indexed_target(target, value_expr, line_number)
             return
-        self._process_push_call(f"{target}.push({value_expr})", line_number)
+        member_path_match = re.match(r'^[\w_]+(?:\.[\w_]+)+$', target)
+        try:
+            if self._is_bare_subprocess_call(value_expr):
+                values = [self.expr_evaluator.eval_or_eval_array(
+                    str(value_expr),
+                    self.current_scope().get_evaluation_scope(),
+                    line_number,
+                )]
+            else:
+                values = self._evaluate_push_expression(
+                    value_expr, line_number)
+            global_scope = self.get_global_scope()
+            for value in values:
+                if member_path_match:
+                    self._update_member_path_target(
+                        target, value, line_number)
+                    continue
+                self._set_var_value(target, value, line_number)
+                collecting_via_compiler = hasattr(
+                    self, 'compiler') and self.compiler is not None
+                if (target.lower() in global_scope.output_variables) and not collecting_via_compiler:
+                    self.output_values.setdefault(
+                        target.lower(), []).append(value)
+                self._enqueue_push(target, value)
+                self._process_when_triggers()
+        except Exception as e:
+            raise ValueError(
+                f"Failed to evaluate push expression at line {line_number}: {e}")
 
     def _update_member_path_target(self, target, value, line_number):
         path_parts = [part.strip() for part in target.split('.') if part.strip()]
@@ -4637,101 +4656,6 @@ class GridLangExecutor:
         self._enqueue_push(root_name, root_value)
         self._process_when_triggers()
         return True
-
-    def _process_push_call(self, line, line_number):
-        """Process a .push() method call"""
-
-        # Handle multi-line expressions by removing newlines and extra whitespace
-        clean_line = line.replace('\n', ' ').replace('  ', ' ').strip()
-
-        # Handle .push() method calls (e.g., low.push(1), high.push(rows(haystack)))
-        m = re.match(
-            r'^\s*(\[[^\]]+\]|[\w_]+(?:\.[\w_]+)*(?:\{[^}]+\}|\[[^\]]+\]|\([^)]*\))?)\.push\s*\(\s*(.+?)\s*\)\s*$', clean_line, re.I)
-        if m:
-            var_name, value_expr = m.groups()
-            var_name = var_name.strip()
-            value_expr = value_expr.strip()
-
-
-            # If pushing directly into a cell reference, translate to an assignment
-            if var_name.startswith('[') and var_name.endswith(']'):
-                assignment_line = f"{var_name} := {value_expr}"
-                try:
-                    self.array_handler.evaluate_line_with_assignment(
-                        assignment_line, line_number, self.current_scope().get_evaluation_scope())
-                    return
-                except Exception as e:
-                    raise
-
-            # Handle object member-path pushes (e.g., Obj.field.push(val), Obj.inner.field.push(val))
-            member_path_match = re.match(r'^[\w_]+(?:\.[\w_]+)+$', var_name)
-
-            # Evaluate the expression to get the value(s)
-            try:
-                if self._is_bare_subprocess_call(value_expr):
-                    # Keep bare subprocess PUSH behavior aligned with INIT.
-                    values = [self.expr_evaluator.eval_or_eval_array(
-                        str(value_expr),
-                        self.current_scope().get_evaluation_scope(),
-                        line_number,
-                    )]
-                else:
-                    values = self._evaluate_push_expression(
-                        value_expr, line_number)
-                # Use the global scope to ensure we can access updated variable values
-                global_scope = self.get_global_scope()
-
-                indexed_var, indices = self.expr_evaluator._parse_index_target(
-                    var_name, self.current_scope().get_evaluation_scope(), line_number)
-                if indexed_var is not None:
-                    defining_scope = self.current_scope().get_defining_scope(indexed_var)
-                    if not defining_scope:
-                        raise NameError(
-                            f"Array variable '{indexed_var}' not defined at line {line_number}")
-                    actual_key = defining_scope._get_case_insensitive_key(
-                        indexed_var, defining_scope.variables) or indexed_var
-                    constraints = defining_scope.constraints.get(
-                        actual_key, {})
-                    if not constraints or not constraints.get('dim'):
-                        rank = infer_array_rank(
-                            defining_scope.variables.get(actual_key))
-                        if rank is not None and len(indices) != rank:
-                            raise ValueError(
-                                f"Expected {rank} indices for array variable '{indexed_var}', got {len(indices)} at line {line_number}")
-                    indices = self._apply_dim_base_offsets(
-                        indexed_var, indices, line_number)
-                    for value in values:
-                        arr = defining_scope.variables.get(actual_key)
-                        updated_array = self.array_handler.set_array_element(
-                            arr, indices, value, line_number)
-                        defining_scope.variables[actual_key] = updated_array
-                        defining_scope.uninitialized.discard(actual_key)
-                        self._enqueue_push(indexed_var, value)
-                    self._process_when_triggers()
-                    return
-
-                for value in values:
-
-                    if member_path_match:
-                        self._update_member_path_target(
-                            var_name, value, line_number)
-                        continue
-
-                    # Update the variable with the new value
-                    self._set_var_value(var_name, value, line_number)
-                    collecting_via_compiler = hasattr(
-                        self, 'compiler') and self.compiler is not None
-                    if (var_name.lower() in global_scope.output_variables) and not collecting_via_compiler:
-                        self.output_values.setdefault(
-                            var_name.lower(), []).append(value)
-                    self._enqueue_push(var_name, value)
-                    self._process_when_triggers()
-
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to evaluate .push() expression at line {line_number}: {e}")
-        else:
-            raise SyntaxError(f"Invalid .push() syntax at line {line_number}")
 
     def _assign_indexed_target(self, target, value_expr, line_number):
         paren_match = re.match(r'^([\w_]+)\s*\(([^)]+)\)$', target)

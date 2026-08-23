@@ -357,19 +357,16 @@ class GridLangControlFlow:
         return True, end_index + 1
 
     def _handle_block_push_or_output_statement(self, i, line, line_number, line_clean):
-        """Handle PUSH/.push and OUTPUT statements in block context."""
-        if line_clean.lower().startswith('push ') or '.push(' in line_clean.lower():
+        """Handle PUSH and OUTPUT statements in block context."""
+        if line_clean.lower().startswith('push '):
             try:
-                if line_clean.lower().startswith('push '):
-                    m_assign = self._match_push_assignment(line_clean)
-                    if not m_assign:
-                        raise SyntaxError(
-                            f"Invalid PUSH syntax at line {line_number}")
-                    target, value_expr = self._unpack_push_assignment(m_assign)
-                    self.compiler._handle_push_assignment(
-                        target, value_expr, line_number)
-                else:
-                    self.compiler._process_push_call(line, line_number)
+                m_assign = self._match_push_assignment(line_clean)
+                if not m_assign:
+                    raise SyntaxError(
+                        f"Invalid PUSH syntax at line {line_number}")
+                target, value_expr = self._unpack_push_assignment(m_assign)
+                self.compiler._handle_push_assignment(
+                    target, value_expr, line_number)
             except Exception as e:
                 raise
             return True, i + 1
@@ -414,8 +411,6 @@ class GridLangControlFlow:
                     elif ':=' in action:
                         self.compiler.array_handler.evaluate_line_with_assignment(
                             action, line_number, self.compiler.current_scope().get_evaluation_scope())
-                    elif '.push(' in action.lower():
-                        self.compiler._process_push_call(action, line_number)
                     else:
                         push_match = self._match_push_assignment(action)
                         return_match = self._match_return_statement(action)
@@ -465,9 +460,6 @@ class GridLangControlFlow:
                             elif ':=' in next_line:
                                 self.compiler.array_handler.evaluate_line_with_assignment(
                                     next_line, next_ln_no, self.compiler.current_scope().get_evaluation_scope())
-                            elif '.push(' in next_line.lower():
-                                self.compiler._process_push_call(
-                                    next_line, next_ln_no)
                             else:
                                 push_match = self._match_push_assignment(
                                     next_line)
@@ -898,38 +890,6 @@ class GridLangControlFlow:
             self._handle_return_statement(
                 return_match.group(1).strip(), line_number)
             return True, i + 1, False
-        if '.push(' in line and ')' in line:
-            try:
-                push_match = re.match(
-                    r'(\w+)\s*\.push\s*\(\s*(.+)\s*\)', line.strip())
-                if push_match:
-                    var_name = push_match.group(1)
-                    expr = push_match.group(2)
-                    var_value = None
-                    defining_scope = self.compiler.current_scope().get_defining_scope(var_name)
-                    if defining_scope:
-                        var_value = defining_scope.get(var_name)
-
-                    if defining_scope:
-                        result = self.compiler.expr_evaluator.eval_expr(
-                            expr, self.compiler.current_scope().get_evaluation_scope())
-                        defining_scope.update(
-                            var_name, result, line_number)
-
-                        if not hasattr(self.compiler, 'output_values'):
-                            self.compiler.output_values = {}
-                        existing = self.compiler.output_values.get(
-                            var_name, [])
-                        if not isinstance(existing, list):
-                            existing = [] if existing is None else [existing]
-                        existing.append(result)
-                        self.compiler.output_values[var_name] = existing
-                    else:
-                        raise NameError(
-                            f"Variable {var_name} not defined at line {line_number}")
-            except Exception as e:
-                pass
-            return True, i + 1, False
         if line.strip().lower().startswith('push(') and line.strip().endswith(')'):
             try:
                 expr_match = re.match(
@@ -1241,9 +1201,6 @@ class GridLangControlFlow:
             return
         if action.lower().startswith('let '):
             self._process_let_statement_inline(action, line_number)
-            return
-        if '.push(' in action.lower():
-            self.compiler._process_push_call(action, line_number)
             return
 
         push_match = self._match_push_assignment(action)

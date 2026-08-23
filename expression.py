@@ -1199,6 +1199,10 @@ class ExpressionEvaluator:
                     obj_type, method_name, obj_value, line_number, evaluated_args)
                 return True, obj_value
 
+        if method_name.lower() == 'push':
+            raise SyntaxError(
+                f"'.push()' syntax is not supported. Use 'Push {obj_name} = value' instead at line {line_number}")
+
         return False, None
 
     def _try_eval_field_access(self, expr, scope, line_number):
