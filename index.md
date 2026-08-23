@@ -46,7 +46,7 @@ are prompted (`compiler.prompt_missing_inputs`).
    executor and compiler are effectively the same object; helper engines
    (`expr_evaluator`, `array_handler`, `control_flow`, `type_processor`,
    `parser`) were already constructed on the compiler and are shared.
-3. `executor.run()` (`executor.py:1976`) is the interpreter entry point:
+3. `executor.run()` (`executor.py:1973`) is the interpreter entry point:
    `_run_setup` → `_run_prepare_execution` → `_run_main_loop` →
    `_resolve_pending_assignments` → `_process_deferred_assignments` →
    `_print_outputs`.
@@ -112,13 +112,13 @@ Notable methods (all copied onto the executor during a run):
 Also defines `SubprocessResult` (46): result container exposing `grid`,
 `variables`, `outputs`.
 
-### `executor.py` (5017 lines) — the interpreter
+### `executor.py` (5014 lines) — the interpreter
 `class GridLangExecutor` contains the main dispatch loop. This is where most
 runtime behavior lives. Key methods:
 - `run` (191918: top-level sequence (see Architecture).
-- `_run_setup` (424220, `_run_prepare_execution` (4361), `_print_outputs`
-  (4680), `_materialize_inits` (4758), `_process_deferred_assignments` (4897).
-- Main loop: `_run_main_loop` (2006) → `_run_main_loop_impl` (2533) →
+- `_run_setup` (424220, `_run_prepare_execution` (4358), `_print_outputs`
+  (4680), `_materialize_inits` (4755), `_process_deferred_assignments` (4894).
+- Main loop: `_run_main_loop` (2003) → `_run_main_loop_impl` (2530) →
   `_run_main_loop_impl_body` (242455. `_handle_main_loop_*` methods dispatch
   statement kinds: quick statements (1113), `Let` (1147/1494/1515), `For`
   (many: 1728 fallback, 1952 array/dim, 2060 simple, 2099 single-line, 2349
@@ -130,36 +130,36 @@ runtime behavior lives. Key methods:
   `_evaluate_global_guards_pre_execution` (71717, `_execute_global_for_loops`
   (827), `_attempt_resolve_pending_var` (1001), `_resolve_ready_pending_vars`
   (1038).
-- `Let` semantics: first pass `_process_let_first_pass` (1186), binding
+- `Let` semantics: first pass `_process_let_first_pass` (1183), binding
   `_bind_declared_var` (131301, standard assignment (1453), second pass
-  (1483), generator values (1607), `_apply_init_values` (1712).
+  (1483), generator values (1607), `_apply_init_values` (1709).
 - For-dim declarations: the regex at `_handle_for_array_and_dim_declarations`
   accepts optional `not null` before `as` and `or = <default>` after the
   dimension spec. `or = <expr>` is stored as `constraints['default']` so
   `_array_unset_value` can find it. The bounded-dim handler creates template
   arrays (`template=True`) when no `init`/standalone `=` is present.
-- `Push` semantics: `_handle_push_assignment` (4570), `_evaluate_push_expression`
-  (4286), `_process_push_call` (4656), `_assign_indexed_target` (4663),
+- `Push` semantics: `_handle_push_assignment` (4567), `_evaluate_push_expression`
+  (4286), `_process_push_call` (4656), `_assign_indexed_target` (4660),
   `_update_member_path_target` (444475.
 - `When` blocks: `_register_when_block` (278), `_process_when_triggers` (310),
   `_run_when_block` (31317.
 - Shared with compiler.py: `_strip_constraint_operands` (module-level, 26) and
   `DEPENDENCY_IGNORED_TOKENS` (1717 — duplicate of compiler's. Keep in sync.
 
-### `expression.py` (3459 lines) — expression evaluation
+### `expression.py` (3472 lines) — expression evaluation
 `class ExpressionEvaluator` evaluates RHS expressions, arrays, ranges, sums,
 dimension selectors, interpolations, member/field access, and Python-fallback
 evaluation.
-- Entry points: `eval_or_eval_array` (74), `eval_expr` (2031), and for
+- Entry points: `eval_or_eval_array` (74), `eval_expr` (2044), and for
   assignments `_evaluate_array` (445).
 - `eval_expr` is the big recursive dispatcher: array literals `{}`, pipes `|`,
   interpolated cell refs, paren/curly indexing, member calls, user function
   calls, object creation, field access, address-indexed access, then scalar
   constructs, then simple variables.
-- Python fallback: `_evaluate_with_python_fallback` (2422) builds a scope and
+- Python fallback: `_evaluate_with_python_fallback` (2435) builds a scope and
   `eval()`s complex arithmetic (`_build_fallback_cell_scope` 2254,
   `_eval_python_fallback_result` 2501, `_get_eval_globals` 2937).
-- Interpolation: `_process_interpolation` (3148). Operators:
+- Interpolation: `_process_interpolation` (3161). Operators:
   `_replace_operators` (292923.
 - Grid indexing: `_replace_grid_indexing` (762) — only still needed for legacy
   dict-based object grids; it early-returns for `GridLiveView` (which flows

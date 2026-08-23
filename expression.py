@@ -1199,9 +1199,22 @@ class ExpressionEvaluator:
                     obj_type, method_name, obj_value, line_number, evaluated_args)
                 return True, obj_value
 
+            func_key = f"{obj_type.lower()}.{method_name.lower()}"
+            func_entry = getattr(self.compiler, 'functions', {}).get(func_key)
+            if func_entry and func_entry.get('hidden'):
+                raise PermissionError(
+                    f"Member function '{method_name}' of type '{obj_type}' is hidden and cannot be called outside its type")
+
+            if isinstance(obj_value, dict) and obj_value.get('_type_name'):
+                alt_func_key = f"{obj_value['_type_name'].lower()}.{method_name.lower()}"
+                alt_entry = getattr(self.compiler, 'functions', {}).get(alt_func_key)
+                if alt_entry and alt_entry.get('hidden'):
+                    raise PermissionError(
+                        f"Member function '{method_name}' of type '{obj_value['_type_name']}' is hidden (prefixed with $) and cannot be called outside its type")
+
         if method_name.lower() == 'push':
             raise SyntaxError(
-                f"'.push()' syntax is not supported. Use 'Push {obj_name} = value' instead at line {line_number}")
+                f"'.push()' syntax is not supported. Use 'Push {obj_name} = value' instead")
 
         return False, None
 
