@@ -1446,6 +1446,11 @@ class GridLangExecutor:
             missing = self.extract_missing_dependencies(e)
             if not missing:
                 raise
+            expr_lower = (expr or '').lower()
+            real_missing = {dep for dep in missing if dep.lower() in expr_lower}
+            if not real_missing:
+                raise
+            missing = real_missing
             if remaining_let_vars:
                 future_refs = {
                     dep for dep in missing if dep.lower() in remaining_let_vars}

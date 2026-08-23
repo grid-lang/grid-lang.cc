@@ -283,7 +283,8 @@ class GridLangTypeProcessor:
 
             if (re.match(r'^(for|let)\b', stripped_line, re.I) and
                     '=' not in stripped_line and not re.search(r'\bdo\b', stripped_line, re.I)
-                    and not re.search(r'\bthen\b', stripped_line, re.I)):
+                    and not re.search(r'\bthen\b', stripped_line, re.I)
+                    and not re.search(r'\binit\b', stripped_line, re.I)):
                 # Skip field declarations that slipped into executable code.
                 i += 1
                 continue
@@ -305,8 +306,10 @@ class GridLangTypeProcessor:
                     assign_line, value_dict, input_values, line_number, init_fields)
                 i += 1
                 continue
-            if (re.match(r'^for\b', stripped_line, re.I) and
-                    '=' in stripped_line and not re.search(r'\bdo\b', stripped_line, re.I)):
+            if (re.match(r'^for\b', stripped_line, re.I)
+                    and not re.search(r'\bdo\b', stripped_line, re.I)
+                    and not re.search(r'\bthen\b', stripped_line, re.I)
+                    and (re.search(r'=', stripped_line) or re.search(r'\binit\b', stripped_line, re.I))):
                 for_body = stripped_line[4:].strip()
                 var, type_name, constraints, expr = self.compiler._parse_variable_def(
                     for_body, line_number)
@@ -378,6 +381,16 @@ class GridLangTypeProcessor:
                 # Let statement: Let grid{a, b} = grid{a-1, b-1} + grid{a-1, b}
                 self._process_type_let_statement(
                     stripped_line, 'this', value_dict, line_number)
+                i += 1
+                continue
+            if stripped_line.startswith(':'):
+                # Field declaration: : attr init "attr" or : attr = expr
+                colon_line = stripped_line[1:].strip()
+                init_m = re.match(r'^(\$?[\w_]+)\s+init\s+(.+)$', colon_line, re.I)
+                if init_m:
+                    colon_line = f"{init_m.group(1)} = {init_m.group(2)}"
+                self._process_type_assignment(
+                    colon_line, value_dict, input_values, line_number, init_fields)
                 i += 1
                 continue
             if '=' in stripped_line:
@@ -642,7 +655,9 @@ class GridLangTypeProcessor:
                     break
             body.append(code_lines[scan_i])
             scan_i += 1
+        self.compiler.push_scope(is_loop_scope=True)
         self._execute_type_block(body, value_dict, input_values, line_number)
+        self.compiler.pop_scope()
         return scan_i + 1
 
     def _process_type_let_statement(self, line, var_name, value_dict, line_number):

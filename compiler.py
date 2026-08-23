@@ -466,7 +466,8 @@ class GridLangCompiler:
                     # Keep the original casing so we can expose multiple aliases
                     'original': func_name,
                     'hidden': hidden,
-                    'code_lines': code_lines
+                    'code_lines': code_lines,
+                    'defining_scope': self.current_scope()
                 }
                 if def_kind == 'privatehelper':
                     type_name = func_name.split('.')[0] if '.' in func_name else None
