@@ -2522,6 +2522,8 @@ class GridLangCompiler:
                 end_pattern = rf'^\s*end(\s+type|\s+{re.escape(type_name)})?\s*$'
                 if (re.match(r'^\s*(for|while|when)\b', stripped, re.I) and stripped_lower.endswith('do')) or (
                     re.match(r'^\s*if\b', stripped, re.I) and stripped_lower.endswith('then')
+                ) or (
+                    re.match(r'^\s*let\b', stripped, re.I) and stripped_lower.endswith('then')
                 ):
                     type_block_depth += 1
                 if stripped_lower.startswith('end'):
