@@ -212,6 +212,8 @@ class GridLangTypeProcessor:
             fields['_computed_fields'] = state['computed_fields']
         if state['init_fields']:
             fields['_init_fields'] = state['init_fields']
+        fields['_member_keys'] = {k.lower() for k in state['fields'].keys()
+                                   if not str(k).startswith('_')}
         return fields
 
     def _execute_type_code(self, code_lines, var_name, value_dict, line_number, input_values=None):
@@ -322,16 +324,12 @@ class GridLangTypeProcessor:
                     value = self.compiler.expr_evaluator.eval_or_eval_array(
                         str(expr), eval_scope, line_number)
                     scope = self.compiler.current_scope()
-                    defining_scope = scope.get_defining_scope(var)
                     inferred = type_name or self.compiler.array_handler.infer_type(
                         value, line_number)
                     if inferred == 'int':
                         inferred = 'number'
-                    if defining_scope:
-                        defining_scope.update(var, value, line_number)
-                    else:
-                        scope.define(var, value, inferred,
-                                     constraints or {}, is_uninitialized=False)
+                    scope.define(var, value, inferred,
+                                 constraints or {}, is_uninitialized=False)
                 i += 1
                 continue
             if re.match(r'^[A-Za-z_][\w_]*\s*\(.*\)\s*$', stripped_line):
@@ -1004,5 +1002,18 @@ class GridLangTypeProcessor:
                 f"Helper '{helper_name}' does not take arguments at line {line_number}")
 
         code_lines = helper_def.get('code_lines') or helper_def.get('code', '').splitlines()
-        self._execute_type_code(
-            code_lines, 'this', value_dict, line_number, input_values)
+        member_keys = type_def.get('_member_keys', set())
+        saved_non_member = {}
+        for key in list(value_dict.keys()):
+            if (not str(key).startswith('_')
+                    and str(key).lower() not in member_keys
+                    and key != 'grid'):
+                saved_non_member[key] = value_dict.pop(key)
+        saved_scopes = self.compiler.scopes[:]
+        self.compiler.scopes = [self.compiler.scopes[0]]
+        try:
+            self._execute_type_code(
+                code_lines, 'this', value_dict, line_number, input_values)
+        finally:
+            value_dict.update(saved_non_member)
+            self.compiler.scopes = saved_scopes
