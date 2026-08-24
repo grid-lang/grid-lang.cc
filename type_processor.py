@@ -705,6 +705,10 @@ class GridLangTypeProcessor:
         # 3) General variable declaration/binding: Let x as T = expr, etc.
         var, type_name, constraints, expr = self.compiler._parse_variable_def(
             body, line_number)
+        init_expr = (constraints or {}).get('init')
+        if expr is None and init_expr is not None:
+            expr = init_expr
+            constraints.pop('init', None)
         self.compiler._process_let_binding(
             var, type_name, constraints, expr, line_number,
             scope_dict=eval_scope, shadow_keyword='LET')
