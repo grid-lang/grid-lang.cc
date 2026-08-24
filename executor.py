@@ -234,13 +234,13 @@ class GridLangExecutor:
         return dedup
 
     def _match_push_assignment(self, text):
-        return re.match(r'^\s*push\s+(\[[^\]]+\]|[\w_]+(?:\.[\w_]+)*(?:\([^)]+\)|\{[^}]+\}|!\[[^\]]+\])?)(?:\s*=\s*(.+))?\s*$', text, re.I)
+        return re.match(r"^\s*push\s+([^=]+)(=\s.+)?", text, re.I)
 
     def _unpack_push_assignment(self, push_match):
         target, value_expr = push_match.groups()
         if value_expr is None:
-            value_expr = target
-        return target, value_expr
+            value_expr = target.strip()
+        return target.strip(), value_expr[1:]
 
     def _match_return_statement(self, text):
         return re.match(r'^\s*return\s+(.+)$', text, re.I)
@@ -249,8 +249,6 @@ class GridLangExecutor:
         if not text:
             return False
         lowered = text.lower()
-        if re.search(r'\bpush\s*\(', text, re.I):
-            return True
         if self._match_push_assignment(text):
             return True
         if re.search(r'\breturn\b', text, re.I):
@@ -1131,9 +1129,6 @@ class GridLangExecutor:
             return True, i + 1
         elif stripped_lower.startswith("push "):
             self._handle_push_assignment_line(stripped, line_number)
-            return True, i + 1
-        elif stripped_lower.startswith("push("):
-            self._handle_push_function_call(line, line_number)
             return True, i + 1
         elif line.lower().strip().startswith("for ") and " do " in line.lower() and self._has_push_action(line):
             handled, next_i = self._handle_for_push_loop(lines, i, line, line_number)
@@ -4113,29 +4108,6 @@ class GridLangExecutor:
             matrix_data.append(matrix)
         return matrix_data
 
-    def _handle_push_function_line(self, line, line_number):
-        # Handle push() function calls (e.g., push(mid))
-        m = re.match(
-            r'^\s*push\s*\(\s*([^)]+)\s*\)\s*$', line, re.I)
-        if m:
-            value_expr = m.group(1).strip()
-        else:
-            raise SyntaxError(
-                f"Invalid push() syntax at line {line_number}")
-
-        # Evaluate the expression and add it to output values
-        try:
-            values = self._evaluate_push_expression(
-                value_expr, line_number)
-            for value in values:
-                self.output_values.setdefault(
-                    'output', []).append(value)
-            if 'output' not in self.output_variables:
-                self.output_variables.append('output')
-        except Exception as e:
-            raise ValueError(
-                f"Failed to evaluate push() expression at line {line_number}: {e}")
-
     def _handle_return_statement(self, stripped, line_number):
         m_return = self._match_return_statement(stripped)
         if not m_return:
@@ -4186,25 +4158,6 @@ class GridLangExecutor:
             target, value_expr = self._unpack_push_assignment(m_assign)
             self._handle_push_assignment(
                 target, value_expr, line_number)
-        else:
-            raise SyntaxError(
-                f"Invalid PUSH syntax at line {line_number}")
-
-    def _handle_push_function_call(self, line, line_number):
-        m_func = re.match(
-            r'^\s*push\s*\(\s*(.+)\s*\)\s*$', line, re.I)
-        if m_func:
-            value_expr = m_func.group(1).strip()
-            try:
-                values = self._evaluate_push_expression(
-                    value_expr, line_number)
-                for value in values:
-                    self.output_values.setdefault(
-                        'output', []).append(value)
-                if 'output' not in self.output_variables:
-                    self.output_variables.append('output')
-            except Exception as e:
-                pass
         else:
             raise SyntaxError(
                 f"Invalid PUSH syntax at line {line_number}")

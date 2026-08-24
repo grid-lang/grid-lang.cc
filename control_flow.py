@@ -84,13 +84,13 @@ class GridLangControlFlow:
             defining_scope.update(var, value, line_number)
 
     def _match_push_assignment(self, text):
-        return re.match(r'^\s*push\s+(\[[^\]]+\]|[\w_]+(?:\.[\w_]+)?(?:\([^)]+\)|\{[^}]+\})?)(?:\s*=\s*(.+))?\s*$', text, re.I)
+        return re.match(r"^\s*push\s+([^=]+)(=\s.+)?", text, re.I)
 
     def _unpack_push_assignment(self, push_match):
         target, value_expr = push_match.groups()
         if value_expr is None:
-            value_expr = target
-        return target, value_expr
+            value_expr = target.strip()
+        return target.strip(), value_expr[1:]
 
     def _match_return_statement(self, text):
         return re.match(r'^\s*return\s+(.+)$', text, re.I)
@@ -421,14 +421,6 @@ class GridLangControlFlow:
                         elif return_match:
                             self._handle_return_statement(
                                 return_match.group(1).strip(), line_number)
-                        elif re.match(r'^\s*push\s*\(', action, re.I):
-                            values = self.compiler._evaluate_push_expression(
-                                re.sub(r'^\s*push\s*\(|\)\s*$', '', action, flags=re.I), line_number)
-                            for value in values:
-                                self.compiler.output_values.setdefault(
-                                    'output', []).append(value)
-                            if 'output' not in self.compiler.output_variables:
-                                self.compiler.output_variables.append('output')
                 return True, i + 1
             except Exception as e:
                 return True, i + 1
@@ -866,19 +858,6 @@ class GridLangControlFlow:
             return True, i + 1, False
         if line.strip() == 'else':
             return True, i + 1, False
-        if re.match(r'^\s*\[[^\]]+\]\s*\.push\s*\(.+\)\s*$', line):
-            try:
-                cell_match = re.match(
-                    r'^\s*(\[[^\]]+\])\s*\.push\s*\(\s*(.+)\s*\)\s*$', line)
-                if cell_match:
-                    target_cell = cell_match.group(1)
-                    expr = cell_match.group(2)
-                    assignment_line = f"{target_cell} := {expr}"
-                    self.compiler.array_handler.evaluate_line_with_assignment(
-                        assignment_line, line_number, self.compiler.current_scope().get_evaluation_scope())
-            except Exception as e:
-                pass
-            return True, i + 1, False
         if self._match_push_assignment(line):
             push_match = self._match_push_assignment(line)
             target, value_expr = self._unpack_push_assignment(push_match)
@@ -889,27 +868,6 @@ class GridLangControlFlow:
             return_match = self._match_return_statement(line)
             self._handle_return_statement(
                 return_match.group(1).strip(), line_number)
-            return True, i + 1, False
-        if line.strip().lower().startswith('push(') and line.strip().endswith(')'):
-            try:
-                expr_match = re.match(
-                    r'push\s*\(\s*(.+)\s*\)\s*$', line.strip(), re.I)
-                if expr_match:
-                    expr = expr_match.group(1)
-                    result = self.compiler.expr_evaluator.eval_expr(
-                        expr, self.compiler.current_scope().get_evaluation_scope())
-                    if not hasattr(self.compiler, 'output_values'):
-                        self.compiler.output_values = {}
-                    existing = self.compiler.output_values.get(
-                        'output', [])
-                    if not isinstance(existing, list):
-                        existing = [] if existing is None else [existing]
-                    existing.append(result)
-                    self.compiler.output_values['output'] = existing
-                    if 'output' not in self.compiler.output_variables:
-                        self.compiler.output_variables.append('output')
-            except Exception as e:
-                pass
             return True, i + 1, False
         return False, i, False
 
@@ -962,6 +920,9 @@ class GridLangControlFlow:
             if handled:
                 i = next_i
                 continue
+
+            self.compiler.expr_evaluator.eval_expr(
+                line, self.compiler.current_scope().get_evaluation_scope(), line_number)
 
             i += 1
         if block_pending:
@@ -1213,13 +1174,6 @@ class GridLangControlFlow:
             self._handle_return_statement(
                 return_match.group(1).strip(), line_number)
             return
-        if re.match(r'^\s*push\s*\(', action, re.I):
-            expr = re.sub(r'^\s*push\s*\(|\)\s*$', '', action, flags=re.I)
-            values = self.compiler._evaluate_push_expression(expr, line_number)
-            for value in values:
-                self.compiler.output_values.setdefault('output', []).append(value)
-            if 'output' not in self.compiler.output_variables:
-                self.compiler.output_variables.append('output')
 
     def _process_let_statement_inline(self, line, line_number):
         """

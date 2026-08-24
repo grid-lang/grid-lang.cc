@@ -2562,27 +2562,9 @@ class GridLangCompiler:
                 current_line = s
                 in_multiline = True
                 continue
-            elif in_multiline and not '.push(' in current_line.lower():
-                current_line += "\n" + line.lstrip()
-                if line.rstrip().endswith('"'):
-                    lines.append((current_line, line_number))
-                    current_line = ""
-                    in_multiline = False
-                continue
-
-            # Handle multiline .push() method calls with string interpolation
-            # But skip if this is a FOR loop with .push() on the same line
-            if ('.push(' in s.lower() and '$"' in s and not s.endswith('"') and
-                    not (s.lower().startswith('for ') and ' do ' in s.lower())):
-                current_line = s
-                in_multiline = True
-                continue
             elif in_multiline:
                 current_line += "\n" + line.lstrip()
-                if '"' in line:
-                    # Find the closing parenthesis and add it back
-                    if not current_line.endswith(')'):
-                        current_line += ')'
+                if line.rstrip().endswith('"'):
                     lines.append((current_line, line_number))
                     current_line = ""
                     in_multiline = False
