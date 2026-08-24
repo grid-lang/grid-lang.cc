@@ -76,7 +76,7 @@ handling) — check both before adding a feature so you extend the live path.
 - Console script `grid=main:main`; declares the 10 top-level modules as
   `py_modules`; **no `install_requires`** (`pyarrow` was removed); LGPLv3.
 
-### `compiler.py` (3553 lines) — state + orchestration
+### `compiler.py` (3573 lines) — state + orchestration
 `class GridLangCompiler` is the **persistent brain** and holds nearly all state
 created in `__init__`:
 - Grid & scoping: `grid` (`_ListenerGrid`), `scopes` (stack of `Scope`),

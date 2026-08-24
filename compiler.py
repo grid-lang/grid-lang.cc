@@ -3446,12 +3446,11 @@ class GridLangCompiler:
 
             default_expr = global_scope.constraints.get(
                 input_var, {}).get('default')
+            default_value = None
             if (not value_assigned) and default_expr is not None:
                 try:
-                    value = self.expr_evaluator.eval_expr(
+                    default_value = self.expr_evaluator.eval_expr(
                         str(default_expr), global_scope.get_evaluation_scope())
-                    global_scope.update(input_var, value)
-                    value_assigned = True
                 except Exception as exc:
                     print(
                         f"Warning: Failed to evaluate default for input '{input_var}': {exc}")
@@ -3460,10 +3459,17 @@ class GridLangCompiler:
             if not value_assigned and prompt_missing:
                 if can_prompt:
                     try:
-                        self._prompt_for_input(input_var, global_scope)
+                        self._prompt_for_input(
+                            input_var, global_scope, default_value)
+                        value_assigned = True
                     except RuntimeError as exc:
                         print(f"Warning: {exc}")
                         break
+
+            # Apply default silently if not prompted or no prompt available
+            if (not value_assigned) and default_value is not None:
+                global_scope.update(input_var, default_value)
+                value_assigned = True
 
             actual_key = global_scope._get_case_insensitive_key(
                 input_var, global_scope.variables) or input_var
@@ -3479,7 +3485,7 @@ class GridLangCompiler:
                     except ValueError:
                         pass
 
-    def _prompt_for_input(self, input_var, global_scope):
+    def _prompt_for_input(self, input_var, global_scope, default_value=None):
         """Prompt user for input value and set it in the global scope"""
         actual_key = global_scope._get_case_insensitive_key(
             input_var, global_scope.types) or input_var
@@ -3499,26 +3505,42 @@ class GridLangCompiler:
                 "Please supply arguments when running the program."
             )
 
+        default_display = ''
+        if default_value is not None:
+            default_display = f" [{default_value}]"
+
         while True:
             try:
                 not_type = constraints.get('not_type')
                 if needs_number:
-                    user_input = input(f"{input_var}: ")
+                    user_input = input(f"{input_var}{default_display}: ")
+                    if not user_input.strip() and default_value is not None:
+                        global_scope.update(input_var, default_value)
+                        return default_value
                     value = float(user_input)
                 elif union_allows_text and union_allows_number:
-                    user_input = input(f"{input_var}: ")
+                    user_input = input(f"{input_var}{default_display}: ")
+                    if not user_input.strip() and default_value is not None:
+                        global_scope.update(input_var, default_value)
+                        return default_value
                     try:
                         value = float(user_input)
                     except ValueError:
                         value = user_input
                 elif not_type == 'text':
-                    user_input = input(f"{input_var}: ")
+                    user_input = input(f"{input_var}{default_display}: ")
+                    if not user_input.strip() and default_value is not None:
+                        global_scope.update(input_var, default_value)
+                        return default_value
                     try:
                         value = float(user_input)
                     except ValueError:
                         value = user_input
                 else:
-                    user_input = input(f"{input_var}: ")
+                    user_input = input(f"{input_var}{default_display}: ")
+                    if not user_input.strip() and default_value is not None:
+                        global_scope.update(input_var, default_value)
+                        return default_value
                     if constraints.get('type') is None and not any(
                             key in constraints for key in comparison_keys + ('range',)):
                         try:
@@ -3529,7 +3551,7 @@ class GridLangCompiler:
                         value = user_input
 
                 global_scope.update(input_var, value)
-                break
+                return value
 
             except EOFError:
                 raise RuntimeError(
