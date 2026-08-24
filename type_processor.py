@@ -372,6 +372,10 @@ class GridLangTypeProcessor:
                 i = self._process_type_for_loop(
                     code_lines, i, value_dict, input_values, line_number)
                 continue
+            if re.match(r'^if\b', stripped_line, re.I) and re.search(r'\bthen\b', stripped_line, re.I):
+                i = self._process_type_if_block(
+                    code_lines, i, value_dict, input_values, line_number)
+                continue
             if re.match(r'^let\b', stripped_line, re.I):
                 # Let ... then block inside type constructor
                 if re.search(r'\bthen\b', stripped_line, re.I):
@@ -403,7 +407,11 @@ class GridLangTypeProcessor:
                 i += 1
                 continue
 
-            i += 1
+            if stripped_line.startswith("'"):
+                i += 1
+                continue
+            raise SyntaxError(
+                f"Unrecognized statement in type constructor: '{stripped_line}' at line {line_number}")
 
     def _process_grid_assignment(self, line, var_name, value_dict, line_number):
         """Process grid assignment like [B1] := 1 or [A1.B1:A2.B2] := 7"""
@@ -713,18 +721,15 @@ class GridLangTypeProcessor:
             var, type_name, constraints, expr, line_number,
             scope_dict=eval_scope, shadow_keyword='LET')
 
-    def _process_type_let_then_block(self, code_lines, i, value_dict, input_values, line_number):
-        """Handle ``Let cond then ... End`` blocks inside type constructors."""
-        header = code_lines[i].strip()
-        header = re.sub(r'\s+then\s*$', '', header, flags=re.I).strip()
-        header = re.sub(r'^Let\s+', '', header, count=1, flags=re.I)
-        eval_scope = self._build_type_eval_scope(value_dict, {})
-        var, type_name, constraints, expr = self.compiler._parse_variable_def(
-            header, line_number)
-        # Collect block body
+    def _collect_type_block_lines(self, code_lines, start_i, track_if_depth=False):
+        """Collect lines for a ``... then ... end`` block.
+
+        Returns ``(block_lines, end_index)`` where *end_index* is the index
+        past the closing ``end``.
+        """
         block_lines = []
         depth = 1
-        scan_i = i + 1
+        scan_i = start_i + 1
         while scan_i < len(code_lines) and depth > 0:
             next_line = code_lines[scan_i].strip()
             if next_line.lower() == 'end':
@@ -735,9 +740,21 @@ class GridLangTypeProcessor:
                 depth += 1
             elif re.match(r'^let\b', next_line, re.I) and re.search(r'\bthen\b', next_line, re.I):
                 depth += 1
+            elif track_if_depth and re.match(r'^if\b', next_line, re.I) and re.search(r'\bthen\b', next_line, re.I):
+                depth += 1
             block_lines.append(next_line)
             scan_i += 1
-        # Evaluate condition
+        return block_lines, scan_i
+
+    def _process_type_let_then_block(self, code_lines, i, value_dict, input_values, line_number):
+        """Handle ``Let cond then ... End`` blocks inside type constructors."""
+        header = code_lines[i].strip()
+        header = re.sub(r'\s+then\s*$', '', header, flags=re.I).strip()
+        header = re.sub(r'^Let\s+', '', header, count=1, flags=re.I)
+        eval_scope = self._build_type_eval_scope(value_dict, {})
+        var, type_name, constraints, expr = self.compiler._parse_variable_def(
+            header, line_number)
+        block_lines, scan_i = self._collect_type_block_lines(code_lines, i)
         condition_passed = True
         if expr is not None:
             try:
@@ -749,6 +766,33 @@ class GridLangTypeProcessor:
         if condition_passed:
             self._execute_type_block(
                 block_lines, value_dict, input_values, line_number)
+        return scan_i + 1
+
+    def _process_type_if_block(self, code_lines, i, value_dict, input_values, line_number):
+        """Handle ``If cond then ... [else ...] End`` blocks inside type constructors."""
+        header = code_lines[i].strip()
+        header = re.sub(r'\s+then\s*$', '', header, flags=re.I).strip()
+        header = re.sub(r'^if\s+', '', header, count=1, flags=re.I)
+        block_lines, scan_i = self._collect_type_block_lines(
+            code_lines, i, track_if_depth=True)
+        # Split at else
+        if_block = block_lines
+        else_block = []
+        for idx, line in enumerate(block_lines):
+            if line.strip().lower() == 'else':
+                if_block = block_lines[:idx]
+                else_block = block_lines[idx + 1:]
+                break
+        condition_passed = True
+        try:
+            condition_passed = self.compiler.control_flow._evaluate_if_condition(
+                header, line_number)
+        except Exception:
+            condition_passed = False
+        chosen = if_block if condition_passed else else_block
+        if chosen:
+            self._execute_type_block(
+                chosen, value_dict, input_values, line_number)
         return scan_i + 1
 
     def _process_type_assignment(self, line, value_dict, input_values, line_number, init_fields=None):
@@ -858,7 +902,8 @@ class GridLangTypeProcessor:
 
         match = re.match(r'^\s*(\$?[\w_]+)\s*=\s*(.+)$', line)
         if not match:
-            return
+            raise SyntaxError(
+                f"Unsupported syntax in type constructor: '{line}' at line {line_number}")
         field_name, value_expr = match.groups()
         if field_name.startswith('$'):
             field_name = field_name[1:]
