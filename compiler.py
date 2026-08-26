@@ -784,7 +784,7 @@ class GridLangCompiler:
 
         value_dict = {}
         input_values = {}
-        target_names = [entry['name'] for entry in inputs_list] if inputs_list else list(public_fields.keys())
+        target_names = [entry['name'] for entry in inputs_list]
         for field_name, val in zip(target_names, args):
             if inputs_list:
                 input_values[field_name] = val

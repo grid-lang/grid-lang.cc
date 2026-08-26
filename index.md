@@ -146,20 +146,20 @@ runtime behavior lives. Key methods:
 - Shared with compiler.py: `_strip_constraint_operands` (module-level, 26) and
   `DEPENDENCY_IGNORED_TOKENS` (1717 — duplicate of compiler's. Keep in sync.
 
-### `expression.py` (3472 lines) — expression evaluation
+### `expression.py` (3478 lines) — expression evaluation
 `class ExpressionEvaluator` evaluates RHS expressions, arrays, ranges, sums,
 dimension selectors, interpolations, member/field access, and Python-fallback
 evaluation.
-- Entry points: `eval_or_eval_array` (74), `eval_expr` (2044), and for
+- Entry points: `eval_or_eval_array` (74), `eval_expr` (2050), and for
   assignments `_evaluate_array` (445).
 - `eval_expr` is the big recursive dispatcher: array literals `{}`, pipes `|`,
   interpolated cell refs, paren/curly indexing, member calls, user function
   calls, object creation, field access, address-indexed access, then scalar
   constructs, then simple variables.
-- Python fallback: `_evaluate_with_python_fallback` (2435) builds a scope and
+- Python fallback: `_evaluate_with_python_fallback` (2441) builds a scope and
   `eval()`s complex arithmetic (`_build_fallback_cell_scope` 2254,
   `_eval_python_fallback_result` 2501, `_get_eval_globals` 2937).
-- Interpolation: `_process_interpolation` (3161). Operators:
+- Interpolation: `_process_interpolation` (3167). Operators:
   `_replace_operators` (292923.
 - Grid indexing: `_replace_grid_indexing` (762) — only still needed for legacy
   dict-based object grids; it early-returns for `GridLiveView` (which flows
@@ -274,7 +274,7 @@ evaluation.
 - `format_display_value` (26265: display formatting with float-trimming and
   list/dict-form array support.
 
-### `test_runner.py` (899 lines) — inline test suite
+### `test_runner.py` (902 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — a huge method
 containing 263 hardcoded test cases (name, code, expected grid dict). At the
 bottom of the file (~830) it runs itself when executed directly:
