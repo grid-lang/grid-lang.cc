@@ -975,9 +975,6 @@ class GridLangCompiler:
             if type_name:
                 self._check_type_field_constraints(
                     type_name, key_name, value[key_name], value, scope, line_number)
-        if assigned_fields:
-            immutable = value.setdefault('_immutable_fields', set())
-            immutable.update(assigned_fields)
         if type_name and type_name.lower() in self.types_defined:
             self._recompute_type_fields_after_with(
                 type_name, value, scope, line_number)
@@ -2956,7 +2953,10 @@ class GridLangCompiler:
                     self.current_scope().get_full_scope(),
                     line_number,
                     type_name=type_name)
-            self.current_scope().define(var, value_dict, type_name)
+            snapshot = {k: copy.deepcopy(v) for k, v in value_dict.items()
+                        if not str(k).startswith('_')}
+            constraints = {'constant': snapshot}
+            self.current_scope().define(var, value_dict, type_name, constraints)
             return True
         all_literals = all(re.match(r'^-?\d*\.?\d+$|^\".*\"$', v)
                            for v in values)
@@ -2971,7 +2971,10 @@ class GridLangCompiler:
                 self.current_scope().get_full_scope(),
                 line_number,
                 type_name=type_name)
-        self.current_scope().define(var, value_dict, type_name)
+        snapshot = {k: copy.deepcopy(v) for k, v in value_dict.items()
+                    if not str(k).startswith('_')}
+        constraints = {'constant': snapshot}
+        self.current_scope().define(var, value_dict, type_name, constraints)
         if not all_literals:
             deps = self._extract_identifier_tokens(values_str)
             if var in deps:

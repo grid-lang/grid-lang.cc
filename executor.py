@@ -293,6 +293,10 @@ class GridLangExecutor:
             return
         defining_scope = self.current_scope().get_defining_scope(var_name)
         if defining_scope:
+            actual_key = defining_scope._get_case_insensitive_key(
+                var_name, defining_scope.variables)
+            if actual_key and defining_scope.constraints.get(actual_key, {}).get('constant') is not None:
+                defining_scope._conflict_flags.add(actual_key)
             defining_scope.update(var_name, value, line_number)
         else:
             self.current_scope().define(
@@ -4564,6 +4568,17 @@ class GridLangExecutor:
         root_value = self.current_scope().get(root_name)
         if not isinstance(root_value, dict):
             raise ValueError(f"'{root_name}' is not an object at line {line_number}")
+
+        # Flag the root variable for lazy conflict validation if it has a
+        # constant constraint.  The mutation below changes the dict in-place,
+        # so the value will no longer match the constant expression on read.
+        defining_scope = self.current_scope().get_defining_scope(root_name)
+        if defining_scope:
+            actual_key = defining_scope._get_case_insensitive_key(
+                root_name, defining_scope.variables)
+            if (actual_key
+                    and defining_scope.constraints.get(actual_key, {}).get('constant') is not None):
+                defining_scope._conflict_flags.add(actual_key)
 
         current_obj = root_value
         owner_path = root_name

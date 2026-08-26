@@ -88,6 +88,9 @@ class Scope:
         # Runtime unit of each variable's current value (lowercase keys).
         # Values are stored stripped of the unit wrapper; reads re-wrap.
         self.value_units = {}
+        # Lazy conflict detection: variables pushed while having a constant
+        # constraint.  Validated on first read to avoid eager #VALUE checks.
+        self._conflict_flags = set()
 
     def get_value_unit(self, name):
         """Return the runtime unit of a variable (or None)."""
@@ -156,6 +159,47 @@ class Scope:
             if self.is_uninitialized(name) and not self._has_pending_assignment(name):
                 return error_value(NA_ERROR)
             return value
+        # Lazy conflict validation: check if a pushed value matches its
+        # constant constraint.  This avoids eager #VALUE checks on Push.
+        actual_key = self._get_case_insensitive_key(name, self.variables)
+        if actual_key and actual_key in self._conflict_flags:
+            self._conflict_flags.discard(actual_key)
+            constraints = self.constraints.get(actual_key, {})
+            constant_expr = constraints.get('constant')
+            if constant_expr is not None:
+                try:
+                    if isinstance(constant_expr, str):
+                        expected = self.compiler.expr_evaluator.eval_or_eval_array(
+                            constant_expr, self.get_full_scope())
+                    else:
+                        expected = constant_expr
+                    # Apply WITH constraints if present
+                    if constraints.get('with'):
+                        try:
+                            type_name = None
+                            actual_type_key = self._get_case_insensitive_key(
+                                actual_key, self.types)
+                            if actual_type_key:
+                                type_name = self.types.get(actual_type_key)
+                            expected = self.compiler._apply_with_constraints(
+                                expected,
+                                constraints.get('with', {}),
+                                self.get_full_scope(),
+                                None,
+                                type_name=type_name,
+                            )
+                        except Exception:
+                            pass
+                    if isinstance(expected, dict) and isinstance(value, dict):
+                        # Type-instance snapshot: compare only public fields
+                        pub_val = {k: v for k, v in value.items()
+                                   if not str(k).startswith('_')}
+                        if pub_val != expected:
+                            return error_value(VALUE_ERROR)
+                    elif value != expected:
+                        return error_value(VALUE_ERROR)
+                except Exception:
+                    pass
         unit = self.get_value_unit(name)
         if unit:
             return UnitValue(value, unit)
@@ -195,7 +239,7 @@ class Scope:
         if isinstance(constant_expr, str):
             constant_text = constant_expr.strip()
             raw_is_typed_literal = constant_text.startswith('{') and constant_text.endswith('}')
-        if raw_is_typed_literal and isinstance(adjusted_value, dict):
+        if raw_is_typed_literal and isinstance(adjusted_value, dict) and isinstance(constant_expr, str):
             adjusted_constraints = dict(adjusted_constraints)
             adjusted_constraints['constant'] = adjusted_value
 
@@ -747,6 +791,9 @@ class Scope:
         self._validate_base_type(key_for_constraints, value, line_number)
         for constraint_type, constraint_expr in constraints.items():
             if constraint_type == 'constant':
+                # Skip constant validation if conflict flag is set (lazy check)
+                if key_for_constraints in self._conflict_flags:
+                    continue
                 if isinstance(constraint_expr, str):
                     try:
                         constraint_val = self.compiler.expr_evaluator.eval_or_eval_array(

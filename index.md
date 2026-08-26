@@ -46,7 +46,7 @@ are prompted (`compiler.prompt_missing_inputs`).
    executor and compiler are effectively the same object; helper engines
    (`expr_evaluator`, `array_handler`, `control_flow`, `type_processor`,
    `parser`) were already constructed on the compiler and are shared.
-3. `executor.run()` (`executor.py:1968`) is the interpreter entry point:
+3. `executor.run()` (`executor.py:1972`) is the interpreter entry point:
    `_run_setup` → `_run_prepare_execution` → `_run_main_loop` →
    `_resolve_pending_assignments` → `_process_deferred_assignments` →
    `_print_outputs`.
@@ -56,7 +56,7 @@ are prompted (`compiler.prompt_missing_inputs`).
    control_flow.py.
 5. Results: `Return x` appends to `output_values` (printed by
    `_print_outputs`); grid writes land in `compiler.grid` (a dict keyed by
-   cell refs like `'A1'`). `--debug` → `compiler.export_to_csv` (`compiler.py:3369`).
+   cell refs like `'A1'`). `--debug` → `compiler.export_to_csv` (`compiler.py:3372`).
 
 The single most important design fact: **`GridLangCompiler` (state holder) and
 `GridLangExecutor` (loop) share one object during execution.** Many helpers
@@ -76,7 +76,7 @@ handling) — check both before adding a feature so you extend the live path.
 - Console script `grid=main:main`; declares the 10 top-level modules as
   `py_modules`; **no `install_requires`** (`pyarrow` was removed); LGPLv3.
 
-### `compiler.py` (3573 lines) — state + orchestration
+### `compiler.py` (3578 lines) — state + orchestration
 `class GridLangCompiler` is the **persistent brain** and holds nearly all state
 created in `__init__`:
 - Grid & scoping: `grid` (`_ListenerGrid`), `scopes` (stack of `Scope`),
@@ -101,7 +101,7 @@ Notable methods (all copied onto the executor during a run):
 - `_instantiate_type` (70702, `_evaluate_with_value` (891), `_apply_with_clause`
   parsing (958+): type/`with` object construction.
 - `call_subprocess` (111128: runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (202080, `_process_declarations_and_labels` (2610),
+- `_process_grid_assignment` (202080, `_process_declarations_and_labels` (2607),
   `_collect_global_declarations` (212168: top-level statement handling.
 - `export_to_csv` (282817: `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
@@ -112,36 +112,36 @@ Notable methods (all copied onto the executor during a run):
 Also defines `SubprocessResult` (46): result container exposing `grid`,
 `variables`, `outputs`.
 
-### `executor.py` (4967 lines) — the interpreter
+### `executor.py` (4982 lines) — the interpreter
 `class GridLangExecutor` contains the main dispatch loop. This is where most
 runtime behavior lives. Key methods:
 - `run` (191918: top-level sequence (see Architecture).
-- `_run_setup` (424220, `_run_prepare_execution` (4311), `_print_outputs`
-  (4680), `_materialize_inits` (4708), `_process_deferred_assignments` (4847).
-- Main loop: `_run_main_loop` (1998) → `_run_main_loop_impl` (2525) →
+- `_run_setup` (424220, `_run_prepare_execution` (4315), `_print_outputs`
+  (4680), `_materialize_inits` (4723), `_process_deferred_assignments` (4862).
+- Main loop: `_run_main_loop` (2002) → `_run_main_loop_impl` (2529) →
   `_run_main_loop_impl_body` (242455. `_handle_main_loop_*` methods dispatch
   statement kinds: quick statements (1113), `Let` (1147/1494/1515), `For`
   (many: 1728 fallback, 1952 array/dim, 2060 simple, 2099 single-line, 2349
   consecutive shortcuts, 2544 declaration, 2980 range, 3315 nested, 3524
   prechecks, 3589 post-branches), grid assignment (3822), `When` blocks
   (3879), `Push` (3994–4176), `Return` (4021), misc (3649).
-- Dependency/guard machinery: `_build_dependency_network` (614),
-  `_determine_needed_lines` (91917, `_evaluate_guard_conditions` (979),
+- Dependency/guard machinery: `_build_dependency_network` (618),
+  `_determine_needed_lines` (91917, `_evaluate_guard_conditions` (983),
   `_evaluate_global_guards_pre_execution` (71717, `_execute_global_for_loops`
-  (827), `_attempt_resolve_pending_var` (999), `_resolve_ready_pending_vars`
+  (827), `_attempt_resolve_pending_var` (1003), `_resolve_ready_pending_vars`
   (1038).
-- `Let` semantics: first pass `_process_let_first_pass` (1178), binding
+- `Let` semantics: first pass `_process_let_first_pass` (1182), binding
   `_bind_declared_var` (131301, standard assignment (1453), second pass
-  (1483), generator values (1607), `_apply_init_values` (1704).
+  (1483), generator values (1607), `_apply_init_values` (1708).
 - For-dim declarations: the regex at `_handle_for_array_and_dim_declarations`
   accepts optional `not null` before `as` and `or = <default>` after the
   dimension spec. `or = <expr>` is stored as `constraints['default']` so
   `_array_unset_value` can find it. The bounded-dim handler creates template
   arrays (`template=True`) when no `init`/standalone `=` is present.
-- `Push` semantics: `_handle_push_assignment` (4520), `_evaluate_push_expression`
-  (4286), `_process_push_call` (4656), `_assign_indexed_target` (4613),
+- `Push` semantics: `_handle_push_assignment` (4524), `_evaluate_push_expression`
+  (4286), `_process_push_call` (4656), `_assign_indexed_target` (4628),
   `_update_member_path_target` (444475.
-- `When` blocks: `_register_when_block` (276), `_process_when_triggers` (308),
+- `When` blocks: `_register_when_block` (276), `_process_when_triggers` (312),
   `_run_when_block` (31317.
 - Shared with compiler.py: `_strip_constraint_operands` (module-level, 26) and
   `DEPENDENCY_IGNORED_TOKENS` (1717 — duplicate of compiler's. Keep in sync.
@@ -210,23 +210,23 @@ evaluation.
   (1339, 1390).
 - `_handle_block_*` methods (343–960): per-statement handling inside blocks.
 
-### `scope.py` (965 lines) — scope + variable semantics
+### `scope.py` (1012 lines) — scope + variable semantics
 - `class Scope` (11119: variable storage with constraints.
-  - `define` (338), `update` (379), `get` (472), `is_uninitialized` (493),
-    `get_defining_scope` (508).
-  - Inputs/outputs: `define_input` (521), `define_output` (536),
-    `is_input`/`is_output` (518/527), `connect_pipe` (561), `push_value`
-    (555), `_propagate_wave` (603) — the publish/listen ripple.
-  - Constraints: `_re_evaluate_constraints` (656), `_check_constraints` (739),
-    `_validate_base_type` (697) — validates scalars AND, since the pyarrow
+  - `define` (382), `update` (423), `get` (516), `is_uninitialized` (537),
+    `get_defining_scope` (552).
+  - Inputs/outputs: `define_input` (565), `define_output` (580),
+    `is_input`/`is_output` (518/527), `connect_pipe` (605), `push_value`
+    (555), `_propagate_wave` (647) — the publish/listen ripple.
+  - Constraints: `_re_evaluate_constraints` (700), `_check_constraints` (783),
+    `_validate_base_type` (741) — validates scalars AND, since the pyarrow
     removal, element-by-element base types of `dim` arrays (via
     `array_handler.validate_array_element_types`), `_expression_depends_on`
     (651). `_array_unset_value` (array_handler.py:1446) resolves `None`
     sentinels for unset template array cells: checks the variable's
     `constraints['default']` (from `or = <expr>`) and evaluates it; falls back
     to `error_value(NA_ERROR)` (`#N/A`).
-  - Scoping: `is_shadowed` (617), `get_evaluation_scope` (625),
-    `get_full_scope` (955), `_coerce_custom_type_value` (172).
+  - Scoping: `is_shadowed` (661), `get_evaluation_scope` (669),
+    `get_full_scope` (1002), `_coerce_custom_type_value` (216).
 - `class _ListenerGrid` (2121: dict backing `compiler.grid`; every cell write
   calls `compiler._notify_cell_changed`.
 - `class GridLiveView` (4040: `(row, col)`-keyed live view of a grid
@@ -274,7 +274,7 @@ evaluation.
 - `format_display_value` (26265: display formatting with float-trimming and
   list/dict-form array support.
 
-### `test_runner.py` (897 lines) — inline test suite
+### `test_runner.py` (899 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — a huge method
 containing 263 hardcoded test cases (name, code, expected grid dict). At the
 bottom of the file (~830) it runs itself when executed directly:
