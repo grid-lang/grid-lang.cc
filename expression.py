@@ -1232,6 +1232,9 @@ class ExpressionEvaluator:
             if self.compiler._is_hidden_field(scope_var, actual_field) and not getattr(self.compiler, '_allow_hidden_field_access', False):
                 raise PermissionError(
                     f"Hidden field '{field}' is not accessible at line {line_number}")
+            if actual_field not in scope_var and scope_var.get('_type_name'):
+                raise NameError(
+                    f"Field '{field}' does not exist on '{var}' at line {line_number}")
             return True, scope_var.get(actual_field)
         try:
             var_value = self.compiler.current_scope().get(var)
@@ -1240,6 +1243,9 @@ class ExpressionEvaluator:
                 if self.compiler._is_hidden_field(var_value, actual_field) and not getattr(self.compiler, '_allow_hidden_field_access', False):
                     raise PermissionError(
                         f"Hidden field '{field}' is not accessible at line {line_number}")
+                if actual_field not in var_value and var_value.get('_type_name'):
+                    raise NameError(
+                        f"Field '{field}' does not exist on '{var}' at line {line_number}")
                 return True, var_value.get(actual_field)
         except NameError:
             pass

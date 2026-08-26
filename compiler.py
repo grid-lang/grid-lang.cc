@@ -778,9 +778,9 @@ class GridLangCompiler:
         if inputs_list and len(args) > expected_args:
             raise ValueError(
                 f"Expected {expected_args} values for type '{type_name}', got {len(args)} at line {line_number}")
-        if not inputs_list and expected_args != len(args):
+        if not inputs_list and args:
             raise ValueError(
-                f"Expected {expected_args} values for type '{type_name}', got {len(args)} at line {line_number}")
+                f"Type '{type_name}' has no Input declarations; positional arguments are not allowed at line {line_number}")
 
         value_dict = {}
         input_values = {}
