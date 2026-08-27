@@ -13,7 +13,7 @@ from units import (
     strip_units,
 )
 from control_flow import GridLangControlFlow
-from type_processor import GridLangTypeProcessor
+from type_processor import GridLangTypeProcessor, split_builder_chain
 from parser import GridLangParser
 
 
@@ -395,12 +395,34 @@ class GridLangCompiler:
         while i < len(lines):
             line, line_number = lines[i]
             m = re.match(
-                r'^\s*define\s+(\$?[\w\.]+)\s+as\s+(function|subprocess|privatehelper)', line, re.I)
-            if m:
+                r'^\s*define\s+(\$?[\w\.]+)\s+as\s+(function|subprocess|privatehelper)\b', line, re.I)
+            m_builder = re.match(
+                r'^\s*define\s+(\$?[\w]+)\s+as\s+builder\s*\(\s*([A-Za-z_][\w]*)\s*\)\s*$', line, re.I)
+            if re.search(r'\bas\s+builder\b', line, re.I) and not m_builder:
+                raise SyntaxError(
+                    f"Invalid Builder definition at line {line_number}: "
+                    f"use 'Define $<name> as Builder(<type>)'")
+            if m and m.group(2).lower() == 'privatehelper':
+                raise SyntaxError(
+                    f"'PrivateHelper' cannot be defined at line {line_number}; "
+                    f"rename it as a builder: 'Define $<name> as Builder(<type>)'")
+            if m_builder:
+                raw_name = m_builder.group(1).strip()
+                builder_type = m_builder.group(2)
+                def_kind = 'builder'
+                hidden = raw_name.startswith('$')
+                func_name = raw_name[1:] if hidden else raw_name
+            elif m:
                 raw_name = m.group(1).strip()
                 def_kind = m.group(2).lower()
                 hidden = raw_name.startswith('$')
                 func_name = raw_name[1:] if hidden else raw_name
+            else:
+                raw_name = None
+                def_kind = None
+                hidden = False
+                func_name = None
+            if def_kind:
                 body_lines = []
                 block_depth = 0
                 i += 1
@@ -456,30 +478,34 @@ class GridLangCompiler:
                             var_list = (parsed_constraints or {}).get('var_list') if parsed_constraints else None
                             names = var_list if var_list else [parsed_var]
                             outputs.extend(names)
+                member_of = (builder_type if def_kind == 'builder'
+                             else (func_name.split('.')[0] if '.' in func_name else None))
                 entry = {
                     'name': func_name,
                     'code': func_code,
                     'outputs': outputs,
                     'inputs': inputs,
                     'input_defs': input_defs,
-                    'member_of': func_name.split('.')[0] if '.' in func_name else None,
+                    'member_of': member_of,
                     # Keep the original casing so we can expose multiple aliases
                     'original': func_name,
                     'hidden': hidden,
                     'code_lines': code_lines,
                     'defining_scope': self.current_scope()
                 }
-                if def_kind == 'privatehelper':
-                    type_name = func_name.split('.')[0] if '.' in func_name else None
-                    if not type_name:
+                if def_kind == 'builder':
+                    type_name = builder_type
+                    if '.' in func_name:
                         raise SyntaxError(
-                            f"PrivateHelper '{func_name}' missing type prefix at line {line_number}")
+                            f"Builder '{func_name}' must not carry a type prefix at line {line_number}; "
+                            f"use 'Define $<name> as Builder(<type>)'")
                     type_def = self.types_defined.get(type_name.lower())
                     if not type_def:
                         raise SyntaxError(
-                            f"Type '{type_name}' not defined for private helper '{func_name}' at line {line_number}")
-                    helpers = type_def.setdefault('_private_helpers', {})
-                    helpers[func_name.split('.', 1)[1].lower()] = entry
+                            f"Type '{type_name}' not defined for builder '{func_name}' at line {line_number}")
+                    if isinstance(type_def, dict):
+                        helpers = type_def.setdefault('_builders', {})
+                        helpers[func_name.lower()] = entry
                 elif def_kind == 'function':
                     functions[func_name.lower()] = entry
                 else:
@@ -593,7 +619,9 @@ class GridLangCompiler:
         sub_compiler.preserve_types_defined = True
         sub_compiler.preserve_functions = True
         sub_compiler._allow_hidden_field_access = True
-        sub_compiler._allow_hidden_member_calls = True
+        # Members of the declaring type may use private builders/member
+        # functions; standalone functions may not.
+        sub_compiler._allow_hidden_member_calls = bool(func_def.get('member_of'))
         # Functions reference the caller's scope chain live but read-only:
         # reads resolve through the parent, writes to caller variables are
         # rejected. The caller's 'grid' is just another caller variable: it
@@ -1917,11 +1945,25 @@ class GridLangCompiler:
             scope_dict[var] = evaluated_value
         return 'bound'
 
+    def _builder_names(self):
+        """Return the set of builder names defined across all types.
+
+        Builder names are used bare in 'new Type(...) -> name(...)' chains,
+        so dependency extraction must not mistake them for variables.
+        """
+        names = set()
+        for t_def in self.types_defined.values():
+            if isinstance(t_def, dict):
+                names.update(k.lower() for k in (t_def.get('_builders') or {}).keys())
+        return names
+
     def _extract_identifier_tokens(self, expr):
         """Extract identifier-like tokens ignoring string literals and numeric literals."""
         if not expr:
             return set()
         cleaned = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', ' ', expr)
+        # Remove builder-call names ('-> name(') so they are not treated as deps.
+        cleaned = re.sub(r'->\s*\$?[A-Za-z_][A-Za-z0-9_]*\s*\(', '(', cleaned)
         # Remove member accesses like "obj.field" or "obj.method" to avoid
         # treating field/method names as standalone dependencies.
         cleaned = re.sub(r'\.\s*[A-Za-z_][A-Za-z0-9_]*', ' ', cleaned)
@@ -1931,6 +1973,7 @@ class GridLangCompiler:
             'to', 'and', 'or', 'not', 'then', 'do', 'step', 'by', 'in', 'new', 'with',
             'true', 'false'
         }
+        builder_names = self._builder_names()
         for tok in tokens:
             if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', tok, re.I):
                 continue
@@ -1938,6 +1981,8 @@ class GridLangCompiler:
                 continue
             lower_tok = tok.lower()
             if lower_tok in keyword_exclusions:
+                continue
+            if lower_tok in builder_names:
                 continue
             if lower_tok in getattr(self, 'types_defined', {}):
                 continue
@@ -2907,13 +2952,18 @@ class GridLangCompiler:
             raise SyntaxError(
                 f"Unclosed constructor for '{type_name}' at line {line_number}: {declaration}")
         with_assignments = {}
+        chain_text = None
         if trailing:
-            if trailing.lower().startswith('with'):
-                with_assignments = self._parse_with_clause(
-                    trailing, line_number=line_number)
-            else:
-                raise SyntaxError(
-                    f"Unexpected characters after constructor at line {line_number}: {trailing}")
+            pre_trailing, chain_text = split_builder_chain(trailing)
+            if chain_text is not None:
+                trailing = pre_trailing.strip()
+            if trailing:
+                if trailing.lower().startswith('with'):
+                    with_assignments = self._parse_with_clause(
+                        trailing, line_number=line_number)
+                else:
+                    raise SyntaxError(
+                        f"Unexpected characters after constructor at line {line_number}: {trailing}")
 
         def _split_args(arg_text):
             args = []
@@ -2953,6 +3003,10 @@ class GridLangCompiler:
                     self.current_scope().get_full_scope(),
                     line_number,
                     type_name=type_name)
+            if chain_text:
+                value_dict = self.type_processor._apply_builder_chain(
+                    value_dict, chain_text,
+                    self.current_scope().get_full_scope(), line_number)
             snapshot = {k: copy.deepcopy(v) for k, v in value_dict.items()
                         if not str(k).startswith('_')}
             constraints = {'constant': snapshot}
@@ -2971,17 +3025,32 @@ class GridLangCompiler:
                 self.current_scope().get_full_scope(),
                 line_number,
                 type_name=type_name)
+        if not all_literals:
+            # Deferred: keep the chain in the stored expression so re-resolution
+            # applies it exactly once; do NOT apply it eagerly here.
+            pending_expr = f"new {type_name}{{{values_str}}}"
+            deps = self._extract_identifier_tokens(values_str)
+            if chain_text:
+                pending_expr += ' ' + chain_text
+                deps |= self._extract_identifier_tokens(chain_text)
+            if var in deps:
+                raise ValueError(
+                    f"Self-referential assignment '{var} = {pending_expr}' at line {line_number}")
+            snapshot = {k: copy.deepcopy(v) for k, v in value_dict.items()
+                        if not str(k).startswith('_')}
+            constraints = {'constant': snapshot}
+            self.current_scope().define(var, value_dict, type_name, constraints)
+            self.pending_assignments[var] = (
+                pending_expr, line_number, deps)
+            return True
+        if chain_text:
+            value_dict = self.type_processor._apply_builder_chain(
+                value_dict, chain_text,
+                self.current_scope().get_full_scope(), line_number)
         snapshot = {k: copy.deepcopy(v) for k, v in value_dict.items()
                     if not str(k).startswith('_')}
         constraints = {'constant': snapshot}
         self.current_scope().define(var, value_dict, type_name, constraints)
-        if not all_literals:
-            deps = self._extract_identifier_tokens(values_str)
-            if var in deps:
-                raise ValueError(
-                    f"Self-referential assignment '{var} = new {type_name}{{{values_str}}}' at line {line_number}")
-            self.pending_assignments[var] = (
-                f"new {type_name}{{{values_str}}}", line_number, deps)
         return True
 
     def _handle_global_assignment_expression(self, var_def, expr, line_number=None):
@@ -3034,6 +3103,13 @@ class GridLangCompiler:
                     known_funcs = set(getattr(self, 'functions', {}).keys())
                     known_subs = set(getattr(self, 'subprocesses', {}).keys())
                     known_types = set(getattr(self, 'types_defined', {}).keys())
+                    builder_names = getattr(
+                        self, 'types_defined', {}).values()
+                    builder_names = {
+                        k.lower() for t_def in builder_names
+                        if isinstance(t_def, dict)
+                        for k in (t_def.get('_builders') or {})
+                    }
                     member_suffixes = {name.split('.', 1)[1]
                                        for name in known_funcs if '.' in name}
                     deps = set()
@@ -3045,7 +3121,7 @@ class GridLangCompiler:
                             continue
                         if dep_lower in known_funcs or dep_lower in known_subs or dep_lower in known_types:
                             continue
-                        if dep_lower in member_suffixes:
+                        if dep_lower in member_suffixes or dep_lower in builder_names:
                             continue
                         deps.add(dep)
             if var in deps:

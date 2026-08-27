@@ -13,6 +13,52 @@ from utils import (
 )
 
 
+def split_builder_chain(expr):
+    """Split a 'new ...' expression into (base_expr, chain_text).
+
+    chain_text is the trailing '-> builder(args) ...' suffix (including the
+    leading arrow), or None when the expression has no top-level chain.
+    Everything inside quotes or nested delimiters is skipped.
+    """
+    in_quote = None
+    paren = brace = bracket = 0
+    for i in range(len(expr)):
+        ch = expr[i]
+        if in_quote:
+            if ch == in_quote and (i == 0 or expr[i - 1] != '\\'):
+                in_quote = None
+            continue
+        if ch in ('"', "'"):
+            in_quote = ch
+            continue
+        if ch == '(':
+            paren += 1
+            continue
+        if ch == ')':
+            paren = max(paren - 1, 0)
+            continue
+        if ch == '{':
+            brace += 1
+            continue
+        if ch == '}':
+            brace = max(brace - 1, 0)
+            continue
+        if ch == '[':
+            bracket += 1
+            continue
+        if ch == ']':
+            bracket = max(bracket - 1, 0)
+            continue
+        if (ch == '-' and i + 1 < len(expr) and expr[i + 1] == '>'
+                and paren == brace == bracket == 0):
+            before = expr[i - 1] if i > 0 else ''
+            after = expr[i + 2:].lstrip()
+            if (not before or before.isspace() or before in '})'):
+                if re.match(r'\$?[A-Za-z_]', after):
+                    return expr[:i].strip(), expr[i:]
+    return expr, None
+
+
 class GridLangTypeProcessor:
     """Handles type definitions and type-related processing."""
 
@@ -339,7 +385,7 @@ class GridLangTypeProcessor:
                 helper_defs = {}
                 if type_name:
                     type_def = self.compiler.types_defined.get(type_name.lower(), {})
-                    helper_defs = type_def.get('_private_helpers', {}) if isinstance(
+                    helper_defs = type_def.get('_builders', {}) if isinstance(
                         type_def, dict) else {}
                 if helper_name.lower() == 'super' or helper_name.lower() in helper_defs:
                     args_text = stripped_line[stripped_line.find('(') + 1: stripped_line.rfind(')')]
@@ -351,7 +397,7 @@ class GridLangTypeProcessor:
                         value_dict, input_values)
                     arg_values = [self.compiler.expr_evaluator.eval_or_eval_array(
                         a, eval_scope, line_number) for a in args]
-                    self._execute_private_helper(
+                    self._execute_builder(
                         type_name, helper_name, value_dict, line_number, arg_values)
                     i += 1
                     continue
@@ -938,12 +984,12 @@ class GridLangTypeProcessor:
                 scope['grid'] = value_dict.get('grid', {})
         return scope
 
-    def _execute_private_helper(self, type_name, helper_name, value_dict, line_number, arg_values):
+    def _execute_builder(self, type_name, builder_name, value_dict, line_number, arg_values):
         if not type_name:
             raise NameError(
-                f"Private helper '{helper_name}' has no type context at line {line_number}")
+                f"Builder '{builder_name}' has no type context at line {line_number}")
         type_def = self.compiler.types_defined.get(type_name.lower(), {})
-        if helper_name.lower() == 'super':
+        if builder_name.lower() == 'super':
             parent = type_def.get('_parent')
             if not parent:
                 raise NameError(
@@ -973,17 +1019,17 @@ class GridLangTypeProcessor:
                 value_dict[key] = val
             return
 
-        helpers = type_def.get('_private_helpers', {}) or {}
-        helper_def = helpers.get(helper_name.lower())
+        helpers = type_def.get('_builders', {}) or {}
+        helper_def = helpers.get(builder_name.lower())
         if not helper_def:
             raise NameError(
-                f"Private helper '{helper_name}' not defined for type '{type_name}' at line {line_number}")
+                f"Builder '{builder_name}' not defined for type '{type_name}' at line {line_number}")
         input_defs = helper_def.get('input_defs', [])
         input_values = {}
         if input_defs:
             if len(arg_values) > len(input_defs):
                 raise ValueError(
-                    f"Too many arguments for helper '{helper_name}' at line {line_number}")
+                    f"Too many arguments for builder '{builder_name}' at line {line_number}")
             for idx, entry in enumerate(input_defs):
                 name = entry.get('name')
                 if idx < len(arg_values):
@@ -992,14 +1038,14 @@ class GridLangTypeProcessor:
                     default_expr = entry.get('constraints', {}).get('default') or entry.get('default')
                     if default_expr is None:
                         raise ValueError(
-                            f"Missing argument '{name}' for helper '{helper_name}' at line {line_number}")
+                            f"Missing argument '{name}' for builder '{builder_name}' at line {line_number}")
                     eval_scope = self._build_type_eval_scope(
                         value_dict, input_values)
                     input_values[name] = self.compiler.expr_evaluator.eval_or_eval_array(
                         str(default_expr), eval_scope, line_number)
         elif arg_values:
             raise ValueError(
-                f"Helper '{helper_name}' does not take arguments at line {line_number}")
+                f"Builder '{builder_name}' does not take arguments at line {line_number}")
 
         code_lines = helper_def.get('code_lines') or helper_def.get('code', '').splitlines()
         member_keys = type_def.get('_member_keys', set())
@@ -1017,3 +1063,113 @@ class GridLangTypeProcessor:
         finally:
             value_dict.update(saved_non_member)
             self.compiler.scopes = saved_scopes
+
+    def _parse_builder_chain(self, chain_text, line_number):
+        """Parse a '-> builder(args) -> ...' suffix into (name, args_text) pairs."""
+        entries = []
+        rest = chain_text.strip()
+        while rest:
+            rest = rest.lstrip()
+            if not rest.startswith('->'):
+                raise SyntaxError(
+                    f"Unexpected tokens in builder chain: '{rest}' at line {line_number}")
+            rest = rest[2:].lstrip()
+            m = re.match(r'(\$?[A-Za-z_][\w_]*)\s*\(', rest)
+            if not m:
+                raise SyntaxError(
+                    f"Invalid builder call in chain at line {line_number}")
+            builder_name = m.group(1).lstrip('$')
+            open_pos = rest.index('(', m.start(1))
+            in_quote = None
+            depth = 0
+            close_pos = None
+            for i in range(open_pos, len(rest)):
+                ch = rest[i]
+                if in_quote:
+                    if ch == in_quote and (i == 0 or rest[i - 1] != '\\'):
+                        in_quote = None
+                    continue
+                if ch in ('"', "'"):
+                    in_quote = ch
+                    continue
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        close_pos = i
+                        break
+            if close_pos is None:
+                raise SyntaxError(
+                    f"Unclosed builder call '{builder_name}' at line {line_number}")
+            entries.append((builder_name, rest[open_pos + 1:close_pos]))
+            rest = rest[close_pos + 1:].strip()
+        return entries
+
+    def _split_builder_args(self, args_text, line_number):
+        args = []
+        current = ""
+        nest = []
+        in_quote = None
+        for ch in args_text + ',':
+            if in_quote:
+                current += ch
+                if ch == in_quote and current[-2:-1] != '\\':
+                    in_quote = None
+                continue
+            if ch in ('"', "'"):
+                in_quote = ch
+                current += ch
+                continue
+            if ch in ('(', '{', '['):
+                nest.append(ch)
+                current += ch
+                continue
+            if ch in (')', '}', ']'):
+                if nest:
+                    nest.pop()
+                current += ch
+                continue
+            if ch == ',' and not nest:
+                if current.strip():
+                    args.append(current.strip())
+                current = ""
+                continue
+            current += ch
+        return args
+
+    def _apply_builder_chain(self, instance, chain_text, scope, line_number):
+        """Apply a '-> builder(args) ...' chain to a freshly-constructed instance.
+
+        Builders only run during construction: either inside a type's own
+        constructor, or in a chain that follows 'new' directly. They mutate
+        the in-progress object and the final chain result is what gets bound.
+        """
+        if not isinstance(instance, dict):
+            raise TypeError(
+                f"Builder chains can only apply to object instances at line {line_number}")
+        type_name = instance.get('_type_name')
+        if not type_name:
+            raise TypeError(
+                f"Cannot determine the type for the builder chain at line {line_number}")
+        type_def = self.compiler.types_defined.get(type_name.lower(), {})
+        builders = type_def.get('_builders', {}) if isinstance(type_def, dict) else {}
+        entries = self._parse_builder_chain(chain_text, line_number)
+        for builder_name, args_text in entries:
+            helper_entry = builders.get(builder_name.lower())
+            if helper_entry is None:
+                raise NameError(
+                    f"Builder '{builder_name}' not defined for type '{type_name}' at line {line_number}")
+            if helper_entry.get('hidden') and not getattr(
+                    self.compiler, '_allow_hidden_member_calls', False):
+                raise PermissionError(
+                    f"Builder '{builder_name}' of type '{type_name}' is private and cannot be called here at line {line_number}")
+            args = self._split_builder_args(args_text, line_number)
+            eval_scope = scope if isinstance(scope, dict) else (
+                self.compiler.current_scope().get_full_scope() if hasattr(
+                    self.compiler, 'current_scope') else {})
+            arg_values = [self.compiler.expr_evaluator.eval_or_eval_array(
+                a, eval_scope, line_number) for a in args]
+            self._execute_builder(
+                type_name, builder_name, instance, line_number, arg_values)
+        return instance

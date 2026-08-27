@@ -13,6 +13,13 @@ from utils import col_to_num, split_cell, offset_cell, parse_address, public_typ
 
 IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*')
 STRING_LITERAL_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+
+
+def _strip_builder_arrows(text):
+    """Remove builder-call names ('-> name(') so dependency extraction does not
+    mistake builder names for variables. The arguments remain (they may carry
+    real dependencies)."""
+    return re.sub(r'->\s*\$?[A-Za-z_][A-Za-z0-9_]*\s*\(', '(', text)
 DEPENDENCY_IGNORED_TOKENS = {
     'sum', 'rows', 'sqrt', 'min', 'max', 'abs', 'int', 'float', 'str', 'len',
     'textsplit', 'print', 'push', 'true', 'false', 'none', 'nan', 'inf', 'and', 'or', 'not',
@@ -153,7 +160,8 @@ class GridLangExecutor:
         """Return identifiers referenced in an expression string."""
         if not expr:
             return set()
-        cleaned = strip_array_cell_indices(_strip_constraint_operands(expr))
+        cleaned = _strip_builder_arrows(
+            strip_array_cell_indices(_strip_constraint_operands(expr)))
         tokens = IDENTIFIER_TOKEN_PATTERN.findall(cleaned)
         dependencies = set()
         for token in tokens:
@@ -3698,7 +3706,7 @@ class GridLangExecutor:
             var, type_name, constraints, value = self._parse_variable_def(
                 var_def, line_number)
             deps = _filter_var_tokens(
-                set(re.findall(r'\b[\w_]+\b', expr)))
+                set(re.findall(r'\b[\w_]+\b', _strip_builder_arrows(expr))))
             if not deps:
                 try:
                     evaluated_value = self.expr_evaluator.eval_expr(

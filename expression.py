@@ -20,6 +20,7 @@ from utils import (
     is_sparse_array,
 )
 from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, REF_ERROR, UNIVERSAL_ZERO, UnitValue, ConstraintError, error_value, is_error_value
+from type_processor import split_builder_chain
 
 
 class CaseInsensitiveDict(dict):
@@ -950,6 +951,21 @@ class ExpressionEvaluator:
         return True, results
 
     def _try_eval_object_creation(self, expr, scope, line_number):
+        # Builder chains ('-> name(args) ...') may only follow 'new'. Evaluate
+        # the base constructor first, then apply the chain to the result.
+        base_expr, chain_text = split_builder_chain(expr)
+        if chain_text is not None:
+            handled, base_value = self._try_eval_object_creation(
+                base_expr, scope, line_number)
+            if not handled:
+                return False, None
+            if not isinstance(base_value, dict):
+                raise TypeError(
+                    f"Builder chains can only apply to object instances at line {line_number}")
+            result = self.compiler.type_processor._apply_builder_chain(
+                base_value, chain_text, scope, line_number)
+            return True, result
+
         if expr.lower().startswith('new ') and 'with' in expr.lower():
             in_quote = None
             paren_level = 0
@@ -1183,21 +1199,12 @@ class ExpressionEvaluator:
 
         if obj_type:
             type_def = getattr(self.compiler, 'types_defined', {}).get(obj_type.lower(), {})
-            helper_defs = type_def.get('_private_helpers', {}) if isinstance(type_def, dict) else {}
-            if method_name.lower() in helper_defs:
-                if not getattr(self.compiler, '_allow_hidden_member_calls', False):
-                    raise PermissionError(
-                        f"Private helper '{method_name}' cannot be called here at line {line_number}")
-                arg_text = args_part if args_part is not None else ""
-                args_list = []
-                if arg_text.strip():
-                    args_list = [a.strip()
-                                 for a in re.split(r',(?![^{]*})', arg_text) if a.strip()]
-                evaluated_args = [self.eval_or_eval_array(
-                    a, scope, line_number) for a in args_list]
-                self.compiler.type_processor._execute_private_helper(
-                    obj_type, method_name, obj_value, line_number, evaluated_args)
-                return True, obj_value
+            builder_defs = type_def.get('_builders', {}) if isinstance(type_def, dict) else {}
+            if method_name.lower().lstrip('$') in builder_defs:
+                raise PermissionError(
+                    f"Builder '{method_name}' of type '{obj_type}' can only be called "
+                    f"after 'new' in a chain ('new {obj_type}(...) -> {method_name}(...)') "
+                    f"at line {line_number}")
 
             func_key = f"{obj_type.lower()}.{method_name.lower()}"
             func_entry = getattr(self.compiler, 'functions', {}).get(func_key)
@@ -1628,9 +1635,11 @@ class ExpressionEvaluator:
             if func_key and func_key in getattr(self.compiler, 'functions', {}):
                 return match.group(0)
             type_def = getattr(self.compiler, 'types_defined', {}).get(obj_type.lower(), {})
-            helper_defs = type_def.get('_private_helpers', {}) if isinstance(type_def, dict) else {}
-            if field_name.lower() in helper_defs:
-                return match.group(0)
+            builder_defs = type_def.get('_builders', {}) if isinstance(type_def, dict) else {}
+            if field_name.lower().lstrip('$') in builder_defs:
+                raise PermissionError(
+                    f"Builder '{field_name}' of type '{obj_type}' can only be called "
+                    f"after 'new' in a chain at line {line_number}")
         actual_field = get_case_insensitive_key(obj_value, field_name) or field_name
         field_val = obj_value.get(actual_field)
         if not isinstance(field_val, (list, tuple, dict)):
@@ -2062,6 +2071,11 @@ class ExpressionEvaluator:
                 f"Expression evaluation depth limit exceeded for '{expr}' at line {line_number}")
 
         expr = expr.strip()
+        if '->' in expr and not expr.lower().startswith('new '):
+            _, stray_chain = split_builder_chain(expr)
+            if stray_chain is not None:
+                raise SyntaxError(
+                    f"Builder chains ('->') can only follow 'new' at line {line_number}")
         if expr.lower() in ('true', 'false'):
             return expr.lower() == 'true'
         if expr.lower() == 'none':

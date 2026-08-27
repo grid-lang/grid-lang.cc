@@ -474,6 +474,12 @@ class GridLangParser:
 
             matched = None
             if not in_quote and brace_depth == 0 and not truth_open:
+                # Builder chains use '->': keep the arrow atomic so the '>'
+                # is not misread as the start of a comparison constraint.
+                if ch == '-' and i + 1 < len(text) and text[i + 1] == '>':
+                    current += '->'
+                    i += 2
+                    continue
                 for kw in keywords:
                     if lower_text.startswith(kw, i):
                         # For word keywords, ensure boundaries

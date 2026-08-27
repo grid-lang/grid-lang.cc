@@ -46,7 +46,7 @@ are prompted (`compiler.prompt_missing_inputs`).
    executor and compiler are effectively the same object; helper engines
    (`expr_evaluator`, `array_handler`, `control_flow`, `type_processor`,
    `parser`) were already constructed on the compiler and are shared.
-3. `executor.run()` (`executor.py:1972`) is the interpreter entry point:
+3. `executor.run()` (`executor.py:1980`) is the interpreter entry point:
    `_run_setup` → `_run_prepare_execution` → `_run_main_loop` →
    `_resolve_pending_assignments` → `_process_deferred_assignments` →
    `_print_outputs`.
@@ -56,7 +56,7 @@ are prompted (`compiler.prompt_missing_inputs`).
    control_flow.py.
 5. Results: `Return x` appends to `output_values` (printed by
    `_print_outputs`); grid writes land in `compiler.grid` (a dict keyed by
-   cell refs like `'A1'`). `--debug` → `compiler.export_to_csv` (`compiler.py:3372`).
+   cell refs like `'A1'`). `--debug` → `compiler.export_to_csv` (`compiler.py:3448`).
 
 The single most important design fact: **`GridLangCompiler` (state holder) and
 `GridLangExecutor` (loop) share one object during execution.** Many helpers
@@ -76,7 +76,7 @@ handling) — check both before adding a feature so you extend the live path.
 - Console script `grid=main:main`; declares the 10 top-level modules as
   `py_modules`; **no `install_requires`** (`pyarrow` was removed); LGPLv3.
 
-### `compiler.py` (3578 lines) — state + orchestration
+### `compiler.py` (3654 lines) — state + orchestration
 `class GridLangCompiler` is the **persistent brain** and holds nearly all state
 created in `__init__`:
 - Grid & scoping: `grid` (`_ListenerGrid`), `scopes` (stack of `Scope`),
@@ -98,10 +98,10 @@ Notable methods (all copied onto the executor during a run):
   `GridLiveView`, so `grid{row, col}` works at top level.
 - `_extract_functions` (38389: pulls `Function`/`Subprocess` defs out of the
   main code and registers them.
-- `_instantiate_type` (70702, `_evaluate_with_value` (891), `_apply_with_clause`
+- `_instantiate_type` (70702, `_evaluate_with_value` (919), `_apply_with_clause`
   parsing (958+): type/`with` object construction.
 - `call_subprocess` (111128: runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (202080, `_process_declarations_and_labels` (2607),
+- `_process_grid_assignment` (202080, `_process_declarations_and_labels` (2652),
   `_collect_global_declarations` (212168: top-level statement handling.
 - `export_to_csv` (282817: `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
@@ -112,60 +112,60 @@ Notable methods (all copied onto the executor during a run):
 Also defines `SubprocessResult` (46): result container exposing `grid`,
 `variables`, `outputs`.
 
-### `executor.py` (4982 lines) — the interpreter
+### `executor.py` (4990 lines) — the interpreter
 `class GridLangExecutor` contains the main dispatch loop. This is where most
 runtime behavior lives. Key methods:
 - `run` (191918: top-level sequence (see Architecture).
-- `_run_setup` (424220, `_run_prepare_execution` (4315), `_print_outputs`
-  (4680), `_materialize_inits` (4723), `_process_deferred_assignments` (4862).
-- Main loop: `_run_main_loop` (2002) → `_run_main_loop_impl` (2529) →
+- `_run_setup` (424220, `_run_prepare_execution` (4323), `_print_outputs`
+  (4680), `_materialize_inits` (4731), `_process_deferred_assignments` (4870).
+- Main loop: `_run_main_loop` (2010) → `_run_main_loop_impl` (2537) →
   `_run_main_loop_impl_body` (242455. `_handle_main_loop_*` methods dispatch
   statement kinds: quick statements (1113), `Let` (1147/1494/1515), `For`
   (many: 1728 fallback, 1952 array/dim, 2060 simple, 2099 single-line, 2349
   consecutive shortcuts, 2544 declaration, 2980 range, 3315 nested, 3524
   prechecks, 3589 post-branches), grid assignment (3822), `When` blocks
   (3879), `Push` (3994–4176), `Return` (4021), misc (3649).
-- Dependency/guard machinery: `_build_dependency_network` (618),
-  `_determine_needed_lines` (91917, `_evaluate_guard_conditions` (983),
+- Dependency/guard machinery: `_build_dependency_network` (626),
+  `_determine_needed_lines` (91917, `_evaluate_guard_conditions` (991),
   `_evaluate_global_guards_pre_execution` (71717, `_execute_global_for_loops`
-  (827), `_attempt_resolve_pending_var` (1003), `_resolve_ready_pending_vars`
+  (827), `_attempt_resolve_pending_var` (1011), `_resolve_ready_pending_vars`
   (1038).
-- `Let` semantics: first pass `_process_let_first_pass` (1182), binding
+- `Let` semantics: first pass `_process_let_first_pass` (1190), binding
   `_bind_declared_var` (131301, standard assignment (1453), second pass
-  (1483), generator values (1607), `_apply_init_values` (1708).
+  (1483), generator values (1607), `_apply_init_values` (1716).
 - For-dim declarations: the regex at `_handle_for_array_and_dim_declarations`
   accepts optional `not null` before `as` and `or = <default>` after the
   dimension spec. `or = <expr>` is stored as `constraints['default']` so
   `_array_unset_value` can find it. The bounded-dim handler creates template
   arrays (`template=True`) when no `init`/standalone `=` is present.
-- `Push` semantics: `_handle_push_assignment` (4524), `_evaluate_push_expression`
-  (4286), `_process_push_call` (4656), `_assign_indexed_target` (4628),
+- `Push` semantics: `_handle_push_assignment` (4532), `_evaluate_push_expression`
+  (4286), `_process_push_call` (4656), `_assign_indexed_target` (4636),
   `_update_member_path_target` (444475.
-- `When` blocks: `_register_when_block` (276), `_process_when_triggers` (312),
+- `When` blocks: `_register_when_block` (284), `_process_when_triggers` (320),
   `_run_when_block` (31317.
 - Shared with compiler.py: `_strip_constraint_operands` (module-level, 26) and
   `DEPENDENCY_IGNORED_TOKENS` (1717 — duplicate of compiler's. Keep in sync.
 
-### `expression.py` (3478 lines) — expression evaluation
+### `expression.py` (3492 lines) — expression evaluation
 `class ExpressionEvaluator` evaluates RHS expressions, arrays, ranges, sums,
 dimension selectors, interpolations, member/field access, and Python-fallback
 evaluation.
-- Entry points: `eval_or_eval_array` (74), `eval_expr` (2050), and for
-  assignments `_evaluate_array` (445).
+- Entry points: `eval_or_eval_array` (75), `eval_expr` (2059), and for
+  assignments `_evaluate_array` (446).
 - `eval_expr` is the big recursive dispatcher: array literals `{}`, pipes `|`,
   interpolated cell refs, paren/curly indexing, member calls, user function
   calls, object creation, field access, address-indexed access, then scalar
   constructs, then simple variables.
-- Python fallback: `_evaluate_with_python_fallback` (2441) builds a scope and
+- Python fallback: `_evaluate_with_python_fallback` (2455) builds a scope and
   `eval()`s complex arithmetic (`_build_fallback_cell_scope` 2254,
   `_eval_python_fallback_result` 2501, `_get_eval_globals` 2937).
-- Interpolation: `_process_interpolation` (3167). Operators:
+- Interpolation: `_process_interpolation` (3181). Operators:
   `_replace_operators` (292923.
-- Grid indexing: `_replace_grid_indexing` (762) — only still needed for legacy
+- Grid indexing: `_replace_grid_indexing` (763) — only still needed for legacy
   dict-based object grids; it early-returns for `GridLiveView` (which flows
   through the generic array path). `_eval_array_element` uses `base=1` for
   `GridLiveView`.
-- Also `CaseInsensitiveDict` (25): case-insensitive dict used for
+- Also `CaseInsensitiveDict` (26): case-insensitive dict used for
   eval scopes.
 
 ### `array_handler.py` (2963 lines) — grid/array/tensor operations
@@ -235,19 +235,19 @@ evaluation.
 - `_ACTIVE_RUNNERS` (1618: stack of executing compilers; used to reject writes
   from read-only function sub-compilers to outer scopes.
 
-### `type_processor.py` (1019 lines) — `Define X as Type` handling
+### `type_processor.py` (1175 lines) — `Define X as Type` handling
 `class GridLangTypeProcessor`:
-- Type-def parsing: `_parse_type_def` (34), `_parse_type_def_line` (42),
-  `_extract_type_field_line` (9696, `_parse_type_field_constraints` (129),
+- Type-def parsing: `_parse_type_def` (80), `_parse_type_def_line` (88),
+  `_extract_type_field_line` (9696, `_parse_type_field_constraints` (175),
   `_record_type_field_definition` (15157, `_collect_type_computed_fields`
-  (178), `_finalize_type_def_state` (200).
-- Executing type body code against an instance: `_execute_type_code` (219),
-  `_execute_type_block` (25252, `_process_grid_assignment` (414),
-  `_process_type_for_loop` (38389, `_process_type_let_statement` (669),
+  (178), `_finalize_type_def_state` (246).
+- Executing type body code against an instance: `_execute_type_code` (265),
+  `_execute_type_block` (25252, `_process_grid_assignment` (460),
+  `_process_type_for_loop` (38389, `_process_type_let_statement` (715),
   `_process_type_assignment` (58581.
-- `_build_type_eval_scope` (70708, `_execute_private_helper` (941).
+- `_build_type_eval_scope` (70708, `_execute_builder` (987).
 
-### `parser.py` (557 lines) — variable-definition parsing
+### `parser.py` (563 lines) — variable-definition parsing
 `class GridLangParser`:
 - `_parse_variable_def` (1616: the central parser for `: name [as type] [of
   unit] [dim ...] [constraints] = expr` / `Input`/`Output` lines. Returns
@@ -255,7 +255,7 @@ evaluation.
 - Constraint handling: `_check_comparison_series` (226),
   `_match_direct_assignment_patterns` (22225, `_apply_with_clause` (263),
   `_apply_dimension_constraints` (33334, `_merge_custom_type_constraints` (422),
-  `_split_on_keywords` (39390, `_parse_dim_size` (523). The `or` keyword in
+  `_split_on_keywords` (39390, `_parse_dim_size` (529). The `or` keyword in
   `_split_on_keywords` extracts `or = <expr>` as `constraints['default']`;
   `not null` sets `constraints['nullable'] = True`. The default value is used
   by `_array_unset_value` when reading unset template array cells.
@@ -274,7 +274,7 @@ evaluation.
 - `format_display_value` (26265: display formatting with float-trimming and
   list/dict-form array support.
 
-### `test_runner.py` (902 lines) — inline test suite
+### `test_runner.py` (926 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — a huge method
 containing 263 hardcoded test cases (name, code, expected grid dict). At the
 bottom of the file (~830) it runs itself when executed directly:
