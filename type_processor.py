@@ -54,7 +54,7 @@ def split_builder_chain(expr):
             before = expr[i - 1] if i > 0 else ''
             after = expr[i + 2:].lstrip()
             if (not before or before.isspace() or before in '})'):
-                if re.match(r'\$?[A-Za-z_]', after):
+                if re.match(r'\$?[A-Za-z]', after):
                     return expr[:i].strip(), expr[i:]
     return expr, None
 
@@ -192,12 +192,12 @@ class GridLangTypeProcessor:
         """Parse one field declaration line into normalized metadata."""
         field_line, init_expr = self._split_type_field_initializer(field_line)
         match = re.match(
-            r'^(\$?[A-Za-z_][\w_]*(?:\s*,\s*\$?[A-Za-z_][\w_]*)*)', field_line)
+            r'^(\$?[A-Za-z][\w_]*(?:\s*,\s*\$?[A-Za-z][\w_.]*)*)', field_line)
         if not match:
             raise SyntaxError(
                 f"Invalid field definition: '{line}' at line {line_number}")
         var_names = [v.strip() for v in match.group(1).split(',') if v.strip()]
-        type_candidates = re.findall(r'\bas\s+([A-Za-z_][\w_]*)', field_line, re.I)
+        type_candidates = re.findall(r'\bas\s+([A-Za-z][\w_]*)', field_line, re.I)
         type_name = type_candidates[-1].lower() if type_candidates else None
         has_dim = re.search(r'\bdim\b', field_line, re.I)
         effective_type = 'array' if has_dim and not type_name else (type_name or 'unknown')
@@ -227,14 +227,14 @@ class GridLangTypeProcessor:
                     f"{clean_name} = {parsed_field['init_expr']}")
                 state['init_fields'].add(clean_name.lower())
         # Allow constructor-style assignments (e.g., ": x = in_x") to execute.
-        if (re.search(r'^\$?[A-Za-z_][\w_]*\s*=', parsed_field['field_line']) and
+        if (re.search(r'^\$?[A-Za-z][\w_.]*\s*=', parsed_field['field_line']) and
                 'or =' not in lowered):
             state['executable_code'].append(parsed_field['field_line'])
 
     def _collect_type_computed_fields(self, state):
         """Capture computed fields for reactive recomputation."""
         for code_line in state['executable_code']:
-            match = re.match(r'^\s*(\$?[A-Za-z_][\w_]*)\s*=\s*(.+)$', code_line)
+            match = re.match(r'^\s*(\$?[A-Za-z][\w_.]*)\s*=\s*(.+)$', code_line)
             if not match:
                 continue
             lhs = match.group(1).strip()
@@ -378,7 +378,7 @@ class GridLangTypeProcessor:
                                  constraints or {}, is_uninitialized=False)
                 i += 1
                 continue
-            if re.match(r'^[A-Za-z_][\w_]*\s*\(.*\)\s*$', stripped_line):
+            if re.match(r'^[A-Za-z][\w_.]*\s*\(.*\)\s*$', stripped_line):
                 helper_name = stripped_line.split('(', 1)[0].strip()
                 type_name = value_dict.get('_type_name') if isinstance(
                     value_dict, dict) else None
@@ -1074,7 +1074,7 @@ class GridLangTypeProcessor:
                 raise SyntaxError(
                     f"Unexpected tokens in builder chain: '{rest}' at line {line_number}")
             rest = rest[2:].lstrip()
-            m = re.match(r'(\$?[A-Za-z_][\w_]*)\s*\(', rest)
+            m = re.match(r'(\$?[A-Za-z][\w.]*)\s*\(', rest)
             if not m:
                 raise SyntaxError(
                     f"Invalid builder call in chain at line {line_number}")

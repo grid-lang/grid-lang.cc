@@ -17,7 +17,7 @@ from type_processor import GridLangTypeProcessor, split_builder_chain
 from parser import GridLangParser
 
 
-_IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*')
+_IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z][A-Za-z0-9_.]*')
 _STRING_LITERAL_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 _DEPENDENCY_IGNORED_TOKENS = {
     'sum', 'rows', 'sqrt', 'min', 'max', 'abs', 'int', 'float', 'str', 'len',
@@ -35,9 +35,9 @@ def _strip_constraint_operands(expr):
     if not expr:
         return expr
     cleaned = _STRING_LITERAL_PATTERN.sub(' ', str(expr))
-    cleaned = re.sub(r'\b(?:of|as)\s+[A-Za-z_][A-Za-z0-9_]*', ' ', cleaned)
+    cleaned = re.sub(r'\b(?:of|as)\s+[A-Za-z][A-Za-z0-9_.]*', ' ', cleaned)
     cleaned = re.sub(
-        r'\bdim\s+(?:\d+(?:\.\d*)?|nan|inf|[A-Za-z_][A-Za-z0-9_]*)',
+        r'\bdim\s+(?:\d+(?:\.\d*)?|[A-Za-z][A-Za-z0-9_.]*)',
         ' ', cleaned, flags=re.I)
     cleaned = re.sub(r'\bnot\s+null\b', ' ', cleaned, flags=re.I)
     return cleaned
@@ -397,7 +397,7 @@ class GridLangCompiler:
             m = re.match(
                 r'^\s*define\s+(\$?[\w\.]+)\s+as\s+(function|subprocess|privatehelper)\b', line, re.I)
             m_builder = re.match(
-                r'^\s*define\s+(\$?[\w]+)\s+as\s+builder\s*\(\s*([A-Za-z_][\w]*)\s*\)\s*$', line, re.I)
+                r'^\s*define\s+(\$?[\w.]+)\s+as\s+builder\s*\(\s*([A-Za-z][\w]*)\s*\)\s*$', line, re.I)
             if re.search(r'\bas\s+builder\b', line, re.I) and not m_builder:
                 raise SyntaxError(
                     f"Invalid Builder definition at line {line_number}: "
@@ -495,10 +495,6 @@ class GridLangCompiler:
                 }
                 if def_kind == 'builder':
                     type_name = builder_type
-                    if '.' in func_name:
-                        raise SyntaxError(
-                            f"Builder '{func_name}' must not carry a type prefix at line {line_number}; "
-                            f"use 'Define $<name> as Builder(<type>)'")
                     type_def = self.types_defined.get(type_name.lower())
                     if not type_def:
                         raise SyntaxError(
@@ -922,7 +918,7 @@ class GridLangCompiler:
             if raw_value.startswith('"') and raw_value.endswith('"'):
                 return self.expr_evaluator.eval_or_eval_array(
                     raw_value, scope, line_number)
-            if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', raw_value):
+            if re.match(r'^[A-Za-z][A-Za-z0-9_]*$', raw_value):
                 resolved = scope.get(raw_value, None)
                 if resolved is None or (
                         isinstance(resolved, UnitValue)
@@ -947,7 +943,7 @@ class GridLangCompiler:
                         if (item.startswith('"') and item.endswith('"')) or (
                                 item.startswith("'") and item.endswith("'")):
                             resolved.append(item[1:-1])
-                        elif re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', item) and item in scope:
+                        elif re.match(r'^[A-Za-z][A-Za-z0-9_]*$', item) and item in scope:
                             resolved.append(scope.get(item))
                         else:
                             resolved.append(item)
@@ -1061,7 +1057,7 @@ class GridLangCompiler:
                 eval_scope[key] = val
 
         string_pattern = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
-        ident_pattern = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*')
+        ident_pattern = re.compile(r'[A-Za-z][A-Za-z0-9_.]*')
 
         for raw_line in exec_lines:
             stripped = raw_line.strip()
@@ -1753,7 +1749,7 @@ class GridLangCompiler:
         constructor_match = None
         try:
             constructor_match = re.match(
-                r'new\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', str(expr), re.I)
+                r'new\s+([A-Za-z][A-Za-z0-9_]*)\s*\(', str(expr), re.I)
         except Exception:
             constructor_match = None
         inferred_type = (
@@ -1945,35 +1941,22 @@ class GridLangCompiler:
             scope_dict[var] = evaluated_value
         return 'bound'
 
-    def _builder_names(self):
-        """Return the set of builder names defined across all types.
-
-        Builder names are used bare in 'new Type(...) -> name(...)' chains,
-        so dependency extraction must not mistake them for variables.
-        """
-        names = set()
-        for t_def in self.types_defined.values():
-            if isinstance(t_def, dict):
-                names.update(k.lower() for k in (t_def.get('_builders') or {}).keys())
-        return names
-
     def _extract_identifier_tokens(self, expr):
         """Extract identifier-like tokens ignoring string literals and numeric literals."""
         if not expr:
             return set()
         cleaned = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', ' ', expr)
         # Remove builder-call names ('-> name(') so they are not treated as deps.
-        cleaned = re.sub(r'->\s*\$?[A-Za-z_][A-Za-z0-9_]*\s*\(', '(', cleaned)
+        cleaned = re.sub(r'->\s*\$?[A-Za-z][A-Za-z0-9_.]*\s*\(', '(', cleaned)
         # Remove member accesses like "obj.field" or "obj.method" to avoid
         # treating field/method names as standalone dependencies.
-        cleaned = re.sub(r'\.\s*[A-Za-z_][A-Za-z0-9_]*', ' ', cleaned)
-        tokens = re.findall(r'[A-Za-z_][A-Za-z0-9_]*', cleaned)
+        cleaned = re.sub(r'\.\s*[A-Za-z][A-Za-z0-9_]*', ' ', cleaned)
+        tokens = re.findall(r'[A-Za-z][A-Za-z0-9_]*', cleaned)
         filtered = set()
         keyword_exclusions = {
             'to', 'and', 'or', 'not', 'then', 'do', 'step', 'by', 'in', 'new', 'with',
             'true', 'false'
         }
-        builder_names = self._builder_names()
         for tok in tokens:
             if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', tok, re.I):
                 continue
@@ -1981,8 +1964,6 @@ class GridLangCompiler:
                 continue
             lower_tok = tok.lower()
             if lower_tok in keyword_exclusions:
-                continue
-            if lower_tok in builder_names:
                 continue
             if lower_tok in getattr(self, 'types_defined', {}):
                 continue
@@ -2662,7 +2643,7 @@ class GridLangCompiler:
                 continue
             if re.search(r'\bgrid\s+dim\b', lowered):
                 continue
-            var_match = re.match(r'^\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\b', stripped, re.I)
+            var_match = re.match(r'^\s*for\s+([A-Za-z][A-Za-z0-9_]*)\b', stripped, re.I)
             dim_match = re.search(r'\bdim\s+(\{[^}]+\})', stripped, re.I)
             if not (var_match and dim_match):
                 continue
@@ -3103,13 +3084,6 @@ class GridLangCompiler:
                     known_funcs = set(getattr(self, 'functions', {}).keys())
                     known_subs = set(getattr(self, 'subprocesses', {}).keys())
                     known_types = set(getattr(self, 'types_defined', {}).keys())
-                    builder_names = getattr(
-                        self, 'types_defined', {}).values()
-                    builder_names = {
-                        k.lower() for t_def in builder_names
-                        if isinstance(t_def, dict)
-                        for k in (t_def.get('_builders') or {})
-                    }
                     member_suffixes = {name.split('.', 1)[1]
                                        for name in known_funcs if '.' in name}
                     deps = set()
@@ -3121,7 +3095,7 @@ class GridLangCompiler:
                             continue
                         if dep_lower in known_funcs or dep_lower in known_subs or dep_lower in known_types:
                             continue
-                        if dep_lower in member_suffixes or dep_lower in builder_names:
+                        if dep_lower in member_suffixes:
                             continue
                         deps.add(dep)
             if var in deps:

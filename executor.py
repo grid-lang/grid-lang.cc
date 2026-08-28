@@ -11,7 +11,7 @@ from units import VALUE_ERROR, ConstraintError, error_value
 from utils import col_to_num, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array, strip_array_cell_indices, is_wildcard_address
 
 
-IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*')
+IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z][A-Za-z0-9_.]*')
 STRING_LITERAL_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 
 
@@ -19,7 +19,7 @@ def _strip_builder_arrows(text):
     """Remove builder-call names ('-> name(') so dependency extraction does not
     mistake builder names for variables. The arguments remain (they may carry
     real dependencies)."""
-    return re.sub(r'->\s*\$?[A-Za-z_][A-Za-z0-9_]*\s*\(', '(', text)
+    return re.sub(r'->\s*\$?[A-Za-z][A-Za-z0-9_.]*\s*\(', '(', text)
 DEPENDENCY_IGNORED_TOKENS = {
     'sum', 'rows', 'sqrt', 'min', 'max', 'abs', 'int', 'float', 'str', 'len',
     'textsplit', 'print', 'push', 'true', 'false', 'none', 'nan', 'inf', 'and', 'or', 'not',
@@ -52,9 +52,9 @@ def _strip_constraint_operands(expr):
     if not expr:
         return expr
     cleaned = STRING_LITERAL_PATTERN.sub(' ', str(expr))
-    cleaned = re.sub(r'\b(?:of|as)\s+[A-Za-z_][A-Za-z0-9_]*', ' ', cleaned)
+    cleaned = re.sub(r'\b(?:of|as)\s+[A-Za-z][A-Za-z0-9_.]*', ' ', cleaned)
     cleaned = re.sub(
-        r'\bdim\s+(?:\d+(?:\.\d*)?|nan|inf|[A-Za-z_][A-Za-z0-9_]*)',
+        r'\bdim\s+(?:\d+(?:\.\d*)?|[A-Za-z][A-Za-z0-9_.]*)',
         ' ', cleaned, flags=re.I)
     cleaned = re.sub(r'\bnot\s+null\b', ' ', cleaned, flags=re.I)
     return cleaned
@@ -225,7 +225,7 @@ class GridLangExecutor:
             if not name:
                 continue
             expanded.append(name)
-            base_match = re.match(r'([A-Za-z_][A-Za-z0-9_]*)', name)
+            base_match = re.match(r'([A-Za-z][A-Za-z0-9_]*)', name)
             if base_match:
                 base = base_match.group(1)
                 expanded.append(base)
@@ -546,11 +546,11 @@ class GridLangExecutor:
             defined_names = [name.strip()
                              for name in iterator_part.split(',') if name.strip()]
             index_match = re.search(
-                r'\bindex\s+([A-Za-z_][A-Za-z0-9_]*)\b', expr_part, re.I)
+                r'\bindex\s+([A-Za-z][A-Za-z0-9_.]*)\b', expr_part, re.I)
             if index_match:
                 index_name = index_match.group(1)
                 expr_part = re.sub(
-                    r'\bindex\s+[A-Za-z_][A-Za-z0-9_]*\b', '', expr_part, flags=re.I)
+                    r'\bindex\s+[A-Za-z][A-Za-z0-9_.]*\b', '', expr_part, flags=re.I)
             dependencies = self._extract_dependencies_from_expression(
                 expr_part)
         else:
@@ -798,7 +798,7 @@ class GridLangExecutor:
             return False
         # Disallow equality binding to a subprocess; require INIT instead
         call_match = re.match(
-            r'^([A-Za-z_][A-Za-z0-9_.]*)\\s*\\(.*\\)$', str(expr))
+            r'^([A-Za-z][A-Za-z0-9_.]*)\\s*\\(.*\\)$', str(expr))
         if call_match:
             call_name = call_match.group(1).lower()
             if hasattr(self, 'subprocesses') and call_name in getattr(self, 'subprocesses', {}):
@@ -825,7 +825,7 @@ class GridLangExecutor:
         inferred_type = type_name
         if not inferred_type:
             ctor_match = re.match(
-                r'new\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', str(expr), re.I)
+                r'new\s+([A-Za-z][A-Za-z0-9_]*)\s*\(', str(expr), re.I)
             if ctor_match:
                 inferred_type = ctor_match.group(1)
         if not inferred_type:
@@ -1274,7 +1274,7 @@ class GridLangExecutor:
         constructor_match = None
         try:
             constructor_match = re.match(
-                r'new\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', str(expr), re.I)
+                r'new\s+([A-Za-z][A-Za-z0-9_]*)\s*\(', str(expr), re.I)
         except Exception:
             constructor_match = None
         inferred_type = (
@@ -1671,7 +1671,7 @@ class GridLangExecutor:
                 values = []
         if not values:
             call_match = re.match(
-                r'^([A-Za-z_][A-Za-z0-9_.]*)\s*\((.*)\)$', str(init_expr))
+                r'^([A-Za-z][A-Za-z0-9_.]*)\s*\((.*)\)$', str(init_expr))
             if call_match:
                 call_name, call_args = call_match.groups()
                 args_list = self._split_call_arguments(
@@ -1697,7 +1697,7 @@ class GridLangExecutor:
 
     def _is_bare_subprocess_call(self, expr):
         call_match = re.match(
-            r'^\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\(.*\)\s*$',
+            r'^\s*([A-Za-z][A-Za-z0-9_.]*)\s*\(.*\)\s*$',
             str(expr),
             re.I,
         )
@@ -1790,7 +1790,7 @@ class GridLangExecutor:
         has_block = stripped_lower.endswith('do')
         index_fallback = None
         index_match_line = re.search(
-            r'\bindex\s+([A-Za-z_][A-Za-z0-9_]*)\b', var_def, re.I)
+            r'\bindex\s+([A-Za-z][A-Za-z0-9_.]*)\b', var_def, re.I)
         if index_match_line:
             index_fallback = index_match_line.group(1)
         var_list = []
@@ -1857,7 +1857,7 @@ class GridLangExecutor:
                 init_match = None
                 try:
                     init_match = re.match(
-                        r'^(.*)\s+index\s+([A-Za-z_][A-Za-z0-9_]*)\s*$', str(raw_init_expr), re.I)
+                        r'^(.*)\s+index\s+([A-Za-z][A-Za-z0-9_.]*)\s*$', str(raw_init_expr), re.I)
                 except Exception:
                     init_match = None
                 if init_match and not index_name:
@@ -3016,7 +3016,7 @@ class GridLangExecutor:
             init_expr = init_entry[2].get('init')
             values = []
             call_match = re.match(
-                r'^([A-Za-z_][A-Za-z0-9_.]*)\s*\((.*)\)$', str(init_expr))
+                r'^([A-Za-z][A-Za-z0-9_.]*)\s*\((.*)\)$', str(init_expr))
             if call_match and call_match.group(1).lower() in getattr(self, 'subprocesses', {}):
                 call_name, call_args = call_match.groups()
                 args_list = self._split_call_arguments(
@@ -3852,7 +3852,7 @@ class GridLangExecutor:
                             violations.append(var)
                 if not violations:
                     is_plain_var_target = re.match(
-                        r'^[A-Za-z_][A-Za-z0-9_]*$', target) is not None
+                        r'^[A-Za-z][A-Za-z0-9_.]*$', target) is not None
                     try:
                         if is_plain_var_target:
                             evaluated_value = self.expr_evaluator.eval_or_eval_array(
@@ -3874,7 +3874,7 @@ class GridLangExecutor:
                             self.array_handler.evaluate_line_with_assignment(
                                 line, line_number, scope.get_evaluation_scope())
                             rhs_simple = re.match(
-                                r'^[A-Za-z_]\w*$', rhs.strip())
+                                r'^[A-Za-z]\w*$', rhs.strip())
                             if rhs_simple and rhs_vars:
                                 for rv in rhs_vars:
                                     if rv.lower() not in (
@@ -3960,7 +3960,7 @@ class GridLangExecutor:
         except Exception as e:
             raise RuntimeError(
                 f"Error evaluating '{value}': {e} at line {line_number}")
-        if re.match(r'^[A-Za-z_]\w*$', value.strip()):
+        if re.match(r'^[A-Za-z]\w*$', value.strip()):
             rhs_var = value.strip()
             if rhs_var.lower() not in (self.functions or {}) and rhs_var.lower() not in (self.subprocesses or {}):
                 scope = self.current_scope()
@@ -4032,7 +4032,7 @@ class GridLangExecutor:
 
         if not type_name and isinstance(expr, str):
             ctor_match = re.match(
-                r'^\s*new\s+([A-Za-z_][A-Za-z0-9_]*)\s*$', expr, re.I)
+                r'^\s*new\s+([A-Za-z][A-Za-z0-9_]*)\s*$', expr, re.I)
             if ctor_match:
                 type_name = ctor_match.group(1).lower()
 
@@ -4357,7 +4357,7 @@ class GridLangExecutor:
         func_defs = getattr(self, 'functions', {}) or {}
         subprocess_defs = getattr(self, 'subprocesses', {}) or {}
 
-        call_pattern = re.compile(r'([A-Za-z_][A-Za-z0-9_.]*)\s*\(')
+        call_pattern = re.compile(r'([A-Za-z][A-Za-z0-9_.]*)\s*\(')
 
         def _find_calls(expr):
             calls = []
