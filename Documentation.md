@@ -90,12 +90,15 @@ Input name as text or = "World"
 Return $"Hello, {name}!"
 ```
 
-Now if the name cannot be read from the command parameters as text, its value becomes "World".
+Now the name has a default value you can select by pressing Enter.
 
 ```bash
 > grid helloworld.grid
+name [World]: 
 Hello, World!
 ```
+
+If the program has no interactive input and the name cannot be read from the command parameters as text, it becomes "World".
 
 ## The Grid
 
@@ -174,11 +177,11 @@ Edit _scratch.grid_ as follows:
 
 ```vb
 [A1] := "Cookie Sales"
-[A2:E2] := {"Sales Rep", "Region", "# Orders", "Total Sales", "Avg Order"}
-[A3:D3] := {"Frank", "West", 268, 72707}
-[A4:D4] := {"Harry", "North", 224, 41676}
-[A5:D5] := {"Janet", "North", 286, 87858}
-[A6:D6] := {"Martha", "East", 228, 49017}
+[A2] := {"Sales Rep", "Region", "# Orders", "Total Sales", "Avg Order"}
+[A3] := {"Frank", "West", 268, 72707}
+[A4] := {"Harry", "North", 224, 41676}
+[A5] := {"Janet", "North", 286, 87858}
+[A6] := {"Martha", "East", 228, 49017}
 [E3:E6] := @ [D] / [C]
 Return [E3]
 ```
@@ -191,8 +194,8 @@ Edit _scratch.grid_ to use a two-dimensional array:
 
 ```vb
 [A1] := "Cookie Sales"
-[A2:E2] := {"Sales Rep", "Region", "# Orders", "Total Sales", "Avg Order"}
-[A3:D6] := { _
+[A2] := {"Sales Rep", "Region", "# Orders", "Total Sales", "Avg Order"}
+[A3] := { _
   "Frank", "West", 268, 72707; _
   "Harry", "North", 224, 41676; _
   "Janet", "North", 286, 87858; _
@@ -215,18 +218,28 @@ Define CookieSales as Type
   : Total as Number
   : Average = Total / Orders
 End CookieSales
+```
 
+Here is a sample use of that custom type:
+
+```vb
+Return new CookieSales with (SalesRep = "Frank", Region = "West", Orders = 268, Total = 72707)
+```
+
+There is a shorter version of the object creation code which we use below.
+
+```vb
 [A1] := "Cookie Sales"
-[A2:E2] := {"Sales Rep", "Region", "# Orders", "Total Sales", "Avg Order"}
+[A2] := {"Sales Rep", "Region", "# Orders", "Total Sales", "Avg Order"}
 [^A3] := { _
-  new CookieSales with (SalesRep = "Frank", Region = "West", Orders = 268, Total = 72707), _
-  new CookieSales with (SalesRep = "Harry", Region = "North", Orders = 224, Total = 41676), _
-  new CookieSales with (SalesRep = "Janet", Region = "North", Orders = 286, Total = 87858), _
-  new CookieSales with (SalesRep = "Martha", Region = "East", Orders = 228, Total = 49017)}
+  new CookieSales with {"Frank", "West", 268, 72707}, _
+  new CookieSales with {"Harry", "North", 224, 41676}, _
+  new CookieSales with {"Janet", "North", 286, 87858}, _
+  new CookieSales with {"Martha", "East", 228, 49017}}
 Return [E3]
 ```
 
-The hat `^` before an address indicates the top-left corner of a range.
+The hat `^` before an address indicates the start of a range.
 The fields of each object are distributed in the cells of a row, which means the grid contents remain the same as before.
 
 The average value is calculated using a formula. You can try adding more calculated fields to the type.
@@ -245,15 +258,6 @@ Define CookieSales as Type
   : Total as Number of Dollar >= 0
   : Average = Total / Orders
 End CookieSales
-
-[A1] := "Cookie Sales"
-[A2:E2] := {"Sales Rep", "Region", "# Orders", "Total Sales", "Avg Order"}
-[^A3] := { _
-  new CookieSales with (SalesRep = "Frank", Region = "West", Orders = 268, Total = 72707), _
-  new CookieSales with (SalesRep = "Harry", Region = "North", Orders = 224, Total = 41676), _
-  new CookieSales with (SalesRep = "Janet", Region = "North", Orders = 286, Total = 87858), _
-  new CookieSales with (SalesRep = "Martha", Region = "East", Orders = 228, Total = 49017)}
-Return [E3]
 ```
 
 Note that two numbers must use the same unit if you want to add them together.
@@ -265,7 +269,17 @@ Define Credit as Type(Number) of Dollar >= 0
 End Credit
 ```
 
-Now 'Credit' can be used instead of 'Number' in the field declaration and its constraints will be automatically applied to the field.
+Now 'Credit' can be used instead of 'Number' in the field declaration and its constraints will be automatically applied to the field:
+
+```vb
+Define CookieSales as Type
+  : SalesRep as Text not null
+  : Region as Text
+  : Orders as Number in 1 to 10000
+  : Total as Credit
+  : Average = Total / Orders
+End CookieSales
+```
 
 ## Named Variables
 
