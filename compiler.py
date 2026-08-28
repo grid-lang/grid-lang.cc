@@ -9,8 +9,8 @@ from array_handler import ArrayHandler
 from utils import col_to_num, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT, is_sparse_array, strip_array_cell_indices
 from scope import Scope, _GridStore
 from units import (
-    UNIT_ERROR, UNIVERSAL_ZERO, UnitValue, error_value, is_error_value,
-    strip_units,
+    UNIT_ERROR, UNIVERSAL_ZERO, UnitValue, ConstraintError, error_value,
+    is_error_value, strip_units,
 )
 from control_flow import GridLangControlFlow
 from type_processor import GridLangTypeProcessor, split_builder_chain
@@ -1042,7 +1042,13 @@ class GridLangCompiler:
                 if not str(k).startswith('_'):
                     tmp_scope.variables[k] = v
         tmp_scope.constraints[actual_key] = constraints
-        tmp_scope._check_constraints(actual_key, value, line_number)
+        try:
+            tmp_scope._check_constraints(actual_key, value, line_number)
+        except ConstraintError:
+            if isinstance(value_dict, dict):
+                value_dict['_with_conflict'] = True
+            else:
+                raise
 
     def _apply_with_clause(self, value, with_kind, with_payload, scope, line_number=None, type_name=None):
         """Apply a parsed WITH clause (kind, payload) to a constructed object.
