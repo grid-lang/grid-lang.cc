@@ -725,7 +725,7 @@ class GridLangCompiler:
             matrix[r - 1][c - 1] = val
         return matrix
 
-    def _instantiate_type(self, type_name, args, line_number, allow_default_if_empty=False, var_name=None, execute_code=True):
+    def _instantiate_type(self, type_name, args, line_number, allow_default_if_empty=False, var_name=None, execute_code=True, input_values_out=None):
         """Create an instance dict for a user-defined type, honoring inputs and constructor code."""
         type_def = self.types_defined[type_name.lower()]
         public_fields = self._get_public_type_fields(type_def)
@@ -787,6 +787,9 @@ class GridLangCompiler:
             hidden_fields = type_def.get('_hidden_fields', set())
             if hidden_fields:
                 value_dict['_hidden_fields'] = set(hidden_fields)
+            if input_values_out is not None:
+                input_values_out.clear()
+                input_values_out.update(input_values)
             self._init_instance_grid(value_dict, type_def, line_number)
             if exec_lines and execute_code:
                 self._execute_type_code(
@@ -829,6 +832,9 @@ class GridLangCompiler:
         hidden_fields = type_def.get('_hidden_fields', set())
         if hidden_fields:
             value_dict['_hidden_fields'] = set(hidden_fields)
+        if input_values_out is not None:
+            input_values_out.clear()
+            input_values_out.update(input_values)
         self._init_instance_grid(value_dict, type_def, line_number)
         if exec_lines and execute_code:
             # Track immutability for fields derived from inputs
@@ -999,6 +1005,11 @@ class GridLangCompiler:
             if type_name:
                 self._check_type_field_constraints(
                     type_name, key_name, value[key_name], value, scope, line_number)
+        # Remember precisely which fields the WITH clause set, so constructor
+        # code that runs afterwards does not overwrite them. The marker is
+        # removed once the constructor body has executed.
+        marker = value.setdefault('_with_applied_fields', set())
+        marker.update(assigned_fields)
         if type_name and type_name.lower() in self.types_defined:
             self._recompute_type_fields_after_with(
                 type_name, value, scope, line_number)
@@ -1032,6 +1043,85 @@ class GridLangCompiler:
                     tmp_scope.variables[k] = v
         tmp_scope.constraints[actual_key] = constraints
         tmp_scope._check_constraints(actual_key, value, line_number)
+
+    def _apply_with_clause(self, value, with_kind, with_payload, scope, line_number=None, type_name=None):
+        """Apply a parsed WITH clause (kind, payload) to a constructed object.
+
+        The constructor has already run: only public fields are overwritten.
+        Clone sources may be a single custom-type instance or an (nested)
+        array of instances; arrays yield equally-shaped arrays of clones.
+        """
+        if with_kind == 'named':
+            return self._apply_with_constraints(
+                value, with_payload, scope, line_number, type_name)
+        if with_kind == 'positional':
+            fields = self._get_public_type_fields(type_name) if type_name and type_name.lower(
+            ) in self.types_defined else {}
+            names = list(fields.keys()) or [
+                k for k in object_public_keys(value)]
+            if len(with_payload) > len(names):
+                raise ValueError(
+                    f"Too many values in WITH clause for '{type_name or 'object'}' "
+                    f"at line {line_number}")
+            named = {}
+            for i, raw in enumerate(with_payload):
+                if i < len(names):
+                    named[names[i]] = raw
+            return self._apply_with_constraints(
+                value, named, scope, line_number, type_name)
+        if with_kind == 'clone':
+            source = self.expr_evaluator.eval_or_eval_array(
+                with_payload, scope, line_number)
+            return self._clone_object_fields(
+                value, source, type_name, scope, line_number)
+        return value
+
+    def _clone_object_fields(self, template, source, type_name, scope, line_number=None):
+        """Copy a source object's public fields onto fresh instance(s)."""
+        # An array variable bound by ``For`` is stored as a coordinate-keyed
+        # dict (e.g. {(0,): obj, (1,): obj}); accept that shape as an array of
+        # source instances.
+        if isinstance(source, dict) and source:
+            keys = list(source.keys())
+            if all(isinstance(k, (int, tuple)) for k in keys):
+                source = [source[k] for k in sorted(keys)]
+        if isinstance(source, (list, tuple)):
+            return [self._clone_object_fields(
+                template, elem, type_name, scope, line_number) for elem in source]
+        if not isinstance(source, dict):
+            raise TypeError(
+                f"Clone source must be an instance or an array of instances "
+                f"at line {line_number}")
+        fields = self._get_public_type_fields(type_name) if type_name and type_name.lower(
+        ) in self.types_defined else {}
+        names = list(fields.keys()) or [
+            k for k in object_public_keys(source)]
+        src_map = {
+            str(k).lower(): v for k, v in source.items()
+            if not str(k).startswith('_') and str(k) != 'grid'}
+        named = {}
+        for name in names:
+            raw = src_map.get(str(name).lower())
+            if raw is None:
+                continue
+            named[name] = raw
+        target = copy.deepcopy(template)
+        return self._apply_with_constraints(
+            target, named, scope, line_number, type_name)
+
+    def _with_deps(self, with_text, line_number=None):
+        """Dependency identifiers referenced by the value side of a WITH clause."""
+        with_kind, with_payload = self._parse_with_clause(with_text, line_number)
+        deps = set()
+        if with_kind == 'named':
+            for raw in (with_payload or {}).values():
+                deps |= self._extract_identifier_tokens(raw)
+        elif with_kind == 'positional':
+            for raw in (with_payload or []):
+                deps |= self._extract_identifier_tokens(raw)
+        elif with_kind == 'clone':
+            deps |= self._extract_identifier_tokens(with_payload)
+        return deps
 
     def _recompute_type_fields_after_with(self, type_name, value, scope, line_number=None):
         type_def = self.types_defined.get(type_name.lower())
@@ -1083,18 +1173,8 @@ class GridLangCompiler:
                 expr, eval_scope, line_number)
             eval_scope[field_name] = value[field_name]
 
-    def _parse_with_clause(self, with_text, line_number=None):
-        """Parse a WITH clause body into key/value expression pairs."""
-        if not with_text:
-            return {}
-        text = with_text.strip()
-        if text.lower().startswith('with'):
-            text = text[4:].strip()
-        if text.startswith('(') and text.endswith(')'):
-            text = text[1:-1].strip()
-        if not text:
-            return {}
-
+    def _split_with_parts(self, text):
+        """Split a WITH clause body into top-level comma-separated parts."""
         parts = []
         current = ""
         in_quotes = False
@@ -1118,9 +1198,12 @@ class GridLangCompiler:
                 current = ""
             else:
                 current += char
+        return parts
 
+    def _split_named_with_parts(self, text):
+        """Split named 'key = value' WITH entries into a {field: expr} dict."""
         assignments = {}
-        for part in parts:
+        for part in text:
             if '=' in part:
                 key, value = part.split('=', 1)
                 assignments[key.strip()] = value.strip()
@@ -1129,6 +1212,33 @@ class GridLangCompiler:
                 if name:
                     assignments[name] = name
         return assignments
+
+    def _parse_with_clause(self, with_text, line_number=None):
+        """Parse a WITH clause body.
+
+        Returns a (kind, payload) tuple:
+          ('named', {field: expr, ...})  -- 'with (a = 1, b = foo)' or 'with a, b'
+          ('positional', [expr, ...])    -- 'with {1, 2, dx}'
+          ('clone', expr_str)            -- 'with identifier' (clone source)
+          ('empty', None)                -- blank clause
+        """
+        if not with_text:
+            return 'empty', None
+        text = with_text.strip()
+        if text.lower().startswith('with'):
+            text = text[4:].strip()
+        if not text:
+            return 'empty', None
+        if text.startswith('(') and text.endswith(')'):
+            return 'named', self._split_named_with_parts(
+                self._split_with_parts(text[1:-1].strip()))
+        if text.startswith('{') and text.endswith('}'):
+            inner = text[1:-1].strip()
+            return 'positional', self._split_with_parts(inner)
+        parts = self._split_with_parts(text)
+        if len(parts) == 1 and '=' not in parts[0]:
+            return 'clone', parts[0]
+        return 'named', self._split_named_with_parts(parts)
 
     def _split_new_with_expr(self, expr):
         """Split a 'new Type ... with (...)' expression into base and with clause."""
@@ -2932,7 +3042,8 @@ class GridLangCompiler:
         if values_str is None:
             raise SyntaxError(
                 f"Unclosed constructor for '{type_name}' at line {line_number}: {declaration}")
-        with_assignments = {}
+        with_kind = 'empty'
+        with_payload = None
         chain_text = None
         if trailing:
             pre_trailing, chain_text = split_builder_chain(trailing)
@@ -2940,7 +3051,7 @@ class GridLangCompiler:
                 trailing = pre_trailing.strip()
             if trailing:
                 if trailing.lower().startswith('with'):
-                    with_assignments = self._parse_with_clause(
+                    with_kind, with_payload = self._parse_with_clause(
                         trailing, line_number=line_number)
                 else:
                     raise SyntaxError(
@@ -2975,15 +3086,33 @@ class GridLangCompiler:
         inputs_list = type_fields.get('_inputs', [])
         _ = len(inputs_list) if inputs_list else len(actual_fields)
         if not values and values_str.strip() == '':
+            with_input_values = {}
             value_dict = self._instantiate_type(
-                type_name, [], line_number, allow_default_if_empty=True, var_name=var)
-            if with_assignments:
-                value_dict = self._apply_with_constraints(
-                    value_dict,
-                    with_assignments,
+                type_name, [], line_number, allow_default_if_empty=True, var_name=var,
+                execute_code=False, input_values_out=with_input_values)
+            if with_kind != 'empty':
+                value_dict = self._apply_with_clause(
+                    value_dict, with_kind, with_payload,
                     self.current_scope().get_full_scope(),
-                    line_number,
-                    type_name=type_name)
+                    line_number, type_name=type_name)
+            exec_lines = type_fields.get('_executable_code', []) or []
+            if isinstance(value_dict, list):
+                for idx, elem in enumerate(value_dict):
+                    if isinstance(elem, dict):
+                        self.type_processor._execute_type_code(
+                            exec_lines, var, elem, line_number, with_input_values)
+                        if elem.pop('_with_conflict', False):
+                            value_dict[idx] = '#VALUE'
+                self.current_scope().define(
+                    var, value_dict, type_name, {}, is_uninitialized=False)
+                return True
+            # Constructor code runs after the WITH clause, so WITH values act
+            # as constraints on the fields the constructor computes.
+            self.type_processor._execute_type_code(
+                exec_lines, var, value_dict, line_number, with_input_values)
+            if value_dict.pop('_with_conflict', False):
+                self.current_scope().define(var, '#VALUE', type_name, {})
+                return True
             if chain_text:
                 value_dict = self.type_processor._apply_builder_chain(
                     value_dict, chain_text,
@@ -2997,20 +3126,41 @@ class GridLangCompiler:
                            for v in values)
         evaluated_args = [self.expr_evaluator.eval_expr(
             value, self.current_scope().get_full_scope(), line_number) for value in values]
+        with_input_values = {}
         value_dict = self._instantiate_type(
-            type_name, evaluated_args, line_number, allow_default_if_empty=False, var_name=var)
-        if with_assignments:
-            value_dict = self._apply_with_constraints(
-                value_dict,
-                with_assignments,
+            type_name, evaluated_args, line_number, allow_default_if_empty=False, var_name=var,
+            execute_code=False, input_values_out=with_input_values)
+        if with_kind != 'empty':
+            value_dict = self._apply_with_clause(
+                value_dict, with_kind, with_payload,
                 self.current_scope().get_full_scope(),
-                line_number,
-                type_name=type_name)
+                line_number, type_name=type_name)
+        exec_lines = type_fields.get('_executable_code', []) or []
+        if isinstance(value_dict, list):
+            for idx, elem in enumerate(value_dict):
+                if isinstance(elem, dict):
+                    self.type_processor._execute_type_code(
+                        exec_lines, var, elem, line_number, with_input_values)
+                    if elem.pop('_with_conflict', False):
+                        value_dict[idx] = '#VALUE'
+            self.current_scope().define(
+                var, value_dict, type_name, {}, is_uninitialized=False)
+            return True
+        # Constructor code runs after the WITH clause, so WITH values act as
+        # constraints on the fields the constructor computes.
+        self.type_processor._execute_type_code(
+            exec_lines, var, value_dict, line_number, with_input_values)
+        if value_dict.pop('_with_conflict', False):
+            self.current_scope().define(var, '#VALUE', type_name, {})
+            return True
         if not all_literals:
             # Deferred: keep the chain in the stored expression so re-resolution
             # applies it exactly once; do NOT apply it eagerly here.
             pending_expr = f"new {type_name}{{{values_str}}}"
             deps = self._extract_identifier_tokens(values_str)
+            if with_kind != 'empty' and trailing:
+                pending_expr += ' ' + trailing
+                deps |= self._with_deps(trailing)
             if chain_text:
                 pending_expr += ' ' + chain_text
                 deps |= self._extract_identifier_tokens(chain_text)
@@ -3058,10 +3208,8 @@ class GridLangCompiler:
         if expr:
             base_expr, with_text = self._split_new_with_expr(expr)
             if with_text:
-                with_assignments = self._parse_with_clause(with_text, line_number)
-                deps = set()
-                for value_expr in with_assignments.values():
-                    deps |= self._extract_identifier_tokens(value_expr)
+                deps = self._with_deps(with_text, line_number)
+                deps |= self._extract_identifier_tokens(base_expr or '')
             else:
                 deps = set()
                 interpolation_only = False

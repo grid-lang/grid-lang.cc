@@ -31,12 +31,20 @@ class GridLangParser:
         if direct_match is not None:
             return direct_match
 
-        # Extract 'with' clause early to preserve parentheses
+        # Extract 'with' clause early to preserve parentheses (the keyword
+        # splitter would otherwise break '=' inside the parentheses). For
+        # 'new Type with (...)' constructions the WITH is folded back into
+        # the expression so the evaluator applies construction, the WITH
+        # values and any trailing builder chain in the correct order.
         with_content_str = None
-        with_match = re.search(r'\s+with\s+(\(.*\))', def_str, re.I)
+        is_new_with = False
+        with_match = self._find_with_clause_balanced(def_str)
         if with_match:
-            with_content_str = with_match.group(1)
-            def_str = def_str[:with_match.start()] + def_str[with_match.end():]
+            span_start, open_idx, close_idx = with_match
+            with_content_str = def_str[open_idx:close_idx + 1]
+            is_new_with = bool(re.match(
+                r'^.*\bnew\s+[\w.]+\s*$', def_str[:span_start], re.I | re.S))
+            def_str = def_str[:span_start] + def_str[close_idx + 1:]
 
         # Split on keywords (as, of, dim, in, <=, >=, <, >, =) while ignoring quoted text
         parts = self._split_on_keywords(def_str)
@@ -200,11 +208,25 @@ class GridLangParser:
                     expr = next_part
             i += 2
 
-        self._apply_with_clause(
-            with_content_str,
-            constraints,
-            line_number,
-        )
+        if is_new_with and expr is not None:
+            # Fold the WITH clause back into the expression so the
+            # evaluator constructs the object, applies the WITH values and
+            # then any builder chain, in that order.
+            base_part = str(expr).strip()
+            chain_part = ''
+            idx = base_part.find('->')
+            if idx != -1:
+                chain_part = base_part[idx:].strip()
+                base_part = base_part[:idx].strip()
+            expr = f"{base_part} with {with_content_str}"
+            if chain_part:
+                expr += ' ' + chain_part
+        else:
+            self._apply_with_clause(
+                with_content_str,
+                constraints,
+                line_number,
+            )
 
         self._apply_dimension_constraints(
             dims,
@@ -222,6 +244,36 @@ class GridLangParser:
         self._merge_custom_type_constraints(type_name, constraints)
 
         return var, type_name, constraints, expr
+
+    def _find_with_clause_balanced(self, def_str):
+        """Locate a top-level WITH ( ... ) clause spanning balanced parens.
+
+        Returns (span_start, open_idx, close_idx) covering the whole
+        ' with (...)' text, or None. Stops at the first balanced close so
+        trailing builder chains are never swallowed.
+        """
+        m = re.search(r'\s+with\s+(?=\()', def_str, re.I)
+        if not m:
+            return None
+        start = m.end()
+        depth = 0
+        in_text = None
+        for i in range(start, len(def_str)):
+            ch = def_str[i]
+            if in_text:
+                if ch == in_text and (i == 0 or def_str[i - 1] != '\\'):
+                    in_text = None
+                continue
+            if ch in ('"', "'"):
+                in_text = ch
+                continue
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    return (m.start(), start, i)
+        return None
 
     def _check_comparison_series(self, parts, i, line_number):
         """Require 'and' between comparison operators used in series.

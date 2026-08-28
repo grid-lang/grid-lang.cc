@@ -75,6 +75,7 @@ class GridLangTypeProcessor:
             'field_constraints': {},
             'computed_fields': {},
             'init_fields': set(),
+            'default_fields': set(),
         }
 
     def _parse_type_def(self, lines, line_number=None):
@@ -160,17 +161,35 @@ class GridLangTypeProcessor:
         return None
 
     def _split_type_field_initializer(self, field_line):
-        """Separate a field declaration from its init/default expression."""
+        """Separate a field declaration from its init/default expression.
+
+        ``or =`` provides a *default* value applied only when the field has no
+        value set yet (e.g. by a ``with`` clause); ``init`` pushes an active
+        initial value into the field.
+        """
         init_expr = None
+        kind = None
         default_match = re.search(r'\bor\s*=\s*(.+)$', field_line, re.I)
         if default_match:
             init_expr = default_match.group(1).strip()
+            kind = 'or_default'
             field_line = field_line[:default_match.start()].strip()
         init_match = re.search(r'\binit\b', field_line, re.I)
         if init_match:
             init_expr = field_line[init_match.end():].strip()
+            kind = 'init'
             field_line = field_line[:init_match.start()].strip()
-        return field_line, init_expr
+        if init_expr is None:
+            # Typed inline initialization: ``: x as number = in_x`` assigns an
+            # active initial value (equivalent to ``init in_x``), distinct from
+            # the inert ``or =`` default.
+            as_pos = re.search(r'\bas\s', field_line, re.I)
+            eq_pos = field_line.find('=')
+            if as_pos and eq_pos > as_pos.end():
+                init_expr = field_line[eq_pos + 1:].strip()
+                kind = 'init'
+                field_line = field_line[:eq_pos].strip()
+        return field_line, init_expr, kind
 
     def _parse_type_field_constraints(self, field_line, line_number, type_name):
         """Parse field constraints with the compiler parser when available."""
@@ -190,7 +209,8 @@ class GridLangTypeProcessor:
 
     def _parse_type_field_definition(self, line, field_line, line_number):
         """Parse one field declaration line into normalized metadata."""
-        field_line, init_expr = self._split_type_field_initializer(field_line)
+        field_line, init_expr, init_kind = self._split_type_field_initializer(
+            field_line)
         match = re.match(
             r'^(\$?[A-Za-z][\w_]*(?:\s*,\s*\$?[A-Za-z][\w_.]*)*)', field_line)
         if not match:
@@ -204,6 +224,7 @@ class GridLangTypeProcessor:
         return {
             'field_line': field_line,
             'init_expr': init_expr,
+            'init_kind': init_kind,
             'var_names': var_names,
             'effective_type': effective_type,
             'parsed_constraints': self._parse_type_field_constraints(
@@ -211,7 +232,7 @@ class GridLangTypeProcessor:
         }
 
     def _record_type_field_definition(self, state, line, field_line, lowered, line_number):
-        """Apply one parsed field declaration to the type-definition state."""
+        """Apply one parsed field definition to the type-definition state."""
         parsed_field = self._parse_type_field_definition(
             line, field_line, line_number)
         for name in parsed_field['var_names']:
@@ -226,6 +247,8 @@ class GridLangTypeProcessor:
                 state['executable_code'].append(
                     f"{clean_name} = {parsed_field['init_expr']}")
                 state['init_fields'].add(clean_name.lower())
+                if parsed_field['init_kind'] == 'or_default':
+                    state['default_fields'].add(clean_name.lower())
         # Allow constructor-style assignments (e.g., ": x = in_x") to execute.
         if (re.search(r'^\$?[A-Za-z][\w_.]*\s*=', parsed_field['field_line']) and
                 'or =' not in lowered):
@@ -258,6 +281,8 @@ class GridLangTypeProcessor:
             fields['_computed_fields'] = state['computed_fields']
         if state['init_fields']:
             fields['_init_fields'] = state['init_fields']
+        if state['default_fields']:
+            fields['_default_fields'] = state['default_fields']
         fields['_member_keys'] = {k.lower() for k in state['fields'].keys()
                                    if not str(k).startswith('_')}
         return fields
@@ -306,8 +331,10 @@ class GridLangTypeProcessor:
                 type_def = self.compiler.types_defined.get(
                     str(inferred_type).lower(), {}) or {}
             init_fields = set(type_def.get('_init_fields', set()))
+            default_fields = set(type_def.get('_default_fields', set()))
             self._execute_type_block(
-                code_lines, value_dict, input_values, line_number, init_fields)
+                code_lines, value_dict, input_values, line_number, init_fields,
+                default_fields=default_fields)
         except Exception as e:
             raise
         finally:
@@ -316,10 +343,14 @@ class GridLangTypeProcessor:
             self.compiler._allow_hidden_field_access = prev_hidden_access
             self.compiler._allow_hidden_member_calls = prev_hidden_member_calls
             self.compiler.pop_scope()
+            if isinstance(value_dict, dict):
+                # The WITH marker only matters while the constructor body runs.
+                value_dict.pop('_with_applied_fields', None)
 
-    def _execute_type_block(self, code_lines, value_dict, input_values, line_number, init_fields=None):
+    def _execute_type_block(self, code_lines, value_dict, input_values, line_number, init_fields=None, default_fields=None):
         """Execute a list of type code lines within the current scope."""
         init_fields = init_fields or set()
+        default_fields = default_fields or set()
         i = 0
         while i < len(code_lines):
             code_line = code_lines[i]
@@ -351,7 +382,8 @@ class GridLangTypeProcessor:
                     value_expr = target
                 assign_line = f"{target} = {value_expr}"
                 self._process_type_assignment(
-                    assign_line, value_dict, input_values, line_number, init_fields)
+                    assign_line, value_dict, input_values, line_number, init_fields,
+                    default_fields=default_fields)
                 i += 1
                 continue
             if (re.match(r'^for\b', stripped_line, re.I)
@@ -438,13 +470,15 @@ class GridLangTypeProcessor:
                 if init_m:
                     colon_line = f"{init_m.group(1)} = {init_m.group(2)}"
                 self._process_type_assignment(
-                    colon_line, value_dict, input_values, line_number, init_fields)
+                    colon_line, value_dict, input_values, line_number, init_fields,
+                    default_fields=default_fields)
                 i += 1
                 continue
             if '=' in stripped_line:
                 # Simple assignment inside constructor (e.g., x = in_x)
                 self._process_type_assignment(
-                    stripped_line, value_dict, input_values, line_number, init_fields)
+                    stripped_line, value_dict, input_values, line_number, init_fields,
+                    default_fields=default_fields)
                 i += 1
                 continue
             if stripped_line.lower().startswith('end'):
@@ -839,9 +873,28 @@ class GridLangTypeProcessor:
                 chosen, value_dict, input_values, line_number)
         return scan_i + 1
 
-    def _process_type_assignment(self, line, value_dict, input_values, line_number, init_fields=None):
+    def _with_value_matches(self, a, b):
+        """True when a WITH-applied value and a constructor-computed value agree."""
+        if isinstance(a, bool) or isinstance(b, bool):
+            return a == b
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return a == b
+        if isinstance(a, list) and isinstance(b, list):
+            return len(a) == len(b) and all(
+                self._with_value_matches(x, y) for x, y in zip(a, b))
+        if isinstance(a, dict) and isinstance(b, dict):
+            pub_a = {k: v for k, v in a.items() if not str(k).startswith('_')}
+            pub_b = {k: v for k, v in b.items() if not str(k).startswith('_')}
+            return pub_a.keys() == pub_b.keys() and all(
+                self._with_value_matches(pub_a[k], pub_b[k]) for k in pub_a)
+        if a is None or b is None:
+            return a is None and b is None
+        return a == b
+
+    def _process_type_assignment(self, line, value_dict, input_values, line_number, init_fields=None, default_fields=None):
         """Handle assignments inside type definitions (e.g., x = in_x)."""
         init_fields = init_fields or set()
+        default_fields = default_fields or set()
 
         def _coerce_field_value(field_name, raw_value):
             if not isinstance(value_dict, dict):
@@ -956,6 +1009,22 @@ class GridLangTypeProcessor:
         scope = self._build_type_eval_scope(value_dict, input_values)
         value = self.compiler.expr_evaluator.eval_or_eval_array(
             value_expr.strip(), scope, line_number)
+        applied_fields = value_dict.get('_with_applied_fields')
+        applied_fields = applied_fields if isinstance(applied_fields, (set, list, tuple)) else set()
+        if (actual_field.lower() in applied_fields
+                and actual_field in value_dict
+                and value_dict[actual_field] is not None):
+            if actual_field.lower() in default_fields:
+                # ``or =`` provides a default only when no value has been set
+                # for the variable yet (e.g. by a ``with`` clause). Keep the
+                # applied value.
+                return
+            # A ``with`` clause value acts as a constraint on the field: the
+            # constructor still computes its value, but a disagreement with the
+            # applied value makes the whole constructed value a #VALUE error.
+            if not self._with_value_matches(value, value_dict[actual_field]):
+                value_dict['_with_conflict'] = True
+                return
         if actual_field.lower() in init_fields:
             try:
                 value = copy.deepcopy(value)

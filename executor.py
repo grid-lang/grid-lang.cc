@@ -3677,6 +3677,23 @@ class GridLangExecutor:
             'match': m,
         }
 
+    def _compute_assignment_deps(self, expr):
+        """Dependencies for an assignment RHS, WITH-aware.
+
+        For 'new Type ... with ...' expressions only the constructor
+        argument variables and the with-clause VALUE expressions are
+        dependencies; field names and the type name are not.
+        """
+        compiler = getattr(self, 'compiler', None)
+        if compiler is not None:
+            base_expr, with_text = compiler._split_new_with_expr(expr)
+            if with_text:
+                deps = compiler._with_deps(with_text)
+                deps |= compiler._extract_identifier_tokens(base_expr or '')
+                return deps
+        return _filter_var_tokens(
+            set(re.findall(r'\b[\w_]+\b', _strip_builder_arrows(expr))))
+
     def _handle_main_loop_post_for_branches(self, lines, i, line, line_number, stripped, stripped_lower):
         if stripped_lower.startswith("if "):
             if_block = None
@@ -3705,8 +3722,7 @@ class GridLangExecutor:
             var_def, expr = map(str.strip, line[1:].split("=", 1))
             var, type_name, constraints, value = self._parse_variable_def(
                 var_def, line_number)
-            deps = _filter_var_tokens(
-                set(re.findall(r'\b[\w_]+\b', _strip_builder_arrows(expr))))
+            deps = self._compute_assignment_deps(expr)
             if not deps:
                 try:
                     evaluated_value = self.expr_evaluator.eval_expr(

@@ -997,35 +997,61 @@ class ExpressionEvaluator:
             if split_pos is not None:
                 base_expr = expr[:split_pos].strip()
                 with_text = expr[split_pos:].strip()
-                bare_new_match = re.match(r'^new\s+(\w+)\s*$', base_expr, re.I)
-                if bare_new_match:
-                    type_name = bare_new_match.group(1)
+                new_ctor_match = re.match(
+                    r'^new\s+(\w+)\s*(?:\(([^)]*)\))?\s*$', base_expr, re.I)
+                if new_ctor_match:
+                    type_name = new_ctor_match.group(1)
+                    with_input_values = {}
+                    args_text = (new_ctor_match.group(2) or '').strip()
+                    evaluated_args = []
+                    if args_text:
+                        for raw in self._split_new_args(args_text, base_expr):
+                            evaluated_args.append(
+                                self.expr_evaluator.eval_or_eval_array(
+                                    raw, scope, line_number))
                     base_value = self.compiler._instantiate_type(
-                        type_name, [], line_number,
-                        allow_default_if_empty=True, execute_code=False)
+                        type_name, evaluated_args, line_number,
+                        allow_default_if_empty=not evaluated_args,
+                        execute_code=False, input_values_out=with_input_values)
                 else:
+                    # Non-`new` base expression: the object already exists, so
+                    # just apply WITH and drop the applied-fields marker.
+                    with_input_values = None
                     base_value = self.eval_expr(base_expr, scope, line_number)
                 if not isinstance(base_value, dict):
                     raise TypeError(
                         f"WITH can only be applied to object instances at line {line_number}")
-                type_match = re.match(r'^new\s+(\w+)', base_expr, re.I)
-                type_name = type_match.group(1) if type_match else None
-                with_assignments = self.compiler._parse_with_clause(
+                with_kind, with_payload = self.compiler._parse_with_clause(
                     with_text, line_number)
-                result = self.compiler._apply_with_constraints(
-                    base_value, with_assignments, scope, line_number,
+                result = self.compiler._apply_with_clause(
+                    base_value, with_kind, with_payload, scope, line_number,
                     type_name=type_name)
-                # Run the type's constructor code after WITH values are
-                # applied, so the instance's grid (and any derived fields)
-                # are populated. _instantiate_type skipped it above.
+                # The WITH clause applies constraints first; the constructor
+                # code then runs (with its input values) and must agree with
+                # the constrained fields or the whole value becomes #VALUE.
+                # Every `new` base is constructed here with execute_code=False
+                # so the code runs in the right order.
                 if type_name and type_name.lower() in self.compiler.types_defined:
                     type_def = self.compiler.types_defined[type_name.lower()]
                     exec_lines = type_def.get('_executable_code', []) if isinstance(
                         type_def, dict) else []
-                    if exec_lines:
-                        self.compiler._execute_type_code(
-                            exec_lines, type_name.lower(), result,
-                            line_number, {})
+                    elements = result if isinstance(result, list) else [result]
+                    for idx, elem in enumerate(elements):
+                        if not isinstance(elem, dict):
+                            continue
+                        if with_input_values is not None:
+                            self.compiler._execute_type_code(
+                                exec_lines, type_name.lower(), elem,
+                                line_number, with_input_values)
+                            if elem.pop('_with_conflict', False):
+                                # A constructor field disagreed with a WITH
+                                # constraint: the whole value is a #VALUE error.
+                                if isinstance(result, list):
+                                    result[idx] = '#VALUE'
+                                else:
+                                    result = '#VALUE'
+                        else:
+                            elem.pop('_with_applied_fields', None)
                 return True, result
 
         bare_new_match = re.match(r'^new\s+(\w+)\s*$', expr)
@@ -1098,6 +1124,31 @@ class ExpressionEvaluator:
         raise ValueError(
             f"Type '{type_name}' not defined at line {line_number}")
 
+    def _split_new_args(self, args_text, expr, line_number=None):
+        """Split a constructor argument list on top-level commas (nest-aware)."""
+        pairs = {'{': '}', '(': ')'}
+        args_list = []
+        current_arg = ""
+        nest_stack = []
+        for char in args_text + ',':
+            if char == ',' and not nest_stack:
+                if current_arg.strip():
+                    args_list.append(current_arg.strip())
+                current_arg = ""
+                continue
+            current_arg += char
+            if char in pairs:
+                nest_stack.append(pairs[char])
+            elif nest_stack and char == nest_stack[-1]:
+                nest_stack.pop()
+            elif char in pairs.values():
+                raise SyntaxError(
+                    f"Mismatched delimiter in arguments: {expr} at line {line_number}")
+        if nest_stack:
+            raise SyntaxError(
+                f"Unbalanced delimiters in arguments: {expr} at line {line_number}")
+        return [a for a in args_list if a.strip()]
+
     def _try_eval_user_function_call(self, expr, scope, line_number):
         m_plain_func = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)$', expr)
         if m_plain_func:
@@ -1161,6 +1212,10 @@ class ExpressionEvaluator:
                     obj_value = self.compiler.current_scope().get(obj_name)
             except Exception:
                 pass
+        if is_error_value(obj_value):
+            if isinstance(obj_value, UnitValue) and obj_value.error_code:
+                return True, obj_value.error_code
+            return True, obj_value
         try:
             defining_scope = self.compiler.current_scope(
             ).get_defining_scope(obj_name)
@@ -1229,6 +1284,12 @@ class ExpressionEvaluator:
         if not re.match(r'^[\w_]+\.\w+$', expr):
             return False, None
         var, field = expr.split('.')
+        def _err_value(value):
+            if is_error_value(value):
+                if isinstance(value, UnitValue) and value.error_code:
+                    return value.error_code
+                return value
+            return None
         if isinstance(scope, dict):
             scope_var_key = get_case_insensitive_key(scope, var)
             scope_var = scope.get(scope_var_key) if scope_var_key else None
@@ -1243,8 +1304,12 @@ class ExpressionEvaluator:
                 raise NameError(
                     f"Field '{field}' does not exist on '{var}' at line {line_number}")
             return True, scope_var.get(actual_field)
+        if _err_value(scope_var) is not None:
+            return True, _err_value(scope_var)
         try:
             var_value = self.compiler.current_scope().get(var)
+            if _err_value(var_value) is not None:
+                return True, _err_value(var_value)
             if isinstance(var_value, dict):
                 actual_field = get_case_insensitive_key(var_value, field) or field
                 if self.compiler._is_hidden_field(var_value, actual_field) and not getattr(self.compiler, '_allow_hidden_field_access', False):
@@ -3029,6 +3094,10 @@ class ExpressionEvaluator:
         if node_type is ast.Attribute:
             obj = self._walk_ast_node(
                 node.value, full_scope, globals_dict, line_number)
+            if is_error_value(obj):
+                if isinstance(obj, UnitValue):
+                    return obj
+                return error_value(obj)
             return getattr(obj, node.attr)
         if node_type is ast.Subscript:
             value = self._walk_ast_node(
