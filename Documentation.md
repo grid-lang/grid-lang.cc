@@ -208,7 +208,7 @@ The output should stay the same as before.
 
 ## Custom Type
 
-Let us define a custom type that describes each row of the table. Edit _scratch.grid_:
+Let us define a custom type that describes each row of the table. Add the following at the top of _scratch.grid_:
 
 ```vb
 Define CookieSales as Type
@@ -226,7 +226,7 @@ Here is a sample use of that custom type:
 Return new CookieSales with (SalesRep = "Frank", Region = "West", Orders = 268, Total = 72707)
 ```
 
-There is a shorter version of the object creation code which we use below.
+There is a shorter version of the object creation code which we use below. Continue editing _scratch.grid_:
 
 ```vb
 [A1] := "Cookie Sales"
@@ -235,7 +235,8 @@ There is a shorter version of the object creation code which we use below.
   new CookieSales with {"Frank", "West", 268, 72707}, _
   new CookieSales with {"Harry", "North", 224, 41676}, _
   new CookieSales with {"Janet", "North", 286, 87858}, _
-  new CookieSales with {"Martha", "East", 228, 49017}}
+  new CookieSales with {"Martha", "East", 228, 49017}, _
+}
 Return [E3]
 ```
 
