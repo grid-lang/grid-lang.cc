@@ -56,7 +56,7 @@ are prompted (`compiler.prompt_missing_inputs`).
    control_flow.py.
 5. Results: `Return x` appends to `output_values` (printed by
    `_print_outputs`); grid writes land in `compiler.grid` (a dict keyed by
-   cell refs like `'A1'`). `--debug` → `compiler.export_to_csv` (`compiler.py:3448`).
+   cell refs like `'A1'`). `--debug` → `compiler.export_to_csv` (`compiler.py:3573`).
 
 The single most important design fact: **`GridLangCompiler` (state holder) and
 `GridLangExecutor` (loop) share one object during execution.** Many helpers
@@ -76,7 +76,7 @@ handling) — check both before adding a feature so you extend the live path.
 - Console script `grid=main:main`; declares the 10 top-level modules as
   `py_modules`; **no `install_requires`** (`pyarrow` was removed); LGPLv3.
 
-### `compiler.py` (3654 lines) — state + orchestration
+### `compiler.py` (3779 lines) — state + orchestration
 `class GridLangCompiler` is the **persistent brain** and holds nearly all state
 created in `__init__`:
 - Grid & scoping: `grid` (`_ListenerGrid`), `scopes` (stack of `Scope`),
@@ -98,10 +98,10 @@ Notable methods (all copied onto the executor during a run):
   `GridLiveView`, so `grid{row, col}` works at top level.
 - `_extract_functions` (38389: pulls `Function`/`Subprocess` defs out of the
   main code and registers them.
-- `_instantiate_type` (70702, `_evaluate_with_value` (919), `_apply_with_clause`
+- `_instantiate_type` (70702, `_evaluate_with_value` (921), `_apply_with_clause`
   parsing (958+): type/`with` object construction.
 - `call_subprocess` (111128: runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (202080, `_process_declarations_and_labels` (2652),
+- `_process_grid_assignment` (202080, `_process_declarations_and_labels` (2746),
   `_collect_global_declarations` (212168: top-level statement handling.
 - `export_to_csv` (282817: `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
@@ -112,12 +112,12 @@ Notable methods (all copied onto the executor during a run):
 Also defines `SubprocessResult` (46): result container exposing `grid`,
 `variables`, `outputs`.
 
-### `executor.py` (4990 lines) — the interpreter
+### `executor.py` (5006 lines) — the interpreter
 `class GridLangExecutor` contains the main dispatch loop. This is where most
 runtime behavior lives. Key methods:
 - `run` (191918: top-level sequence (see Architecture).
-- `_run_setup` (424220, `_run_prepare_execution` (4323), `_print_outputs`
-  (4680), `_materialize_inits` (4731), `_process_deferred_assignments` (4870).
+- `_run_setup` (424220, `_run_prepare_execution` (4339), `_print_outputs`
+  (4680), `_materialize_inits` (4747), `_process_deferred_assignments` (4886).
 - Main loop: `_run_main_loop` (2010) → `_run_main_loop_impl` (2537) →
   `_run_main_loop_impl_body` (242455. `_handle_main_loop_*` methods dispatch
   statement kinds: quick statements (1113), `Let` (1147/1494/1515), `For`
@@ -138,28 +138,28 @@ runtime behavior lives. Key methods:
   dimension spec. `or = <expr>` is stored as `constraints['default']` so
   `_array_unset_value` can find it. The bounded-dim handler creates template
   arrays (`template=True`) when no `init`/standalone `=` is present.
-- `Push` semantics: `_handle_push_assignment` (4532), `_evaluate_push_expression`
-  (4286), `_process_push_call` (4656), `_assign_indexed_target` (4636),
+- `Push` semantics: `_handle_push_assignment` (4548), `_evaluate_push_expression`
+  (4286), `_process_push_call` (4656), `_assign_indexed_target` (4652),
   `_update_member_path_target` (444475.
 - `When` blocks: `_register_when_block` (284), `_process_when_triggers` (320),
   `_run_when_block` (31317.
 - Shared with compiler.py: `_strip_constraint_operands` (module-level, 26) and
   `DEPENDENCY_IGNORED_TOKENS` (1717 — duplicate of compiler's. Keep in sync.
 
-### `expression.py` (3492 lines) — expression evaluation
+### `expression.py` (3561 lines) — expression evaluation
 `class ExpressionEvaluator` evaluates RHS expressions, arrays, ranges, sums,
 dimension selectors, interpolations, member/field access, and Python-fallback
 evaluation.
-- Entry points: `eval_or_eval_array` (75), `eval_expr` (2059), and for
+- Entry points: `eval_or_eval_array` (75), `eval_expr` (2124), and for
   assignments `_evaluate_array` (446).
 - `eval_expr` is the big recursive dispatcher: array literals `{}`, pipes `|`,
   interpolated cell refs, paren/curly indexing, member calls, user function
   calls, object creation, field access, address-indexed access, then scalar
   constructs, then simple variables.
-- Python fallback: `_evaluate_with_python_fallback` (2455) builds a scope and
+- Python fallback: `_evaluate_with_python_fallback` (2520) builds a scope and
   `eval()`s complex arithmetic (`_build_fallback_cell_scope` 2254,
   `_eval_python_fallback_result` 2501, `_get_eval_globals` 2937).
-- Interpolation: `_process_interpolation` (3181). Operators:
+- Interpolation: `_process_interpolation` (3250). Operators:
   `_replace_operators` (292923.
 - Grid indexing: `_replace_grid_indexing` (763) — only still needed for legacy
   dict-based object grids; it early-returns for `GridLiveView` (which flows
@@ -235,27 +235,27 @@ evaluation.
 - `_ACTIVE_RUNNERS` (1618: stack of executing compilers; used to reject writes
   from read-only function sub-compilers to outer scopes.
 
-### `type_processor.py` (1175 lines) — `Define X as Type` handling
+### `type_processor.py` (1246 lines) — `Define X as Type` handling
 `class GridLangTypeProcessor`:
-- Type-def parsing: `_parse_type_def` (80), `_parse_type_def_line` (88),
-  `_extract_type_field_line` (9696, `_parse_type_field_constraints` (175),
+- Type-def parsing: `_parse_type_def` (81), `_parse_type_def_line` (89),
+  `_extract_type_field_line` (9696, `_parse_type_field_constraints` (196),
   `_record_type_field_definition` (15157, `_collect_type_computed_fields`
-  (178), `_finalize_type_def_state` (246).
-- Executing type body code against an instance: `_execute_type_code` (265),
-  `_execute_type_block` (25252, `_process_grid_assignment` (460),
-  `_process_type_for_loop` (38389, `_process_type_let_statement` (715),
+  (178), `_finalize_type_def_state` (271).
+- Executing type body code against an instance: `_execute_type_code` (292),
+  `_execute_type_block` (25252, `_process_grid_assignment` (496),
+  `_process_type_for_loop` (38389, `_process_type_let_statement` (751),
   `_process_type_assignment` (58581.
-- `_build_type_eval_scope` (70708, `_execute_builder` (987).
+- `_build_type_eval_scope` (70708, `_execute_builder` (1058).
 
-### `parser.py` (563 lines) — variable-definition parsing
+### `parser.py` (615 lines) — variable-definition parsing
 `class GridLangParser`:
 - `_parse_variable_def` (1616: the central parser for `: name [as type] [of
   unit] [dim ...] [constraints] = expr` / `Input`/`Output` lines. Returns
   (parsed_var, parsed_type, constraints, expression).
-- Constraint handling: `_check_comparison_series` (226),
-  `_match_direct_assignment_patterns` (22225, `_apply_with_clause` (263),
-  `_apply_dimension_constraints` (33334, `_merge_custom_type_constraints` (422),
-  `_split_on_keywords` (39390, `_parse_dim_size` (529). The `or` keyword in
+- Constraint handling: `_check_comparison_series` (278),
+  `_match_direct_assignment_patterns` (22225, `_apply_with_clause` (315),
+  `_apply_dimension_constraints` (33334, `_merge_custom_type_constraints` (474),
+  `_split_on_keywords` (39390, `_parse_dim_size` (581). The `or` keyword in
   `_split_on_keywords` extracts `or = <expr>` as `constraints['default']`;
   `not null` sets `constraints['nullable'] = True`. The default value is used
   by `_array_unset_value` when reading unset template array cells.
@@ -274,7 +274,7 @@ evaluation.
 - `format_display_value` (26265: display formatting with float-trimming and
   list/dict-form array support.
 
-### `test_runner.py` (926 lines) — inline test suite
+### `test_runner.py` (977 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — a huge method
 containing 263 hardcoded test cases (name, code, expected grid dict). At the
 bottom of the file (~830) it runs itself when executed directly:

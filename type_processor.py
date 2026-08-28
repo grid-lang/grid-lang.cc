@@ -185,6 +185,8 @@ class GridLangTypeProcessor:
             # the inert ``or =`` default.
             as_pos = re.search(r'\bas\s', field_line, re.I)
             eq_pos = field_line.find('=')
+            while eq_pos > 0 and field_line[eq_pos - 1] in '<>=':
+                eq_pos = field_line.find('=', eq_pos + 1)
             if as_pos and eq_pos > as_pos.end():
                 init_expr = field_line[eq_pos + 1:].strip()
                 kind = 'init'
