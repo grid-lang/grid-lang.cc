@@ -1200,7 +1200,7 @@ class GridLangCompiler:
                 current += char
         return parts
 
-    def _split_named_with_parts(self, text):
+    def _split_named_with_parts(self, text, line_number=None):
         """Split named 'key = value' WITH entries into a {field: expr} dict."""
         assignments = {}
         for part in text:
@@ -1210,7 +1210,10 @@ class GridLangCompiler:
             else:
                 name = part.strip()
                 if name:
-                    assignments[name] = name
+                    raise SyntaxError(
+                        f"Ambiguous 'with ({name})' at line {line_number}: use "
+                        "'<field> = <value>' for named constraints or 'with {…}' "
+                        "for positional — by-name shorthand is not implied")
         return assignments
 
     def _parse_with_clause(self, with_text, line_number=None):
@@ -1231,14 +1234,14 @@ class GridLangCompiler:
             return 'empty', None
         if text.startswith('(') and text.endswith(')'):
             return 'named', self._split_named_with_parts(
-                self._split_with_parts(text[1:-1].strip()))
+                self._split_with_parts(text[1:-1].strip()), line_number)
         if text.startswith('{') and text.endswith('}'):
             inner = text[1:-1].strip()
             return 'positional', self._split_with_parts(inner)
         parts = self._split_with_parts(text)
         if len(parts) == 1 and '=' not in parts[0]:
             return 'clone', parts[0]
-        return 'named', self._split_named_with_parts(parts)
+        return 'named', self._split_named_with_parts(parts, line_number)
 
     def _split_new_with_expr(self, expr):
         """Split a 'new Type ... with (...)' expression into base and with clause."""
