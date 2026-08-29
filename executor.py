@@ -2057,7 +2057,7 @@ class GridLangExecutor:
 
         # Handle For var as type dim {dimensions} syntax
         m = re.match(
-            r'^\s*for\s+([\w_]+)\s+(?:not\s+null\s+)?as\s+(\w+)\s+dim\s*(\{[^}]*\})', line, re.I)
+            r'^\s*for\s+([\w_]+)\s+as\s+(\w+)\s+(?:of\s+\w+\s+)?(?:not\s+null\s+)?dim\s*(\{[^}]*\})', line, re.I)
         if m:
             # Declarations carrying an initializer ('init'/'=') or any
             # unbounded ('*'/named/empty) dimension are handled by the
@@ -2115,7 +2115,7 @@ class GridLangExecutor:
 
         # Handle For var as type dim number syntax
         m = re.match(
-            r'^\s*for\s+([\w_]+)\s+as\s+(\w+)\s+dim\s+(\d+)', line, re.I)
+            r'^\s*for\s+([\w_]+)\s+as\s+(\w+)\s+(?:of\s+\w+\s+)?(?:not\s+null\s+)?dim\s+(\d+)', line, re.I)
         if m:
             var_name, type_name, dim_size = m.groups()
 

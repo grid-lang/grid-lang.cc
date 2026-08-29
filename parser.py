@@ -350,9 +350,6 @@ class GridLangParser:
                         f"Multiple grid DIM statements not allowed in with clause at line {line_number}")
                 rest = wc[len('grid'):].strip()
                 not_null = False
-                if rest.lower().startswith('not null'):
-                    not_null = True
-                    rest = rest[len('not null'):].strip()
                 grid_type = None
                 if rest.lower().startswith('as '):
                     rest = rest[3:].strip()
@@ -360,6 +357,9 @@ class GridLangParser:
                     if m_type:
                         grid_type = m_type.group(1)
                         rest = rest[m_type.end():].strip()
+                if rest.lower().startswith('not null'):
+                    not_null = True
+                    rest = rest[len('not null'):].strip()
                 if not rest.lower().startswith('dim'):
                     raise SyntaxError(
                         f"Expected 'dim' after grid definition at line {line_number}")

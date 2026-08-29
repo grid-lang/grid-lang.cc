@@ -1042,6 +1042,9 @@ class GridLangCompiler:
                 if not str(k).startswith('_'):
                     tmp_scope.variables[k] = v
         tmp_scope.constraints[actual_key] = constraints
+        declared_type = constraints.get('type')
+        if isinstance(declared_type, str) and declared_type.lower() in ('number', 'text'):
+            tmp_scope.types[actual_key] = declared_type.lower()
         try:
             tmp_scope._check_constraints(actual_key, value, line_number)
         except ConstraintError:
@@ -1132,6 +1135,8 @@ class GridLangCompiler:
     def _recompute_type_fields_after_with(self, type_name, value, scope, line_number=None):
         type_def = self.types_defined.get(type_name.lower())
         if not type_def or not isinstance(value, dict):
+            return
+        if value.get('_with_conflict'):
             return
         exec_lines = type_def.get('_executable_code', [])
         if not exec_lines:
@@ -2672,7 +2677,7 @@ class GridLangCompiler:
                     if re.match(end_pattern, s, re.I) and type_block_depth == 0:
                         in_type_def = False
                         type_def = self._parse_type_def(
-                            type_def_lines, line_number)
+                            type_def_lines, line_number, type_name)
                         if type_parent:
                             type_def['_parent'] = type_parent
                         if type_constraints:
@@ -2729,9 +2734,9 @@ class GridLangCompiler:
         self._resolve_type_inheritance()
         return lines, label_lines, dim_lines
 
-    def _parse_type_def(self, lines, line_number=None):
+    def _parse_type_def(self, lines, line_number=None, type_name=None):
         """Delegate to type processor."""
-        return self.type_processor._parse_type_def(lines, line_number)
+        return self.type_processor._parse_type_def(lines, line_number, type_name)
 
     def _execute_type_code(self, code_lines, var_name, value_dict, line_number, input_values=None):
         """Delegate to type processor."""

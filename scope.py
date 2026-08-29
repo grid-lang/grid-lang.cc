@@ -734,9 +734,39 @@ class Scope:
             r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', ' ', expr_text)
         if extra:
             expr_text += ' ' + ' '.join(extra)
-        # Create a pattern that matches the variable name as a whole word
-        pattern = r'\b' + re.escape(var_name) + r'\b'
-        return bool(re.search(pattern, expr_text))
+        # For `new Type with (f1=e1, f2=e2)` the field NAMES inside the payload
+        # are not variable references; only the value sides are. Reuse the
+        # compiler's dependency extraction so e.g. `new P2 with (x=9, y=7)` is
+        # not treated as depending on variables named x or y. The leading type
+        # name in a construction is likewise not a variable reference.
+        dep_text = expr_text
+        splitter = getattr(self.compiler, '_split_new_with_expr', None)
+        if splitter is not None:
+            try:
+                base_expr, with_text = splitter(expr_text)
+            except Exception:
+                base_expr, with_text = expr_text, None
+            if base_expr is None:
+                base_expr = expr_text
+            dep_text = re.sub(
+                r'^\s*new\s+[A-Za-z][A-Za-z0-9_.]*', '', base_expr)
+            if with_text:
+                getter = getattr(self.compiler, '_with_deps', None)
+                if getter is not None:
+                    try:
+                        extra += list(getter(with_text))
+                    except Exception:
+                        pass
+        needle = var_name.lower()
+        for token in re.finditer(r'[A-Za-z][A-Za-z0-9_.]*', dep_text):
+            token_l = token.group(0).lower()
+            if token_l == needle or token_l.startswith(needle + '.'):
+                return True
+        for candidate in set(extra):
+            candidate_l = candidate.lower()
+            if candidate_l == needle or candidate_l.startswith(needle + '.'):
+                return True
+        return False
 
     def _validate_base_type(self, name, value, line_number=None):
         """Validate that a scalar value matches the declared base type.
@@ -788,6 +818,15 @@ class Scope:
         actual_key = self._get_case_insensitive_key(name, self.constraints)
         key_for_constraints = actual_key if actual_key is not None else name
         constraints = self.constraints.get(key_for_constraints, {})
+
+        def _as_numeric(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                raise ConstraintError(
+                    TYPE_ERROR,
+                    f"'{key_for_constraints}' must be a number, got {type(v).__name__} at line {line_number}")
+
         self._validate_base_type(key_for_constraints, value, line_number)
         for constraint_type, constraint_expr in constraints.items():
             if constraint_type == 'constant':
@@ -839,21 +878,23 @@ class Scope:
                         VALUE_ERROR,
                         f"Cannot change constant '{key_for_constraints}' at line {line_number}")
             elif constraint_type in ('<=', '>=', '<', '>'):
-                constraint_val = float(self.compiler.expr_evaluator.eval_or_eval_array(
-                    constraint_expr, self.get_full_scope(), line_number))
-                if constraint_type == '<=' and value > constraint_val:
+                constraint_val = _as_numeric(
+                    self.compiler.expr_evaluator.eval_or_eval_array(
+                        constraint_expr, self.get_full_scope(), line_number))
+                num_value = _as_numeric(value)
+                if constraint_type == '<=' and num_value > constraint_val:
                     raise ConstraintError(
                         VALUE_ERROR,
                         f"'{key_for_constraints}' exceeds maximum {constraint_val} at line {line_number}")
-                elif constraint_type == '>=' and value < constraint_val:
+                elif constraint_type == '>=' and num_value < constraint_val:
                     raise ConstraintError(
                         VALUE_ERROR,
                         f"'{key_for_constraints}' is below minimum {constraint_val} at line {line_number}")
-                elif constraint_type == '<' and value >= constraint_val:
+                elif constraint_type == '<' and num_value >= constraint_val:
                     raise ConstraintError(
                         VALUE_ERROR,
                         f"'{key_for_constraints}' is not less than {constraint_val} at line {line_number}")
-                elif constraint_type == '>' and value <= constraint_val:
+                elif constraint_type == '>' and num_value <= constraint_val:
                     raise ConstraintError(
                         VALUE_ERROR,
                         f"'{key_for_constraints}' is not greater than {constraint_val} at line {line_number}")
@@ -871,21 +912,23 @@ class Scope:
                         f"'{key_for_constraints}' must not equal {constraint_val} at line {line_number}")
             elif constraint_type.startswith('not_') and constraint_type[4:] in ('<=', '>=', '<', '>'):
                 op = constraint_type[4:]
-                constraint_val = float(self.compiler.expr_evaluator.eval_or_eval_array(
-                    constraint_expr, self.get_full_scope(), line_number))
-                if op == '<' and value < constraint_val:
+                constraint_val = _as_numeric(
+                    self.compiler.expr_evaluator.eval_or_eval_array(
+                        constraint_expr, self.get_full_scope(), line_number))
+                num_value = _as_numeric(value)
+                if op == '<' and num_value < constraint_val:
                     raise ConstraintError(
                         VALUE_ERROR,
                         f"'{key_for_constraints}' must not be less than {constraint_val} at line {line_number}")
-                elif op == '<=' and value <= constraint_val:
+                elif op == '<=' and num_value <= constraint_val:
                     raise ConstraintError(
                         VALUE_ERROR,
                         f"'{key_for_constraints}' must be greater than {constraint_val} at line {line_number}")
-                elif op == '>' and value > constraint_val:
+                elif op == '>' and num_value > constraint_val:
                     raise ConstraintError(
                         VALUE_ERROR,
                         f"'{key_for_constraints}' must not be greater than {constraint_val} at line {line_number}")
-                elif op == '>=' and value >= constraint_val:
+                elif op == '>=' and num_value >= constraint_val:
                     raise ConstraintError(
                         VALUE_ERROR,
                         f"'{key_for_constraints}' must be less than {constraint_val} at line {line_number}")
@@ -917,17 +960,17 @@ class Scope:
                 start_expr = constraint_expr.get('start')
                 end_expr = constraint_expr.get('end')
                 step_expr = constraint_expr.get('step')
-                start_val = float(self.compiler.expr_evaluator.eval_or_eval_array(
+                start_val = _as_numeric(self.compiler.expr_evaluator.eval_or_eval_array(
                     start_expr, self.get_full_scope(), line_number))
-                end_val = float(self.compiler.expr_evaluator.eval_or_eval_array(
+                end_val = _as_numeric(self.compiler.expr_evaluator.eval_or_eval_array(
                     end_expr, self.get_full_scope(), line_number))
-                val = float(value)
+                val = _as_numeric(value)
                 if not (start_val <= val <= end_val):
                     raise ConstraintError(
                         VALUE_ERROR,
                         f"'{key_for_constraints}' value {value} not in range {start_val} to {end_val} at line {line_number}")
                 if step_expr is not None:
-                    step_val = float(self.compiler.expr_evaluator.eval_or_eval_array(
+                    step_val = _as_numeric(self.compiler.expr_evaluator.eval_or_eval_array(
                         step_expr, self.get_full_scope(), line_number))
                     if step_val == 0:
                         raise ConstraintError(

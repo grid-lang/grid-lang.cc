@@ -56,7 +56,7 @@ are prompted (`compiler.prompt_missing_inputs`).
    control_flow.py.
 5. Results: `Return x` appends to `output_values` (printed by
    `_print_outputs`); grid writes land in `compiler.grid` (a dict keyed by
-   cell refs like `'A1'`). `--debug` → `compiler.export_to_csv` (`compiler.py:3573`).
+   cell refs like `'A1'`). `--debug` → `compiler.export_to_csv` (`compiler.py:3584`).
 
 The single most important design fact: **`GridLangCompiler` (state holder) and
 `GridLangExecutor` (loop) share one object during execution.** Many helpers
@@ -76,7 +76,7 @@ handling) — check both before adding a feature so you extend the live path.
 - Console script `grid=main:main`; declares the 10 top-level modules as
   `py_modules`; **no `install_requires`** (`pyarrow` was removed); LGPLv3.
 
-### `compiler.py` (3779 lines) — state + orchestration
+### `compiler.py` (3790 lines) — state + orchestration
 `class GridLangCompiler` is the **persistent brain** and holds nearly all state
 created in `__init__`:
 - Grid & scoping: `grid` (`_ListenerGrid`), `scopes` (stack of `Scope`),
@@ -101,7 +101,7 @@ Notable methods (all copied onto the executor during a run):
 - `_instantiate_type` (70702, `_evaluate_with_value` (921), `_apply_with_clause`
   parsing (958+): type/`with` object construction.
 - `call_subprocess` (111128: runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (202080, `_process_declarations_and_labels` (2746),
+- `_process_grid_assignment` (202080, `_process_declarations_and_labels` (2757),
   `_collect_global_declarations` (212168: top-level statement handling.
 - `export_to_csv` (282817: `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
@@ -210,15 +210,15 @@ evaluation.
   (1339, 1390).
 - `_handle_block_*` methods (343–960): per-statement handling inside blocks.
 
-### `scope.py` (1012 lines) — scope + variable semantics
+### `scope.py` (1055 lines) — scope + variable semantics
 - `class Scope` (11119: variable storage with constraints.
   - `define` (382), `update` (423), `get` (516), `is_uninitialized` (537),
     `get_defining_scope` (552).
   - Inputs/outputs: `define_input` (565), `define_output` (580),
     `is_input`/`is_output` (518/527), `connect_pipe` (605), `push_value`
     (555), `_propagate_wave` (647) — the publish/listen ripple.
-  - Constraints: `_re_evaluate_constraints` (700), `_check_constraints` (783),
-    `_validate_base_type` (741) — validates scalars AND, since the pyarrow
+  - Constraints: `_re_evaluate_constraints` (700), `_check_constraints` (813),
+    `_validate_base_type` (771) — validates scalars AND, since the pyarrow
     removal, element-by-element base types of `dim` arrays (via
     `array_handler.validate_array_element_types`), `_expression_depends_on`
     (651). `_array_unset_value` (array_handler.py:1446) resolves `None`
@@ -226,7 +226,7 @@ evaluation.
     `constraints['default']` (from `or = <expr>`) and evaluates it; falls back
     to `error_value(NA_ERROR)` (`#N/A`).
   - Scoping: `is_shadowed` (661), `get_evaluation_scope` (669),
-    `get_full_scope` (1002), `_coerce_custom_type_value` (216).
+    `get_full_scope` (1045), `_coerce_custom_type_value` (216).
 - `class _ListenerGrid` (2121: dict backing `compiler.grid`; every cell write
   calls `compiler._notify_cell_changed`.
 - `class GridLiveView` (4040: `(row, col)`-keyed live view of a grid
@@ -235,17 +235,17 @@ evaluation.
 - `_ACTIVE_RUNNERS` (1618: stack of executing compilers; used to reject writes
   from read-only function sub-compilers to outer scopes.
 
-### `type_processor.py` (1246 lines) — `Define X as Type` handling
+### `type_processor.py` (1251 lines) — `Define X as Type` handling
 `class GridLangTypeProcessor`:
-- Type-def parsing: `_parse_type_def` (81), `_parse_type_def_line` (89),
-  `_extract_type_field_line` (9696, `_parse_type_field_constraints` (196),
+- Type-def parsing: `_parse_type_def` (81), `_parse_type_def_line` (95),
+  `_extract_type_field_line` (9696, `_parse_type_field_constraints` (199),
   `_record_type_field_definition` (15157, `_collect_type_computed_fields`
-  (178), `_finalize_type_def_state` (271).
-- Executing type body code against an instance: `_execute_type_code` (292),
-  `_execute_type_block` (25252, `_process_grid_assignment` (496),
-  `_process_type_for_loop` (38389, `_process_type_let_statement` (751),
+  (178), `_finalize_type_def_state` (274).
+- Executing type body code against an instance: `_execute_type_code` (295),
+  `_execute_type_block` (25252, `_process_grid_assignment` (501),
+  `_process_type_for_loop` (38389, `_process_type_let_statement` (756),
   `_process_type_assignment` (58581.
-- `_build_type_eval_scope` (70708, `_execute_builder` (1058).
+- `_build_type_eval_scope` (70708, `_execute_builder` (1063).
 
 ### `parser.py` (615 lines) — variable-definition parsing
 `class GridLangParser`:
@@ -274,7 +274,7 @@ evaluation.
 - `format_display_value` (26265: display formatting with float-trimming and
   list/dict-form array support.
 
-### `test_runner.py` (977 lines) — inline test suite
+### `test_runner.py` (980 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — a huge method
 containing 263 hardcoded test cases (name, code, expected grid dict). At the
 bottom of the file (~830) it runs itself when executed directly:

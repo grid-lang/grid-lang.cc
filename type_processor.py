@@ -78,12 +78,18 @@ class GridLangTypeProcessor:
             'default_fields': set(),
         }
 
-    def _parse_type_def(self, lines, line_number=None):
+    def _parse_type_def(self, lines, line_number=None, type_name=None):
         """Parse type definition lines and extract fields and executable code."""
         state = self._new_type_def_state()
         for line in lines:
             self._parse_type_def_line(line, line_number, state)
         self._collect_type_computed_fields(state)
+        if type_name:
+            for field_name in state['fields']:
+                if str(field_name).lower() == str(type_name).lower():
+                    raise SyntaxError(
+                        f"Variable name conflicts with type: '{field_name}' "
+                        f"at line {line_number}")
         return self._finalize_type_def_state(state)
 
     def _parse_type_def_line(self, line, line_number, state):
@@ -129,9 +135,6 @@ class GridLangTypeProcessor:
             if m_default:
                 names_part = input_body[:m_default.start()].strip()
                 input_default = m_default.group(1).strip()
-
-        # 'not null' is a constraint, not part of the variable name
-        names_part = re.sub(r'\s+not\s+null\s*$', '', names_part, flags=re.I)
 
         name_list = [n.strip() for n in names_part.split(',') if n.strip()]
         if not name_list:
@@ -328,6 +331,8 @@ class GridLangTypeProcessor:
             self.compiler._context_grid_stack.append(instance_grid)
 
         try:
+            if isinstance(value_dict, dict) and value_dict.get('_with_conflict'):
+                return
             type_def = {}
             if inferred_type:
                 type_def = self.compiler.types_defined.get(
