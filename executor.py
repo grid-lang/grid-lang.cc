@@ -4375,7 +4375,7 @@ class GridLangExecutor:
         self.needed_line_numbers = self._determine_needed_lines()
         return guard_entries
 
-    def _evaluate_push_expression(self, value_expr, line_number):
+    def _evaluate_push_expression(self, value_expr, line_number, expected_unit=None):
         """Evaluate a PUSH expression, expanding generator outputs into a sequence."""
         base_scope = self.current_scope().get_evaluation_scope()
         func_defs = getattr(self, 'functions', {}) or {}
@@ -4451,7 +4451,7 @@ class GridLangExecutor:
 
         if not call_entries:
             return [self.expr_evaluator.eval_or_eval_array(
-                value_expr, base_scope, line_number)]
+                value_expr, base_scope, line_number, expected_unit=expected_unit)]
 
         replacements = []
         sequences = []
@@ -4464,10 +4464,10 @@ class GridLangExecutor:
             has_sequence_arg = False
             for a in args_parts:
                 try:
-                    vals = self._evaluate_push_expression(a, line_number)
+                    vals = self._evaluate_push_expression(a, line_number, expected_unit)
                 except Exception:
                     vals = [self.expr_evaluator.eval_or_eval_array(
-                        a, base_scope, line_number)]
+                        a, base_scope, line_number, expected_unit=expected_unit)]
                 if isinstance(vals, list) and len(vals) > 1:
                     has_sequence_arg = True
                     eval_args.append(list(vals))
@@ -4563,16 +4563,32 @@ class GridLangExecutor:
             self._assign_indexed_target(target, value_expr, line_number)
             return
         member_path_match = re.match(r'^[\w_]+(?:\.[\w_]+)+$', target)
+        # Get target's declared unit for LHS-informed conversion (Push/For etc.)
+        target_unit = None
+        try:
+            t_scope = self.current_scope().get_defining_scope(target)
+            if t_scope:
+                ak = t_scope._get_case_insensitive_key(target, t_scope.constraints)
+                if ak:
+                    target_unit = t_scope.constraints.get(ak, {}).get('unit')
+                else:
+                    for k in t_scope.constraints:
+                        if k.lower() == target.lower():
+                            target_unit = t_scope.constraints[k].get('unit')
+                            break
+        except Exception:
+            pass
         try:
             if self._is_bare_subprocess_call(value_expr):
                 values = [self.expr_evaluator.eval_or_eval_array(
                     str(value_expr),
                     self.current_scope().get_evaluation_scope(),
                     line_number,
+                    expected_unit=target_unit,
                 )]
             else:
                 values = self._evaluate_push_expression(
-                    value_expr, line_number)
+                    value_expr, line_number, target_unit)
             global_scope = self.get_global_scope()
             for value in values:
                 if member_path_match:

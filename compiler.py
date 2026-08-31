@@ -276,8 +276,9 @@ class GridLangCompiler:
         The RHS is evaluated with the formula's parameter bound to a plain
         number (unitless, so it composes cleanly with any unit-bearing factor
         such as ``x * SILength.inch``); the resulting value's unit is the
-        conversion target. Returns None when the RHS cannot be evaluated or
-        carries no unit.
+        conversion target. Falls back to declared units of RHS variables for
+        Input/Let/For/:/Push/Init when evaluation needs values not yet in scope.
+        Returns None when the RHS cannot be evaluated or carries no unit.
         """
         try:
             scope = self.current_scope()
@@ -288,10 +289,33 @@ class GridLangCompiler:
         try:
             result = self.expr_evaluator.eval_or_eval_array(
                 dest_expr, eval_scope, line_number)
+            unit = getattr(result, 'unit', None)
+            if unit is not None:
+                return unit
         except Exception:
-            return None
-        unit = getattr(result, 'unit', None)
-        return unit if unit is not None else None
+            pass
+        # Fallback: look at declared units of variables in RHS (for not-yet-bound Input/Let/For/:/Push/Init)
+        try:
+            for tok in re.findall(r'[A-Za-z][A-Za-z0-9_.]*', dest_expr):
+                base = tok.split('.')[0].split('[')[0]
+                if base.lower() == var_name.lower():
+                    continue
+                u = None
+                try:
+                    u = scope.get_value_unit(base)
+                except Exception:
+                    pass
+                if u is None:
+                    try:
+                        c = scope.constraints.get(base) or scope.constraints.get(base.lower()) or {}
+                        u = c.get('unit')
+                    except Exception:
+                        pass
+                if u is not None:
+                    return u
+        except Exception:
+            pass
+        return None
 
     def _register_top_level_converts(self):
         """Register top-level Convert lines once the scope and UnitSource
@@ -3904,6 +3928,14 @@ class GridLangCompiler:
                     except ValueError:
                         value = value
                 if value is not None:
+                    # Handle unit literals like "5 of in" for Input with conversion
+                    if isinstance(value, str) and ' of ' in value.lower():
+                        try:
+                            ev = self.expr_evaluator.eval_or_eval_array(value, global_scope.get_evaluation_scope())
+                            if ev is not None:
+                                value = ev
+                        except Exception:
+                            pass
                     global_scope.update(input_var, value)
                     value_assigned = True
 

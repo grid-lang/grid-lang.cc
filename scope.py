@@ -8,8 +8,8 @@ import re
 
 from units import (
     DIM_ERROR, NA_ERROR, NUM_ERROR, TYPE_ERROR, UNIT_ERROR, UNIVERSAL_ZERO,
-    VALUE_ERROR, ConstraintError, UnitValue, error_value, is_error_value,
-    strip_units,
+    VALUE_ERROR, ConstraintError, UnitValue, apply_conversion, error_value,
+    is_error_value, strip_units,
 )
 from utils import (
     iter_interpolation_placeholders, is_sparse_array,
@@ -125,6 +125,16 @@ class Scope:
         if declared:
             declared = str(declared).lower()
             if incoming and str(incoming).lower() != declared:
+                try:
+                    conv = None
+                    if hasattr(self, 'compiler') and hasattr(self.compiler, 'expr_evaluator'):
+                        conv = apply_conversion(plain, incoming, declared, self.compiler.expr_evaluator._formula_eval)
+                    else:
+                        conv = apply_conversion(plain, incoming, declared)
+                    if conv is not None:
+                        return conv.value, conv.unit
+                except Exception:
+                    pass
                 return UNIT_ERROR, None
             return plain, declared
         return plain, incoming
@@ -582,6 +592,13 @@ class Scope:
         self.output_variables.add(name.lower())
         constraints = constraints or {}
         constraints.setdefault('output', True)
+        # Preserve unit from existing Input/Let/For/: definition (e.g. Input a of m + Output a)
+        existing = self.constraints.get(name) or self.constraints.get(name.lower()) or {}
+        if 'unit' not in constraints and 'unit' in existing:
+            constraints['unit'] = existing['unit']
+        # Also preserve other unit-related constraints
+        if 'not_unit' not in constraints and 'not_unit' in existing:
+            constraints['not_unit'] = existing['not_unit']
         self.define(name, None, type_name, constraints, is_uninitialized=True)
 
     def is_input(self, name):
@@ -867,6 +884,24 @@ class Scope:
                             key_for_constraints, constraint_val, line_number)
                     except Exception:
                         pass
+                # Unit-aware constant check for Let/For/Input/: with conversion (e.g. Let b of m = 5 of in)
+                try:
+                    if isinstance(constraint_val, UnitValue) or isinstance(value, UnitValue):
+                        c = constraint_val.value if isinstance(constraint_val, UnitValue) else constraint_val
+                        c_u = constraint_val.unit if isinstance(constraint_val, UnitValue) else None
+                        v = value.value if isinstance(value, UnitValue) else value
+                        v_u = value.unit if isinstance(value, UnitValue) else constraints.get('unit')
+                        if c_u and v_u and str(c_u).lower() != str(v_u).lower():
+                            conv = apply_conversion(c, c_u, str(v_u).lower(), self.compiler.expr_evaluator._formula_eval) if hasattr(self, 'compiler') else None
+                            if conv is not None:
+                                constraint_val = conv.value
+                                value = v
+                        elif isinstance(constraint_val, UnitValue):
+                            constraint_val = c
+                        elif isinstance(value, UnitValue):
+                            value = v
+                except Exception:
+                    pass
                 if isinstance(value, (list, dict)):
                     if not is_error_value(value):
                         flat = self.compiler.array_handler.flatten_array(
