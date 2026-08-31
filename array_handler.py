@@ -1989,7 +1989,20 @@ class ArrayHandler:
             return 'object'
         from units import UnitValue
         if isinstance(value, UnitValue):
-            return 'number'
+            if value.error_code is not None:
+                return 'unknown'
+            inner = value.value
+            if isinstance(inner, bool):
+                return 'logical'
+            if isinstance(inner, (int, float)):
+                return 'number' if isinstance(inner, float) else 'int'
+            if isinstance(inner, str):
+                return 'text'
+            if isinstance(inner, dict):
+                return 'object'
+            if isinstance(inner, list):
+                return 'array'
+            return 'unknown'
         return 'unknown'
 
     def get_array_shape(self, arr, line_number=None):

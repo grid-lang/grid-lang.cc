@@ -491,12 +491,18 @@ class GridLangParser:
     def _split_on_keywords(self, text):
         """Split a variable definition on keywords, skipping quoted sections."""
         keywords = ['<=', '>=', '<>', '<', '>', '=', 'as', 'of', 'dim', 'in', 'init', 'index', 'and', 'not', 'or']
+        # Soft keywords (constraint clauses and logical connectors) only split
+        # the left-hand side of a declaration. Once the first '=' has been seen,
+        # the remainder is an arbitrary RHS expression and must be preserved
+        # verbatim (e.g. 'x of m = 2.54 of cm' keeps the RHS 'of cm' intact).
+        soft_keywords = {'as', 'of', 'dim', 'init', 'index', 'and', 'not', 'in'}
         parts = []
         current = ""
         in_quote = False
         quote_char = None
         brace_depth = 0
         truth_open = False
+        seen_equals = False
         i = 0
         lower_text = text.lower()
 
@@ -525,6 +531,7 @@ class GridLangParser:
                 continue
 
             matched = None
+            break_keyword_loop = False
             if not in_quote and brace_depth == 0 and not truth_open:
                 # Builder chains use '->': keep the arrow atomic so the '>'
                 # is not misread as the start of a comparison constraint.
@@ -541,6 +548,14 @@ class GridLangParser:
                                        ] if i + len(kw) < len(text) else ' '
                             if prev.isalnum() or prev == '_' or nxt.isalnum() or nxt == '_':
                                 continue
+                        if seen_equals and kw in soft_keywords:
+                            # Inside the RHS, constraint clauses / connectors
+                            # are ordinary tokens (e.g. '500 of in'): consume
+                            # the keyword as part of the current token.
+                            current += kw
+                            i += len(kw)
+                            break_keyword_loop = True
+                            break
                         if kw == 'or':
                             # 'or' only separates the 'or = <default>'
                             # null-default clause; 'or' used as a union
@@ -555,12 +570,17 @@ class GridLangParser:
                         matched = kw
                         break
 
+            if break_keyword_loop:
+                continue
+
             if matched:
                 if current.strip():
                     parts.append(current.strip())
                 parts.append(matched)
                 current = ""
                 truth_open = False
+                if matched == '=':
+                    seen_equals = True
                 i += len(matched)
                 # Skip following whitespace to mimic regex split behavior
                 while i < len(text) and text[i].isspace():

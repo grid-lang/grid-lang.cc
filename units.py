@@ -47,6 +47,39 @@ ERROR_CODES = frozenset({
 })
 
 
+# ---------------------------------------------------------------------------
+# Unit conversion registry.
+#
+# Keyed by (source_unit.lower(), target_unit.lower()) -> list of conversion
+# entries. Two kinds of entry:
+#   {'kind': 'constant', 'src': <raw value>, 'dst': <raw result>}
+#       a literal category mapping (e.g. Convert "ox" of animal to "beef")
+#   {'kind': 'formula', 'var': <param name>, 'expr': <rhs string>,
+#    'target': <target unit>}
+#       binds <var> to the raw incoming value and evaluates <expr> (e.g.
+#       Convert x as number of cm to x/100)
+# ---------------------------------------------------------------------------
+
+CONVERSIONS = {}
+
+
+def register_conversion(src_unit, target_unit, entry):
+    """Register a conversion from *src_unit* to *target_unit*."""
+    key = (str(src_unit).lower(), str(target_unit).lower())
+    CONVERSIONS.setdefault(key, []).append(entry)
+
+
+def lookup_conversions(src_unit, target_unit):
+    """Return the conversions from *src_unit* to *target_unit* (may be empty)."""
+    if src_unit is None or target_unit is None:
+        return []
+    return CONVERSIONS.get((str(src_unit).lower(), str(target_unit).lower()), [])
+
+
+def has_conversion(src_unit, target_unit):
+    return bool(lookup_conversions(src_unit, target_unit))
+
+
 def is_error_value(value):
     """True when ``value`` is a sticky error: a stored error string or a
     wrapped error value."""
@@ -440,6 +473,28 @@ class UnitValue:
     def __repr__(self):
         return (f'UnitValue({self.value!r}, {self.unit!r}, '
                 f'error_code={self.error_code!r})')
+
+
+def apply_conversion(value, value_unit, target_unit, eval_fn=None):
+    """Convert *value* (carrying *value_unit*) to *target_unit*.
+
+    Returns a ``UnitValue(result, target_unit)`` on a registered match, or
+    ``None`` when there is no applicable conversion. ``eval_fn(entry, value)``
+    evaluates a formula entry (binding its parameter to the raw value); when it
+    is omitted, formula entries are skipped.
+    """
+    for entry in lookup_conversions(value_unit, target_unit):
+        if entry.get('kind') == 'constant':
+            if entry.get('src') == value:
+                return UnitValue(entry.get('dst'), target_unit)
+        elif eval_fn is not None:
+            try:
+                result = eval_fn(entry, value)
+            except Exception:
+                result = None
+            if result is not None and not is_error_value(result):
+                return UnitValue(result, target_unit)
+    return None
 
 
 def strip_units(value):

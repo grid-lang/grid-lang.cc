@@ -10,7 +10,8 @@ from utils import col_to_num, split_cell, offset_cell, validate_cell_ref, object
 from scope import Scope, _GridStore
 from units import (
     UNIT_ERROR, UNIVERSAL_ZERO, UnitValue, ConstraintError, error_value,
-    is_error_value, strip_units,
+    is_error_value, strip_units, register_conversion, has_conversion,
+    lookup_conversions,
 )
 from control_flow import GridLangControlFlow
 from type_processor import GridLangTypeProcessor, split_builder_chain
@@ -58,6 +59,26 @@ class SubprocessResult:
             f"Attribute '{item}' not found in subprocess result")
 
 
+class _UnitSourceNamespace:
+    """Attribute-access namespace for a UnitSource block's materialized
+    constants, so member reads like ``SILength.inch`` resolve in the AST
+    walker (``getattr`` on the block object)."""
+
+    __slots__ = ('_fields',)
+
+    def __init__(self, fields):
+        object.__setattr__(self, '_fields', dict(fields))
+
+    def __getattr__(self, name):
+        try:
+            return self._fields[name]
+        except KeyError:
+            raise AttributeError(name)
+
+    def __getitem__(self, name):
+        return self._fields[name]
+
+
 class GridLangCompiler:
     def __init__(self):
         self.scopes = [Scope(self)]
@@ -83,6 +104,8 @@ class GridLangCompiler:
         self.types_defined = {}
         self.functions = {}
         self.subprocesses = {}
+        self.unit_sources = {}
+        self._top_level_converts = []
         self.expr_evaluator = ExpressionEvaluator(self)
         self.array_handler = ArrayHandler(self)
         self.control_flow = GridLangControlFlow(self)
@@ -144,6 +167,187 @@ class GridLangCompiler:
                 raise SyntaxError(
                     f"Invalid type constraints in '{line}' at line {line_number}: {exc}")
         return type_name, parent, constraints
+
+    def _parse_unit_source_header(self, line, line_number=None):
+        """Parse a ``Define X as UnitSource(TargetUnit)`` header.
+
+        Returns ``(name, target_unit)`` or ``(None, None)`` when the line is
+        not a UnitSource definition.
+        """
+        m = re.match(
+            r'^\s*define\s+([\w_]+)\s+as\s+unitsource\s*\(\s*(\w+)\s*\)\s*$',
+            line, re.I)
+        if not m:
+            return None, None
+        return m.group(1).strip(), m.group(2).strip()
+
+    def _finalize_unit_source(self, body_lines, name, target_unit, line_number=None):
+        """Parse and register the Convert/constant lines of a UnitSource block.
+
+        Each ``Convert`` is registered into the global conversion registry
+        (targeting *target_unit*). Each ``: field as ... of <T> = <rhs>`` is
+        recorded as a constant field (with declared unit *T*) exposed as
+        ``<name>.<field>`` and materialized at runtime.
+        """
+        source = self.unit_sources.setdefault(name.lower(), {
+            '_target_unit': target_unit,
+            '_constants': {},
+            '_orig_name': name,
+        })
+        source['_target_unit'] = target_unit
+        source['_orig_name'] = name
+        for raw in body_lines:
+            line = raw.lstrip()
+            if not line.strip():
+                continue
+            stripped = line.strip()
+            # Constant field: ": field [as type] of <T> = <rhs>" (leading ':')
+            if stripped.startswith(':'):
+                field_line = stripped[1:].strip()
+                field_match = re.match(
+                    r'^([\w_]+)(?:\s+as\s+\w+)?\s+of\s+(\w+)\s*=\s*(.+)$',
+                    field_line, re.I)
+                if field_match:
+                    field_name, field_unit, field_expr = field_match.groups()
+                    source['_constants'][field_name.lower()] = {
+                        'unit': field_unit, 'expr': field_expr,
+                        'name': name, 'field': field_name,
+                    }
+                    continue
+            self._register_convert_line(stripped, target_unit, line_number)
+
+    def _register_convert_line(self, raw, target_unit, line_number=None, var_name=None):
+        """Parse a single ``Convert <p1> to <val>`` line and register it.
+
+        ``p1`` is either a constant (``"ox" of animal``) producing a category
+        mapping, or a new variable with a source unit (``x as number of cm``)
+        producing a formula conversion. *target_unit* may be None for a
+        top-level Convert, in which case it is inferred from the RHS value's
+        unit when possible.
+        """
+        line = raw.strip()
+        m = re.match(
+            r'^\s*convert\s+(.+?)\s+to\s+(.+)$', line, re.I)
+        if not m:
+            return
+        source_spec, dest_expr = m.group(1).strip(), m.group(2).strip()
+
+        # Constant mapping: "<value>" of <unit> -> <dest>
+        cst = re.match(
+            r'^("[^"]*"|\'[^\']*\'|[\d.eE+-]+)\s+of\s+(\w+)$',
+            source_spec, re.I)
+        if cst:
+            raw_lit = cst.group(1)
+            src_unit = cst.group(2)
+            if raw_lit.startswith(('"', "'")):
+                src_value = raw_lit[1:-1]
+            else:
+                try:
+                    src_value = float(raw_lit)
+                except ValueError:
+                    src_value = raw_lit
+            if target_unit is None:
+                return
+            register_conversion(src_unit, target_unit, {
+                'kind': 'constant', 'src': src_value, 'dst': dest_expr.strip('"').strip("'"),
+            })
+            return
+
+        # Formula: "x [as type] of <unit>" -> <dest expr>
+        form = re.match(
+            r'^([\w_]+)(?:\s+as\s+\w+)?\s+of\s+(\w+)$', source_spec, re.I)
+        if not form:
+            return
+        var_name = form.group(1)
+        src_unit = form.group(2)
+        if target_unit is None:
+            target_unit = self._infer_convert_target_unit(
+                dest_expr, var_name, line_number)
+            if target_unit is None:
+                return
+        register_conversion(src_unit, target_unit, {
+            'kind': 'formula', 'var': var_name, 'expr': dest_expr,
+            'target': target_unit,
+        })
+
+    def _infer_convert_target_unit(self, dest_expr, var_name, line_number=None):
+        """Infer the target unit of a top-level Convert by evaluating its RHS.
+
+        The RHS is evaluated with the formula's parameter bound to a plain
+        number (unitless, so it composes cleanly with any unit-bearing factor
+        such as ``x * SILength.inch``); the resulting value's unit is the
+        conversion target. Returns None when the RHS cannot be evaluated or
+        carries no unit.
+        """
+        try:
+            scope = self.current_scope()
+            eval_scope = dict(scope.get_evaluation_scope())
+        except Exception:
+            return None
+        eval_scope[str(var_name)] = 1.0
+        try:
+            result = self.expr_evaluator.eval_or_eval_array(
+                dest_expr, eval_scope, line_number)
+        except Exception:
+            return None
+        unit = getattr(result, 'unit', None)
+        return unit if unit is not None else None
+
+    def _register_top_level_converts(self):
+        """Register top-level Convert lines once the scope and UnitSource
+        constants are available (so RHS target units can be inferred)."""
+        for raw, line_number in getattr(self, '_top_level_converts', []):
+            self._register_convert_line(raw, None, line_number)
+
+    def _materialize_unit_source_constants(self):
+        """Inject UnitSource constant values into the current scope.
+
+        Each constant's RHS is evaluated (so ``2.54 of cm`` with a cm->m
+        conversion becomes ``0.0254 of m``) and stored as a scope variable
+        named ``<block>.<field>`` so member reads resolve at evaluation time.
+        A namespace object for the block (e.g. ``SILength``) is also defined
+        so ``SILength.inch`` attribute access resolves in the AST walker.
+        """
+        scope = self.current_scope()
+        for blk, source in self.unit_sources.items():
+            namespace = {}
+            for field, const in list(source.get('_constants', {}).items()):
+                if 'value' in const:
+                    namespace[field] = const.get('value')
+                    continue
+                expr = const.get('expr')
+                unit = const.get('unit')
+                value = None
+                try:
+                    value = self.expr_evaluator.eval_or_eval_array(
+                        expr, scope.get_evaluation_scope(), None,
+                        expected_unit=unit)
+                except Exception:
+                    value = None
+                if value is not None and not is_error_value(value):
+                    if isinstance(value, UnitValue) and value.unit is None:
+                        value = UnitValue(value.value, unit)
+                    elif not isinstance(value, UnitValue):
+                        value = UnitValue(value, unit)
+                    const['value'] = value
+                    namespace[field] = value
+            for field, value in namespace.items():
+                const = source.get('_constants', {}).get(field)
+                var_name = f"{const['name']}.{const['field']}"
+                scope.define(var_name, value, None, {'constant': const.get('expr')},
+                             line_number=None)
+            if namespace:
+                ns = _UnitSourceNamespace(namespace)
+                # Use original block name (preserving case) for the namespace
+                # so 'SILength.inch' attribute access resolves (case-insensitive
+                # fallback also handles mixed case).
+                orig = source.get('_orig_name', blk)
+                for key in {blk, orig, orig.lower(), orig.upper()}:
+                    if not scope.get_defining_scope(key):
+                        scope.define(key, ns, None, {'unit_source': blk},
+                                     line_number=None)
+                        break
+        return scope
 
     def _resolve_type_inheritance(self):
         """Merge inherited fields and constraints into child type definitions."""
@@ -1483,7 +1687,8 @@ class GridLangCompiler:
             if hasattr(scope, 'get_evaluation_scope'):
                 eval_scope = scope.get_evaluation_scope()
             value = self.expr_evaluator.eval_or_eval_array(
-                expr, eval_scope, assign_line)
+                expr, eval_scope, assign_line,
+                expected_unit=(constraints or {}).get('unit'))
             value = self.array_handler.check_dimension_constraints(
                 var, value, assign_line)
             if constraints.get('with'):
@@ -1585,7 +1790,8 @@ class GridLangCompiler:
                                     violations.append(dep)
                         if not violations:
                             value = self.expr_evaluator.eval_or_eval_array(
-                                expr, self.current_scope().get_full_scope(), line_number)
+                                expr, self.current_scope().get_full_scope(), line_number,
+                                expected_unit=(constraints or {}).get('unit'))
                             value = self.array_handler.check_dimension_constraints(
                                 var, value, line_number)
                             if constraints.get('with'):
@@ -1631,7 +1837,8 @@ class GridLangCompiler:
                         continue
                     try:
                         value = self.expr_evaluator.eval_or_eval_array(
-                            expr, self.current_scope().get_full_scope(), line_number)
+                            expr, self.current_scope().get_full_scope(), line_number,
+                            expected_unit=(constraints or {}).get('unit'))
                         value = self.array_handler.check_dimension_constraints(
                             var, value, line_number)
                         if constraints.get('with') and not target.startswith('['):
@@ -1731,7 +1938,8 @@ class GridLangCompiler:
                             violations.append(dep)
                 if not violations:
                     value = self.expr_evaluator.eval_or_eval_array(
-                        expr, self.current_scope().get_full_scope(), line_number)
+                            expr, self.current_scope().get_full_scope(), line_number,
+                            expected_unit=(constraints or {}).get('unit'))
                     value = self.array_handler.check_dimension_constraints(
                         var, value, line_number)
                     if constraints.get('with'):
@@ -2072,6 +2280,11 @@ class GridLangCompiler:
         cleaned = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', ' ', expr)
         # Remove builder-call names ('-> name(') so they are not treated as deps.
         cleaned = re.sub(r'->\s*\$?[A-Za-z][A-Za-z0-9_.]*\s*\(', '(', cleaned)
+        # Remove '<number> of <unit>' RHS literals so the unit name and the
+        # 'of' connector are not mistaken for dependency variables.
+        cleaned = re.sub(
+            r'(?<![\w.])(\d+(?:\.\d*)?|\.\d+)\s+of\s+[A-Za-z_][A-Za-z0-9_]*',
+            r'\1', cleaned, flags=re.I)
         # Remove member accesses like "obj.field" or "obj.method" to avoid
         # treating field/method names as standalone dependencies.
         cleaned = re.sub(r'\.\s*[A-Za-z][A-Za-z0-9_]*', ' ', cleaned)
@@ -2079,7 +2292,7 @@ class GridLangCompiler:
         filtered = set()
         keyword_exclusions = {
             'to', 'and', 'or', 'not', 'then', 'do', 'step', 'by', 'in', 'new', 'with',
-            'true', 'false'
+            'true', 'false', 'of', 'as', 'dim', 'index', 'init'
         }
         for tok in tokens:
             if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', tok, re.I):
@@ -2591,6 +2804,10 @@ class GridLangCompiler:
         type_name = None
         type_parent = None
         type_constraints = {}
+        in_unit_source = False
+        unit_source_name = None
+        unit_source_target = None
+        unit_source_lines = []
         line_number = 0
         current_line = ""
         in_multiline = False
@@ -2649,6 +2866,16 @@ class GridLangCompiler:
 
             # Handle start of type definition
             if s.lower().startswith("define "):
+                # UnitSource definitions are collected and registered eagerly
+                # so top-level Convert lines can reference their constants.
+                us_name, us_target = self._parse_unit_source_header(
+                    s, line_number)
+                if us_name:
+                    in_unit_source = True
+                    unit_source_name = us_name
+                    unit_source_target = us_target
+                    unit_source_lines = []
+                    continue
                 parsed_name, parsed_parent, parsed_constraints = self._parse_type_header(
                     s, line_number)
                 if parsed_name:
@@ -2661,6 +2888,18 @@ class GridLangCompiler:
                     continue
                 # Other definitions (functions/subprocesses) are handled later
                 in_type_def = False
+
+            # Handle lines inside a UnitSource definition block
+            if in_unit_source:
+                stripped_us = s.strip()
+                if stripped_us.lower().startswith('end'):
+                    in_unit_source = False
+                    self._finalize_unit_source(
+                        unit_source_lines, unit_source_name,
+                        unit_source_target, line_number)
+                    continue
+                unit_source_lines.append(s.lstrip())
+                continue
 
             # Handle lines inside a type definition block
             if in_type_def:
@@ -2687,6 +2926,14 @@ class GridLangCompiler:
                     if type_block_depth > 0:
                         type_block_depth = max(0, type_block_depth - 1)
                 type_def_lines.append(s.lstrip())
+                continue
+
+            # Handle top-level Convert instruction (outside a UnitSource block):
+            # keep it out of the normal declaration/dependency flow and defer
+            # registration until the scope / UnitSource constants are ready, so
+            # the RHS target unit can be inferred by evaluation.
+            if re.match(r'^\s*convert\s+', s, re.I):
+                self._top_level_converts.append((s, line_number))
                 continue
 
             def _has_unclosed_interpolation(text):
@@ -3373,7 +3620,8 @@ class GridLangCompiler:
         if expr is not None and 'constant' not in constraints:
             constraints['constant'] = expr
         value = self.expr_evaluator.eval_or_eval_array(
-            expr, self.current_scope().get_full_scope(), line_number)
+                            expr, self.current_scope().get_full_scope(), line_number,
+                            expected_unit=(constraints or {}).get('unit'))
         value = self.array_handler.check_dimension_constraints(
             var, value, line_number)
         if constraints.get('with'):

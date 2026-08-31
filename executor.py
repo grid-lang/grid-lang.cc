@@ -818,7 +818,8 @@ class GridLangExecutor:
         full_scope = defining_scope.get_full_scope(
         ) if hasattr(defining_scope, 'get_full_scope') else scope.get_full_scope()
         value = self.expr_evaluator.eval_or_eval_array(
-            expr, full_scope, line_number)
+            expr, full_scope, line_number,
+            expected_unit=(constraints or {}).get('unit'))
         value = self.array_handler.check_dimension_constraints(
             var, value, line_number)
         # Infer type for constructor patterns or value shape
@@ -1409,9 +1410,10 @@ class GridLangExecutor:
             self._register_listeners(var, expr, search_scope)
 
         try:
+            expected_unit = (constraints or {}).get('unit')
             evaluated_value = self.expr_evaluator.eval_or_eval_array(
                 expr, scope_dict or search_scope.get_evaluation_scope(),
-                line_number)
+                line_number, expected_unit=expected_unit)
             if constraints.get('with'):
                 evaluated_value = self._apply_with_constraints(
                     evaluated_value,
@@ -4338,6 +4340,12 @@ class GridLangExecutor:
 
     def _run_prepare_execution(self, lines, label_lines, dim_lines, args):
         self._process_declarations_and_labels(lines, label_lines, dim_lines)
+        # Materialize UnitSource constants into scope so references like
+        # SILength.inch resolve during evaluation.
+        if hasattr(self, '_materialize_unit_source_constants'):
+            self._materialize_unit_source_constants()
+        if hasattr(self, '_register_top_level_converts'):
+            self._register_top_level_converts()
         # Store the root scope after declarations
         self.root_scope = self.current_scope()
 

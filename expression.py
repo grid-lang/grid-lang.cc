@@ -19,7 +19,7 @@ from utils import (
     format_display_value,
     is_sparse_array,
 )
-from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, REF_ERROR, UNIVERSAL_ZERO, UnitValue, ConstraintError, error_value, is_error_value
+from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, REF_ERROR, UNIVERSAL_ZERO, UnitValue, ConstraintError, error_value, is_error_value, apply_conversion
 from type_processor import split_builder_chain
 
 
@@ -71,8 +71,50 @@ class ExpressionEvaluator:
         """
         self.compiler = compiler
         self.dim_ranges = {}  # Stores dimension ranges for variables
+        self._expected_unit = None
 
-    def eval_or_eval_array(self, expr, scope, line_number=None, is_grid_dim=False):
+    def _apply_expected_unit(self, value, target_unit):
+        """Convert a value to *target_unit* when it carries a different unit
+        and a registered conversion exists. Returns the (possibly converted)
+        value; the original is returned when no conversion applies or the
+        value is unitless."""
+        if target_unit is None:
+            return value
+        if not isinstance(value, UnitValue):
+            return value
+        if value.error_code is not None:
+            return value
+        if value.unit is None:
+            return value
+        if str(value.unit).lower() == str(target_unit).lower():
+            return value
+        converted = apply_conversion(
+            value.value, value.unit, target_unit, self._formula_eval)
+        if converted is not None:
+            return converted
+        return value
+
+    def _formula_eval(self, entry, value):
+        """Evaluate a formula conversion entry with its parameter bound to the
+        raw incoming value, returning the numerical result or None."""
+        try:
+            scope_dict = self.compiler.current_scope().get_evaluation_scope()
+        except Exception:
+            return None
+        scope_dict = dict(scope_dict)
+        scope_dict[entry.get('var')] = value
+        try:
+            result = self.eval_expr(entry.get('expr', ''), scope_dict, None)
+        except Exception:
+            return None
+        if isinstance(result, UnitValue):
+            if result.error_code is not None:
+                return None
+            return result.value
+        return result
+
+    def eval_or_eval_array(self, expr, scope, line_number=None, is_grid_dim=False,
+                           expected_unit=None):
         """
         Evaluate an expression that could be a scalar, array, range, sum, or grid dimension.
         Handles dimension constraints, reshaping, and grid indexing if specified.
@@ -80,10 +122,25 @@ class ExpressionEvaluator:
         :param scope: The current scope dictionary.
         :param line_number: Optional line number for error reporting.
         :param is_grid_dim: Use grid dimension logic if True.
+        :param expected_unit: Optional target unit; unit-bearing operands are
+            converted to it during evaluation (LHS-informed conversion).
         :return: Evaluated value (scalar, list, or dict-form array).
         """
         if isinstance(expr, list):
             return self._eval_array_literal_elements(expr, scope, line_number)
+        if expected_unit is not None:
+            prev = self._expected_unit
+            self._expected_unit = expected_unit
+            try:
+                result = self._eval_or_eval_array_inner(
+                    expr, scope, line_number, is_grid_dim, expected_unit)
+            finally:
+                self._expected_unit = prev
+            return self._apply_expected_unit(result, expected_unit)
+        return self._eval_or_eval_array_inner(
+            expr, scope, line_number, is_grid_dim, expected_unit)
+
+    def _eval_or_eval_array_inner(self, expr, scope, line_number, is_grid_dim, expected_unit):
         expr = expr.strip()
         if is_grid_dim and '--' in expr:
             expr = expr.split('--')[0].strip()
@@ -2530,6 +2587,7 @@ class ExpressionEvaluator:
             eval_expr, scope, line_number)
         eval_expr = self._replace_piped_array_literals(
             eval_expr, scope, line_number)
+        eval_expr = self._replace_of_unit_literals(eval_expr)
         eval_expr = self._replace_operators(eval_expr, line_number)
         if re.match(r'^[\w_]+\[', eval_expr):
             raise SyntaxError(
@@ -3011,11 +3069,23 @@ class ExpressionEvaluator:
         the restricted builtins dict. All lookups are case-insensitive."""
         if name in full_scope:
             return full_scope[name]
+        # case-insensitive fallback for full_scope (e.g. 'SILength' vs 'silength')
+        low = name.lower()
+        for k in full_scope:
+            if k.lower() == low:
+                return full_scope[k]
         if name in globals_dict:
             return globals_dict[name]
+        for k in globals_dict:
+            if k.lower() == low:
+                return globals_dict[k]
         builtins_dict = globals_dict.get('__builtins__')
-        if isinstance(builtins_dict, dict) and name in builtins_dict:
-            return builtins_dict[name]
+        if isinstance(builtins_dict, dict):
+            if name in builtins_dict:
+                return builtins_dict[name]
+            for k in builtins_dict:
+                if k.lower() == low:
+                    return builtins_dict[k]
         raise NameError(f"Name '{name}' is not defined")
 
     def _walk_ast_node(self, node, full_scope, globals_dict, line_number):
@@ -3033,12 +3103,16 @@ class ExpressionEvaluator:
                 return UNIVERSAL_ZERO
             return node.value
         if node_type is ast.Name:
-            return self._resolve_fallback_name(node.id, full_scope, globals_dict)
+            value = self._resolve_fallback_name(
+                node.id, full_scope, globals_dict)
+            return self._apply_expected_unit(value, self._expected_unit)
         if node_type is ast.BinOp:
             left = self._walk_ast_node(
                 node.left, full_scope, globals_dict, line_number)
             right = self._walk_ast_node(
                 node.right, full_scope, globals_dict, line_number)
+            left = self._apply_expected_unit(left, self._expected_unit)
+            right = self._apply_expected_unit(right, self._expected_unit)
             return self._apply_fallback_binop(node.op, left, right)
         if node_type is ast.UnaryOp:
             operand = self._walk_ast_node(
@@ -3047,9 +3121,11 @@ class ExpressionEvaluator:
         if node_type is ast.Compare:
             left = self._walk_ast_node(
                 node.left, full_scope, globals_dict, line_number)
+            left = self._apply_expected_unit(left, self._expected_unit)
             for op, comparator in zip(node.ops, node.comparators):
                 right = self._walk_ast_node(
                     comparator, full_scope, globals_dict, line_number)
+                right = self._apply_expected_unit(right, self._expected_unit)
                 cmp_result = self._apply_fallback_compare(op, left, right)
                 if len(node.ops) == 1:
                     return cmp_result
@@ -3092,13 +3168,34 @@ class ExpressionEvaluator:
                     kw.value, full_scope, globals_dict, line_number)
             return func(*args, **kwargs)
         if node_type is ast.Attribute:
+            # Support flat dotted keys like 'SILength.inch' stored as a single
+            # scope entry: resolve 'Block.field' directly before walking.
+            if isinstance(node.value, ast.Name):
+                dotted = f"{node.value.id}.{node.attr}"
+                # case-insensitive lookup for flat key
+                for k in full_scope:
+                    if k.lower() == dotted.lower():
+                        return self._resolve_fallback_name(k, full_scope, globals_dict)
+                try:
+                    return self._resolve_fallback_name(dotted, full_scope, globals_dict)
+                except NameError:
+                    pass
             obj = self._walk_ast_node(
                 node.value, full_scope, globals_dict, line_number)
             if is_error_value(obj):
                 if isinstance(obj, UnitValue):
                     return obj
                 return error_value(obj)
-            return getattr(obj, node.attr)
+            try:
+                return getattr(obj, node.attr)
+            except AttributeError:
+                if isinstance(node.value, ast.Name):
+                    dotted = f"{node.value.id}.{node.attr}"
+                    try:
+                        return self._resolve_fallback_name(dotted, full_scope, globals_dict)
+                    except NameError:
+                        pass
+                raise
         if node_type is ast.Subscript:
             value = self._walk_ast_node(
                 node.value, full_scope, globals_dict, line_number)
@@ -3375,6 +3472,17 @@ class ExpressionEvaluator:
             return [start + i * step for i in range(count)]
         raise ValueError(f"Invalid sequence: '{expr}' at line {line_number}")
 
+    def _replace_of_unit_literals(self, expr):
+        """Rewrite ``<number> of <unit>`` RHS literals into a UnitValue factory.
+
+        ``2.54 of cm`` becomes ``gridlang_of_unit(2.54, 'cm')`` (equivalently
+        ``500 of in``, ``4 of km``). ``of`` binds tighter than binary operators,
+        so only a numeric factor directly preceding ``of`` is matched.
+        """
+        return re.sub(
+            r'(?<![\w.])(\d+(?:\.\d*)?|\.\d+)\s+of\s+([A-Za-z_][A-Za-z0-9_]*)',
+            r"gridlang_of_unit(\1, '\2')", expr, flags=re.I)
+
     def _replace_operators(self, expr, line_number=None):
         """
         Replace GridLang operators with Python equivalents for eval.
@@ -3536,7 +3644,8 @@ class ExpressionEvaluator:
             'sqrt': math.sqrt,
             'Sqrt': math.sqrt,
             '_lookup_cell': self.compiler.array_handler.lookup_cell,
-            'rows': rows
+            'rows': rows,
+            'gridlang_of_unit': lambda n, u: UnitValue(n, u),
         }
         if hasattr(self.compiler, 'functions'):
             for fname, fdef in self.compiler.functions.items():
