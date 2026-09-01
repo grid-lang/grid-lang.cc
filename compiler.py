@@ -1228,6 +1228,23 @@ class GridLangCompiler:
             if declared_field_type:
                 coerced_value = self._coerce_with_field_value(
                     declared_field_type, coerced_value, line_number)
+            # Handle unit conversion for field (e.g. : f of m = 5 of in)
+            try:
+                from units import UnitValue as UV, apply_conversion as AC
+                if isinstance(coerced_value, UV) and coerced_value.unit:
+                    # Find field's unit from type definition
+                    f_cons = None
+                    if type_name:
+                        td = self.types_defined.get(type_name.lower(), {})
+                        f_cons = (td.get('_field_constraints', {}) or {}).get(key_name) or (td.get('_field_constraints', {}) or {}).get(key_name.lower())
+                    if f_cons and f_cons.get('unit'):
+                        tgt = str(f_cons.get('unit')).lower()
+                        if str(coerced_value.unit).lower() != tgt:
+                            conv = AC(coerced_value.value, coerced_value.unit, tgt, self.expr_evaluator._formula_eval)
+                            if conv is not None:
+                                coerced_value = conv
+            except Exception:
+                pass
             value[key_name] = coerced_value
             assigned_fields.add(str(key_name).lower())
             if type_name:
