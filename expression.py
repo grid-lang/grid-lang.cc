@@ -3479,6 +3479,10 @@ class ExpressionEvaluator:
         ``500 of in``, ``4 of km``). ``of`` binds tighter than binary operators,
         so only a numeric factor directly preceding ``of`` is matched.
         """
+        # Handle both numeric and quoted text literals with unit (e.g. 5 of m, "ox" of animal)
+        expr = re.sub(
+            r'(?<![\w.])("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')\s+of\s+([\w1][\w0-9./]*)',
+            r"gridlang_of_unit(\1, '\2')", expr, flags=re.I)
         return re.sub(
             r'(?<![\w.])(\d+(?:\.\d*)?|\.\d+)\s+of\s+([\w1][\w0-9./]*)',
             r"gridlang_of_unit(\1, '\2')", expr, flags=re.I)

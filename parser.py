@@ -503,6 +503,7 @@ class GridLangParser:
         brace_depth = 0
         truth_open = False
         seen_equals = False
+        seen_init = False
         i = 0
         lower_text = text.lower()
 
@@ -548,9 +549,9 @@ class GridLangParser:
                                        ] if i + len(kw) < len(text) else ' '
                             if prev.isalnum() or prev == '_' or nxt.isalnum() or nxt == '_':
                                 continue
-                        if seen_equals and kw in soft_keywords:
-                            # Inside the RHS, constraint clauses / connectors
-                            # are ordinary tokens (e.g. '500 of in'): consume
+                        if (seen_equals or seen_init) and kw in soft_keywords:
+                            # Inside the RHS or after init, constraint clauses / connectors
+                            # are ordinary tokens (e.g. '500 of in' or '5 of in' after init): consume
                             # the keyword as part of the current token.
                             current += kw
                             i += len(kw)
@@ -581,6 +582,8 @@ class GridLangParser:
                 truth_open = False
                 if matched == '=':
                     seen_equals = True
+                elif matched == 'init':
+                    seen_init = True
                 i += len(matched)
                 # Skip following whitespace to mimic regex split behavior
                 while i < len(text) and text[i].isspace():
