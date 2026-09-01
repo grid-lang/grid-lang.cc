@@ -3480,7 +3480,7 @@ class ExpressionEvaluator:
         so only a numeric factor directly preceding ``of`` is matched.
         """
         return re.sub(
-            r'(?<![\w.])(\d+(?:\.\d*)?|\.\d+)\s+of\s+([A-Za-z_][A-Za-z0-9_]*)',
+            r'(?<![\w.])(\d+(?:\.\d*)?|\.\d+)\s+of\s+([\w1][\w0-9./]*)',
             r"gridlang_of_unit(\1, '\2')", expr, flags=re.I)
 
     def _replace_operators(self, expr, line_number=None):

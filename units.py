@@ -269,6 +269,10 @@ class UnitValue:
     def _raw(other):
         return other.value if isinstance(other, UnitValue) else other
 
+    @staticmethod
+    def _is_one(unit):
+        return isinstance(unit, str) and str(unit) == "1"
+
     def _same_unit(self, other_unit):
         if self.unit is None or other_unit is None:
             return True
@@ -316,32 +320,40 @@ class UnitValue:
 
     __rsub__ = __sub__
 
-    # ----- multiplicative: at least one operand must be unitless -----
+    # ----- multiplicative: at least one operand must be unitless (or 1) -----
 
     def __mul__(self, other):
         bad = self._check(other)
         if bad is not None:
             return bad
         other_unit = self._unit_of(other)
-        if self.unit is not None and other_unit is not None:
+        is_self_one = self._is_one(self.unit)
+        is_other_one = self._is_one(other_unit)
+        if self.unit is not None and other_unit is not None and not is_self_one and not is_other_one:
             return self._error_value()
-        unit = self.unit if self.unit is not None else other_unit
+        elif is_self_one and other_unit is None:
+            unit = "1"
+        else:
+            unit = self.unit if self.unit is not None and not is_self_one else other_unit
         return self._result(self._raw(self) * self._raw(other), unit)
 
     __rmul__ = __mul__
 
-    # ----- division/mod: right operand unitless or same unit -----
+    # ----- division/mod: right operand unitless, 1, or same unit -----
 
     def _divide(self, other, op):
         bad = self._check(other)
         if bad is not None:
             return bad
         other_unit = self._unit_of(other)
-        if other_unit is not None and not self._same_unit(other_unit):
+        is_other_one = self._is_one(other_unit)
+        if is_other_one:
+            unit = self.unit
+        elif other_unit is not None and not self._same_unit(other_unit):
             return self._error_value()
-        # Same unit on both sides produces a unitless result; a unitless
-        # right operand keeps the left operand's unit.
-        unit = None if other_unit is not None else self.unit
+        else:
+            # Same unit on both sides produces unit 1; unitless right keeps left.
+            unit = "1" if other_unit is not None else self.unit
         try:
             result = op(self._raw(self), self._raw(other))
         except ZeroDivisionError:
@@ -374,7 +386,8 @@ class UnitValue:
         bad = self._check(other)
         if bad is not None:
             return bad
-        if self._unit_of(other) is not None:
+        other_unit = self._unit_of(other)
+        if other_unit is not None and not self._is_one(other_unit):
             return self._error_value()
         try:
             result = self._raw(self) ** self._raw(other)

@@ -36,7 +36,8 @@ def _strip_constraint_operands(expr):
     if not expr:
         return expr
     cleaned = _STRING_LITERAL_PATTERN.sub(' ', str(expr))
-    cleaned = re.sub(r'\b(?:of|as)\s+[A-Za-z][A-Za-z0-9_.]*', ' ', cleaned)
+    cleaned = re.sub(r'\b(?:as)\s+(?:[A-Za-z][A-Za-z0-9_.]*)\b', ' ', cleaned)
+    cleaned = re.sub(r'\b(?:of)\s+(?:[\w1][\w0-9./]*)\b', ' ', cleaned)
     cleaned = re.sub(
         r'\bdim\s+(?:\d+(?:\.\d*)?|[A-Za-z][A-Za-z0-9_.]*)',
         ' ', cleaned, flags=re.I)
@@ -2324,7 +2325,7 @@ class GridLangCompiler:
         # Remove '<number> of <unit>' RHS literals so the unit name and the
         # 'of' connector are not mistaken for dependency variables.
         cleaned = re.sub(
-            r'(?<![\w.])(\d+(?:\.\d*)?|\.\d+)\s+of\s+[A-Za-z_][A-Za-z0-9_]*',
+            r'(?<![\w.])(\d+(?:\.\d*)?|\.\d+)\s+of\s+(?:[A-Za-z_][A-Za-z0-9_]*|1)',
             r'\1', cleaned, flags=re.I)
         # Remove member accesses like "obj.field" or "obj.method" to avoid
         # treating field/method names as standalone dependencies.
