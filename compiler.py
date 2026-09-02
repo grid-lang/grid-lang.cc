@@ -16,42 +16,15 @@ from units import (
 from control_flow import GridLangControlFlow
 from type_processor import GridLangTypeProcessor, split_builder_chain
 from parser import GridLangParser
+from grid_lang_common import GridLangBase
 
 
-# Tiny tokenizer for statement dispatch — replaces re.match(r'^\s*keyword\b')
-_STATEMENT_KEYWORDS = frozenset(['input','define','output','let','if','for','when','return','push','while'])
-def _first_keyword(line):
-    s = line.lstrip()
-    if s.startswith('['):
-        return ""
-    m = re.match(r'([A-Za-z_]+)', s)
-    return m.group(1).lower() if m else ""
-
-_IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z][A-Za-z0-9_.]*')
-_STRING_LITERAL_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
-_DEPENDENCY_IGNORED_TOKENS = {
-    'sum', 'rows', 'sqrt', 'min', 'max', 'abs', 'int', 'float', 'str', 'len',
-    'textsplit', 'print', 'push', 'true', 'false', 'none', 'nan', 'inf', 'and', 'or', 'not',
-    'if', 'then', 'else', 'elseif', 'end', 'do', 'for', 'while', 'when', 'step', 'return',
-    'index', 'as', 'dim', 'with', 'grid', 'output', 'input', 'number', 'text',
-    'array', 'mod', 'div', 'to', 'by', 'e', 'new', 'in', 'counta', 'rows', 'of', 'null'
-}
-
-
-def _strip_constraint_operands(expr):
-    """Remove constraint clauses (' of <unit>', ' as <type>', ' dim <n>',
-    ' not null') so dependency extraction doesn't treat unit/type names as
-    variable references."""
-    if not expr:
-        return expr
-    cleaned = _STRING_LITERAL_PATTERN.sub(' ', str(expr))
-    cleaned = re.sub(r'\b(?:as)\s+(?:[A-Za-z][A-Za-z0-9_.]*)\b', ' ', cleaned)
-    cleaned = re.sub(r'\b(?:of)\s+(?:[\w1][\w0-9./]*)\b', ' ', cleaned)
-    cleaned = re.sub(
-        r'\bdim\s+(?:\d+(?:\.\d*)?|[A-Za-z][A-Za-z0-9_.]*)',
-        ' ', cleaned, flags=re.I)
-    cleaned = re.sub(r'\bnot\s+null\b', ' ', cleaned, flags=re.I)
-    return cleaned
+from grid_lang_common import (
+    _STATEMENT_KEYWORDS, _first_keyword,
+    _IDENTIFIER_TOKEN_PATTERN, _STRING_LITERAL_PATTERN, _DEPENDENCY_IGNORED_TOKENS,
+    _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens,
+    _is_numeric_token,
+)
 
 
 class SubprocessResult:
@@ -89,7 +62,7 @@ class _UnitSourceNamespace:
         return self._fields[name]
 
 
-class GridLangCompiler:
+class GridLangCompiler(GridLangBase):
     def __init__(self):
         self.scopes = [Scope(self)]
         # Predefine the 'grid' variable containing the current grid, like in a
@@ -535,9 +508,6 @@ class GridLangCompiler:
             obj[field_name] = val
             eval_scope[field_name] = val
 
-    def current_scope(self):
-        return self.scopes[-1]
-
     def _is_outer_scope(self, scope):
         """Return True when the given scope belongs to the caller's scope chain."""
         parent = getattr(self, '_parent_scope', None)
@@ -549,18 +519,6 @@ class GridLangCompiler:
                 return True
             cur = cur.parent
         return False
-
-    def push_scope(self, is_private=False, is_loop_scope=False):
-        scope = Scope(self, parent=self.current_scope(), is_private=is_private)
-        if is_loop_scope:
-            scope.is_loop_scope = True
-        self.scopes.append(scope)
-
-    def pop_scope(self):
-        if len(self.scopes) > 1:
-            self.scopes.pop()
-        else:
-            raise RuntimeError("Cannot pop global scope")
 
     def run(self, code, args=None, suppress_output=False, return_output=False):
         """Delegates to the extracted run function."""
@@ -3903,9 +3861,6 @@ class GridLangCompiler:
         """Case-insensitive keyword end check"""
         return line.strip().lower().endswith(keyword.lower())
 
-    def get_global_scope(self):
-        return self.scopes[0]
-
     def set_input_values(self, args, prompt_missing=False):
         """Set input values from args/defaults. Optionally prompt for missing ones."""
         global_scope = self.get_global_scope()
@@ -4090,8 +4045,4 @@ class GridLangCompiler:
                 print("\nExiting...")
                 sys.exit(1)
 
-    def collect_input_output_variables(self):
-        """Collect all input and output variables from the current scope"""
-        global_scope = self.get_global_scope()
-        self.input_variables = list(global_scope.input_variables)
-        self.output_variables = list(global_scope.output_variables)
+

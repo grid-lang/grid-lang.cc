@@ -5,14 +5,7 @@ Handles code preprocessing, variable parsing, and declaration processing.
 import re
 from type_processor import GridLangTypeProcessor
 from expression import ExpressionEvaluator
-
-_STATEMENT_KEYWORDS = frozenset(['input','define','output','let','if','for','when','return','push','while'])
-def _first_keyword(line):
-    s = line.lstrip()
-    if s.startswith('['):
-        return ""
-    m = re.match(r'([A-Za-z_]+)', s)
-    return m.group(1).lower() if m else ""
+from grid_lang_common import _STATEMENT_KEYWORDS, _first_keyword
 
 
 class GridLangParser:

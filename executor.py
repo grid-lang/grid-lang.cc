@@ -9,32 +9,11 @@ from control_flow import GridLangControlFlow
 from parser import GridLangParser
 from units import VALUE_ERROR, ConstraintError, error_value
 from utils import col_to_num, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array, strip_array_cell_indices, is_wildcard_address
-
+from grid_lang_common import GridLangBase, _STATEMENT_KEYWORDS, _first_keyword, _DEPENDENCY_IGNORED_TOKENS, _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens
+DEPENDENCY_IGNORED_TOKENS = _DEPENDENCY_IGNORED_TOKENS
 
 IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z][A-Za-z0-9_.]*')
 STRING_LITERAL_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
-# Tiny tokenizer for statement dispatch — replaces regex for keyword checks
-_STATEMENT_KEYWORDS = frozenset(['input','define','output','let','if','for','when','return','push'])
-def _first_keyword(line):
-    s = line.lstrip()
-    if s.startswith('['):
-        return ""
-    m = re.match(r'([A-Za-z_]+)', s)
-    return m.group(1).lower() if m else ""
-
-
-def _strip_builder_arrows(text):
-    """Remove builder-call names ('-> name(') so dependency extraction does not
-    mistake builder names for variables. The arguments remain (they may carry
-    real dependencies)."""
-    return re.sub(r'->\s*\$?[A-Za-z][A-Za-z0-9_.]*\s*\(', '(', text)
-DEPENDENCY_IGNORED_TOKENS = {
-    'sum', 'rows', 'sqrt', 'min', 'max', 'abs', 'int', 'float', 'str', 'len',
-    'textsplit', 'print', 'push', 'true', 'false', 'none', 'nan', 'inf', 'and', 'or', 'not',
-    'if', 'then', 'else', 'elseif', 'end', 'do', 'for', 'while', 'when', 'step', 'return',
-    'index', 'as', 'dim', 'with', 'grid', 'output', 'input', 'number', 'text',
-    'array', 'mod', 'div', 'to', 'by', 'e', 'new', 'in', 'counta', 'rows', 'of', 'null'
-}
 
 
 def infer_array_rank(value):
@@ -51,21 +30,6 @@ def infer_array_rank(value):
                 depth = max(depth, infer_array_rank(item))
         return 1 + depth
     return None
-
-
-def _strip_constraint_operands(expr):
-    """Remove constraint clauses (' of <unit>', ' as <type>', ' dim <n>',
-    ' not null') so dependency extraction doesn't treat unit/type names as
-    variable references."""
-    if not expr:
-        return expr
-    cleaned = STRING_LITERAL_PATTERN.sub(' ', str(expr))
-    cleaned = re.sub(r'\b(?:of|as)\s+[A-Za-z][A-Za-z0-9_.]*', ' ', cleaned)
-    cleaned = re.sub(
-        r'\bdim\s+(?:\d+(?:\.\d*)?|[A-Za-z][A-Za-z0-9_.]*)',
-        ' ', cleaned, flags=re.I)
-    cleaned = re.sub(r'\bnot\s+null\b', ' ', cleaned, flags=re.I)
-    return cleaned
 
 
 def _strip_cell_address_tokens(line, var_set):
@@ -111,7 +75,7 @@ def _filter_var_tokens(tokens):
     return filtered
 
 
-class GridLangExecutor:
+class GridLangExecutor(GridLangBase):
     def __init__(self):
         self.control_flow = GridLangControlFlow(self)
         self.exit_loop = False  # Simple boolean flag for breaking out of loops
@@ -131,14 +95,6 @@ class GridLangExecutor:
         self._push_queues = {}
         self._processing_when = False
 
-    def get_global_scope(self):
-        """Get the global scope from the compiler"""
-        if hasattr(self, 'compiler') and self.compiler:
-            return self.compiler.scopes[0]  # First scope is always global
-        else:
-            # Fallback if no compiler reference
-            return self.current_scope()
-
     def _is_outer_defining_scope(self, scope):
         """Return True when the given scope belongs to the caller's scope chain."""
         parent = getattr(self, '_parent_scope', None)
@@ -150,15 +106,6 @@ class GridLangExecutor:
                 return True
             cur = cur.parent
         return False
-
-    def collect_input_output_variables(self):
-        """Collect all input and output variables from the current scope"""
-        global_scope = self.get_global_scope()
-        self.input_variables = list(global_scope.input_variables)
-        self.output_variables = list(global_scope.output_variables)
-        # Add 'output' as a default output variable for push() calls
-        if 'output' not in self.output_variables:
-            self.output_variables.append('output')
 
     def _reset_dependency_graph(self):
         """Reset dependency graph storage for a new run."""
@@ -272,10 +219,14 @@ class GridLangExecutor:
         return False
 
     def _has_star_dim(self, constraints):
-        return self.compiler._has_star_dim(constraints) if hasattr(self, 'compiler') else False
+        from grid_lang_common import _has_star_dim as _common_has_star
+        return _common_has_star(constraints, getattr(self, 'array_handler', None) or getattr(getattr(self, 'compiler', None), 'array_handler', None))
 
     def _apply_dim_base_offsets(self, var_name, indices, line_number=None):
-        return self.compiler._apply_dim_base_offsets(var_name, indices, line_number) if hasattr(self, 'compiler') else indices
+        from grid_lang_common import _apply_dim_base_offsets as _common_apply
+        dims = getattr(self, 'dimensions', None) or getattr(getattr(self, 'compiler', None), 'dimensions', None)
+        ah = getattr(self, 'array_handler', None) or getattr(getattr(self, 'compiler', None), 'array_handler', None)
+        return _common_apply(var_name, indices, dims, ah, line_number)
 
     def _has_when_dependency(self, var_name):
         var_lower = var_name.lower()

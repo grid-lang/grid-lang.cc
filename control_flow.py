@@ -6,14 +6,7 @@ Handles FOR loops, IF statements, LET statements, and block processing.
 import re
 from units import UNIVERSAL_ZERO
 from utils import num_to_col, split_var_defs, is_sparse_array
-
-_STATEMENT_KEYWORDS = frozenset(['input','define','output','let','if','for','when','return','push','while'])
-def _first_keyword(line):
-    s = line.lstrip()
-    if s.startswith('['):
-        return ""
-    m = re.match(r'([A-Za-z_]+)', s)
-    return m.group(1).lower() if m else ""
+from grid_lang_common import _STATEMENT_KEYWORDS, _first_keyword
 
 # Regex patterns for block parsing
 HEADER_IF = re.compile(r'^\s*if\b(.+?)\bthen\s*$', re.I)
