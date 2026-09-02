@@ -1,12 +1,14 @@
-"""Shared helpers for GridLang compiler and executor.
+"""Shared helpers for the GridLang engine.
 
-This module is the single source of truth for constants and utilities that were
-previously duplicated between compiler.py and executor.py. Both modules import
-from here instead of re-defining or monkey-patching at runtime.
+This module is the single source of truth for constants and utilities shared
+across the engine's classes. Both compiler.py (GridLangCompiler) and
+executor.py (GridLangExecutor, now the runtime-loop base of the compiler)
+import from here instead of re-defining or monkey-patching at runtime.
 
-The goal is to eliminate the `setattr(extracted, method, getattr(self, method))`
-handoff in compiler.py:_run_inner and replace it with explicit imports / shared
-base functionality.
+The earlier `setattr(extracted, method, getattr(self, method))` handoff in
+compiler.py:_run_inner was eliminated: GridLangCompiler now inherits
+GridLangExecutor directly, so there is a single engine object with no method
+copying between a compiler and a separate facade executor.
 """
 
 import re
@@ -120,15 +122,11 @@ def _infer_declared_type(value, array_handler=None):
 
 
 class GridLangBase:
-    """Shared base for GridLangCompiler and GridLangExecutor.
+    """Shared base for the GridLang engine classes.
 
-    Holds the small set of helpers that were previously duplicated via
-    monkey-patching (setattr loop) in compiler.py:_run_inner. By inheriting
-    from this base, both classes share a single implementation without runtime
-    copying.
-
-    Only helpers with no circular dependencies are here; larger pending/when
-    resolvers stay in their owning files for now to keep the change small.
+    Holds the small shared helpers (scope management, dependency filtering,
+    type inference) used by both GridLangExecutor (the runtime-loop layer) and
+    GridLangCompiler (the single public engine, which inherits it).
     """
 
     def current_scope(self):

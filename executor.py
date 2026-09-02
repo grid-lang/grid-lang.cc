@@ -76,6 +76,14 @@ def _filter_var_tokens(tokens):
 
 
 class GridLangExecutor(GridLangBase):
+    """Runtime-execution layer of the GridLang engine.
+
+    This is no longer a separate engine object: GridLangCompiler inherits it and
+    runs directly on itself. Instances of this class represent the runtime loop
+    (parsing, scopes, dependencies, for/when/push handling, output) shared by the
+    single public engine.
+    """
+
     def __init__(self):
         self.control_flow = GridLangControlFlow(self)
         self.exit_loop = False  # Simple boolean flag for breaking out of loops

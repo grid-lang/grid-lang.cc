@@ -16,6 +16,7 @@ from units import (
 from control_flow import GridLangControlFlow
 from type_processor import GridLangTypeProcessor, split_builder_chain
 from parser import GridLangParser
+from executor import GridLangExecutor
 from grid_lang_common import GridLangBase
 
 
@@ -62,8 +63,13 @@ class _UnitSourceNamespace:
         return self._fields[name]
 
 
-class GridLangCompiler(GridLangBase):
+class GridLangCompiler(GridLangExecutor):
     def __init__(self):
+        super().__init__()
+        # The merged engine is both compiler and executor: executor methods that
+        # reference self.compiler (previously the owning compiler of a copied
+        # executor) resolve back to this same object.
+        self.compiler = self
         self.scopes = [Scope(self)]
         # Predefine the 'grid' variable containing the current grid, like in a
         # type definition, so programs can read and write cells with grid{row, col}.
@@ -521,60 +527,31 @@ class GridLangCompiler(GridLangBase):
         return False
 
     def run(self, code, args=None, suppress_output=False, return_output=False):
-        """Delegates to the extracted run function."""
-        from executor import GridLangExecutor
+        """Compile and execute a GridLang program.
+
+        The single engine (GridLangCompiler) owns all state and components and
+        executes directly on itself; there is no separate executor object and
+        no method/state copy handoff.
+        """
         from scope import _ACTIVE_RUNNERS
 
-        extracted = GridLangExecutor()
-        # Store reference to compiler for output values access
-        extracted.compiler = self
         # Track this compiler as the currently executing context so that
         # read-only function sub-compilers can reject writes to outer scopes
         # routed through the defining scope object.
         _ACTIVE_RUNNERS.append(self)
         try:
-            return self._run_inner(extracted, code, args, suppress_output, return_output)
+            result = super().run(code, args, suppress_output=suppress_output,
+                                 return_output=return_output)
         finally:
             _ACTIVE_RUNNERS.pop()
 
-    def _run_inner(self, extracted, code, args=None, suppress_output=False, return_output=False):
-        # Copy all necessary attributes from self to extracted
-        for attr in ['grid', 'scopes', 'expr_evaluator', 'array_handler', 'types_defined',
-                     'dimensions', 'pending_assignments', 'dim_labels', 'undefined_dependencies',
-                     'dependency_graph', 'global_guard_entries', 'global_for_line_numbers',
-                     'executed_global_for_lines', 'output_values', 'functions', 'subprocesses',
-                     'prompt_missing_inputs', '_allow_hidden_field_access', '_allow_hidden_member_calls',
-                     '_parent_scope', '_outer_scope_read_only',
-                     '_context_grid_stack']:
-            if hasattr(self, attr):
-                setattr(extracted, attr, getattr(self, attr))
-
-        # Copy ALL methods from self to extracted (except run to avoid recursion)
-        for method_name in dir(self):
-            if callable(getattr(self, method_name)) and method_name != 'run' and not method_name.startswith('__'):
-                setattr(extracted, method_name, getattr(self, method_name))
-
-        # Call the extracted run function
-        result = extracted.run(code, args, suppress_output=suppress_output,
-                               return_output=return_output)
-
         # Capture the final root-scope variables for callers that need them
         try:
-            self._last_scope_vars = extracted.current_scope().variables.copy()
-            self._last_scope_types = extracted.current_scope().types.copy()
+            self._last_scope_vars = self.current_scope().variables.copy()
+            self._last_scope_types = self.current_scope().types.copy()
         except Exception:
             self._last_scope_vars = {}
             self._last_scope_types = {}
-
-        # Copy back any changes to attributes
-        for attr in ['grid', 'scopes', 'expr_evaluator', 'array_handler', 'types_defined',
-                     'dimensions', 'pending_assignments', 'dim_labels', 'undefined_dependencies',
-                     'dependency_graph', 'global_guard_entries', 'global_for_line_numbers',
-                     'executed_global_for_lines', 'output_values', 'functions', 'subprocesses',
-                     'prompt_missing_inputs', '_allow_hidden_field_access', '_allow_hidden_member_calls',
-                     '_parent_scope', '_outer_scope_read_only', '_deferred_output_inits']:
-            if hasattr(extracted, attr):
-                setattr(self, attr, getattr(extracted, attr))
 
         # Keep variables reference aligned with the active root scope
         if hasattr(self, 'scopes') and self.scopes:
