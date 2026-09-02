@@ -6,6 +6,14 @@ import re
 from type_processor import GridLangTypeProcessor
 from expression import ExpressionEvaluator
 
+_STATEMENT_KEYWORDS = frozenset(['input','define','output','let','if','for','when','return','push','while'])
+def _first_keyword(line):
+    s = line.lstrip()
+    if s.startswith('['):
+        return ""
+    m = re.match(r'([A-Za-z_]+)', s)
+    return m.group(1).lower() if m else ""
+
 
 class GridLangParser:
     """Handles parsing and preprocessing of GridLang code."""
@@ -63,7 +71,7 @@ class GridLangParser:
         else:
             var = re.sub(r'^(input|output)\s+', '', parts[0], flags=re.I).strip()
         first_word = var.split()[0] if var.split() else ''
-        if re.match(r'^(let|for|if|when|declare|input|output)\b', first_word, re.I):
+        if _first_keyword(first_word) in ('let','for','if','when','declare','input','output'):
             raise SyntaxError(
                 f"'{first_word}' is an instruction and must be at the start "
                 f"of a line, or after 'Then', 'Else', 'Do' or ':' at line "

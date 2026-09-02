@@ -13,6 +13,14 @@ from utils import col_to_num, split_cell, offset_cell, parse_address, public_typ
 
 IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z][A-Za-z0-9_.]*')
 STRING_LITERAL_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+# Tiny tokenizer for statement dispatch — replaces regex for keyword checks
+_STATEMENT_KEYWORDS = frozenset(['input','define','output','let','if','for','when','return','push'])
+def _first_keyword(line):
+    s = line.lstrip()
+    if s.startswith('['):
+        return ""
+    m = re.match(r'([A-Za-z_]+)', s)
+    return m.group(1).lower() if m else ""
 
 
 def _strip_builder_arrows(text):
@@ -1583,7 +1591,7 @@ class GridLangExecutor:
         let_var_names = set()
         for bl, _ in block_lines:
             bl_stripped = bl.strip()
-            if re.match(r'^let\b', bl_stripped, re.I) and re.search(r'\binit\b', bl_stripped, re.I):
+            if _first_keyword(bl_stripped) == 'let' and 'init' in bl_stripped.lower().split():
                 m_let = re.match(r'^let\s+(\w+)', bl_stripped, re.I)
                 if m_let:
                     let_var_names.add(m_let.group(1).lower())
@@ -3772,7 +3780,7 @@ class GridLangExecutor:
         if (
             '=' in line
             and ':=' not in line
-            and not re.match(r'^\s*(input|define|output|let|if|for|when|return|push)\b', line, re.I)
+            and _first_keyword(line) not in _STATEMENT_KEYWORDS
             and not re.match(r'^\[\s*\^?[A-Za-z]+\d+\s*\]\s*:\s*', line)
         ):
             target, rhs = line.split('=', 1)

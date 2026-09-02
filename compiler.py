@@ -18,6 +18,15 @@ from type_processor import GridLangTypeProcessor, split_builder_chain
 from parser import GridLangParser
 
 
+# Tiny tokenizer for statement dispatch — replaces re.match(r'^\s*keyword\b')
+_STATEMENT_KEYWORDS = frozenset(['input','define','output','let','if','for','when','return','push','while'])
+def _first_keyword(line):
+    s = line.lstrip()
+    if s.startswith('['):
+        return ""
+    m = re.match(r'([A-Za-z_]+)', s)
+    return m.group(1).lower() if m else ""
+
 _IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z][A-Za-z0-9_.]*')
 _STRING_LITERAL_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 _DEPENDENCY_IGNORED_TOKENS = {
@@ -2948,8 +2957,8 @@ class GridLangCompiler:
                 stripped = s.strip()
                 stripped_lower = stripped.lower()
                 end_pattern = rf'^\s*end(\s+type|\s+{re.escape(type_name)})?\s*$'
-                if (re.match(r'^\s*(for|while|when)\b', stripped, re.I) and stripped_lower.endswith('do')) or (
-                    re.match(r'^\s*if\b', stripped, re.I) and stripped_lower.endswith('then')
+                if (_first_keyword(stripped) in ('for','while','when') and stripped_lower.endswith('do')) or (
+                    _first_keyword(stripped) == 'if' and stripped_lower.endswith('then')
                 ) or (
                     re.match(r'^\s*let\b', stripped, re.I) and stripped_lower.endswith('then')
                 ):
