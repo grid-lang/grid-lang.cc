@@ -318,7 +318,10 @@ class ExpressionEvaluator:
             tensor = self._get_scope_value_case_insensitive(scope_lookup, var_name)
             if tensor is None:
                 return False, None
-            if isinstance(tensor, dict) and 'grid' in tensor:
+            if isinstance(tensor, dict):
+                # Lazy grid: missing 'grid' means empty grid; grid{...} -> #N/A
+                if 'grid' not in tensor:
+                    return True, error_value(NA_ERROR)
                 array = tensor['grid']
                 original_shape = tensor.get('original_shape')
                 adjusted_indices = [idx - 1 for idx in indices]
@@ -329,6 +332,11 @@ class ExpressionEvaluator:
                 except (IndexError, ValueError) as e:
                     raise IndexError(
                         f"Invalid indices {indices_str} for '{var_name}.grid': {e} at line {line_number}")
+            # Primitive grid dim none has rank 0: any indexing is #REF
+            if isinstance(tensor, (int, float, str, bool)) or isinstance(tensor, UnitValue):
+                raw = tensor.value if isinstance(tensor, UnitValue) else tensor
+                if isinstance(raw, (int, float, str, bool)) or is_error_value(tensor):
+                    return True, error_value(REF_ERROR)
             raise TypeError(
                 f"Variable '{var_name}' does not have a 'grid' field at line {line_number}")
         field_match = re.match(r'^([\w_]+)\.(\w+)$', expr)
@@ -345,7 +353,21 @@ class ExpressionEvaluator:
             tensor = self._get_scope_value_case_insensitive(scope_lookup, var)
         if tensor is None:
             return False, None
+        # Primitive grid dim none is 0D (rank 0): var.grid returns scalar value, not array/dict
+        if field.lower() == 'grid' and isinstance(tensor, (int, float, str, bool, UnitValue)):
+            from units import strip_units
+            return True, strip_units(tensor)
         if isinstance(tensor, dict):
+            # Lazy grid: missing grid returns {} (read-only outside type)
+            if field.lower() == 'grid' and get_case_insensitive_key(tensor, 'grid') is None:
+                if '_type_name' in tensor or any(k.lower() == 'grid' for k in []):
+                    return True, {}
+                # Also allow any dict object to have lazy empty grid
+                if isinstance(tensor, dict):
+                    # Check if var is a type instance (has _type_name) or general object
+                    # Return empty grid for type instances missing grid
+                    if tensor.get('_type_name') is not None or field.lower() == 'grid':
+                        return True, {}
             actual_field = get_case_insensitive_key(tensor, field) or field
             if actual_field in tensor:
                 if (hasattr(self.compiler, '_is_hidden_field') and
@@ -354,6 +376,9 @@ class ExpressionEvaluator:
                     raise PermissionError(
                         f"Hidden field '{field}' is not accessible at line {line_number}")
                 return True, tensor[actual_field]
+            # Lazy grid fallback for field == grid
+            if field.lower() == 'grid':
+                return True, {}
         if isinstance(tensor, (list, tuple, dict)):
             shape = self.compiler.array_handler.get_array_shape(
                 tensor, line_number)
@@ -1358,8 +1383,12 @@ class ExpressionEvaluator:
                 raise PermissionError(
                     f"Hidden field '{field}' is not accessible at line {line_number}")
             if actual_field not in scope_var and scope_var.get('_type_name'):
+                if field.lower() == 'grid':
+                    return True, {}
                 raise NameError(
                     f"Field '{field}' does not exist on '{var}' at line {line_number}")
+            if actual_field not in scope_var and field.lower() == 'grid':
+                return True, {}
             return True, scope_var.get(actual_field)
         if _err_value(scope_var) is not None:
             return True, _err_value(scope_var)
@@ -1373,11 +1402,40 @@ class ExpressionEvaluator:
                     raise PermissionError(
                         f"Hidden field '{field}' is not accessible at line {line_number}")
                 if actual_field not in var_value and var_value.get('_type_name'):
+                    if field.lower() == 'grid':
+                        return True, {}
                     raise NameError(
                         f"Field '{field}' does not exist on '{var}' at line {line_number}")
+                if actual_field not in var_value and field.lower() == 'grid':
+                    return True, {}
                 return True, var_value.get(actual_field)
         except NameError:
             pass
+        # Primitive grid simulation for field == grid (dim none, rank 0)
+        if field.lower() == 'grid':
+            # Primitive grid dim none rank 0: n.grid returns scalar value (or #VALUE if n is error)
+            for candidate in (scope_var,):
+                if isinstance(candidate, (int, float, str, bool)) or isinstance(candidate, UnitValue):
+                    if is_error_value(candidate):
+                        continue
+                    raw = candidate.value if isinstance(candidate, UnitValue) else candidate
+                    if isinstance(raw, (int, float, str, bool)):
+                        from units import strip_units
+                        # For dim none, n.grid returns scalar value, not dict
+                        return True, strip_units(candidate)
+            try:
+                var_value2 = self.compiler.current_scope().get(var)
+                if isinstance(var_value2, (int, float, str, bool)) or isinstance(var_value2, UnitValue):
+                    if is_error_value(var_value2):
+                        # Defer: n.grid when n is #VALUE just returns #VALUE
+                        pass
+                    else:
+                        raw = var_value2.value if isinstance(var_value2, UnitValue) else var_value2
+                        if isinstance(raw, (int, float, str, bool)):
+                            from units import strip_units
+                            return True, strip_units(var_value2)
+            except Exception:
+                pass
         return False, None
 
     def _try_eval_single_cell_reference(self, expr, line_number):
@@ -1593,8 +1651,13 @@ class ExpressionEvaluator:
             except ValueError:
                 # If not a number, evaluate as an expression
                 index_value = self.eval_expr(index_expr, scope, line_number)
-                if isinstance(index_value, float) and index_value.is_integer():
-                    index_value = int(index_value)
+                if isinstance(index_value, float):
+                    if index_value.is_integer():
+                        index_value = int(index_value)
+                    else:
+                        # Non-integer index like 1.1 is invalid
+                        return self._substitute_curly_result(
+                            f"{var_name}{{{indices_str}}}", f"{var_name}{{{indices_str}}}", error_value(REF_ERROR), scope)
                 specs.append(int(index_value))
 
         # Get the array and evaluate the access
@@ -1694,6 +1757,8 @@ class ExpressionEvaluator:
         specs = []
         for index_expr in indices_str.split(','):
             index_expr = index_expr.strip()
+            if not index_expr:
+                continue
             if index_expr == '*':
                 specs.append(None)
                 continue
@@ -1709,8 +1774,12 @@ class ExpressionEvaluator:
                 specs.append(int(index_expr))
             except ValueError:
                 index_value = self.eval_expr(index_expr, scope, line_number)
-                if isinstance(index_value, float) and index_value.is_integer():
-                    index_value = int(index_value)
+                if isinstance(index_value, float):
+                    if index_value.is_integer():
+                        index_value = int(index_value)
+                    else:
+                        return self._substitute_curly_result(
+                            f"{obj_name}.{field_name}{{{indices_str}}}", f"{obj_name}.{field_name}{{{indices_str}}}", error_value(REF_ERROR), scope)
                 specs.append(int(index_value))
 
         # Member arrays are 1-based; storage is 0-based.
@@ -2130,7 +2199,7 @@ class ExpressionEvaluator:
         # But skip if this looks like object creation
         if not expr.strip().startswith('new '):
             expr = re.sub(
-                r'[\w_]+\{[^}]+\}',
+                r'(?<![\w.])[\w_]+\{[^}]+\}',
                 lambda m: self._array_access_replacer(m, scope, line_number),
                 expr)
 
@@ -2193,6 +2262,18 @@ class ExpressionEvaluator:
                 f"Expression evaluation depth limit exceeded for '{expr}' at line {line_number}")
 
         expr = expr.strip()
+        # Primitive grid dim none rank 0: any n.grid{...} is #REF
+        m_grid_idx = re.match(r'^([\w_]+)\.grid\{[^}]+\}$', expr, re.I)
+        if m_grid_idx:
+            var_name = m_grid_idx.group(1)
+            try:
+                defining_scope = self.compiler.current_scope().get_defining_scope(var_name)
+                if defining_scope:
+                    actual_key = defining_scope._get_case_insensitive_key(var_name, defining_scope.types)
+                    if actual_key and defining_scope.types.get(actual_key) in ('number', 'text', 'logical'):
+                        return error_value(REF_ERROR)
+            except Exception:
+                pass
         if '->' in expr and not expr.lower().startswith('new '):
             _, stray_chain = split_builder_chain(expr)
             if stray_chain is not None:
@@ -2273,10 +2354,32 @@ class ExpressionEvaluator:
             r'^([\w_]+)\.([\w_]+)\{([\d,\s]+)\}$', expr, re.I)
         if grid_index_match:
             var_name, field_name, indices_str = grid_index_match.groups()
-            indices = [int(i.strip()) - 1 for i in indices_str.split(',')]
+            # Primitive grid dim none has rank 0: any indexing is #REF
+            if field_name.lower() == 'grid':
+                try:
+                    defining_scope = self.compiler.current_scope().get_defining_scope(var_name)
+                    if defining_scope:
+                        actual_key = defining_scope._get_case_insensitive_key(var_name, defining_scope.types)
+                        if actual_key and defining_scope.types.get(actual_key) in ('number', 'text', 'logical'):
+                            return error_value(REF_ERROR)
+                except Exception:
+                    pass
+            parts = [p.strip() for p in indices_str.split(',') if p.strip()]
+            indices = [int(i.strip()) - 1 for i in parts if i.strip()]
             full_scope = self.compiler.current_scope().get_full_scope()
+            # Try full_scope first, then current_scope direct lookup (for pending vars)
+            value = None
+            found = False
             if var_name in full_scope:
                 value = full_scope.get(var_name)
+                found = True
+            else:
+                try:
+                    value = self.compiler.current_scope().get(var_name)
+                    found = True
+                except Exception:
+                    found = False
+            if found:
                 if value is None:
                     raise ValueError(
                         f"Variable '{var_name}' is uninitialized at line {line_number}")
@@ -2290,6 +2393,26 @@ class ExpressionEvaluator:
                             result = self.compiler.array_handler.read_array_element(
                                 field_val, indices, line_number, original_shape=value.get('original_shape'), var_name=f"{var_name}.{field_name}")
                             return result
+                        # Lazy grid for object missing grid, or primitive grid simulation
+                        if field_name.lower() == 'grid':
+                            # Primitive scalar stored in value? value is dict with missing grid -> #N/A
+                            # For type instances missing grid, return #N/A
+                            return error_value(NA_ERROR)
+                    # Primitive grid dim none has rank 0: any indexing is #REF
+                    if field_name.lower() == 'grid':
+                        try:
+                            defining_scope = self.compiler.current_scope().get_defining_scope(var_name)
+                            if defining_scope:
+                                actual_key = defining_scope._get_case_insensitive_key(var_name, defining_scope.types)
+                                if actual_key and defining_scope.types.get(actual_key) in ('number', 'text', 'logical'):
+                                    return error_value(REF_ERROR)
+                        except Exception:
+                            pass
+                        # Fallback check on value type
+                        if isinstance(value, (int, float, str, bool, UnitValue)):
+                            raw = value.value if isinstance(value, UnitValue) else value
+                            if isinstance(raw, (int, float, str, bool)) or is_error_value(value):
+                                return error_value(REF_ERROR)
                     result = self.compiler.array_handler.read_array_element(
                         value, indices, line_number, var_name=var_name)
                     return result
@@ -2725,7 +2848,7 @@ class ExpressionEvaluator:
         return eval_expr.replace(curly_expr, placeholder)
 
     def _replace_fallback_curly_accesses(self, eval_expr, scope, line_number):
-        curly_brace_pattern = re.compile(r'([\w_]+)\{([^}]+)\}')
+        curly_brace_pattern = re.compile(r'(?<![\w.]) ([\w_]+)\{([^}]+)\}'.replace(' ', ''))
         curly_matches = curly_brace_pattern.findall(eval_expr)
         for var_name, indices_str in curly_matches:
             if var_name not in scope and var_name not in self.compiler.variables:

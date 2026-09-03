@@ -483,7 +483,7 @@ class GridLangCompiler(GridLangExecutor):
         hidden_fields = type_def.get('_hidden_fields', set())
         if hidden_fields:
             obj['_hidden_fields'] = set(hidden_fields)
-        obj.setdefault('grid', {})
+        # Lazy grid: don't create unless needed
         try:
             self._recompute_computed_fields(obj, line_number=line_number)
         except Exception:
@@ -1079,7 +1079,10 @@ class GridLangCompiler(GridLangExecutor):
                     template=(fill_value is None))
                 value_dict['grid'] = grid_store
         else:
-            value_dict.setdefault('grid', {})
+            # Lazy grid: don't create 'grid' if not explicitly dimensioned
+            # and not touched by constructor/builders. Access returns {}
+            # and grid{...} returns #N/A.
+            pass
 
     def resolve_with_value(self, raw_value, line_number=None):
         """Finalize a single WITH-clause value against the current scope.
@@ -1150,7 +1153,7 @@ class GridLangCompiler(GridLangExecutor):
                 hidden_fields = self.types_defined.get(expected_type, {}).get('_hidden_fields', set())
                 if hidden_fields and '_hidden_fields' not in coerced:
                     coerced['_hidden_fields'] = set(hidden_fields)
-                coerced.setdefault('grid', {})
+                # Lazy grid
                 return coerced
         return field_value
 
@@ -2616,6 +2619,22 @@ class GridLangCompiler(GridLangExecutor):
         ctx_stack = getattr(self, '_context_grid_stack', None)
         if ctx_stack and ctx_stack[-1] is not None:
             return ctx_stack[-1]
+        # Functions (and unit sources) use the global grid via parent chain
+        if getattr(self, '_outer_scope_read_only', False):
+            parent = getattr(self, '_parent_scope', None)
+            # Walk parent scope chain to find the caller's grid variable
+            cur = parent
+            while cur is not None:
+                g = cur.variables.get('grid')
+                if isinstance(g, _GridStore):
+                    return g
+                cur = getattr(cur, 'parent', None)
+            # Fallback to parent compiler's store if parent scope is from caller
+            if parent is not None and hasattr(parent, 'compiler'):
+                try:
+                    return parent.compiler._get_grid_store()
+                except Exception:
+                    pass
         scopes = getattr(self, 'scopes', None)
         if scopes and scopes[0].variables.get('grid') is not None:
             return scopes[0].variables['grid']

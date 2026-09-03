@@ -1160,6 +1160,12 @@ class GridLangExecutor(GridLangBase):
         for idx, (var, type_name, constraints, expr) in enumerate(var_list):
             var_lower = var.lower()
             remaining_let_vars = set(let_var_order[idx + 1:])
+            # grid field is read-only outside type
+            if '.grid' in var_lower:
+                ctx = getattr(self, '_context_grid_stack', None) or getattr(getattr(self, 'compiler', None), '_context_grid_stack', None)
+                if not ctx:
+                    raise PermissionError(
+                        f"Field 'grid' is read-only outside type at line {line_number}")
 
             if self._try_handle_let_field_assignment(
                     var, expr, scope_dict, line_number):
@@ -1182,6 +1188,12 @@ class GridLangExecutor(GridLangBase):
 
     def _try_handle_let_field_assignment(
             self, var, expr, scope_dict, line_number):
+        # grid field is read-only outside type
+        if '.grid' in var.lower():
+            ctx = getattr(self, '_context_grid_stack', None) or getattr(getattr(self, 'compiler', None), '_context_grid_stack', None)
+            if not ctx:
+                raise PermissionError(
+                    f"Field 'grid' is read-only outside type at line {line_number}")
         field_index_match = re.match(
             r'^([\w_]+)\.([\w_]+)\(([^)]+)\)\.(\w+)$', var)
         if not field_index_match:
@@ -4521,6 +4533,12 @@ class GridLangExecutor(GridLangBase):
         return results
 
     def _handle_push_assignment(self, target, value_expr, line_number):
+        # grid field is read-only outside type constructors/builders
+        if '.grid' in target.lower():
+            ctx = getattr(self, '_context_grid_stack', None) or getattr(getattr(self, 'compiler', None), '_context_grid_stack', None)
+            if not ctx:
+                raise PermissionError(
+                    f"Field 'grid' is read-only outside type at line {line_number}")
         if target.startswith('['):
             assignment_line = f"{target} := {value_expr}"
             self.array_handler.evaluate_line_with_assignment(
@@ -4575,6 +4593,12 @@ class GridLangExecutor(GridLangBase):
                 f"Failed to evaluate push expression at line {line_number}: {e}")
 
     def _update_member_path_target(self, target, value, line_number):
+        # grid field is read-only outside type
+        if '.grid' in target.lower():
+            ctx = getattr(self, '_context_grid_stack', None) or getattr(getattr(self, 'compiler', None), '_context_grid_stack', None)
+            if not ctx:
+                raise PermissionError(
+                    f"Field 'grid' is read-only outside type at line {line_number}")
         path_parts = [part.strip() for part in target.split('.') if part.strip()]
         if len(path_parts) < 2:
             return False
