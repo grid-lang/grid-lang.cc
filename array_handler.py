@@ -1815,19 +1815,36 @@ class ArrayHandler:
                 for field in fields.keys():
                     value = obj.get(field)
                     if isinstance(value, dict):
-                        nested_type = None
-                        for n_name, n_fields in self.compiler.types_defined.items():
-                            if object_public_keys(value) == set(public_type_fields(n_fields).keys()):
-                                nested_type = n_name
-                                break
-                        if nested_type:
-                            nested_fields = public_type_fields(
-                                self.compiler.types_defined[nested_type])
-                            for n_field in nested_fields.keys():
-                                result.append(value.get(n_field))
+                        # Check if field is explicitly dim none (0-D, can't be an array)
+                        is_dim_none = False
+                        try:
+                            field_cons = self.compiler.types_defined[type_name.lower()].get('_field_constraints', {}).get(field)
+                            if field_cons is None:
+                                field_cons = self.compiler.types_defined[type_name.lower()].get('_field_constraints', {}).get(field.lower())
+                            if isinstance(field_cons, dict):
+                                dim_val = field_cons.get('dim')
+                                if dim_val == '{}' or (isinstance(dim_val, str) and dim_val.lower() == 'none'):
+                                    is_dim_none = True
+                        except Exception:
+                            pass
+                        if is_dim_none:
+                            # dim none: spill the nested object's fields
+                            nested_type = None
+                            for n_name, n_fields in self.compiler.types_defined.items():
+                                if object_public_keys(value) == set(public_type_fields(n_fields).keys()):
+                                    nested_type = n_name
+                                    break
+                            if nested_type:
+                                nested_fields = public_type_fields(
+                                    self.compiler.types_defined[nested_type])
+                                for n_field in nested_fields.keys():
+                                    result.append(value.get(n_field))
+                            else:
+                                result.extend([value[k]
+                                               for k in sorted(object_public_keys(value))])
                         else:
-                            result.extend([value[k]
-                                           for k in sorted(object_public_keys(value))])
+                            # by default, whole field occupies one cell
+                            result.append(value)
                     else:
                         result.append(value)
             else:
