@@ -224,24 +224,40 @@ class ExpressionEvaluator:
                 raise RuntimeError(
                     f"Error evaluating range '{s_ref}:{e_ref}': {e} at line {line_number}")
 
-        # Handle sum over range (e.g., sum[A1:B2])
-        if expr.lower().startswith('sum[') and expr.endswith(']') and not is_grid_dim:
-            return self._evaluate_sum_range(expr, scope, line_number)
-
-        # Handle sum with parentheses (e.g., sum([A1:B2]))
-        if expr.lower().startswith('sum([') and expr.endswith('])') and not is_grid_dim:
-            inner_expr = expr[4:-2].strip()
-            m = re.match(
-                rf'^\[?({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})\]?$', inner_expr, re.I)
-            if m:
-                start_ref, end_ref = m.groups()
-                return self._evaluate_sum_range(f"sum[{start_ref}:{end_ref}]", scope, line_number)
-            raise SyntaxError(
-                f"Invalid sum range syntax in parentheses: {expr} at line {line_number}")
-
-        # Handle sum over variables (e.g., sum{a, b})
-        if expr.startswith('sum{') and expr.endswith('}') and not is_grid_dim:
-            return self._evaluate_sum_vars(expr, scope, line_number)
+        # Normalize func[...] / func{...} to func(...) for any function
+        # e.g. abs{2.3, -5} -> abs({2.3, -5}), func[A1:C5] -> func([A1:C5])
+        # Use balanced bracket matching to handle nested braces/brackets correctly
+        m_bracket_func = re.match(r'^([A-Za-z_][\w]*)\s*([\{\[])', expr)
+        if m_bracket_func and not is_grid_dim and expr.strip().endswith((']', '}')):
+            func_name = m_bracket_func.group(1)
+            open_br = m_bracket_func.group(2)
+            close_br = '}' if open_br == '{' else ']'
+            # Find matching closing bracket for the outer func{...} / func[...]
+            # The expr should be func{...} or func[...] where ... is the entire inner content
+            # Use simple check: expr startswith func + open_br and endswith close_br
+            # This handles single-arg bracket calls like abs{...} or func[A1:C5]
+            # For these, convert to func({...}) or func([...])
+            if expr.strip().startswith(func_name) and expr.strip().endswith(close_br):
+                # Extract inner content between the outermost brackets
+                # Find the position of the first open_br after func_name
+                start_idx = expr.find(open_br)
+                end_idx = expr.rfind(close_br)
+                if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
+                    inner = expr[start_idx+1:end_idx]
+                    # Check if it's a known builtin or user function
+                    is_known = False
+                    try:
+                        from builtin_functions import BUILTINS
+                        if func_name.lower() in BUILTINS:
+                            is_known = True
+                    except ImportError:
+                        pass
+                    if not is_known and hasattr(self.compiler, 'functions') and func_name.lower() in self.compiler.functions:
+                        is_known = True
+                    if is_known:
+                        normalized = f"{func_name}({open_br}{inner}{close_br})"
+                        if normalized != expr:
+                            return self.eval_or_eval_array(normalized, scope, line_number)
 
         # Try to parse as number for grid_dim
         if is_grid_dim:
@@ -2340,21 +2356,6 @@ class ExpressionEvaluator:
                 raise RuntimeError(
                     f"Error evaluating range '{s_ref}:{e_ref}': {e} at line {line_number}")
 
-        # Handle sum ranges and vars (delegated to helper methods)
-        if expr.lower().startswith('sum[') and expr.endswith(']'):
-            return self._evaluate_sum_range(expr, scope, line_number)
-        if expr.lower().startswith('sum([') and expr.endswith('])'):
-            inner_expr = expr[4:-2].strip()
-            m = re.match(
-                rf'^\[?({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})\]?$', inner_expr, re.I)
-            if m:
-                start_ref, end_ref = m.groups()
-                return self._evaluate_sum_range(f"sum[{start_ref}:{end_ref}]", scope, line_number)
-            raise SyntaxError(
-                f"Invalid sum range syntax in parentheses: {expr} at line {line_number}")
-        if expr.startswith('sum{') and expr.endswith('}'):
-            return self._evaluate_sum_vars(expr, scope, line_number)
-
         # Handle member indexing (e.g., var.field{1,2})
         grid_index_match = re.match(
             r'^([\w_]+)\.([\w_]+)\{([\d,\s]+)\}$', expr, re.I)
@@ -2706,12 +2707,16 @@ class ExpressionEvaluator:
     def _evaluate_with_python_fallback(self, expr, scope, line_number):
         eval_expr = expr
         full_scope = self._build_fallback_cell_scope(scope)
+        eval_expr = self._normalize_fallback_bracket_calls(
+            eval_expr, scope, line_number)
         eval_expr = self._replace_fallback_cell_refs(
             eval_expr, scope, line_number)
         handled, result = self._try_eval_fallback_array_operation(
             eval_expr, full_scope, line_number)
         if handled:
             return result
+        eval_expr = self._replace_fallback_range_literals(
+            eval_expr, scope, line_number)
         eval_expr = self._replace_fallback_curly_accesses(
             eval_expr, scope, line_number)
         eval_expr = self._replace_piped_array_literals(
@@ -2760,6 +2765,123 @@ class ExpressionEvaluator:
             return placeholder
 
         return cell_ref_pattern.sub(replacer, eval_expr)
+
+    def _is_known_function_name(self, func_name):
+        try:
+            from builtin_functions import BUILTINS
+            if func_name.lower() in BUILTINS:
+                return True
+        except ImportError:
+            pass
+        if hasattr(self.compiler, 'functions') and func_name.lower() in self.compiler.functions:
+            return True
+        return False
+
+    def _normalize_fallback_bracket_calls(self, eval_expr, scope, line_number):
+        """Rewrite func[...] / func{...} sub-expressions to func([...]) /
+        func({...}) for any known builtin or user function, so nested bracket
+        calls (e.g. 'sum[A1:B2] < 1000', 'abs{2,3} + 1') evaluate like the
+        empty-paren form. This is the same rule applied to a whole expression
+        in _eval_or_eval_array_inner, but for function calls embedded inside a
+        larger expression reachable through the python fallback.
+        """
+        out = []
+        i = 0
+        n = len(eval_expr)
+        while i < n:
+            ch = eval_expr[i]
+            if ch in ('"', "'"):
+                quote = ch
+                out.append(ch)
+                i += 1
+                while i < n:
+                    c = eval_expr[i]
+                    out.append(c)
+                    i += 1
+                    if c == '\\' and i < n:
+                        out.append(eval_expr[i])
+                        i += 1
+                    elif c == quote:
+                        break
+                continue
+            if ch.isalpha() or ch == '_':
+                j = i
+                while j < n and (eval_expr[j].isalnum() or eval_expr[j] == '_'):
+                    j += 1
+                name = eval_expr[i:j]
+                k = j
+                while k < n and eval_expr[k] == ' ':
+                    k += 1
+                if k < n and eval_expr[k] in ('[', '{') and self._is_known_function_name(name):
+                    open_br = eval_expr[k]
+                    close_br = '}' if open_br == '{' else ']'
+                    depth = 0
+                    p = k
+                    while p < n:
+                        if eval_expr[p] == open_br:
+                            depth += 1
+                        elif eval_expr[p] == close_br:
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        p += 1
+                    if p < n:
+                        inner = eval_expr[k + 1:p]
+                        normalized = f"{name}({open_br}{inner}{close_br})"
+                        out.append(normalized)
+                        i = p + 1
+                        continue
+                out.append(eval_expr[i:j])
+                i = j
+                continue
+            out.append(ch)
+            i += 1
+        return ''.join(out)
+
+    def _replace_fallback_range_literals(self, eval_expr, scope, line_number):
+        """Convert GridLang range literals '[addr1:addr2]' into placeholder
+        names holding the resolved array, so any function (abs, SUM, user
+        defined...) receives the same single array argument.
+
+        Returns a 2-tuple (handled, value) when the WHOLE expression is a
+        single range literal (e.g. '[A1:B2]'), otherwise the rewritten
+        expression string.
+
+        :return: rewritten expression string (or placeholder if whole expr
+            was a single range literal).
+        """
+        range_pattern = re.compile(
+            rf'\[\s*({_ADDRESS_FRAGMENT})\s*:\s*({_ADDRESS_FRAGMENT})\s*\]')
+        whole_match = range_pattern.fullmatch(eval_expr.strip())
+        if whole_match:
+            s_ref, e_ref = whole_match.groups()
+            values = self._eval_range_values(s_ref, e_ref, line_number)
+            return self._inject_eval_placeholder(
+                f'[{s_ref}:{e_ref}]', values, scope)
+
+        def replacer(m):
+            s_ref, e_ref = m.group(1), m.group(2)
+            values = self._eval_range_values(s_ref, e_ref, line_number)
+            return self._inject_eval_placeholder(
+                f'[{s_ref}:{e_ref}]', values, scope)
+
+        return range_pattern.sub(replacer, eval_expr)
+
+    def _eval_range_values(self, s_ref, e_ref, line_number):
+        """Evaluate a GridLang cell range into a flat list of values."""
+        if '.' in s_ref or '.' in e_ref:
+            values = self.compiler.array_handler.get_range_values_address(
+                self.compiler._to_index(s_ref),
+                self.compiler._to_index(e_ref), line_number)
+            flat_values = self.compiler.array_handler.flatten_array(
+                values, line_number)
+            return list(flat_values)
+        values = self.compiler.array_handler.get_range_values(
+            self.compiler._to_index(s_ref),
+            self.compiler._to_index(e_ref), line_number)
+        flat_values = [v for row in values for v in (
+            row if isinstance(row, list) else [row])]
+        return list(flat_values)
 
     def _try_eval_fallback_array_operation(self, eval_expr, full_scope, line_number):
         array_op_match = re.match(
@@ -3319,8 +3441,9 @@ class ExpressionEvaluator:
                     v, full_scope, globals_dict, line_number)
                 for k, v in zip(node.keys, node.values) if k is not None}
         if node_type is ast.Set:
-            return {self._walk_ast_node(
-                e, full_scope, globals_dict, line_number) for e in node.elts}
+            # In GridLang, {1,2,3} is an array, not a Python set – preserve order as list
+            return [self._walk_ast_node(
+                e, full_scope, globals_dict, line_number) for e in node.elts]
         if node_type is ast.IfExp:
             test = self._walk_ast_node(
                 node.test, full_scope, globals_dict, line_number)

@@ -1998,6 +1998,15 @@ class GridLangExecutor(GridLangBase):
             r'^\s*for\s+([\w_]+)\s*=\s*([\w_]+)\(([^)]+)\)\s*$', line, re.I)
         if m:
             var_name, array_name, index_expr = m.groups()
+            # Don't handle if array_name is a known builtin or user function (e.g., For h = Power(...))
+            try:
+                from builtin_functions import BUILTINS
+                if array_name.lower() in BUILTINS:
+                    return False, i
+            except ImportError:
+                pass
+            if array_name.lower() in getattr(self.compiler, 'functions', {}):
+                return False, i
 
             try:
                 # Evaluate the index expression

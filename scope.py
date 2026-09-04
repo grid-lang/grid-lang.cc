@@ -403,6 +403,10 @@ class Scope:
         if value is not None and not is_error_value(value) and type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
             value, effective_constraints = self._coerce_custom_type_value(
                 type, value, effective_constraints, line_number)
+        # For primitive arrays (number/text with dim), set constraints early so _validate_base_type sees dim
+        if type in ('number', 'text') and effective_constraints and effective_constraints.get('dim'):
+            self.types[name] = type
+            self.constraints[name] = effective_constraints
         if value is not None and not is_uninitialized:
             if not is_error_value(value) and effective_constraints and effective_constraints.get('dim') and hasattr(self, 'compiler'):
                 try:

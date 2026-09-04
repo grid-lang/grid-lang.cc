@@ -37,6 +37,8 @@ from utils import is_sparse_array
 
 BUILTINS = {}
 ALIASES = {}
+VECTORIZED = set()  # names (lower) of builtins that are applied element-wise to array args
+ARG_COUNTS = {}  # name (lower) -> expected argument count (int or (min, max))
 
 # All keywords that must be ignored when extracting variable dependencies.
 # Keep this list at a single place – compiler.py and expression.py import it.
@@ -47,19 +49,74 @@ KEYWORDS = {
 }
 
 
-def register_builtin(name, aliases=None, func=None):
-    """Register a builtin. Can be used as @register_builtin("NAME")."""
-    def decorator(fn):
+def register_builtin(name, aliases=None, func=None, arg_count=None):
+    """Register a builtin. Can be used as @register_builtin("NAME"). Non-vectorized by default.
+
+    arg_count declares how many comma-separated arguments a call may pass:
+      - an int N means exactly N arguments,
+      - a 2-tuple (min, max) means between min and max arguments (inclusive),
+      - None means no arity check (variadic).
+    The check is applied to the outer GridLang call (a single bracket array
+    arg counts as one argument).
+    """
+    def _store(fn):
         key = name.lower()
         BUILTINS[key] = fn
+        if arg_count is not None:
+            ARG_COUNTS[key] = arg_count
         if aliases:
             for a in aliases:
                 ALIASES[a.lower()] = key
                 BUILTINS[a.lower()] = fn
+                if arg_count is not None:
+                    ARG_COUNTS[a.lower()] = arg_count
+    def decorator(fn):
+        _store(fn)
         return fn
     if func is not None:
-        return decorator(func)
+        _store(func)
+        return func
     return decorator
+
+
+def register_vectorized_builtin(name, aliases=None, func=None, arg_count=None):
+    """Register a vectorized builtin (applied element-wise, scalar broadcast)."""
+    def decorator(fn):
+        # Register as normal builtin first
+        register_builtin(name, aliases=aliases, func=fn, arg_count=arg_count)
+        VECTORIZED.add(name.lower())
+        if aliases:
+            for a in aliases:
+                VECTORIZED.add(a.lower())
+        return fn
+    if func is not None:
+        register_builtin(name, aliases=aliases, func=func, arg_count=arg_count)
+        VECTORIZED.add(name.lower())
+        if aliases:
+            for a in aliases:
+                VECTORIZED.add(a.lower())
+        return func
+    return decorator
+
+
+def _check_arity(name, nargs, line_number=None):
+    """Validate that a builtin call passes an allowed number of arguments.
+    Raises a SyntaxError (compile-time) on mismatch instead of letting the
+    function return a runtime error value."""
+    expected = ARG_COUNTS.get(name.lower())
+    if expected is None:
+        return
+    if isinstance(expected, (tuple, list)):
+        lo, hi = expected
+        ok = lo <= nargs <= hi
+        desc = f"between {lo} and {hi}"
+    else:
+        ok = nargs == expected
+        desc = f"{expected}"
+    if not ok:
+        where = f" at line {line_number}" if line_number is not None else ""
+        raise SyntaxError(
+            f"{name} expects {desc} argument(s) but received {nargs}{where}")
 
 
 def _resolve_builtin(name):
@@ -90,7 +147,7 @@ def _strip_list(val):
 # Builtins
 # ---------------------------------------------------------------------------
 
-@register_builtin("ROWS")
+@register_builtin("ROWS", arg_count=1)
 def builtin_rows(arr, _evaluator=None, _scope=None, _line_number=None):
     if is_sparse_array(arr):
         return max((k[0] for k in arr.keys()), default=-1) + 1
@@ -104,40 +161,30 @@ def builtin_rows(arr, _evaluator=None, _scope=None, _line_number=None):
     return 0
 
 
-@register_builtin("LEN", aliases=["Text.Len"])
+@register_vectorized_builtin("LEN", aliases=["Text.Len"], arg_count=1)
 def builtin_len(val, _evaluator=None, _scope=None, _line_number=None):
     if isinstance(val, str):
         return len(val)
-    if is_sparse_array(val):
-        items = [val[k] for k in sorted(val.keys())]
-    elif isinstance(val, dict) and 'array' in val:
-        items = list(val['array'])
-    elif isinstance(val, (list, tuple)):
-        items = list(val)
     else:
-        raise TypeError("Len expects text or an array of text values")
-    lengths = []
-    for item in items:
-        if item is None:
-            lengths.append(0)
-        elif isinstance(item, str):
-            lengths.append(len(item))
-        else:
-            raise TypeError("Len expects text or an array of text values")
-    return lengths
+        raise TypeError("Len expects a text")
 
 
-@register_builtin("ABS", aliases=["Number.Abs"])
+@register_vectorized_builtin("ABS", aliases=["Number.Abs"], arg_count=1)
 def builtin_abs(n, _evaluator=None, _scope=None, _line_number=None):
     return abs(n)
 
 
-@register_builtin("INT", aliases=["Number.Int"])
+@register_vectorized_builtin("POWER", aliases=["Power", "Number.Power"], arg_count=2)
+def builtin_power(a, b, _evaluator=None, _scope=None, _line_number=None):
+    return math.pow(a, b) if isinstance(a, (int, float)) and isinstance(b, (int, float)) else a ** b
+
+
+@register_vectorized_builtin("INT", aliases=["Number.Int"], arg_count=1)
 def builtin_int(n, _evaluator=None, _scope=None, _line_number=None):
     return int(n)
 
 
-@register_builtin("MID", aliases=["Text.Mid"])
+@register_vectorized_builtin("MID", aliases=["Text.Mid"], arg_count=(2, 3))
 def builtin_mid(text, start, length=1, _evaluator=None, _scope=None, _line_number=None):
     s = str(text)
     start_idx = max(int(start) - 1, 0)
@@ -145,12 +192,12 @@ def builtin_mid(text, start, length=1, _evaluator=None, _scope=None, _line_numbe
     return s[start_idx:start_idx + length]
 
 
-@register_builtin("TEXTSPLIT", aliases=["Text.Split"])
+@register_vectorized_builtin("TEXTSPLIT", aliases=["Text.Split"], arg_count=2)
 def builtin_textsplit(text, delimiter, _evaluator=None, _scope=None, _line_number=None):
     return str(text).split(str(delimiter))
 
 
-@register_builtin("COUNTA")
+@register_builtin("COUNTA", arg_count=1)
 def builtin_counta(val, _evaluator=None, _scope=None, _line_number=None):
     items = _to_list(val)
     count = 0
@@ -166,13 +213,13 @@ def builtin_counta(val, _evaluator=None, _scope=None, _line_number=None):
     return count
 
 
-@register_builtin("RANDARRAY")
+@register_builtin("RANDARRAY", arg_count=1)
 def builtin_randarray(n, _evaluator=None, _scope=None, _line_number=None):
     length = int(n)
     return [random.random() for _ in range(length)]
 
 
-@register_builtin("SORTBY")
+@register_builtin("SORTBY", arg_count=2)
 def builtin_sortby(arr, ord_vals, _evaluator=None, _scope=None, _line_number=None):
     arr_list = _to_list(arr)
     ord_list = _to_list(ord_vals)
@@ -183,7 +230,7 @@ def builtin_sortby(arr, ord_vals, _evaluator=None, _scope=None, _line_number=Non
     return [v for _, v in pairs]
 
 
-@register_builtin("TRANSPOSE")
+@register_builtin("TRANSPOSE", arg_count=1)
 def builtin_transpose(arr, _evaluator=None, _scope=None, _line_number=None):
     # Use evaluator's array_handler for shape handling if available
     if _evaluator is not None:
@@ -225,7 +272,7 @@ def builtin_transpose(arr, _evaluator=None, _scope=None, _line_number=None):
     return arr
 
 
-@register_builtin("MIN")
+@register_builtin("MIN", arg_count=1)
 def builtin_min(*args, _evaluator=None, _scope=None, _line_number=None):
     # Flatten single array arg
     if len(args) == 1 and isinstance(args[0], (list, dict)):
@@ -233,19 +280,24 @@ def builtin_min(*args, _evaluator=None, _scope=None, _line_number=None):
     return min(args)
 
 
-@register_builtin("MAX")
+@register_builtin("MAX", arg_count=1)
 def builtin_max(*args, _evaluator=None, _scope=None, _line_number=None):
     if len(args) == 1 and isinstance(args[0], (list, dict)):
         args = tuple(_to_list(args[0]))
     return max(args)
 
 
-# Math aliases via math module (SIN, COS, etc. are available as math.sin)
+# Math aliases via math module (SIN, COS, etc. are available as math.sin) – vectorized
 for _name in ["sqrt", "sin", "cos", "tan", "log", "exp", "asin", "acos", "atan"]:
     fn = getattr(math, _name, None)
     if fn:
-        register_builtin(_name, aliases=["Number." + _name])(lambda *a, _fn=fn, **kw: _fn(*a))
+        register_vectorized_builtin(_name, aliases=["Number." + _name], arg_count=1)(lambda *a, _fn=fn, **kw: _fn(*a))
 
+# For abs/int/float/str, use Python builtins
+for _name in ["str", "int", "float", "abs"]:
+    fn = getattr(__builtins__, _name, None)
+    if fn:
+        register_vectorized_builtin(_name, aliases=["Number." + _name], arg_count=1)(lambda *a, _fn=fn, **kw: _fn(*a))
 
 # ---------------------------------------------------------------------------
 # SUM – handled specially because it has 3 syntaxes: sum[A1:B2], sum{a,b}, sum(...)
@@ -253,7 +305,7 @@ for _name in ["sqrt", "sin", "cos", "tan", "log", "exp", "asin", "acos", "atan"]
 # for sum(...) that delegates to them when a single string arg is given.
 # ---------------------------------------------------------------------------
 
-@register_builtin("SUM")
+@register_builtin("SUM", arg_count=1)
 def builtin_sum(*args, _evaluator=None, _scope=None, _line_number=None):
     if _evaluator is None:
         return sum(args)
@@ -269,31 +321,81 @@ def builtin_sum(*args, _evaluator=None, _scope=None, _line_number=None):
             return _evaluator._evaluate_sum_vars(f"sum{s}", _scope, _line_number)
         if s.startswith('[') and s.endswith(']'):
             return _evaluator._evaluate_sum_range(f"sum{s}", _scope, _line_number)
-    # Handle multiple args like SUM(1,2,3) or SUM(A1, B1)
-    # Flatten single array arg case already handled, now handle multiple
-    # If called as SUM({1,2,3}) where {1,2,3} was evaluated to set, the above handles set
-    # For SUM(1,2,3) as three separate args, sum them directly
-    try:
-        return sum(args)
-    except TypeError:
-        # If args contains non-numeric like string, try to handle
-        return sum(args[0]) if len(args) == 1 else sum(args)
+    return sum(args)
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
+def _is_array_arg(val):
+    return isinstance(val, (list, tuple)) or is_sparse_array(val) or (isinstance(val, dict) and 'array' in val)
+
+def _broadcast_builtin(fn, args, evaluator, fn_name=None):
+    # Only broadcast for builtins explicitly marked as vectorized
+    if fn_name and fn_name.lower() not in VECTORIZED:
+        return None
+    # Check if any arg is an array; if so, apply element-wise with broadcasting
+    array_args = []
+    for idx, arg in enumerate(args):
+        if _is_array_arg(arg):
+            # Convert to list for uniform handling
+            if is_sparse_array(arg):
+                # For sparse, flatten to list ordered by key
+                vals = [arg[k] for k in sorted(arg.keys())]
+                array_args.append((idx, vals))
+            elif isinstance(arg, dict) and 'array' in arg:
+                array_args.append((idx, list(arg['array'])))
+            elif isinstance(arg, (list, tuple)):
+                array_args.append((idx, list(arg)))
+            else:
+                array_args.append((idx, _to_list(arg)))
+    if not array_args:
+        return None  # No array, call normally
+    # Check shapes: all array args must have same length or be scalar-broadcast
+    # If one is scalar (not in array_args), it will be broadcast
+    # For multiple array args, they must have same length
+    lengths = {len(vals) for _, vals in array_args}
+    if len(lengths) > 1:
+        # Mismatched array lengths -> error
+        raise ValueError(f"Array arguments must have same shape for element-wise operation, got lengths {lengths}")
+    count = next(iter(lengths)) if lengths else 0
+    results = []
+    for i in range(count):
+        elem_args = []
+        for idx, arg in enumerate(args):
+            # Check if this arg was an array
+            is_array_idx = any(idx == a_idx for a_idx, _ in array_args)
+            if is_array_idx:
+                # Find the array vals for this idx
+                for a_idx, vals in array_args:
+                    if a_idx == idx:
+                        elem_args.append(vals[i])
+                        break
+            else:
+                elem_args.append(arg)
+        results.append(fn(*elem_args))
+    return results
+
+
 def get_builtin_functions(evaluator, scope=None, line_number=None):
     """
     Return a dict of name -> callable for the evaluator.
     Each callable is wrapped so that _evaluator/_scope/_line_number are
-    injected. Simple builtins that don't need those still work.
+    injected and array arguments are broadcast element-wise.
     """
     wrapped = {}
     for name, fn in BUILTINS.items():
-        def _make_wrapper(fn):
+        def _make_wrapper(fn, fn_name=name):
             def wrapper(*args, **kwargs):
+                # Compile-time arity check: the number of top-level GridLang
+                # arguments must match the builtin's declared parameter count
+                # (a single bracket array/range argument counts as one).
+                _check_arity(fn_name, len(args), line_number)
+                # Array broadcasting: if any arg is array, apply element-wise (except for reductions like SUM)
+                array_result = _broadcast_builtin(fn, args, evaluator, fn_name=fn_name)
+                if array_result is not None:
+                    return array_result
                 kwargs['_evaluator'] = evaluator
                 kwargs['_scope'] = scope
                 kwargs['_line_number'] = line_number
@@ -305,8 +407,14 @@ def get_builtin_functions(evaluator, scope=None, line_number=None):
                             kwargs.pop('_evaluator', None)
                             kwargs.pop('_scope', None)
                             kwargs.pop('_line_number', None)
+                            array_result2 = _broadcast_builtin(fn, args, evaluator, fn_name=fn_name)
+                            if array_result2 is not None:
+                                return array_result2
                             return fn(*args, **kwargs)
                         except TypeError:
+                            array_result3 = _broadcast_builtin(lambda *a: fn(*a), args, evaluator, fn_name=fn_name)
+                            if array_result3 is not None:
+                                return array_result3
                             return fn(*args)
                     raise
             return wrapper
