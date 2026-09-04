@@ -26,6 +26,7 @@ from grid_lang_common import (
     _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens,
     _is_numeric_token,
 )
+from builtin_functions import BUILTINS, KEYWORDS
 
 
 class SubprocessResult:
@@ -2279,17 +2280,13 @@ class GridLangCompiler(GridLangExecutor):
         cleaned = re.sub(r'\.\s*[A-Za-z][A-Za-z0-9_]*', ' ', cleaned)
         tokens = re.findall(r'[A-Za-z][A-Za-z0-9_]*', cleaned)
         filtered = set()
-        keyword_exclusions = {
-            'to', 'and', 'or', 'not', 'then', 'do', 'step', 'by', 'in', 'new', 'with',
-            'true', 'false', 'of', 'as', 'dim', 'index', 'init'
-        }
         for tok in tokens:
             if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', tok, re.I):
                 continue
             if re.match(r'^e[+-]?\d*$', tok, re.I):
                 continue
             lower_tok = tok.lower()
-            if lower_tok in keyword_exclusions:
+            if lower_tok in KEYWORDS:
                 continue
             if lower_tok in getattr(self, 'types_defined', {}):
                 continue
@@ -3491,10 +3488,7 @@ class GridLangCompiler(GridLangExecutor):
                         ' ', expr_no_quotes, flags=re.I)
                     expr_no_numbers = re.sub(r'\[[^\]]*\]', ' ', expr_no_numbers)
                     potential_deps = re.findall(r'\b[\w_]+\b', expr_no_numbers)
-                    built_in_functions = {
-                        'sum', 'rows', 'sqrt', 'min', 'max', 'abs', 'int', 'float', 'str', 'len',
-                        'to', 'step', 'by', 'mod', 'div', 'and', 'or', 'not', 'new',
-                        'true', 'false', 'none', 'nan', 'inf'}
+                    built_in_functions = set(BUILTINS.keys()) | KEYWORDS
                     known_funcs = set(getattr(self, 'functions', {}).keys())
                     known_subs = set(getattr(self, 'subprocesses', {}).keys())
                     known_types = set(getattr(self, 'types_defined', {}).keys())

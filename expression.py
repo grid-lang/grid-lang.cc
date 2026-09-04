@@ -7,6 +7,7 @@ import re
 import math
 import random
 import ast
+from builtin_functions import get_builtin_functions
 from utils import (
     col_to_num,
     num_to_col,
@@ -1891,10 +1892,12 @@ class ExpressionEvaluator:
         if hasattr(self.compiler, 'subprocesses'):
             known_subprocesses.update(
                 getattr(self.compiler, 'subprocesses', {}) or {})
-        builtin_callables = {
-            'len', 'mid', 'textsplit', 'counta', 'randarray', 'sortby',
-            'sqrt', 'rows', 'transpose'
-        }
+        # Check if it's a builtin (from builtin_functions.py) or user-defined
+        try:
+            from builtin_functions import BUILTINS
+            builtin_callables = set(BUILTINS.keys())
+        except ImportError:
+            builtin_callables = set()
         if var_name.lower() in known_funcs:
             return match.group(0)
         if var_name.lower() in known_subprocesses:
@@ -1999,8 +2002,11 @@ class ExpressionEvaluator:
 
     def _paren_access_replacer_with_check(self, match, scope, line_number):
         var_name, index_expr = match.groups()
-        callable_names = {'sqrt', 'abs', 'sin', 'cos',
-                          'tan', 'log', 'exp', 'len', 'mid', 'textsplit', 'transpose'}
+        try:
+            from builtin_functions import BUILTINS
+            callable_names = set(BUILTINS.keys())
+        except ImportError:
+            callable_names = set()
         if hasattr(self.compiler, 'functions'):
             callable_names.update({n.lower() for n in self.compiler.functions.keys()})
         if hasattr(self.compiler, 'subprocesses'):
@@ -3022,34 +3028,10 @@ class ExpressionEvaluator:
         if isinstance(full_scope, dict):
             full_scope = CaseInsensitiveDict(full_scope)
 
-        def rows(arr):
-            if is_sparse_array(arr):
-                return max((k[0] for k in arr.keys()), default=-1) + 1
-            if isinstance(arr, dict) and 'array' in arr:
-                shape = arr.get('shape') or arr.get('original_shape') or []
-                return shape[0] if shape else 0
-            if hasattr(arr, '__len__'):
-                return len(arr)
-            if isinstance(arr, (list, tuple)):
-                return len(arr)
-            return 0
-
-        def sum_func(*args):
-            if len(args) == 1 and is_sparse_array(args[0]):
-                return sum(args[0].values())
-            if len(args) == 1 and isinstance(args[0], dict) and 'array' in args[0]:
-                return sum(args[0]['array'])
-            if len(args) == 1 and isinstance(args[0], (list, tuple)):
-                return sum(args[0])
-            if len(args) == 1 and isinstance(args[0], str):
-                if args[0].startswith('{') and args[0].endswith('}'):
-                    return self._evaluate_sum_vars(f"sum{args[0]}", scope, line_number)
-                if args[0].startswith('[') and args[0].endswith(']'):
-                    return self._evaluate_sum_range(f"sum{args[0]}", scope, line_number)
-            return sum(args)
-
-        full_scope['rows'] = rows
-        full_scope['sum'] = sum_func
+        builtins = get_builtin_functions(self, scope, line_number)
+        for k, v in builtins.items():
+            if k not in full_scope:
+                full_scope[k] = v
         return full_scope
 
     def _wrap_eval_scope_value(self, value, line_number):
@@ -3627,130 +3609,11 @@ class ExpressionEvaluator:
     def _get_eval_globals(self):
         """
         Provide safe globals for eval, including math functions and builtins.
+        Delegates to builtin_functions.get_builtin_functions for all
+        predefined GridLang functions (SUM, ROWS, TEXTSPLIT, MID, etc.).
         :return: Globals dictionary.
         """
-        def rows(arr):
-            """Return the length of an array or list."""
-            if is_sparse_array(arr):
-                return max((k[0] for k in arr.keys()), default=-1) + 1
-            if isinstance(arr, dict) and 'array' in arr:
-                shape = arr.get('shape') or arr.get('original_shape') or []
-                return shape[0] if shape else 0
-            if hasattr(arr, '__len__'):
-                return len(arr)
-            elif isinstance(arr, (list, tuple)):
-                return len(arr)
-            else:
-                return 0
-
-        def Len(val):
-            if isinstance(val, str):
-                return len(val)
-            if is_sparse_array(val):
-                items = [val[k] for k in sorted(val.keys())]
-            elif isinstance(val, dict) and 'array' in val:
-                items = list(val['array'])
-            elif isinstance(val, (list, tuple)):
-                items = list(val)
-            else:
-                raise TypeError("Len expects text or an array of text values")
-            lengths = []
-            for item in items:
-                if item is None:
-                    lengths.append(0)
-                elif isinstance(item, str):
-                    lengths.append(len(item))
-                else:
-                    raise TypeError("Len expects text or an array of text values")
-            return lengths
-
-        def Mid(text, start, length=1):
-            s = str(text)
-            start_idx = max(int(start) - 1, 0)
-            length = int(length)
-            return s[start_idx:start_idx + length]
-
-        def TextSplit(text, delimiter):
-            return str(text).split(str(delimiter))
-
-        def _to_list(val):
-            if is_sparse_array(val):
-                return [val[k] for k in sorted(val.keys())]
-            if isinstance(val, dict) and 'array' in val:
-                return list(val['array'])
-            if isinstance(val, (list, tuple, set)):
-                return list(val)
-            return [val]
-
-        def CountA(val):
-            items = _to_list(val)
-            count = 0
-            for item in items:
-                if isinstance(item, list) or (
-                        isinstance(item, dict) and 'array' in item):
-                    count += CountA(item)
-                elif item is None:
-                    continue
-                elif isinstance(item, str) and item == "":
-                    continue
-                else:
-                    count += 1
-            return count
-
-        def RandArray(n):
-            length = int(n)
-            return [random.random() for _ in range(length)]
-
-        def SortBy(arr, ord_vals):
-            arr_list = _to_list(arr)
-            ord_list = _to_list(ord_vals)
-            if len(arr_list) != len(ord_list):
-                raise ValueError("SortBy expects arrays of the same length")
-            pairs = list(zip(ord_list, arr_list))
-            pairs.sort(key=lambda p: p[0])
-            return [v for _, v in pairs]
-
-        def Transpose(arr):
-            """Return the transpose of an array (swaps the first two dims)."""
-            ah = self.compiler.array_handler
-            if is_sparse_array(arr):
-                # No-dim sparse arrays stay sparse: swap the first two indices
-                # of each stored cell (a 1D array is its own transpose).
-                result = {}
-                for k, v in arr.items():
-                    if len(k) >= 2:
-                        result[(k[1], k[0]) + k[2:]] = v
-                    else:
-                        result[k] = v
-                return result
-            flat = ah.flatten_array(arr)
-            shape = list(ah.get_array_shape(arr))
-            flat = [float(v) if isinstance(v, (int, float))
-                    and not isinstance(v, bool) else v for v in flat]
-            if len(shape) <= 1:
-                if isinstance(arr, dict) and 'array' in arr:
-                    return arr
-                return list(flat) if flat else arr
-            new_shape = [shape[1], shape[0]] + shape[2:]
-            strides = []
-            acc = 1
-            for s in shape:
-                strides.append(acc)
-                acc *= s
-            new_total = acc
-            new_flat = []
-            for n_idx in range(new_total):
-                rem = n_idx
-                idxs = []
-                for s in new_shape:
-                    idxs.append(rem % s)
-                    rem //= s
-                old_idxs = [idxs[1], idxs[0]] + idxs[2:]
-                old_flat = sum(oi * st for oi, st in zip(old_idxs, strides))
-                new_flat.append(flat[old_flat])
-            return {'array': list(new_flat),
-                    'shape': list(new_shape), 'original_shape': list(new_shape)}
-
+        builtin_funcs = get_builtin_functions(self, None, None)
         globals_dict = {
             '__builtins__': {
                 'float': float,
@@ -3760,20 +3623,10 @@ class ExpressionEvaluator:
                 'sum': sum
             },
             'math': math,
-            'Len': Len,
-            'Mid': Mid,
-            'TextSplit': TextSplit,
-            'CountA': CountA,
-            'RandArray': RandArray,
-            'SortBy': SortBy,
-            'Transpose': Transpose,
-            'SQRT': math.sqrt,
-            'sqrt': math.sqrt,
-            'Sqrt': math.sqrt,
             '_lookup_cell': self.compiler.array_handler.lookup_cell,
-            'rows': rows,
             'gridlang_of_unit': lambda n, u: UnitValue(n, u),
         }
+        globals_dict.update(builtin_funcs)
         if hasattr(self.compiler, 'functions'):
             for fname, fdef in self.compiler.functions.items():
                 wrapper = (lambda *a, _fname=fname:
