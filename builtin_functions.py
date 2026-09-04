@@ -29,15 +29,16 @@ import random
 import re
 
 from utils import is_sparse_array
+from units import error_value, TYPE_ERROR
 
 
 # ---------------------------------------------------------------------------
 # Registry and keyword exclusions (single source of truth)
 # ---------------------------------------------------------------------------
 
+VECTORIZED = set()
 BUILTINS = {}
 ALIASES = {}
-VECTORIZED = set()  # names (lower) of builtins that are applied element-wise to array args
 ARG_COUNTS = {}  # name (lower) -> expected argument count (int or (min, max))
 
 # All keywords that must be ignored when extracting variable dependencies.
@@ -158,7 +159,20 @@ def builtin_rows(arr, _evaluator=None, _scope=None, _line_number=None):
         return len(arr)
     if isinstance(arr, (list, tuple)):
         return len(arr)
-    return 0
+    raise TypeError("Rows expects an array")
+
+
+@register_builtin("SUM", arg_count=1)
+def builtin_sum(args, _evaluator=None, _scope=None, _line_number=None):
+    if _evaluator is None:
+        return sum(args)
+    if is_sparse_array(args):
+        return sum(args.values())
+    if isinstance(args, dict) and 'array' in args:
+        return sum(args['array'])
+    if isinstance(args, (list, tuple, set)):
+        return sum(args)
+    return sum(args)
 
 
 @register_vectorized_builtin("LEN", aliases=["Text.Len"], arg_count=1)
@@ -186,15 +200,20 @@ def builtin_int(n, _evaluator=None, _scope=None, _line_number=None):
 
 @register_vectorized_builtin("MID", aliases=["Text.Mid"], arg_count=(2, 3))
 def builtin_mid(text, start, length=1, _evaluator=None, _scope=None, _line_number=None):
-    s = str(text)
-    start_idx = max(int(start) - 1, 0)
-    length = int(length)
-    return s[start_idx:start_idx + length]
+    if isinstance(text, str):
+        start_idx = max(int(start) - 1, 0)
+        length = int(length)
+        return text[start_idx:start_idx + length]
+    else:
+        raise TypeError("Mid expects a text as first argument")
 
 
 @register_vectorized_builtin("TEXTSPLIT", aliases=["Text.Split"], arg_count=2)
 def builtin_textsplit(text, delimiter, _evaluator=None, _scope=None, _line_number=None):
-    return str(text).split(str(delimiter))
+    if isinstance(text, str) and isinstance(delimiter, str):
+        return text.split(delimiter)
+    else:
+        raise TypeError("Split expects two text arguments")
 
 
 @register_builtin("COUNTA", arg_count=1)
@@ -273,16 +292,16 @@ def builtin_transpose(arr, _evaluator=None, _scope=None, _line_number=None):
 
 
 @register_builtin("MIN", arg_count=1)
-def builtin_min(*args, _evaluator=None, _scope=None, _line_number=None):
+def builtin_min(args, _evaluator=None, _scope=None, _line_number=None):
     # Flatten single array arg
-    if len(args) == 1 and isinstance(args[0], (list, dict)):
+    if isinstance(args, (list, dict)):
         args = tuple(_to_list(args[0]))
     return min(args)
 
 
 @register_builtin("MAX", arg_count=1)
-def builtin_max(*args, _evaluator=None, _scope=None, _line_number=None):
-    if len(args) == 1 and isinstance(args[0], (list, dict)):
+def builtin_max(args, _evaluator=None, _scope=None, _line_number=None):
+    if isinstance(args, (list, dict)):
         args = tuple(_to_list(args[0]))
     return max(args)
 
@@ -298,30 +317,6 @@ for _name in ["str", "int", "float", "abs"]:
     fn = getattr(__builtins__, _name, None)
     if fn:
         register_vectorized_builtin(_name, aliases=["Number." + _name], arg_count=1)(lambda *a, _fn=fn, **kw: _fn(*a))
-
-# ---------------------------------------------------------------------------
-# SUM – handled specially because it has 3 syntaxes: sum[A1:B2], sum{a,b}, sum(...)
-# We keep the range/var helpers in expression.py, but expose a sum function
-# for sum(...) that delegates to them when a single string arg is given.
-# ---------------------------------------------------------------------------
-
-@register_builtin("SUM", arg_count=1)
-def builtin_sum(*args, _evaluator=None, _scope=None, _line_number=None):
-    if _evaluator is None:
-        return sum(args)
-    if len(args) == 1 and is_sparse_array(args[0]):
-        return sum(args[0].values())
-    if len(args) == 1 and isinstance(args[0], dict) and 'array' in args[0]:
-        return sum(args[0]['array'])
-    if len(args) == 1 and isinstance(args[0], (list, tuple, set)):
-        return sum(args[0])
-    if len(args) == 1 and isinstance(args[0], str):
-        s = args[0]
-        if s.startswith('{') and s.endswith('}'):
-            return _evaluator._evaluate_sum_vars(f"sum{s}", _scope, _line_number)
-        if s.startswith('[') and s.endswith(']'):
-            return _evaluator._evaluate_sum_range(f"sum{s}", _scope, _line_number)
-    return sum(args)
 
 
 # ---------------------------------------------------------------------------
@@ -392,31 +387,35 @@ def get_builtin_functions(evaluator, scope=None, line_number=None):
                 # arguments must match the builtin's declared parameter count
                 # (a single bracket array/range argument counts as one).
                 _check_arity(fn_name, len(args), line_number)
-                # Array broadcasting: if any arg is array, apply element-wise (except for reductions like SUM)
-                array_result = _broadcast_builtin(fn, args, evaluator, fn_name=fn_name)
-                if array_result is not None:
-                    return array_result
-                kwargs['_evaluator'] = evaluator
-                kwargs['_scope'] = scope
-                kwargs['_line_number'] = line_number
                 try:
+                    # Array broadcasting: if any arg is array, apply element-wise
+                    # (except for reductions like SUM).
+                    array_result = _broadcast_builtin(
+                        fn, args, evaluator, fn_name=fn_name)
+                    if array_result is not None:
+                        return array_result
+                    kwargs['_evaluator'] = evaluator
+                    kwargs['_scope'] = scope
+                    kwargs['_line_number'] = line_number
                     return fn(*args, **kwargs)
                 except TypeError as e:
                     if '_evaluator' in str(e) or '_scope' in str(e) or '_line_number' in str(e):
+                        # The builtin did not accept the injected keyword
+                        # arguments: retry without them.
                         try:
                             kwargs.pop('_evaluator', None)
                             kwargs.pop('_scope', None)
                             kwargs.pop('_line_number', None)
-                            array_result2 = _broadcast_builtin(fn, args, evaluator, fn_name=fn_name)
-                            if array_result2 is not None:
-                                return array_result2
+                            array_result = _broadcast_builtin(
+                                fn, args, evaluator, fn_name=fn_name)
+                            if array_result is not None:
+                                return array_result
                             return fn(*args, **kwargs)
                         except TypeError:
-                            array_result3 = _broadcast_builtin(lambda *a: fn(*a), args, evaluator, fn_name=fn_name)
-                            if array_result3 is not None:
-                                return array_result3
-                            return fn(*args)
-                    raise
+                            return error_value(TYPE_ERROR)
+                    # A genuine operand/type mismatch: report #TYPE/I instead of
+                    # raising, so builtins degrade to a sticky type error value.
+                    return error_value(TYPE_ERROR)
             return wrapper
         wrapped[name] = _make_wrapper(fn)
     wrapped['math'] = math
