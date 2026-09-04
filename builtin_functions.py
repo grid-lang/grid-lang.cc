@@ -10,14 +10,11 @@ To add a new builtin:
     from builtin_functions import register_builtin
 
     @register_builtin("MYFUNC", aliases=["MyFuncAlias"])
-    def myfunc(*args, _evaluator=None, _scope=None, _line_number=None):
-        # _evaluator is the ExpressionEvaluator (for array helpers, etc.)
-        # Use _evaluator.compiler.array_handler etc. if needed
+    def myfunc(*args):
         return ...
 
-The decorator stores the raw function; get_builtin_functions() wraps it so the
-evaluator/scope/line_number are injected when the function is called from
-GridLang. For simple pure functions (e.g. SQRT) the wrapper is unnecessary.
+The decorator stores the raw function; get_builtin_functions() wraps it
+when the function is called from GridLang.
 
 The two scope builders (_build_python_fallback_scope / _get_eval_globals) both
 call get_builtin_functions() so a new function is instantly available in both
@@ -139,44 +136,35 @@ def _to_list(val):
     return [val]
 
 
-def _strip_list(val):
-    # for single-arg sum handling
-    return _to_list(val)
-
-
 # ---------------------------------------------------------------------------
 # Builtins
 # ---------------------------------------------------------------------------
 
 @register_builtin("ROWS", arg_count=1)
-def builtin_rows(arr, _evaluator=None, _scope=None, _line_number=None):
+def builtin_rows(arr):
     if is_sparse_array(arr):
         return max((k[0] for k in arr.keys()), default=-1) + 1
     if isinstance(arr, dict) and 'array' in arr:
         shape = arr.get('shape') or arr.get('original_shape') or []
         return shape[0] if shape else 0
-    if hasattr(arr, '__len__'):
-        return len(arr)
     if isinstance(arr, (list, tuple)):
         return len(arr)
     raise TypeError("Rows expects an array")
 
 
 @register_builtin("SUM", arg_count=1)
-def builtin_sum(args, _evaluator=None, _scope=None, _line_number=None):
-    if _evaluator is None:
-        return sum(args)
+def builtin_sum(args):
     if is_sparse_array(args):
         return sum(args.values())
     if isinstance(args, dict) and 'array' in args:
         return sum(args['array'])
     if isinstance(args, (list, tuple, set)):
         return sum(args)
-    return sum(args)
+    return sum([args])
 
 
 @register_vectorized_builtin("LEN", aliases=["Text.Len"], arg_count=1)
-def builtin_len(val, _evaluator=None, _scope=None, _line_number=None):
+def builtin_len(val):
     if isinstance(val, str):
         return len(val)
     else:
@@ -184,22 +172,22 @@ def builtin_len(val, _evaluator=None, _scope=None, _line_number=None):
 
 
 @register_vectorized_builtin("ABS", aliases=["Number.Abs"], arg_count=1)
-def builtin_abs(n, _evaluator=None, _scope=None, _line_number=None):
+def builtin_abs(n):
     return abs(n)
 
 
 @register_vectorized_builtin("POWER", aliases=["Power", "Number.Power"], arg_count=2)
-def builtin_power(a, b, _evaluator=None, _scope=None, _line_number=None):
+def builtin_power(a, b):
     return math.pow(a, b) if isinstance(a, (int, float)) and isinstance(b, (int, float)) else a ** b
 
 
 @register_vectorized_builtin("INT", aliases=["Number.Int"], arg_count=1)
-def builtin_int(n, _evaluator=None, _scope=None, _line_number=None):
+def builtin_int(n):
     return int(n)
 
 
 @register_vectorized_builtin("MID", aliases=["Text.Mid"], arg_count=(2, 3))
-def builtin_mid(text, start, length=1, _evaluator=None, _scope=None, _line_number=None):
+def builtin_mid(text, start, length=1):
     if isinstance(text, str):
         start_idx = max(int(start) - 1, 0)
         length = int(length)
@@ -209,7 +197,7 @@ def builtin_mid(text, start, length=1, _evaluator=None, _scope=None, _line_numbe
 
 
 @register_vectorized_builtin("TEXTSPLIT", aliases=["Text.Split"], arg_count=2)
-def builtin_textsplit(text, delimiter, _evaluator=None, _scope=None, _line_number=None):
+def builtin_textsplit(text, delimiter):
     if isinstance(text, str) and isinstance(delimiter, str):
         return text.split(delimiter)
     else:
@@ -217,7 +205,7 @@ def builtin_textsplit(text, delimiter, _evaluator=None, _scope=None, _line_numbe
 
 
 @register_builtin("COUNTA", arg_count=1)
-def builtin_counta(val, _evaluator=None, _scope=None, _line_number=None):
+def builtin_counta(val):
     items = _to_list(val)
     count = 0
     for item in items:
@@ -233,13 +221,13 @@ def builtin_counta(val, _evaluator=None, _scope=None, _line_number=None):
 
 
 @register_builtin("RANDARRAY", arg_count=1)
-def builtin_randarray(n, _evaluator=None, _scope=None, _line_number=None):
+def builtin_randarray(n):
     length = int(n)
     return [random.random() for _ in range(length)]
 
 
 @register_builtin("SORTBY", arg_count=2)
-def builtin_sortby(arr, ord_vals, _evaluator=None, _scope=None, _line_number=None):
+def builtin_sortby(arr, ord_vals):
     arr_list = _to_list(arr)
     ord_list = _to_list(ord_vals)
     if len(arr_list) != len(ord_list):
@@ -250,34 +238,34 @@ def builtin_sortby(arr, ord_vals, _evaluator=None, _scope=None, _line_number=Non
 
 
 @register_builtin("TRANSPOSE", arg_count=1)
-def builtin_transpose(arr, _evaluator=None, _scope=None, _line_number=None):
-    # Use evaluator's array_handler for shape handling if available
-    if _evaluator is not None:
-        ah = _evaluator.compiler.array_handler
-        if is_sparse_array(arr):
-            result = {}
-            for k, v in arr.items():
-                if len(k) >= 2:
-                    result[(k[1], k[0]) + k[2:]] = v
-                else:
-                    result[k] = v
-            return result
-        flat = ah.flatten_array(arr)
-        shape = list(ah.get_array_shape(arr))
-        flat = [float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v for v in flat]
-        if len(shape) <= 1:
-            if isinstance(arr, dict) and 'array' in arr:
-                return arr
-            return list(flat) if flat else arr
+def builtin_transpose(arr):
+    # Sparse dict: swap the first two tuple indices.
+    if is_sparse_array(arr):
+        result = {}
+        for k, v in arr.items():
+            if len(k) >= 2:
+                result[(k[1], k[0]) + k[2:]] = v
+            else:
+                result[k] = v
+        return result
+    # Structured dict with flat array + shape: transpose the first two axes.
+    if isinstance(arr, dict) and 'array' in arr:
+        flat = list(arr['array'])
+        shape = list(arr.get('shape', []))
+        if len(shape) < 2:
+            return arr
+        s0, s1 = shape[0], shape[1]
         new_shape = [shape[1], shape[0]] + shape[2:]
+        total = 1
+        for s in shape:
+            total *= s
         strides = []
         acc = 1
         for s in shape:
             strides.append(acc)
             acc *= s
-        new_total = acc
         new_flat = []
-        for n_idx in range(new_total):
+        for n_idx in range(total):
             rem = n_idx
             idxs = []
             for s in new_shape:
@@ -286,13 +274,22 @@ def builtin_transpose(arr, _evaluator=None, _scope=None, _line_number=None):
             old_idxs = [idxs[1], idxs[0]] + idxs[2:]
             old_flat = sum(oi * st for oi, st in zip(old_idxs, strides))
             new_flat.append(flat[old_flat])
-        return {'array': list(new_flat), 'shape': list(new_shape), 'original_shape': list(new_shape)}
-    # Fallback without evaluator (should not happen)
+        return {'array': list(new_flat), 'shape': list(new_shape),
+                'original_shape': list(new_shape)}
+    # Flat list: treat as a row vector → single-column result.
+    if isinstance(arr, list):
+        if not arr or not any(isinstance(v, list) for v in arr):
+            return [[v] for v in arr]
+        # Nested list: swap first two axes.
+        s0 = len(arr)
+        s1 = len(arr[0]) if s0 else 0
+        new_arr = [[arr[r][c] for r in range(s0)] for c in range(s1)]
+        return new_arr
     return arr
 
 
 @register_builtin("MIN", arg_count=1)
-def builtin_min(args, _evaluator=None, _scope=None, _line_number=None):
+def builtin_min(args):
     # Flatten single array arg
     if isinstance(args, (list, dict)):
         args = tuple(_to_list(args[0]))
@@ -300,7 +297,7 @@ def builtin_min(args, _evaluator=None, _scope=None, _line_number=None):
 
 
 @register_builtin("MAX", arg_count=1)
-def builtin_max(args, _evaluator=None, _scope=None, _line_number=None):
+def builtin_max(args):
     if isinstance(args, (list, dict)):
         args = tuple(_to_list(args[0]))
     return max(args)
@@ -394,25 +391,8 @@ def get_builtin_functions(evaluator, scope=None, line_number=None):
                         fn, args, evaluator, fn_name=fn_name)
                     if array_result is not None:
                         return array_result
-                    kwargs['_evaluator'] = evaluator
-                    kwargs['_scope'] = scope
-                    kwargs['_line_number'] = line_number
-                    return fn(*args, **kwargs)
+                    return fn(*args)
                 except TypeError as e:
-                    if '_evaluator' in str(e) or '_scope' in str(e) or '_line_number' in str(e):
-                        # The builtin did not accept the injected keyword
-                        # arguments: retry without them.
-                        try:
-                            kwargs.pop('_evaluator', None)
-                            kwargs.pop('_scope', None)
-                            kwargs.pop('_line_number', None)
-                            array_result = _broadcast_builtin(
-                                fn, args, evaluator, fn_name=fn_name)
-                            if array_result is not None:
-                                return array_result
-                            return fn(*args, **kwargs)
-                        except TypeError:
-                            return error_value(TYPE_ERROR)
                     # A genuine operand/type mismatch: report #TYPE/I instead of
                     # raising, so builtins degrade to a sticky type error value.
                     return error_value(TYPE_ERROR)
