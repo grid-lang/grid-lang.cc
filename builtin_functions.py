@@ -288,18 +288,18 @@ def builtin_transpose(arr):
     return arr
 
 
-@register_builtin("MIN", arg_count=1)
+@register_builtin("MIN", aliases=["Number.Min"], arg_count=1)
 def builtin_min(args):
     # Flatten single array arg
     if isinstance(args, (list, dict)):
-        args = tuple(_to_list(args[0]))
+        args = tuple(_to_list(args))
     return min(args)
 
 
-@register_builtin("MAX", arg_count=1)
+@register_builtin("MAX", aliases=["Number.Max"], arg_count=1)
 def builtin_max(args):
     if isinstance(args, (list, dict)):
-        args = tuple(_to_list(args[0]))
+        args = tuple(_to_list(args))
     return max(args)
 
 

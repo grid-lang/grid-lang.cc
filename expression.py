@@ -1377,6 +1377,47 @@ class ExpressionEvaluator:
             raise SyntaxError(
                 f"'.push()' syntax is not supported. Use 'Push {obj_name} = value' instead")
 
+        # --- Builtin member call support (e.g., numbers.Min(), myText.Split(",") ) ---
+        # Allows primitive-typed variables to call builtins as methods:
+        #   numbers.Min()  ->  Number.Min(numbers)
+        #   txt.Split(",") -> Text.Split(txt, ",")
+        try:
+            from builtin_functions import get_builtin_functions
+            builtins_wrapped = get_builtin_functions(self, scope, line_number)
+            candidates = []
+            if obj_type:
+                candidates.append(f"{obj_type}.{method_name}".lower())
+            candidates.append(method_name.lower())
+            if isinstance(obj_value, str) and f"text.{method_name}".lower() not in candidates:
+                candidates.append(f"text.{method_name}".lower())
+            if isinstance(obj_value, (int, float)) and not isinstance(obj_value, bool) and f"number.{method_name}".lower() not in candidates:
+                candidates.append(f"number.{method_name}".lower())
+            wrapped = None
+            for cand in candidates:
+                if cand in builtins_wrapped:
+                    wrapped = builtins_wrapped[cand]
+                    break
+            if wrapped is not None:
+                # Only dispatch as method call when parens are present or builtin expects the receiver
+                # The regex matches both 'obj.method' and 'obj.method(args)'; treat missing args as empty call
+                is_call = '(' in expr
+                # For field-like access without parens, still dispatch if builtin is zero-arg or one-arg expecting receiver
+                # (e.g., numbers.Min without parens is unlikely; require call syntax for safety)
+                if is_call or args_part is not None:
+                    # If args_part is None, it was a field access without parens -> treat as zero-arg method call
+                    arg_text = args_part if args_part is not None else ""
+                    args_list = []
+                    if arg_text.strip():
+                        args_list = [a.strip() for a in re.split(r',(?![^{]*})', arg_text) if a.strip()]
+                    evaluated_args = [self.eval_or_eval_array(a, scope, line_number) for a in args_list]
+                    return True, wrapped(obj_value, *evaluated_args)
+                else:
+                    # Bare field access like 'numbers.Min' without () -> return the builtin itself? Not needed.
+                    # Prefer to return the wrapped function so fallback can call it
+                    return True, wrapped
+        except Exception:
+            pass
+
         return False, None
 
     def _try_eval_field_access(self, expr, scope, line_number):
@@ -3414,7 +3455,15 @@ class ExpressionEvaluator:
                     return obj
                 return error_value(obj)
             try:
-                return getattr(obj, node.attr)
+                result = getattr(obj, node.attr)
+                # DotDict returns None for missing keys instead of raising;
+                # treat that as missing so builtin member dispatch can try.
+                if result is None and isinstance(obj, dict):
+                    # check actual key absence (case-insensitive)
+                    has_key = any(k.lower() == node.attr.lower() for k in obj.keys())
+                    if not has_key:
+                        raise AttributeError(f"'{type(obj).__name__}' object has no attribute '{node.attr}'")
+                return result
             except AttributeError:
                 if isinstance(node.value, ast.Name):
                     dotted = f"{node.value.id}.{node.attr}"
@@ -3422,6 +3471,33 @@ class ExpressionEvaluator:
                         return self._resolve_fallback_name(dotted, full_scope, globals_dict)
                     except NameError:
                         pass
+                # Builtin member fallback: e.g., numbers.Min() where obj is an
+                # array/dict-form list and Min is a builtin alias (Number.Min).
+                # Return a wrapper that prepends the receiver as the first arg,
+                # so the Call node can invoke it as func(*args).
+                try:
+                    candidates = []
+                    if isinstance(obj, str):
+                        candidates.append(f"text.{node.attr}".lower())
+                    elif isinstance(obj, (int, float)) and not isinstance(obj, bool):
+                        candidates.append(f"number.{node.attr}".lower())
+                    elif isinstance(obj, (list, dict)):
+                        # Heuristic: arrays of numbers -> number.<method>
+                        candidates.append(f"number.{node.attr}".lower())
+                        if isinstance(obj, dict) and obj.get('_type_name'):
+                            candidates.append(f"{obj.get('_type_name')}.{node.attr}".lower())
+                    candidates.append(node.attr.lower())
+                    for cand in candidates:
+                        try:
+                            builtin = self._resolve_fallback_name(cand, full_scope, globals_dict)
+                        except NameError:
+                            continue
+                        if callable(builtin):
+                            def _member_wrapper(*a, _b=builtin, _o=obj, **kw):
+                                return _b(_o, *a, **kw)
+                            return _member_wrapper
+                except Exception:
+                    pass
                 raise
         if node_type is ast.Subscript:
             value = self._walk_ast_node(
