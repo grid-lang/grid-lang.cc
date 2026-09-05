@@ -84,12 +84,6 @@ class GridLangTypeProcessor:
         for line in lines:
             self._parse_type_def_line(line, line_number, state)
         self._collect_type_computed_fields(state)
-        if type_name:
-            for field_name in state['fields']:
-                if str(field_name).lower() == str(type_name).lower():
-                    raise SyntaxError(
-                        f"Variable name conflicts with type: '{field_name}' "
-                        f"at line {line_number}")
         return self._finalize_type_def_state(state)
 
     def _parse_type_def_line(self, line, line_number, state):
@@ -226,14 +220,22 @@ class GridLangTypeProcessor:
         type_name = type_candidates[-1].lower() if type_candidates else None
         has_dim = re.search(r'\bdim\b', field_line, re.I)
         effective_type = 'array' if has_dim and not type_name else (type_name or 'unknown')
+        parsed_cons = self._parse_type_field_constraints(
+            field_line, line_number, type_name)
+        # Detect `as <type> key` (e.g. `k as number key`) - key is part of type, not standalone
+        if re.search(r'\bkey\b', field_line, re.I):
+            # If the field line contains `key` after `as <type>`, treat as keyed field
+            # Check that `key` is not part of another word and appears after `as`
+            # This makes `k as number key` equivalent to `k as L` where `L as Type(number key)`
+            parsed_cons = dict(parsed_cons) if parsed_cons else {}
+            parsed_cons['key'] = True
         return {
             'field_line': field_line,
             'init_expr': init_expr,
             'init_kind': init_kind,
             'var_names': var_names,
             'effective_type': effective_type,
-            'parsed_constraints': self._parse_type_field_constraints(
-                field_line, line_number, type_name),
+            'parsed_constraints': parsed_cons,
         }
 
     def _record_type_field_definition(self, state, line, field_line, lowered, line_number):

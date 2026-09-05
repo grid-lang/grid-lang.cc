@@ -3,6 +3,7 @@
 # arrays, ranges, and special functions in the GridLang compiler. It handles various syntax
 # including binary operations, dimension constraints, sums, interpolations, and more.
 
+import copy
 import re
 import math
 import random
@@ -1100,18 +1101,32 @@ class ExpressionEvaluator:
                     r'^new\s+(\w+)\s*(?:\(([^)]*)\))?\s*$', base_expr, re.I)
                 if new_ctor_match:
                     type_name = new_ctor_match.group(1)
-                    with_input_values = {}
-                    args_text = (new_ctor_match.group(2) or '').strip()
-                    evaluated_args = []
-                    if args_text:
-                        for raw in self._split_new_args(args_text, base_expr):
-                            evaluated_args.append(
-                                self.expr_evaluator.eval_or_eval_array(
-                                    raw, scope, line_number))
-                    base_value = self.compiler._instantiate_type(
-                        type_name, evaluated_args, line_number,
-                        allow_default_if_empty=not evaluated_args,
-                        execute_code=False, input_values_out=with_input_values)
+                    if type_name.lower() == "copy":
+                        # Special Copy type: new Copy(Obj) clones Obj and morphs to its type
+                        with_input_values = None
+                        args_text = (new_ctor_match.group(2) or '').strip()
+                        if not args_text:
+                            raise ValueError(f"Copy requires an argument at line {line_number}")
+                        raw_args = self._split_new_args(args_text, base_expr)
+                        if len(raw_args) != 1:
+                            raise ValueError(f"Copy expects exactly one argument at line {line_number}")
+                        source = self.eval_or_eval_array(raw_args[0], scope, line_number)
+                        base_value = self.compiler._copy_instance(source, line_number)
+                        # Effective type for WITH is the source type, not "copy"
+                        type_name = base_value.get('_type_name', type_name) if isinstance(base_value, dict) else type_name
+                    else:
+                        with_input_values = {}
+                        args_text = (new_ctor_match.group(2) or '').strip()
+                        evaluated_args = []
+                        if args_text:
+                            for raw in self._split_new_args(args_text, base_expr):
+                                evaluated_args.append(
+                                    self.expr_evaluator.eval_or_eval_array(
+                                        raw, scope, line_number))
+                        base_value = self.compiler._instantiate_type(
+                            type_name, evaluated_args, line_number,
+                            allow_default_if_empty=not evaluated_args,
+                            execute_code=False, input_values_out=with_input_values)
                 else:
                     # Non-`new` base expression: the object already exists, so
                     # just apply WITH and drop the applied-fields marker.
@@ -1156,6 +1171,8 @@ class ExpressionEvaluator:
         bare_new_match = re.match(r'^new\s+(\w+)\s*$', expr)
         if bare_new_match:
             type_name = bare_new_match.group(1)
+            if type_name.lower() == "copy":
+                raise ValueError(f"Copy requires an argument at line {line_number}")
             if type_name.lower() in self.compiler.types_defined:
                 return True, self.compiler._instantiate_type(
                     type_name, [], line_number, allow_default_if_empty=True)
@@ -1215,6 +1232,13 @@ class ExpressionEvaluator:
         args_list = [a for a in args_list if a.strip()]
         evaluated_args = [self.eval_or_eval_array(
             a, scope, line_number) for a in args_list]
+
+        if type_name.lower() == "copy":
+            if len(args_list) != 1:
+                raise ValueError(f"Copy expects exactly one argument at line {line_number}")
+            source = evaluated_args[0]
+            new_obj = self.compiler._copy_instance(source, line_number)
+            return True, new_obj
 
         if type_name.lower() in self.compiler.types_defined:
             allow_defaults = len(args_list) == 0 and args_str.strip() == ''

@@ -70,7 +70,7 @@ are prompted (`compiler.prompt_missing_inputs`).
 
 1. `main.py` reads the file and constructs one `GridLangCompiler` (a fresh one
    per run).
-2. `compiler.run(code, args)` (`compiler.py:530`) is the interpreter entry
+2. `compiler.run(code, args)` (`compiler.py:645`) is the interpreter entry
    point. `GridLangCompiler` is a **single engine class** — it inherits its
    whole runtime loop from `GridLangExecutor` and executes directly on itself.
    There is **no separate executor object and no method/state copy handoff**:
@@ -122,7 +122,7 @@ no duplication to keep in sync across two live objects anymore.
   `1` is special: `UnitValue._is_one`, `__mul__` treats `1` as unitless, `_divide` `m/1→m` `m/m→1`, `__pow__` allows exponent `1`.
 - `UnitValue` overloads: `+`/`-` same unit or one side unitless; `*` with `1`; `/`/`\`/`mod` with `1`; `^` with `1`.
 
-### `compiler.py` (4038 lines) — state + orchestration, public API
+### `compiler.py` (4190 lines) — state + orchestration, public API
 `class GridLangCompiler` is the engine's **state holder and public surface**. It
 is the only class `main.py` constructs. It inherits the runtime loop from
 `GridLangExecutor` and holds nearly all persistent state created in `__init__`:
@@ -143,24 +143,24 @@ Public API (called from `main.py` / tests): `run`, `call_function`,
 `call_subprocess`, `set_input_values`, `export_to_csv`.
 
 Notable methods:
-- `run` (530): engine entry — `_reset_state()` then delegates to the inherited
+- `run` (645): engine entry — `_reset_state()` then delegates to the inherited
   runtime pipeline (no executor handoff).
 - `current_scope`/`push_scope`/`pop_scope` (310/325/331).
-- `_seed_grid_variable` (2594): predefines `grid` in the global scope as a
+- `_seed_grid_variable` (2709): predefines `grid` in the global scope as a
   `_GridStore` (sparse array keyed by 0-based `(row,col)` tuples; aliased as
   `self.grid`), so `grid{row, col}` works at top level. Skipped inside
   read-only function sub-compilers.
-- UnitSource: `_parse_unit_source_header` (161) / `_finalize_unit_source` (174) / `_register_convert_line` (209) / `_infer_convert_target_unit` (262, evaluates RHS with stripped var, falls back to declared units) / `_materialize_unit_source_constants` (316) / `_register_top_level_converts` (310).
-- `_extract_functions` (563): pulls `Function`/`Subprocess` defs out of the
+- UnitSource: `_parse_unit_source_header` (181) / `_finalize_unit_source` (194) / `_register_convert_line` (229) / `_infer_convert_target_unit` (262, evaluates RHS with stripped var, falls back to declared units) / `_materialize_unit_source_constants` (336) / `_register_top_level_converts` (330).
+- `_extract_functions` (678): pulls `Function`/`Subprocess` defs out of the
   main code and registers them.
-- `_instantiate_type` (902), `_evaluate_with_value` (1098), `_apply_with_clause`
+- `_instantiate_type` (1017), `_evaluate_with_value` (1213), `_apply_with_clause`
   (1246): type/`with` object construction; now handles `:` field unit conversion.
-- `call_subprocess` (1544): runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (2994), `_process_declarations_and_labels` (3006),
-  `_collect_global_declarations` (3082): top-level statement handling; now handles `of 1` and `"ox" of animal`.
-- `export_to_csv` (3831): `--debug` CSV export (grid as matrix, or outputs as
+- `call_subprocess` (1659): runs a sub-`GridLangCompiler` in isolation.
+- `_process_grid_assignment` (3111), `_process_declarations_and_labels` (3123),
+  `_collect_global_declarations` (3199): top-level statement handling; now handles `of 1` and `"ox" of animal`.
+- `export_to_csv` (3983): `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
-- `set_input_values` (3854): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
+- `set_input_values` (4006): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
 - `_seed_globals` (1670): for sub-compilers; **skips redefining `grid`**.
 
 Also defines `SubprocessResult` (32): result container exposing `grid`,
@@ -207,31 +207,31 @@ live entry. Key methods (the `compiler.py`/`grid_lang_common.py` layers call
 both the compiler and executor layers here. (Note: `error_value`/`UNIVERSAL_ZERO`
 live in `units.py`, not here.)
 
-### `expression.py` (3849 lines) — expression evaluation
+### `expression.py` (3873 lines) — expression evaluation
 `class ExpressionEvaluator` evaluates RHS expressions, arrays, ranges, sums,
 dimension selectors, interpolations, member/field access, and Python-fallback
 evaluation.
-- Entry points: `eval_or_eval_array` (116, now `expected_unit`), `eval_expr` (2313), and for
-  assignments `_evaluate_array` (545).
-- LHS-informed: `_apply_expected_unit` (77) + `_formula_eval` (97, strips LHS var) threaded via `expected_unit`.
+- Entry points: `eval_or_eval_array` (116, now `expected_unit`), `eval_expr` (2337), and for
+  assignments `_evaluate_array` (546).
+- LHS-informed: `_apply_expected_unit` (78) + `_formula_eval` (97, strips LHS var) threaded via `expected_unit`.
 - `eval_expr` is the big recursive dispatcher: array literals `{}`, pipes `|`,
   interpolated cell refs, paren/curly indexing, member calls, user function
   calls, object creation, field access, address-indexed access, then scalar
   constructs, then simple variables.
-- Python fallback: `_evaluate_with_python_fallback` (2748) builds a scope and
+- Python fallback: `_evaluate_with_python_fallback` (2772) builds a scope and
   `eval()`s complex arithmetic (`_build_fallback_cell_scope` 2254,
   `_eval_python_fallback_result` 2501, `_get_eval_globals` 2937). Now includes
-  `_replace_of_unit_literals` (3779) for `"ox" of animal`/`5 of in`/`2 of 1` → `gridlang_of_unit` and `Attribute` flat-key `SILength.inch` + case-insensitive `_resolve_fallback_name` (3335).
-- Interpolation: `_process_interpolation` (3651). Operators:
-  `_replace_operators` (3794).
-- Grid indexing: `_replace_grid_indexing` (862) — rewrites bare `grid{...}`
+  `_replace_of_unit_literals` (3803) for `"ox" of animal`/`5 of in`/`2 of 1` → `gridlang_of_unit` and `Attribute` flat-key `SILength.inch` + case-insensitive `_resolve_fallback_name` (3359).
+- Interpolation: `_process_interpolation` (3675). Operators:
+  `_replace_operators` (3818).
+- Grid indexing: `_replace_grid_indexing` (863) — rewrites bare `grid{...}`
   when the predefined `grid` variable is in scope; otherwise falls through to
   the generic array-access path (ranges, `*` selectors, `#N/A` for unset cells).
-- Also `CaseInsensitiveDict` (27): case-insensitive dict used for
+- Also `CaseInsensitiveDict` (28): case-insensitive dict used for
   eval scopes.
 
 ### `builtin_functions.py` (402 lines) — builtin registry + predefined functions
-Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`/`ROWS`/`ABS`/`LEN`/`TEXTSPLIT`/`TRANSPOSE`/math, …). Both evaluation paths (`ExpressionEvaluator._build_python_fallback_scope` (`expression.py:3184`) and `_get_eval_globals` (`expression.py:3808`)) call `get_builtin_functions()` so a new builtin is instantly available everywhere.
+Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`/`ROWS`/`ABS`/`LEN`/`TEXTSPLIT`/`TRANSPOSE`/math, …). Both evaluation paths (`ExpressionEvaluator._build_python_fallback_scope` (`expression.py:3208`) and `_get_eval_globals` (`expression.py:3832`)) call `get_builtin_functions()` so a new builtin is instantly available everywhere.
 - Registry (37): `BUILTINS`/`ALIASES`/`ARG_COUNTS`/`VECTORIZED` plus `KEYWORDS` (43, re-exported by `compiler.py`/`expression.py` for dependency stripping). `register_builtin` (50) and `register_vectorized_builtin` (80) are decorators (`@register_builtin("MIN", aliases=["Number.Min"], arg_count=1)`); non-vectorized by default, vectorized ones broadcast element-wise.
 - Arity + helpers: `_check_arity` (100) / `_resolve_builtin` (120) / `_to_list` (129, normalizes sparse `dict`, `{'array':…}`, `list` → flat list).
 - Builtins (143): `ROWS` (143) / `SUM` (155) / `LEN` (166, `Text.Len`) / `ABS` (174, `Number.Abs`) / `POWER` (179) / `INT` (184) / `MID` (189, `Text.Mid`) / `TEXTSPLIT` (199, `Text.Split`) / `COUNTA` (207) / `RANDARRAY` (223) / `SORTBY` (229) / `TRANSPOSE` (240) / `MIN` (291, `Number.Min`) / `MAX` (299, `Number.Max`) plus math shims (`sqrt`/`sin`/… → `Number.<name>`, 306) and `str`/`int`/`float`/`abs` (313). `MIN`/`MAX` flatten via `_to_list` before `min`/`max`.
@@ -296,24 +296,24 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   - Scoping: `is_shadowed` (682), `get_evaluation_scope` (690),
     `get_full_scope` (1084), `_coerce_custom_type_value` (226).
 - `class _GridStore` (24): dict backing `compiler.grid`; every cell write
-  calls `compiler._notify_cell_changed` (compiler.py:2430). (The old
+  calls `compiler._notify_cell_changed` (compiler.py:2545). (The old
   `_ListenerGrid`/`GridLiveView` classes were removed — `_GridStore` is the
   single grid store, keyed by 0-based index tuples.)
 - `_ACTIVE_RUNNERS` (21): stack of executing compilers; used with the
   `_outer_scope_read_only` flag to reject writes from read-only function
   sub-compilers to outer scopes.
 
-### `type_processor.py` (1251 lines) — `Define X as Type` handling
+### `type_processor.py` (1253 lines) — `Define X as Type` handling
 `class GridLangTypeProcessor`:
-- Type-def parsing: `_parse_type_def` (81), `_parse_type_def_line` (95),
-  `_extract_type_field_line` (9696, `_parse_type_field_constraints` (199),
+- Type-def parsing: `_parse_type_def` (81), `_parse_type_def_line` (89),
+  `_extract_type_field_line` (9696, `_parse_type_field_constraints` (193),
   `_record_type_field_definition` (15157, `_collect_type_computed_fields`
-  (178), `_finalize_type_def_state` (274).
-- Executing type body code against an instance: `_execute_type_code` (295),
-  `_execute_type_block` (25252, `_process_grid_assignment` (501),
-  `_process_type_for_loop` (38389, `_process_type_let_statement` (756),
+  (178), `_finalize_type_def_state` (276).
+- Executing type body code against an instance: `_execute_type_code` (297),
+  `_execute_type_block` (25252, `_process_grid_assignment` (503),
+  `_process_type_for_loop` (38389, `_process_type_let_statement` (758),
   `_process_type_assignment` (58581.
-- `_build_type_eval_scope` (70708, `_execute_builder` (1063).
+- `_build_type_eval_scope` (70708, `_execute_builder` (1065).
 
 ### `parser.py` (639 lines) — variable-definition parsing
 `class GridLangParser`:

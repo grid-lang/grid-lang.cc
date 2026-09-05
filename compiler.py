@@ -84,6 +84,7 @@ class GridLangCompiler(GridLangExecutor):
         self._listeners = {'cell': {}, 'var': {}}
         self._set_by = {}
         self._propagating = set()
+        self._singletons = {}
         self.dimensions = {}
         self.dim_names = {}
         self.dim_labels = {}
@@ -142,12 +143,29 @@ class GridLangCompiler(GridLangExecutor):
     def _parse_type_header(self, line, line_number=None):
         """Parse a type definition header, returning name, parent, and constraints."""
         m = re.match(
-            r'^\s*define\s+([\w_]+)\s+as\s+type(?:\s*\(\s*([\w_]+)\s*\))?\s*(.*)$', line, re.I)
+            r'^\s*define\s+([\w_]+)\s+as\s+type(?:\s*\(\s*([^)]*)\s*\))?\s*(.*)$', line, re.I)
         if not m:
             return None, None, None
         type_name = m.group(1).strip()
-        parent = m.group(2).strip() if m.group(2) else None
+        inner = m.group(2).strip() if m.group(2) else ""
         remainder = m.group(3).strip()
+        parent = None
+        keyed = False
+        if inner:
+            parts = inner.split()
+            # inner may be "key", "Parent", "Parent key", "number key"
+            lower_parts = [p.lower() for p in parts]
+            if "key" in lower_parts:
+                keyed = True
+                # parent is first non-key token, if any
+                for p in parts:
+                    if p.lower() != "key":
+                        parent = p.strip()
+                        break
+            else:
+                # No key, inner is parent
+                if parts:
+                    parent = parts[0].strip()
         constraints = {}
         if remainder:
             try:
@@ -156,6 +174,8 @@ class GridLangCompiler(GridLangExecutor):
             except Exception as exc:
                 raise SyntaxError(
                     f"Invalid type constraints in '{line}' at line {line_number}: {exc}")
+        if keyed:
+            constraints['key'] = True
         return type_name, parent, constraints
 
     def _parse_unit_source_header(self, line, line_number=None):
@@ -460,6 +480,101 @@ class GridLangCompiler(GridLangExecutor):
                 break
             current = parent.lower()
         return None
+
+    def _copy_instance(self, source, line_number=None):
+        """Deep-copy an object instance for `new Copy(Obj)`.
+
+        No constructor is run. Listeners internal/external are cloned so that
+        a field `b = a + 1` stays internal (`dst.b -> dst.a`) and
+        `b = global + 1` stays external (`dst.b -> global`). Keyed fields are
+        nulled so the builder must assign them (Not Null).
+        """
+        import copy
+        if not isinstance(source, dict):
+            raise TypeError(f"Copy source must be an object instance at line {line_number}")
+        dst = copy.deepcopy(source)
+        dst.pop('_with_applied_fields', None)
+        dst.pop('_with_conflict', None)
+        type_name = dst.get('_type_name')
+        if type_name:
+            tdef = self.types_defined.get(type_name.lower(), {})
+            # Null out key fields for keyed types (defer singleton: Type(key) with no fields)
+            # Type-level key: null all fields that are declared as keyed or whose type is keyed
+            if tdef.get('_keyed'):
+                # For Type(key) with fields, null all fields? Specification: Define A as Type(key) means all instances distinct - likely whole object keyed, so builder must init something? For now null out fields that are keyed via field type.
+                pass
+            # Field-level key: if any field's type is a keyed type (e.g. L as Type(number key)), null it
+            for field, ftype in self._get_public_type_fields(tdef).items():
+                if not ftype:
+                    continue
+                fdef = self.types_defined.get(ftype.lower(), {})
+                if fdef and fdef.get('_keyed'):
+                    # Field type is keyed (e.g. number key) -> null it
+                    if field in dst:
+                        dst[field] = None
+                # Also handle direct field `key` constraint (e.g. : k as number key)
+                field_cons = (tdef.get('_field_constraints', {}) or {}).get(field, {})
+                if field_cons.get('key'):
+                    if field in dst:
+                        dst[field] = None
+            # Handle direct number key alias: field `k as number key` stored as ftype 'number' with constraint key - need to check field_constraints
+        # Clone listeners (internal/external)
+        # self._clone_listeners_for_copy is called by caller when source/dest var names are known (global decl)
+        # For templated expression copies, listeners will be cloned when the copy is bound to a variable
+        return dst
+
+    def _clone_listeners_for_copy(self, src_var, dst_var, src_scope=None, dst_scope=None):
+        """Clone listener edges from src_var to dst_var.
+
+        Internal `src.a -> src.b` becomes `dst.a -> dst.b`.
+        External `src.a -> global` becomes `dst.a -> global`.
+        No ctor is run, so this preserves arrangement.
+        """
+        if not src_var or not dst_var:
+            return
+        src_lower = src_var.lower()
+        dst_lower = dst_var.lower()
+        # Walk current _listeners table; duplicate records where var == src_var or var starts with src_var.
+        for kind in ('var', 'cell'):
+            for dep_key, holders in list(self._listeners.get(kind, {}).items()):
+                for holder_key, rec in list(holders.items()):
+                    var_name = rec.get('var')
+                    if not var_name:
+                        continue
+                    # Field of src object: var_name == src_var or var_name startswith src_var + '.'
+                    if var_name.lower() == src_lower or var_name.lower().startswith(src_lower + '.'):
+                        suffix = var_name[len(src_var):]  # includes dot if present
+                        new_var = dst_var + suffix
+                        # Determine new dep keys: remap internal deps (src.* -> dst.*)
+                        new_deps = set()
+                        for dep in rec.get('deps', ()):
+                            if dep.lower() == src_lower or dep.lower().startswith(src_lower + '.'):
+                                new_dep = dst_var + dep[len(src_var):]
+                                new_deps.add(new_dep)
+                            else:
+                                new_deps.add(dep)
+                        # Re-register with same scope (dst_scope or rec scope)
+                        scope = dst_scope if dst_scope is not None else rec.get('scope')
+                        # Use original expr but with src->dst substitution for internal refs? Keep expr as is for now; recompute will resolve via new var
+                        # Register under same dep keys but with dst var
+                        for dep in new_deps:
+                            # Skip dependency tokens that are types/functions
+                            if dep.lower() in self.types_defined or dep.lower() in getattr(self, 'functions', {}) or dep.lower() in getattr(self, 'subprocesses', {}):
+                                continue
+                            key = ('var', dep.lower()) if not re.match(r'^[A-Za-z]+\d+$', dep) else ('cell', dep)
+                            # For cell deps keep as is
+                            if key[0] == 'cell':
+                                key = ('cell', dep)
+                            holder2 = self._listeners.setdefault(key[0], {}).setdefault(key[1], {})
+                            # Use new_var as key
+                            new_rec = dict(rec)
+                            new_rec['var'] = new_var
+                            new_rec['deps'] = new_deps
+                            # scope stays same (dst scope)
+                            new_rec['scope'] = scope
+                            holder2[(new_var.lower(), id(scope) if scope else 0)] = new_rec
+                        if new_var:
+                            self._set_by[('var', new_var.lower())] = 'client'
 
     def _convert_array_to_object(self, type_name, value, line_number=None):
         type_def = self.types_defined.get(type_name.lower())
@@ -2923,6 +3038,8 @@ class GridLangCompiler(GridLangExecutor):
                             type_def['_parent'] = type_parent
                         if type_constraints:
                             type_def['_constraints'] = type_constraints
+                        if type_constraints and type_constraints.get('key'):
+                            type_def['_keyed'] = True
                         self.types_defined[type_name.lower()] = type_def
                         continue
                     if type_block_depth > 0:
@@ -3281,7 +3398,10 @@ class GridLangCompiler(GridLangExecutor):
         if not m_new:
             return False
         var, type_name, opener, _ = m_new.groups()
-        if type_name.lower() not in self.types_defined:
+        if type_name.lower() == "copy":
+            # Copy is a pseudo-type handled specially after parsing
+            pass
+        elif type_name.lower() not in self.types_defined:
             raise SyntaxError(
                 f"Type '{type_name}' not defined at line {line_number}")
         pairs = {'{': '}', '(': ')'}
@@ -3344,6 +3464,38 @@ class GridLangCompiler(GridLangExecutor):
             return [arg for arg in args if arg.strip()]
 
         values = _split_args(values_str)
+        if type_name.lower() == "copy":
+            if len(values) != 1:
+                raise ValueError(f"Copy expects exactly one argument at line {line_number}")
+            src_expr = values[0]
+            source = self.expr_evaluator.eval_expr(src_expr, self.current_scope().get_full_scope(), line_number)
+            value_dict = self._copy_instance(source, line_number)
+            effective_type = value_dict.get('_type_name') if isinstance(value_dict, dict) else None
+            # Clone listeners: internal/external edges from src var to dst var
+            m_src_var = re.match(r'^\s*([A-Za-z_][\w]*)\s*$', src_expr)
+            if m_src_var:
+                src_var = m_src_var.group(1)
+                try:
+                    self._clone_listeners_for_copy(src_var, var, self.current_scope(), self.current_scope())
+                except Exception:
+                    pass
+            if with_kind != 'empty':
+                value_dict = self._apply_with_clause(value_dict, with_kind, with_payload, self.current_scope().get_full_scope(), line_number, type_name=effective_type)
+                if isinstance(value_dict, list):
+                    for elem in value_dict:
+                        if isinstance(elem, dict):
+                            elem.pop('_with_applied_fields', None)
+                elif isinstance(value_dict, dict):
+                    value_dict.pop('_with_applied_fields', None)
+            if chain_text:
+                value_dict = self.type_processor._apply_builder_chain(value_dict, chain_text, self.current_scope().get_full_scope(), line_number)
+            if isinstance(value_dict, list):
+                self.current_scope().define(var, value_dict, effective_type or 'object', {}, is_uninitialized=False)
+                return True
+            snapshot = {k: copy.deepcopy(v) for k, v in value_dict.items() if not str(k).startswith('_')}
+            constraints = {'constant': snapshot}
+            self.current_scope().define(var, value_dict, effective_type or 'object', constraints)
+            return True
         type_fields = self.types_defined[type_name.lower()]
         actual_fields = self._get_public_type_fields(type_fields)
         inputs_list = type_fields.get('_inputs', [])
