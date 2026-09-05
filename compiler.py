@@ -141,31 +141,32 @@ class GridLangCompiler(GridLangExecutor):
         return str(field_name).lower() in {str(h).lower() for h in hidden}
 
     def _parse_type_header(self, line, line_number=None):
-        """Parse a type definition header, returning name, parent, and constraints."""
+        """Parse a type definition header, returning name, parent, and constraints.
+
+        Supports `Define X as Type`, `Define X as Type(Parent)`,
+        and `Define X as Keytype` / `Define X as Keytype(Parent)`.
+        """
         m = re.match(
-            r'^\s*define\s+([\w_]+)\s+as\s+type(?:\s*\(\s*([^)]*)\s*\))?\s*(.*)$', line, re.I)
+            r'^\s*define\s+([\w_]+)\s+as\s+(type|keytype)(?:\s*\(\s*([^)]*)\s*\))?\s*(.*)$', line, re.I)
         if not m:
             return None, None, None
         type_name = m.group(1).strip()
-        inner = m.group(2).strip() if m.group(2) else ""
-        remainder = m.group(3).strip()
+        kind = m.group(2).strip().lower()  # type or keytype
+        inner = m.group(3).strip() if m.group(3) else ""
+        remainder = m.group(4).strip()
         parent = None
         keyed = False
-        if inner:
-            parts = inner.split()
-            # inner may be "key", "Parent", "Parent key", "number key"
-            lower_parts = [p.lower() for p in parts]
-            if "key" in lower_parts:
-                keyed = True
-                # parent is first non-key token, if any
-                for p in parts:
-                    if p.lower() != "key":
-                        parent = p.strip()
-                        break
-            else:
-                # No key, inner is parent
-                if parts:
-                    parent = parts[0].strip()
+        if kind == "keytype":
+            keyed = True
+            if inner:
+                # Keytype(Parent) -> parent is inner
+                parent = inner.split()[0].strip()
+        else:
+            # kind == type, only Type or Type(Parent) - Type(key) removed, use Keytype
+            if inner and "key" in inner.lower().split():
+                raise SyntaxError(f"Type(key) syntax removed, use Keytype at line {line_number}: '{line}'")
+            if inner:
+                parent = inner.split()[0].strip()
         constraints = {}
         if remainder:
             try:
@@ -3173,7 +3174,7 @@ class GridLangCompiler(GridLangExecutor):
             is_end = stripped == 'end'
 
             # Track entering/exiting type definitions to avoid treating inner lines as globals
-            if stripped.startswith("define ") and " as type" in stripped:
+            if stripped.startswith("define ") and (" as type" in stripped or " as keytype" in stripped):
                 type_depth += 1
             elif stripped.startswith("end") and type_depth > 0:
                 type_depth -= 1

@@ -222,11 +222,8 @@ class GridLangTypeProcessor:
         effective_type = 'array' if has_dim and not type_name else (type_name or 'unknown')
         parsed_cons = self._parse_type_field_constraints(
             field_line, line_number, type_name)
-        # Detect `as <type> key` (e.g. `k as number key`) - key is part of type, not standalone
+        # Keep `: x as number key` - key is part of type (`number key` ≡ `L` where `L as Keytype(number)`)
         if re.search(r'\bkey\b', field_line, re.I):
-            # If the field line contains `key` after `as <type>`, treat as keyed field
-            # Check that `key` is not part of another word and appears after `as`
-            # This makes `k as number key` equivalent to `k as L` where `L as Type(number key)`
             parsed_cons = dict(parsed_cons) if parsed_cons else {}
             parsed_cons['key'] = True
         return {
