@@ -307,11 +307,11 @@ class GridLangTypeProcessor:
         inferred_type = value_dict.get('_type_name') if isinstance(
             value_dict, dict) else None
         self.compiler.current_scope().define(
-            var_name, value_dict, inferred_type or 'object')
+            var_name, value_dict, inferred_type or 'object', preserve_freshness=True)
         # Use lowercase "this"; case-insensitive lookup covers "This".
         if str(var_name).lower() != 'this':
             self.compiler.current_scope().define(
-                'this', value_dict, inferred_type or 'object')
+                'this', value_dict, inferred_type or 'object', preserve_freshness=True)
         input_values = input_values or {}
         for in_name, in_val in input_values.items():
             self.compiler.current_scope().define(
@@ -466,7 +466,8 @@ class GridLangTypeProcessor:
                     continue
                 # Let statement: Let grid{a, b} = grid{a-1, b-1} + grid{a-1, b}
                 self._process_type_let_statement(
-                    stripped_line, 'this', value_dict, line_number)
+                    stripped_line, 'this', value_dict, line_number,
+                    input_values)
                 i += 1
                 continue
             if stripped_line.startswith(':'):
@@ -752,7 +753,7 @@ class GridLangTypeProcessor:
         self.compiler.pop_scope()
         return scan_i + 1
 
-    def _process_type_let_statement(self, line, var_name, value_dict, line_number):
+    def _process_type_let_statement(self, line, var_name, value_dict, line_number, input_values=None):
         """Process let statement inside type definition.
 
         Routes to the shared compiler utilities for all forms:
@@ -801,9 +802,30 @@ class GridLangTypeProcessor:
         if expr is None and init_expr is not None:
             expr = init_expr
             constraints.pop('init', None)
+        prev_fields = set(value_dict.keys()) if isinstance(value_dict, dict) else set()
+        eval_scope_before = eval_scope
         self.compiler._process_let_binding(
             var, type_name, constraints, expr, line_number,
-            scope_dict=eval_scope, shadow_keyword='LET')
+            scope_dict=eval_scope_before, shadow_keyword='LET')
+        # Sync a single-field binding back into the instance (mirrors the
+        # plain 'x = value' constructor assignment so 'Let x = value'
+        # initialises an existing field rather than only a local variable).
+        field_key = None
+        if isinstance(value_dict, dict):
+            for k in value_dict:
+                if not str(k).startswith('_') and str(k).lower() == str(var).lower():
+                    field_key = k
+                    break
+        if field_key is not None:
+            bound_value = eval_scope_before.get(var)
+            if bound_value is not None:
+                value_dict[field_key] = bound_value
+                if input_values:
+                    tokens = re.findall(r'\b[\w_]+\b', body)
+                    input_names = {name.lower() for name in input_values.keys()}
+                    if any(tok.lower() in input_names for tok in tokens):
+                        value_dict.setdefault(
+                            '_immutable_fields', set()).add(field_key.lower())
 
     def _collect_type_block_lines(self, code_lines, start_i, track_if_depth=False):
         """Collect lines for a ``... then ... end`` block.

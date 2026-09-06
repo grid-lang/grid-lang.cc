@@ -243,15 +243,17 @@ class UnitValue:
     ``#...`` string at the grid boundary.
     """
 
-    __slots__ = ('value', 'unit', 'error_code')
+    __slots__ = ('value', 'unit', 'error_code', 'key_type', 'fresh_key')
 
-    def __init__(self, value, unit=None, error=False, error_code=None):
+    def __init__(self, value, unit=None, error=False, error_code=None, key_type=None, fresh_key=False):
         self.value = value
         self.unit = unit
         if error:
             self.error_code = error_code or UNIT_ERROR
         else:
             self.error_code = error_code
+        self.key_type = key_type
+        self.fresh_key = fresh_key
 
     @property
     def error(self):

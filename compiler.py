@@ -9,7 +9,7 @@ from array_handler import ArrayHandler
 from utils import col_to_num, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT, is_sparse_array, strip_array_cell_indices
 from scope import Scope, _GridStore
 from units import (
-    UNIT_ERROR, UNIVERSAL_ZERO, UnitValue, ConstraintError, error_value,
+    UNIT_ERROR, UNIVERSAL_ZERO, TYPE_ERROR, UnitValue, ConstraintError, error_value,
     is_error_value, strip_units, register_conversion, has_conversion,
     lookup_conversions,
 )
@@ -441,6 +441,10 @@ class GridLangCompiler(GridLangExecutor):
                         merged_fields.update(child_field_constraints)
                         type_def['_field_constraints'] = merged_fields
 
+                    # Option 2: subclasses of a Keytype are keyed (flexible)
+                    if parent_def.get('_keyed'):
+                        type_def['_keyed'] = True
+
                 if base_type:
                     type_def['_base_type'] = base_type
                 type_def['_inheritance_applied'] = True
@@ -493,6 +497,10 @@ class GridLangCompiler(GridLangExecutor):
         import copy
         if not isinstance(source, dict):
             raise TypeError(f"Copy source must be an object instance at line {line_number}")
+        # A stored (non-fresh) keytype instance cannot be copied at all.
+        src_key_type = self._key_type_of_value(source)
+        if src_key_type and not self._key_value_is_fresh(source):
+            raise ConstraintError(TYPE_ERROR, f"Cannot copy instance of key type '{src_key_type}' at line {line_number}")
         dst = copy.deepcopy(source)
         dst.pop('_with_applied_fields', None)
         dst.pop('_with_conflict', None)
@@ -576,6 +584,69 @@ class GridLangCompiler(GridLangExecutor):
                             holder2[(new_var.lower(), id(scope) if scope else 0)] = new_rec
                         if new_var:
                             self._set_by[('var', new_var.lower())] = 'client'
+
+    def _is_key_type(self, type_name):
+        """Return True if type_name is a Keytype (declared ``as Keytype``) whose
+        instances cannot be copied once stored."""
+        if not type_name:
+            return False
+        tdef = self.types_defined.get(str(type_name).lower(), {})
+        return bool(tdef and tdef.get('_keyed'))
+
+    def _key_type_of_value(self, value):
+        """Return the keytype name if ``value`` is a keytype instance (primitive
+        ``UnitValue`` or keyed object dict), else None."""
+        if isinstance(value, UnitValue) and getattr(value, 'key_type', None):
+            return value.key_type
+        if isinstance(value, dict):
+            tn = value.get('_type_name')
+            if tn and self._is_key_type(tn):
+                return tn
+        return None
+
+    def _key_value_is_fresh(self, value):
+        """Return True if ``value`` is a freshly-constructed keytype instance
+        (allowed to flow to its first binding) rather than a stored one."""
+        if isinstance(value, UnitValue) and getattr(value, 'key_type', None):
+            return bool(getattr(value, 'fresh_key', False))
+        if isinstance(value, dict):
+            return bool(value.get('_fresh_key', False))
+        return False
+
+    def _mark_keytype_stored(self, value):
+        """Recursively clear the fresh marker on keytype instances nested in a
+        stored value (a Let/For/Push/`:` variable or a stored object field)."""
+        if isinstance(value, UnitValue) and getattr(value, 'key_type', None):
+            if getattr(value, 'fresh_key', False):
+                value.fresh_key = False
+            return
+        if isinstance(value, dict):
+            if self._is_key_type(value.get('_type_name')):
+                value['_fresh_key'] = False
+            for k in list(value.keys()):
+                if str(k).startswith('_'):
+                    continue
+                self._mark_keytype_stored(value[k])
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                self._mark_keytype_stored(item)
+
+    def _check_key_type_copy(self, dest_var, dest_type, src_type, source_value=None, src_scope=None, line_number=None):
+        """Raise if a non-fresh key type instance is being copied.
+
+        Called after the RHS is evaluated: ``src_type`` is the keytype name
+        derived from the evaluated value. ``new Copy(x)``, ``For d as L = x``,
+        ``Push d = x``, ``Let d = x`` where L is a Keytype and x is an already
+        stored keytype instance are errors. Fresh values (``new L(...)``,
+        ``new K ...``, wrapping imports) may flow to their first binding.
+        ``k as number key`` field values (plain numbers, foreign keys) are not
+        keytype instances and remain copyable.
+        """
+        if not src_type or not self._is_key_type(src_type):
+            return
+        if source_value is not None and self._key_value_is_fresh(source_value):
+            return
+        raise ConstraintError(TYPE_ERROR, f"Cannot copy instance of key type '{src_type}' at line {line_number}")
 
     def _convert_array_to_object(self, type_name, value, line_number=None):
         type_def = self.types_defined.get(type_name.lower())
@@ -1015,6 +1086,51 @@ class GridLangCompiler(GridLangExecutor):
             matrix[r - 1][c - 1] = val
         return matrix
 
+    def _is_keyed_primitive_field_type(self, ftype):
+        """True if ``ftype`` is a Keytype primitive alias (e.g. ``L as Keytype(number)``),
+        i.e. a Keytype with no composite fields based on a primitive base type."""
+        fdef = self.types_defined.get(str(ftype).lower(), {}) if ftype else {}
+        return bool(fdef.get('_keyed') and not self._get_public_type_fields(fdef)
+                    and fdef.get('_base_type') in ('number', 'text', 'logical'))
+
+    def _wrap_keytype_primitive_fields(self, value_dict, public_fields, type_def=None, ensure_fresh=False):
+        """Wrap values of Keytype primitive-alias fields as fresh UnitValues so
+        they read as fresh key instances (e.g. ``k as L`` where ``L as Keytype(number)``).
+        Returns the (possibly reused) ``value_dict``."""
+        for fname, ftype in list(public_fields.items()):
+            if not self._is_keyed_primitive_field_type(ftype):
+                continue
+            raw = value_dict.get(fname)
+            if raw is not None and not isinstance(raw, UnitValue):
+                from units import UnitValue
+                if isinstance(raw, UnitValue) and getattr(raw, 'key_type', None):
+                    continue
+                base = self.types_defined.get(str(ftype).lower(), {}).get('_base_type')
+                if raw is None:
+                    base_val = 0 if base == 'number' else ("" if base == 'text' else False)
+                    raw = base_val
+                value_dict[fname] = UnitValue(raw, unit=None, key_type=str(ftype).lower(), fresh_key=True)
+            elif isinstance(raw, UnitValue) and ensure_fresh and not getattr(raw, 'fresh_key', False):
+                raw.fresh_key = True
+        return value_dict
+
+    def _mark_keyed_fields_immutable(self, value_dict, public_fields, type_def=None):
+        """Mark keyed fields (Keytype primitive aliases and ``as ... key`` field
+        constraints) immutable so Push on them is a compile error."""
+        keyed = set()
+        for fname, ftype in public_fields.items():
+            fdef = self.types_defined.get(str(ftype).lower(), {}) if ftype else {}
+            if fdef.get('_keyed') and not self._get_public_type_fields(fdef):
+                keyed.add(fname.lower())
+            fcons = ((type_def or {}).get('_field_constraints', {}) or {}).get(fname) \
+                or ((type_def or {}).get('_field_constraints', {}) or {}).get(fname.lower(), {})
+            if fcons.get('key'):
+                keyed.add(fname.lower())
+        if keyed:
+            immk = value_dict.setdefault('_immutable_fields', set())
+            immk.update(keyed)
+        return value_dict
+
     def _instantiate_type(self, type_name, args, line_number, allow_default_if_empty=False, var_name=None, execute_code=True, input_values_out=None):
         """Create an instance dict for a user-defined type, honoring inputs and constructor code."""
         type_def = self.types_defined[type_name.lower()]
@@ -1038,6 +1154,23 @@ class GridLangCompiler(GridLangExecutor):
 
         args = args or []
         if base_type and not all_fields:
+            # Keytype primitive alias (e.g. L as Keytype(number)) wraps the primitive as a fresh key instance
+            is_keyed_primitive = type_def.get('_keyed') and base_type in ('number', 'text', 'logical')
+            if is_keyed_primitive:
+                from units import UnitValue
+                if not args and allow_default_if_empty:
+                    base_val = 0 if base_type == 'number' else ("" if base_type == 'text' else False if base_type == 'logical' else None)
+                    return UnitValue(base_val, unit=None, key_type=type_name.lower(), fresh_key=True)
+                if len(args) != 1:
+                    raise ValueError(
+                        f"Expected 1 value for type '{type_name}', got {len(args)} at line {line_number}")
+                # Wrap the primitive value as a fresh key instance
+                raw = args[0]
+                # Unwrap if already a UnitValue (e.g. from 5 of unit) - keep value, add key
+                if isinstance(raw, UnitValue):
+                    # Preserve unit, add key_type and fresh
+                    return UnitValue(raw.value, raw.unit, key_type=type_name.lower(), fresh_key=True)
+                return UnitValue(raw, unit=None, key_type=type_name.lower(), fresh_key=True)
             if not args and allow_default_if_empty:
                 if base_type == 'number':
                     return 0
@@ -1077,6 +1210,8 @@ class GridLangCompiler(GridLangExecutor):
             hidden_fields = type_def.get('_hidden_fields', set())
             if hidden_fields:
                 value_dict['_hidden_fields'] = set(hidden_fields)
+            # Wrap Keytype fields (e.g. k as L where L as Keytype(number)) as fresh UnitValue
+            self._wrap_keytype_primitive_fields(value_dict, public_fields, type_def)
             if input_values_out is not None:
                 input_values_out.clear()
                 input_values_out.update(input_values)
@@ -1090,6 +1225,10 @@ class GridLangCompiler(GridLangExecutor):
                 if value_dict:
                     immutable = value_dict.setdefault('_immutable_fields', set())
                     immutable.update(n.lower() for n in value_dict.keys())
+            # Keyed fields are immutable after construction (Push on key → compile error)
+            self._mark_keyed_fields_immutable(value_dict, public_fields, type_def)
+            if type_def.get('_keyed'):
+                value_dict.setdefault('_fresh_key', True)
             return value_dict
 
         if inputs_list and len(args) > expected_args:
@@ -1122,6 +1261,8 @@ class GridLangCompiler(GridLangExecutor):
         hidden_fields = type_def.get('_hidden_fields', set())
         if hidden_fields:
             value_dict['_hidden_fields'] = set(hidden_fields)
+        # Wrap Keytype fields (e.g. k as L where L as Keytype) as fresh UnitValue
+        self._wrap_keytype_primitive_fields(value_dict, public_fields, type_def)
         if input_values_out is not None:
             input_values_out.clear()
             input_values_out.update(input_values)
@@ -1139,6 +1280,15 @@ class GridLangCompiler(GridLangExecutor):
             if value_dict:
                 immutable = value_dict.setdefault('_immutable_fields', set())
                 immutable.update(n.lower() for n in value_dict.keys())
+
+        # Wrap any remaining Keytype fields that were set via with/args after exec (e.g. k as L with k=5)
+        self._wrap_keytype_primitive_fields(value_dict, public_fields, type_def, ensure_fresh=True)
+
+        # Keyed fields are immutable after construction (Push on key → compile error)
+        self._mark_keyed_fields_immutable(value_dict, public_fields, type_def)
+        # Keyed object instances are fresh on construction; storing clears it.
+        if type_def.get('_keyed'):
+            value_dict.setdefault('_fresh_key', True)
 
         return value_dict
 
@@ -3469,6 +3619,40 @@ class GridLangCompiler(GridLangExecutor):
             if len(values) != 1:
                 raise ValueError(f"Copy expects exactly one argument at line {line_number}")
             src_expr = values[0]
+            # Instances of a key type (Keytype) cannot be copied at all - e.g. L as Keytype(number)
+            # Check statically via src var type
+            m_key_src = re.match(r'^\s*([A-Za-z_][\w]*)(?:\.([\w_]+))?\s*$', src_expr)
+            if m_key_src:
+                base_var = m_key_src.group(1)
+                field = m_key_src.group(2)
+                try:
+                    def_scope = self.current_scope().get_defining_scope(base_var)
+                    if def_scope:
+                        if field:
+                            base_type = def_scope.types.get(def_scope._get_case_insensitive_key(base_var, def_scope.types) or base_var)
+                            if base_type:
+                                base_tdef = self.types_defined.get(base_type.lower(), {})
+                                field_type = None
+                                for fname, ftype in self._get_public_type_fields(base_tdef).items():
+                                    if fname.lower() == field.lower():
+                                        field_type = ftype
+                                        break
+                                if field_type:
+                                    if self._is_keyed_primitive_field_type(field_type):
+                                        raise TypeError(f"Cannot copy instance of key type '{field_type}' at line {line_number}")
+                                # field `k as number key` - the field itself is key, but its value is ordinary number
+                                # Copying the field value via `new Copy(p.k)` where p.k is number key should be allowed as ordinary number?
+                                # For now, only block L-type (Keytype) instances, not `number key` field values
+                        else:
+                            var_key = def_scope._get_case_insensitive_key(base_var, def_scope.types)
+                            var_type = def_scope.types.get(var_key) if var_key else None
+                            if var_type:
+                                if self._is_keyed_primitive_field_type(var_type):
+                                    raise TypeError(f"Cannot copy instance of key type '{var_type}' at line {line_number}")
+                except TypeError:
+                    raise
+                except Exception:
+                    pass
             source = self.expr_evaluator.eval_expr(src_expr, self.current_scope().get_full_scope(), line_number)
             value_dict = self._copy_instance(source, line_number)
             effective_type = value_dict.get('_type_name') if isinstance(value_dict, dict) else None
@@ -3490,6 +3674,20 @@ class GridLangCompiler(GridLangExecutor):
                     value_dict.pop('_with_applied_fields', None)
             if chain_text:
                 value_dict = self.type_processor._apply_builder_chain(value_dict, chain_text, self.current_scope().get_full_scope(), line_number)
+            # Keyed fields become immutable after Copy+builder (Push on key → compile error)
+            if isinstance(value_dict, dict):
+                tdef_eff = self.types_defined.get((effective_type or '').lower(), {})
+                if tdef_eff:
+                    self._mark_keyed_fields_immutable(value_dict, self._get_public_type_fields(tdef_eff), tdef_eff)
+            elif isinstance(value_dict, list):
+                for elem in value_dict:
+                    if not isinstance(elem, dict):
+                        continue
+                    eff = elem.get('_type_name', effective_type)
+                    tdef2 = self.types_defined.get((eff or '').lower(), {})
+                    if not tdef2:
+                        continue
+                    self._mark_keyed_fields_immutable(elem, self._get_public_type_fields(tdef2), tdef2)
             if isinstance(value_dict, list):
                 self.current_scope().define(var, value_dict, effective_type or 'object', {}, is_uninitialized=False)
                 return True
@@ -3636,6 +3834,10 @@ class GridLangCompiler(GridLangExecutor):
                 if not interpolation_only:
                     expr_no_quotes = re.sub(r'"[^"]*"', '', expr)
                     expr_no_quotes = re.sub(r"'[^']*'", '', expr_no_quotes)
+                    # Remove builder-call names ('-> name(') so they are not
+                    # treated as dependency variables.
+                    expr_no_quotes = re.sub(
+                        r'->\s*\$?[A-Za-z][A-Za-z0-9_.]*\s*\(', '(', expr_no_quotes)
                     expr_no_numbers = re.sub(
                         r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?',
                         ' ', expr_no_quotes, flags=re.I)

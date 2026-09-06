@@ -21,6 +21,18 @@ from utils import (
 _ACTIVE_RUNNERS = []
 
 
+def _strip_meta(value):
+    """Return a copy of ``value`` with transient meta keys (underscore-prefixed)
+    removed recursively, so dict comparisons in constant checks ignore internal
+    markers such as ``_fresh_key`` and ``_immutable_fields``."""
+    if isinstance(value, dict):
+        return {k: _strip_meta(v) for k, v in value.items()
+                if not str(k).startswith('_')}
+    if isinstance(value, (list, tuple)):
+        return [_strip_meta(v) for v in value]
+    return value
+
+
 class _GridStore(dict):
     """The single grid backing store, held as the predefined ``grid`` variable.
 
@@ -389,7 +401,49 @@ class Scope:
         raise SyntaxError(
             f"Invalid variable name '{name}'{at}.")
 
-    def define(self, name, value=None, type=None, constraints=None, is_uninitialized=False, line_number=None, internal=False):
+    def _is_keyed_type(self, type_name, compiler=None):
+        """True if ``type_name`` is a declared Keytype (``as Keytype``)."""
+        if not type_name:
+            return False
+        compiler = compiler or getattr(self, 'compiler', None)
+        td = (getattr(compiler, 'types_defined', None)
+              or {}).get(str(type_name).lower(), {})
+        return bool(td.get('_keyed'))
+
+    def _keytype_primitive_base(self, type_name, compiler=None):
+        """Return the primitive base type of ``type_name`` if it is a Keytype
+        primitive alias (e.g. ``L as Keytype(number)``), else None."""
+        if not self._is_keyed_type(type_name, compiler):
+            return None
+        compiler = compiler or getattr(self, 'compiler', None)
+        td = (getattr(compiler, 'types_defined', None)
+              or {}).get(str(type_name).lower(), {})
+        if td.get('_base_type') not in ('number', 'text', 'logical'):
+            return None
+        try:
+            public = compiler._get_public_type_fields(td) if hasattr(
+                compiler, '_get_public_type_fields') else {}
+        except Exception:
+            public = {}
+        if public:
+            return None
+        return td.get('_base_type')
+
+    def _wrap_keytype_primitive(self, value, type_name, compiler=None):
+        """Wrap a plain primitive ``value`` as a fresh Keytype instance when the
+        destination is a Keytype primitive alias (e.g. ``x as L = 5`` where
+        ``L as Keytype(number)``). Returns the possibly-wrapped value."""
+        base = self._keytype_primitive_base(type_name, compiler)
+        if base is None or isinstance(value, UnitValue) or value is None \
+                or is_error_value(value):
+            return value
+        if (base == 'number' and isinstance(value, (int, float)) and not isinstance(value, bool)) \
+                or (base == 'text' and isinstance(value, str)) \
+                or (base == 'logical' and isinstance(value, bool)):
+            return UnitValue(value, unit=None, key_type=type_name.lower(), fresh_key=True)
+        return value
+
+    def define(self, name, value=None, type=None, constraints=None, is_uninitialized=False, line_number=None, internal=False, preserve_freshness=False):
         effective_constraints = constraints or {}
         self._validate_variable_name(name, line_number, internal=internal)
         # Check for case-insensitive conflicts
@@ -397,7 +451,53 @@ class Scope:
         if existing_key and not is_uninitialized:
             raise ValueError(
                 f"Variable '{name}' conflicts with existing variable '{existing_key}' in this scope")
-        value, runtime_unit = self._unit_convert(
+        # Handle Keytype freshness and implicit as IdKey
+        # Wrap plain primitive values as fresh Keytype instances when dest is a Keytype (e.g. x as L = 5 where L as Keytype(number))
+        value = self._wrap_keytype_primitive(value, type)
+        # If value is a fresh Keytype instance (UnitValue with key_type, or a
+        # keyed object dict marked _fresh_key) and dest has no explicit type,
+        # implicitly add `as <keytype>` (e.g. Let x = new IdKey -> x as IdKey).
+        value_key_type = None
+        value_is_fresh = False
+        compiler_ref = getattr(self, 'compiler', None)
+        if compiler_ref is not None and hasattr(compiler_ref, '_key_type_of_value'):
+            value_key_type = compiler_ref._key_type_of_value(value)
+            value_is_fresh = bool(value_key_type and compiler_ref._key_value_is_fresh(value))
+        if value_key_type and value_is_fresh:
+            if (not type or type.lower() in ('unknown', 'object')) and not effective_constraints.get('type'):
+                # Implicitly add `as <keytype>` for storage vars (not Output, which doesn't store)
+                is_output = effective_constraints.get('output') or self.is_output(name)
+                if not is_output:
+                    # Check if dest already has another type constraint (hard error)
+                    existing_type = self.types.get(name) or self.types.get(self._get_case_insensitive_key(name, self.types) or "")
+                    if existing_type and existing_type.lower() not in ('unknown', 'object', str(value_key_type).lower()):
+                        raise ConstraintError(TYPE_ERROR, f"Variable '{name}' already has type '{existing_type}', cannot implicitly add '{value_key_type}' at line {line_number}")
+                    type = str(value_key_type).lower()
+                    effective_constraints = dict(effective_constraints)
+                    effective_constraints['type'] = type.lower()
+            elif type and type.lower() not in ('unknown', 'object', str(value_key_type).lower()):
+                raise ConstraintError(TYPE_ERROR, f"Variable '{name}' already has type '{type}', cannot assign '{value_key_type}' instance at line {line_number}")
+        # Copying a stored (non-fresh) keytype instance via Let/:/For/Input/new Copy is #TYPE/I.
+        # `k as number key` field values (plain numbers, foreign keys) are not
+        # keytype instances and remain copyable.
+        if value_key_type and compiler_ref is not None and hasattr(compiler_ref, '_check_key_type_copy'):
+            compiler_ref._check_key_type_copy(
+                name, type, value_key_type, value, self, line_number)
+        # Clear freshness when stored to a non-Output var (Output doesn't store)
+        is_output_final = effective_constraints.get('output') or self.is_output(name)
+        if not is_output_final and not preserve_freshness:
+            if isinstance(value, UnitValue) and getattr(value, 'fresh_key', False):
+                # Create a non-fresh copy for storage
+                value = UnitValue(value.value, value.unit, error_code=value.error_code, key_type=value.key_type, fresh_key=False)
+            if compiler_ref is not None and hasattr(compiler_ref, '_mark_keytype_stored'):
+                compiler_ref._mark_keytype_stored(value)
+        # For Keytype values, bypass _unit_convert's stripping of UnitValue wrapper (keep key_type)
+        if isinstance(value, UnitValue) and getattr(value, 'key_type', None):
+            runtime_unit = value.unit
+            # Keep value as UnitValue with key_type (don't strip to plain value)
+            # _coerce_universal_zero and other handling should preserve it
+        else:
+            value, runtime_unit = self._unit_convert(
             name, value, effective_constraints, line_number)
         value = self._coerce_universal_zero(value, type)
         if value is not None and not is_error_value(value) and type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
@@ -434,7 +534,7 @@ class Scope:
         if hasattr(self.compiler, 'mark_dependency_resolved'):
             self.compiler.mark_dependency_resolved(name)
 
-    def update(self, name, value, line_number=None):
+    def update(self, name, value, line_number=None, preserve_freshness=False):
         defining_scope = self.get_defining_scope(name)
         if defining_scope:
             # Functions are read-only with respect to the caller's scope chain.
@@ -455,7 +555,58 @@ class Scope:
             if actual_key:
                 var_type = defining_scope.types.get(actual_key)
                 constraints = defining_scope.constraints.get(actual_key, {})
-                value, runtime_unit = self._unit_convert(
+                # Wrap plain primitive values as fresh Keytype instances when dest is a Keytype (e.g. x as L = 5 where L as Keytype(number))
+                value = defining_scope._wrap_keytype_primitive(value, var_type, defining_scope.compiler)
+                # For key types (e.g. x as L where L as Keytype), the variable is immutable after first assignment
+                # But Output variables are not storage - they can be pushed multiple times (freshness kept)
+                is_output_check = constraints.get('output') or defining_scope.is_output(actual_key)
+                if not is_output_check and defining_scope._is_keyed_type(var_type, defining_scope.compiler):
+                    existing_val = defining_scope.variables.get(actual_key)
+                    # Allow initial assignment from None (e.g. Let x = new IdKey where x was is_uninitialized with None)
+                    # But any subsequent Push/For update where existing already has a non-None, non-error value should error
+                    if existing_val is not None and existing_val is not UNIVERSAL_ZERO and not is_error_value(existing_val):
+                        # Check if this is an update (not initial) - actual_key already exists and has value
+                        # For key types, even Push with same value should be considered immutable
+                        # However, allow the first builder assignment after Copy where old is None (nulled) -> but old is not None here, it's 5, so need to distinguish
+                        # For Copy case, old is None (nulled) and new is value, so existing would be None, not here
+                        # Here, existing is not None, so any update to a keytype var should error
+                        raise ConstraintError(TYPE_ERROR, f"Cannot modify key type '{var_type}' at line {line_number}")
+                # Handle Keytype freshness, implicit as IdKey, and copy check for Push/For updates
+                compiler_ref = getattr(defining_scope, 'compiler', None) or getattr(self, 'compiler', None)
+                value_key_type = None
+                value_is_fresh = False
+                if compiler_ref is not None and hasattr(compiler_ref, '_key_type_of_value'):
+                    value_key_type = compiler_ref._key_type_of_value(value)
+                    value_is_fresh = bool(value_key_type and compiler_ref._key_value_is_fresh(value))
+                if value_key_type:
+                    # Hard error if dest already has a different explicit type
+                    if var_type and var_type.lower() not in ('unknown', 'object', str(value_key_type).lower()):
+                        raise ConstraintError(TYPE_ERROR, f"Variable '{actual_key}' already has type '{var_type}', cannot assign '{value_key_type}' instance at line {line_number}")
+                    if value_is_fresh:
+                        # Implicit as Keytype if dest has no explicit type and value is fresh
+                        if (not var_type or var_type.lower() in ('unknown', 'object')):
+                            is_output_dest = constraints.get('output') or defining_scope.is_output(actual_key)
+                            if not is_output_dest:
+                                existing_type_for_check = defining_scope.types.get(actual_key)
+                                if existing_type_for_check and existing_type_for_check.lower() not in ('unknown', 'object', str(value_key_type).lower()):
+                                    raise ConstraintError(TYPE_ERROR, f"Variable '{actual_key}' already has type '{existing_type_for_check}', cannot implicitly add '{value_key_type}' at line {line_number}")
+                                var_type = str(value_key_type).lower()
+                                defining_scope.types[actual_key] = var_type
+                    # Copying a stored (non-fresh) keytype instance via Push/For/Let -> #TYPE/I
+                    if compiler_ref is not None and hasattr(compiler_ref, '_check_key_type_copy'):
+                        compiler_ref._check_key_type_copy(actual_key, var_type, value_key_type, value, defining_scope, line_number)
+                is_output = constraints.get('output') or defining_scope.is_output(actual_key)
+                if not is_output and not preserve_freshness:
+                    # Fresh keytype instance being stored to a storage var -> clear freshness
+                    if isinstance(value, UnitValue) and getattr(value, 'fresh_key', False):
+                        value = UnitValue(value.value, value.unit, error_code=value.error_code, key_type=value.key_type, fresh_key=False)
+                    if compiler_ref is not None and hasattr(compiler_ref, '_mark_keytype_stored'):
+                        compiler_ref._mark_keytype_stored(value)
+                # For Keytype values, bypass _unit_convert's stripping of UnitValue wrapper (keep key_type)
+                if isinstance(value, UnitValue) and getattr(value, 'key_type', None):
+                    runtime_unit = value.unit
+                else:
+                    value, runtime_unit = self._unit_convert(
                     name, value, constraints, line_number)
                 value = self._coerce_universal_zero(value, var_type)
                 if value is not None and not is_error_value(value) and var_type and hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined'):
@@ -912,7 +1063,7 @@ class Scope:
                             value, line_number)
                         if any(is_error_value(e) for e in flat):
                             continue
-                if value != constraint_val:
+                if _strip_meta(value) != _strip_meta(constraint_val):
                     raise ConstraintError(
                         VALUE_ERROR,
                         f"Cannot change constant '{key_for_constraints}' at line {line_number}")

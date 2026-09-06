@@ -7,7 +7,7 @@ from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
 from control_flow import GridLangControlFlow
 from parser import GridLangParser
-from units import VALUE_ERROR, ConstraintError, error_value
+from units import VALUE_ERROR, TYPE_ERROR, ConstraintError, error_value
 from utils import col_to_num, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array, strip_array_cell_indices, is_wildcard_address
 from grid_lang_common import GridLangBase, _STATEMENT_KEYWORDS, _first_keyword, _DEPENDENCY_IGNORED_TOKENS, _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens
 DEPENDENCY_IGNORED_TOKENS = _DEPENDENCY_IGNORED_TOKENS
@@ -261,6 +261,33 @@ class GridLangExecutor(GridLangBase):
         self._process_when_triggers()
 
     def _set_var_value(self, var_name, value, line_number):
+        # For key types, even client-owned variables are immutable after first assignment
+        # Check before the client check so Push on a keytype still errors
+        try:
+            owner_check = getattr(self, 'compiler', None) or self
+            def_scope_check = self.current_scope().get_defining_scope(var_name)
+            if def_scope_check:
+                actual_key_check = def_scope_check._get_case_insensitive_key(var_name, def_scope_check.variables)
+                if actual_key_check:
+                    var_type_check = def_scope_check.types.get(actual_key_check)
+                    if def_scope_check._is_keyed_type(var_type_check, owner_check):
+                        # Output variables are not storage - they can be pushed multiple times
+                        is_output_check2 = False
+                        try:
+                            is_output_check2 = def_scope_check.is_output(actual_key_check) or def_scope_check.constraints.get(actual_key_check, {}).get('output')
+                        except Exception:
+                            pass
+                        if not is_output_check2:
+                            existing_val_check = def_scope_check.variables.get(actual_key_check)
+                            from units import is_error_value, UNIVERSAL_ZERO
+                            if existing_val_check is not None and existing_val_check is not UNIVERSAL_ZERO and not is_error_value(existing_val_check):
+                                # Any Push/For update that tries to change a keytype var should error
+                                # Even if value is plain number 6 (not UnitValue), it's still an attempt to modify key
+                                raise ValueError(f"Cannot modify key type '{var_type_check}' at line {line_number}")
+        except ValueError:
+            raise
+        except Exception:
+            pass
         # Publisher-side write: a client equality binding wins over the pushed
         # value, so skip the overwrite for client-owned variables.
         owner = getattr(self, 'compiler', None) or self
@@ -796,6 +823,12 @@ class GridLangExecutor(GridLangBase):
                 r'new\s+([A-Za-z][A-Za-z0-9_]*)\s*\(', str(expr), re.I)
             if ctor_match:
                 inferred_type = ctor_match.group(1)
+        if not inferred_type:
+            from units import UnitValue as _UV
+            if isinstance(value, _UV) and getattr(value, 'key_type', None):
+                inferred_type = value.key_type
+            elif isinstance(value, dict) and value.get('_type_name'):
+                inferred_type = value.get('_type_name')
         if not inferred_type:
             inferred_type = self.array_handler.infer_type(value, line_number)
         try:
@@ -4542,6 +4575,28 @@ class GridLangExecutor(GridLangBase):
         return results
 
     def _handle_push_assignment(self, target, value_expr, line_number):
+        # Key type variables are immutable: Push to a stored keytype var is forbidden
+        try:
+            compiler = getattr(self, 'compiler', None) or self
+            if hasattr(compiler, '_is_key_type') and hasattr(compiler, 'current_scope'):
+                dest_type = None
+                is_output_dest = False
+                try:
+                    def_scope = self.current_scope().get_defining_scope(target)
+                    if def_scope:
+                        var_key = def_scope._get_case_insensitive_key(target, def_scope.types)
+                        dest_type = def_scope.types.get(var_key) if var_key else None
+                        con_key = def_scope._get_case_insensitive_key(target, def_scope.constraints)
+                        con = def_scope.constraints.get(con_key, {}) if con_key else {}
+                        is_output_dest = bool(con.get('output')) or def_scope.is_output(target)
+                except Exception:
+                    pass
+                if dest_type and compiler._is_key_type(dest_type) and not is_output_dest:
+                    raise ConstraintError(TYPE_ERROR, f"Cannot modify key type '{dest_type}' at line {line_number}")
+        except ConstraintError:
+            raise
+        except Exception:
+            pass
         # grid field is read-only outside type constructors/builders
         if '.grid' in target.lower():
             ctx = getattr(self, '_context_grid_stack', None) or getattr(getattr(self, 'compiler', None), '_context_grid_stack', None)
@@ -4646,8 +4701,12 @@ class GridLangExecutor(GridLangBase):
                 f.lower() for f in current_obj.get('_immutable_fields', set())
             }
             if actual_field.lower() in immutable_fields:
-                raise ValueError(
-                    f"Field '{field_name}' of '{owner_path}' is immutable at line {line_number}")
+                # Allow initialisation of a nulled key (None) via builder following Copy
+                from units import is_error_value, UNIVERSAL_ZERO
+                existing_val = current_obj.get(actual_field)
+                if existing_val is not None and existing_val is not UNIVERSAL_ZERO and not is_error_value(existing_val):
+                    raise ValueError(
+                        f"Field '{field_name}' of '{owner_path}' is immutable at line {line_number}")
 
             is_last = idx == len(member_parts) - 1
             if is_last:
