@@ -443,6 +443,33 @@ class Scope:
             return UnitValue(value, unit=None, key_type=type_name.lower(), fresh_key=True)
         return value
 
+    def _apply_keyed_not_null(self, value):
+        """If ``value`` is a stored custom-type instance with a keyed field left
+        unset (``None``), turn the whole instance into a sticky #VALUE error.
+
+        Keyed fields (Keytype-typed or ``as ... key``) imply Not Null, so an
+        instance whose keyed field is never assigned is invalid at storage.
+        """
+        if not isinstance(value, dict) or is_error_value(value):
+            return value
+        type_name = value.get('_type_name')
+        if not type_name or not hasattr(self, 'compiler') \
+                or not hasattr(self.compiler, 'types_defined') \
+                or type_name.lower() not in self.compiler.types_defined:
+            return value
+        tdef = self.compiler.types_defined.get(type_name.lower())
+        try:
+            keyed = self.compiler._keyed_field_names(tdef)
+        except Exception:
+            keyed = set()
+        if not keyed:
+            return value
+        for field in keyed:
+            for key, item in value.items():
+                if key.lower() == field and item is None:
+                    return error_value(VALUE_ERROR)
+        return value
+
     def define(self, name, value=None, type=None, constraints=None, is_uninitialized=False, line_number=None, internal=False, preserve_freshness=False):
         effective_constraints = constraints or {}
         self._validate_variable_name(name, line_number, internal=internal)
@@ -523,6 +550,8 @@ class Scope:
                     runtime_unit = None
         value = self._materialize_no_dim_list(
             name, value, effective_constraints, line_number)
+        if not preserve_freshness:
+            value = self._apply_keyed_not_null(value)
         self.variables[name] = value
         self.value_units[name.lower()] = runtime_unit
         self.types[name] = type
@@ -632,6 +661,8 @@ class Scope:
                         runtime_unit = None
                 value = defining_scope._materialize_no_dim_list(
                     actual_key, value, constraints, line_number)
+                if not preserve_freshness:
+                    value = defining_scope._apply_keyed_not_null(value)
                 defining_scope.variables[actual_key] = value
                 defining_scope.value_units[actual_key.lower()] = runtime_unit
                 defining_scope.uninitialized.discard(actual_key)
@@ -658,6 +689,10 @@ class Scope:
                     except ConstraintError as exc:
                         value = exc.code
                         runtime_unit = None
+                value = defining_scope._materialize_no_dim_list(
+                    name, value, defining_scope.constraints.get(name, {}), line_number)
+                if not preserve_freshness:
+                    value = defining_scope._apply_keyed_not_null(value)
                 defining_scope.variables[name] = value
                 defining_scope.value_units[name.lower()] = runtime_unit
                 defining_scope.uninitialized.discard(name)

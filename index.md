@@ -70,7 +70,7 @@ are prompted (`compiler.prompt_missing_inputs`).
 
 1. `main.py` reads the file and constructs one `GridLangCompiler` (a fresh one
    per run).
-2. `compiler.run(code, args)` (`compiler.py:717`) is the interpreter entry
+2. `compiler.run(code, args)` (`compiler.py:707`) is the interpreter entry
    point. `GridLangCompiler` is a **single engine class** — it inherits its
    whole runtime loop from `GridLangExecutor` and executes directly on itself.
    There is **no separate executor object and no method/state copy handoff**:
@@ -122,7 +122,7 @@ no duplication to keep in sync across two live objects anymore.
   `1` is special: `UnitValue._is_one`, `__mul__` treats `1` as unitless, `_divide` `m/1→m` `m/m→1`, `__pow__` allows exponent `1`.
 - `UnitValue` overloads: `+`/`-` same unit or one side unitless; `*` with `1`; `/`/`\`/`mod` with `1`; `^` with `1`.
 
-### `compiler.py` (4393 lines) — state + orchestration, public API
+### `compiler.py` (4397 lines) — state + orchestration, public API
 `class GridLangCompiler` is the engine's **state holder and public surface**. It
 is the only class `main.py` constructs. It inherits the runtime loop from
 `GridLangExecutor` and holds nearly all persistent state created in `__init__`:
@@ -143,24 +143,24 @@ Public API (called from `main.py` / tests): `run`, `call_function`,
 `call_subprocess`, `set_input_values`, `export_to_csv`.
 
 Notable methods:
-- `run` (717): engine entry — `_reset_state()` then delegates to the inherited
+- `run` (707): engine entry — `_reset_state()` then delegates to the inherited
   runtime pipeline (no executor handoff).
 - `current_scope`/`push_scope`/`pop_scope` (310/325/331).
-- `_seed_grid_variable` (2860): predefines `grid` in the global scope as a
+- `_seed_grid_variable` (2864): predefines `grid` in the global scope as a
   `_GridStore` (sparse array keyed by 0-based `(row,col)` tuples; aliased as
   `self.grid`), so `grid{row, col}` works at top level. Skipped inside
   read-only function sub-compilers.
 - UnitSource: `_parse_unit_source_header` (182) / `_finalize_unit_source` (195) / `_register_convert_line` (230) / `_infer_convert_target_unit` (262, evaluates RHS with stripped var, falls back to declared units) / `_materialize_unit_source_constants` (337) / `_register_top_level_converts` (331).
-- `_extract_functions` (750): pulls `Function`/`Subprocess` defs out of the
+- `_extract_functions` (740): pulls `Function`/`Subprocess` defs out of the
   main code and registers them.
-- `_instantiate_type` (1134), `_evaluate_with_value` (1364), `_apply_with_clause`
+- `_instantiate_type` (1138), `_evaluate_with_value` (1368), `_apply_with_clause`
   (1246): type/`with` object construction; now handles `:` field unit conversion.
-- `call_subprocess` (1810): runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (3262), `_process_declarations_and_labels` (3274),
-  `_collect_global_declarations` (3350): top-level statement handling; now handles `of 1` and `"ox" of animal`.
-- `export_to_csv` (4186): `--debug` CSV export (grid as matrix, or outputs as
+- `call_subprocess` (1814): runs a sub-`GridLangCompiler` in isolation.
+- `_process_grid_assignment` (3266), `_process_declarations_and_labels` (3278),
+  `_collect_global_declarations` (3354): top-level statement handling; now handles `of 1` and `"ox" of animal`.
+- `export_to_csv` (4190): `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
-- `set_input_values` (4209): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
+- `set_input_values` (4213): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
 - `_seed_globals` (1670): for sub-compilers; **skips redefining `grid`**.
 
 Also defines `SubprocessResult` (32): result container exposing `grid`,
@@ -279,24 +279,24 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   (1339, 1390).
 - `_handle_block_*` methods (343–960): per-statement handling inside blocks.
 
-### `scope.py` (1245 lines) — scope + variable semantics
+### `scope.py` (1280 lines) — scope + variable semantics
 - `class Scope` (11119: variable storage with constraints.
-  - `define` (446), `update` (537), `get` (681), `is_uninitialized` (702),
-    `get_defining_scope` (717).
-  - Inputs/outputs: `define_input` (730), `define_output` (590, now preserves `unit` from `Input` when `Output` shares name), `is_input`/`is_output` (518/527), `connect_pipe` (777), `push_value`
-    (555), `_propagate_wave` (819) — the publish/listen ripple.
+  - `define` (473), `update` (566), `get` (716), `is_uninitialized` (737),
+    `get_defining_scope` (752).
+  - Inputs/outputs: `define_input` (765), `define_output` (590, now preserves `unit` from `Input` when `Output` shares name), `is_input`/`is_output` (518/527), `connect_pipe` (812), `push_value`
+    (555), `_propagate_wave` (854) — the publish/listen ripple.
   - Unit handling: `_unit_convert` (104, now tries `apply_conversion` before `#UNIT`), `_has_pending_assignment` (154).
-  - Constraints: `_re_evaluate_constraints` (872), `_check_constraints` (830, now unit-aware for `Let y of m = 5 of in`), `_validate_base_type` (943) — validates scalars AND, since the pyarrow
+  - Constraints: `_re_evaluate_constraints` (907), `_check_constraints` (830, now unit-aware for `Let y of m = 5 of in`), `_validate_base_type` (978) — validates scalars AND, since the pyarrow
     removal, element-by-element base types of `dim` arrays (via
     `array_handler.validate_array_element_types`), `_expression_depends_on`
     (651). `_array_unset_value` (array_handler.py:1446) resolves `None`
     sentinels for unset template array cells: checks the variable's
     `constraints['default']` (from `or = <expr>`) and evaluates it; falls back
     to `error_value(NA_ERROR)` (`#N/A`).
-  - Scoping: `is_shadowed` (833), `get_evaluation_scope` (841),
-    `get_full_scope` (1235), `_coerce_custom_type_value` (238).
+  - Scoping: `is_shadowed` (868), `get_evaluation_scope` (876),
+    `get_full_scope` (1270), `_coerce_custom_type_value` (238).
 - `class _GridStore` (36): dict backing `compiler.grid`; every cell write
-  calls `compiler._notify_cell_changed` (compiler.py:2696). (The old
+  calls `compiler._notify_cell_changed` (compiler.py:2700). (The old
   `_ListenerGrid`/`GridLiveView` classes were removed — `_GridStore` is the
   single grid store, keyed by 0-based index tuples.)
 - `_ACTIVE_RUNNERS` (21): stack of executing compilers; used with the
@@ -342,7 +342,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
 - `format_display_value` (26265: display formatting with float-trimming and
   list/dict-form array support.
 
-### `test_runner.py` (1044 lines) — inline test suite
+### `test_runner.py` (1050 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — now 314 tests (was 263) including 12 new unit tests (`Test 282`–`Test 293` for `UnitSource` constant/numeric, `Output` addition, `Let`/`For`/`Push`/`Init`/`:`, `1` dimensionless, and relaxed unit comparison). At the bottom of the file (~840) it runs itself when executed directly:
 `python test_runner.py [names...]`. Failing names are printed.
 

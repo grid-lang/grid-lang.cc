@@ -512,21 +512,11 @@ class GridLangCompiler(GridLangExecutor):
             if tdef.get('_keyed'):
                 # For Type(key) with fields, null all fields? Specification: Define A as Type(key) means all instances distinct - likely whole object keyed, so builder must init something? For now null out fields that are keyed via field type.
                 pass
-            # Field-level key: if any field's type is a keyed type (e.g. L as Type(number key)), null it
-            for field, ftype in self._get_public_type_fields(tdef).items():
-                if not ftype:
-                    continue
-                fdef = self.types_defined.get(ftype.lower(), {})
-                if fdef and fdef.get('_keyed'):
-                    # Field type is keyed (e.g. number key) -> null it
-                    if field in dst:
-                        dst[field] = None
-                # Also handle direct field `key` constraint (e.g. : k as number key)
-                field_cons = (tdef.get('_field_constraints', {}) or {}).get(field, {})
-                if field_cons.get('key'):
-                    if field in dst:
-                        dst[field] = None
-            # Handle direct number key alias: field `k as number key` stored as ftype 'number' with constraint key - need to check field_constraints
+            # Field-level key: null keyed fields (Not Null) so a following builder must assign them
+            for field in self._keyed_field_names(tdef):
+                for key in list(dst.keys()):
+                    if key.lower() == field:
+                        dst[key] = None
         # Clone listeners (internal/external)
         # self._clone_listeners_for_copy is called by caller when source/dest var names are known (global decl)
         # For templated expression copies, listeners will be cloned when the copy is bound to a variable
@@ -1086,6 +1076,23 @@ class GridLangCompiler(GridLangExecutor):
             matrix[r - 1][c - 1] = val
         return matrix
 
+    def _keyed_field_names(self, type_def):
+        """Field names that are keyed: declared as a Keytype type (composite or
+        primitive alias) or with an ``as ... key`` field constraint.
+
+        Keyed fields imply Not Null, so an instance whose keyed field is left
+        unset is a sticky #VALUE error at storage."""
+        keyed = set()
+        for fname, ftype in self._get_public_type_fields(type_def).items():
+            fdef = self.types_defined.get(str(ftype).lower(), {}) if ftype else {}
+            if fdef.get('_keyed'):
+                keyed.add(fname.lower())
+            fcons = (type_def.get('_field_constraints', {}) or {}).get(fname) \
+                or (type_def.get('_field_constraints', {}) or {}).get(fname.lower(), {})
+            if fcons.get('key'):
+                keyed.add(fname.lower())
+        return keyed
+
     def _is_keyed_primitive_field_type(self, ftype):
         """True if ``ftype`` is a Keytype primitive alias (e.g. ``L as Keytype(number)``),
         i.e. a Keytype with no composite fields based on a primitive base type."""
@@ -1115,17 +1122,14 @@ class GridLangCompiler(GridLangExecutor):
         return value_dict
 
     def _mark_keyed_fields_immutable(self, value_dict, public_fields, type_def=None):
-        """Mark keyed fields (Keytype primitive aliases and ``as ... key`` field
+        """Mark keyed fields (Keytype-typed fields and ``as ... key`` field
         constraints) immutable so Push on them is a compile error."""
-        keyed = set()
-        for fname, ftype in public_fields.items():
-            fdef = self.types_defined.get(str(ftype).lower(), {}) if ftype else {}
-            if fdef.get('_keyed') and not self._get_public_type_fields(fdef):
-                keyed.add(fname.lower())
-            fcons = ((type_def or {}).get('_field_constraints', {}) or {}).get(fname) \
-                or ((type_def or {}).get('_field_constraints', {}) or {}).get(fname.lower(), {})
-            if fcons.get('key'):
-                keyed.add(fname.lower())
+        keyed = self._keyed_field_names(type_def) if type_def else set()
+        if type_def is None:
+            for fname, ftype in public_fields.items():
+                fdef = self.types_defined.get(str(ftype).lower(), {}) if ftype else {}
+                if fdef.get('_keyed'):
+                    keyed.add(fname.lower())
         if keyed:
             immk = value_dict.setdefault('_immutable_fields', set())
             immk.update(keyed)
