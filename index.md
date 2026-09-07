@@ -166,7 +166,7 @@ Notable methods:
 Also defines `SubprocessResult` (32): result container exposing `grid`,
 `variables`, `outputs`, and `_UnitSourceNamespace` (47) the UnitSource lookups.
 
-### `executor.py` (5089 lines) — the runtime loop
+### `executor.py` (5100 lines) — the runtime loop
 `class GridLangExecutor` is the **base class that owns the interpreter's
 dispatch loop and its per-run runtime state**. It is not instantiated directly
 as a facade (the old compiler→executor copy handoff was removed); `run` is the
@@ -174,7 +174,7 @@ live entry. Key methods (the `compiler.py`/`grid_lang_common.py` layers call
 `super()`/override these):
 - `run` (1994): top-level sequence (acts on `self`; see Architecture).
 - `_run_setup` (4327), `_run_prepare_execution` (4362), `_print_outputs`
-  (4716), `_materialize_inits` (4830), `_process_deferred_assignments` (4969).
+  (4716), `_materialize_inits` (4841), `_process_deferred_assignments` (4980).
   `_run_prepare_execution` now calls `_materialize_unit_source_constants` + `_register_top_level_converts`.
 - Main loop: `_run_main_loop` (2024) → `_run_main_loop_impl` (2560) →
   `_run_main_loop_impl_body` (2563). `_handle_main_loop_*` methods dispatch
@@ -279,22 +279,22 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   (1339, 1390).
 - `_handle_block_*` methods (343–960): per-statement handling inside blocks.
 
-### `scope.py` (1280 lines) — scope + variable semantics
+### `scope.py` (1295 lines) — scope + variable semantics
 - `class Scope` (11119: variable storage with constraints.
-  - `define` (473), `update` (566), `get` (716), `is_uninitialized` (737),
-    `get_defining_scope` (752).
-  - Inputs/outputs: `define_input` (765), `define_output` (590, now preserves `unit` from `Input` when `Output` shares name), `is_input`/`is_output` (518/527), `connect_pipe` (812), `push_value`
-    (555), `_propagate_wave` (854) — the publish/listen ripple.
+  - `define` (488), `update` (581), `get` (731), `is_uninitialized` (752),
+    `get_defining_scope` (767).
+  - Inputs/outputs: `define_input` (780), `define_output` (590, now preserves `unit` from `Input` when `Output` shares name), `is_input`/`is_output` (518/527), `connect_pipe` (827), `push_value`
+    (555), `_propagate_wave` (869) — the publish/listen ripple.
   - Unit handling: `_unit_convert` (104, now tries `apply_conversion` before `#UNIT`), `_has_pending_assignment` (154).
-  - Constraints: `_re_evaluate_constraints` (907), `_check_constraints` (830, now unit-aware for `Let y of m = 5 of in`), `_validate_base_type` (978) — validates scalars AND, since the pyarrow
+  - Constraints: `_re_evaluate_constraints` (922), `_check_constraints` (830, now unit-aware for `Let y of m = 5 of in`), `_validate_base_type` (993) — validates scalars AND, since the pyarrow
     removal, element-by-element base types of `dim` arrays (via
     `array_handler.validate_array_element_types`), `_expression_depends_on`
     (651). `_array_unset_value` (array_handler.py:1446) resolves `None`
     sentinels for unset template array cells: checks the variable's
     `constraints['default']` (from `or = <expr>`) and evaluates it; falls back
     to `error_value(NA_ERROR)` (`#N/A`).
-  - Scoping: `is_shadowed` (868), `get_evaluation_scope` (876),
-    `get_full_scope` (1270), `_coerce_custom_type_value` (238).
+  - Scoping: `is_shadowed` (883), `get_evaluation_scope` (891),
+    `get_full_scope` (1285), `_coerce_custom_type_value` (240).
 - `class _GridStore` (36): dict backing `compiler.grid`; every cell write
   calls `compiler._notify_cell_changed` (compiler.py:2700). (The old
   `_ListenerGrid`/`GridLiveView` classes were removed — `_GridStore` is the
@@ -303,17 +303,17 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   `_outer_scope_read_only` flag to reject writes from read-only function
   sub-compilers to outer scopes.
 
-### `type_processor.py` (1272 lines) — `Define X as Type` handling
+### `type_processor.py` (1318 lines) — `Define X as Type` handling
 `class GridLangTypeProcessor`:
 - Type-def parsing: `_parse_type_def` (81), `_parse_type_def_line` (89),
   `_extract_type_field_line` (9696, `_parse_type_field_constraints` (193),
   `_record_type_field_definition` (15157, `_collect_type_computed_fields`
   (178), `_finalize_type_def_state` (273).
 - Executing type body code against an instance: `_execute_type_code` (294),
-  `_execute_type_block` (25252, `_process_grid_assignment` (501),
-  `_process_type_for_loop` (38389, `_process_type_let_statement` (756),
+  `_execute_type_block` (25252, `_process_grid_assignment` (519),
+  `_process_type_for_loop` (38389, `_process_type_let_statement` (774),
   `_process_type_assignment` (58581.
-- `_build_type_eval_scope` (70708, `_execute_builder` (1084).
+- `_build_type_eval_scope` (70708, `_execute_builder` (1130).
 
 ### `parser.py` (639 lines) — variable-definition parsing
 `class GridLangParser`:
@@ -342,7 +342,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
 - `format_display_value` (26265: display formatting with float-trimming and
   list/dict-form array support.
 
-### `test_runner.py` (1050 lines) — inline test suite
+### `test_runner.py` (1080 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — now 314 tests (was 263) including 12 new unit tests (`Test 282`–`Test 293` for `UnitSource` constant/numeric, `Output` addition, `Let`/`For`/`Push`/`Init`/`:`, `1` dimensionless, and relaxed unit comparison). At the bottom of the file (~840) it runs itself when executed directly:
 `python test_runner.py [names...]`. Failing names are printed.
 

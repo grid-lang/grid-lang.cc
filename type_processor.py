@@ -295,17 +295,32 @@ class GridLangTypeProcessor:
         """Execute code that was defined inside a type definition"""
 
         # Create a temporary scope for execution
+        # The scope just outside the type body is read-only: constructor and
+        # builder code can write the instance's own fields/scope but must not
+        # modify outer/global variables (reads still resolve through it).
+        outer_scope = self.compiler.current_scope()
         self.compiler.push_scope()
         prev_hidden_access = getattr(
             self.compiler, '_allow_hidden_field_access', False)
         prev_hidden_member_calls = getattr(
             self.compiler, '_allow_hidden_member_calls', False)
+        prev_outer_ro = getattr(self.compiler, '_outer_scope_read_only', False)
+        prev_parent_scope = getattr(self.compiler, '_parent_scope', None)
+        prev_member_keys = getattr(self.compiler, '_type_member_keys', None)
         self.compiler._allow_hidden_field_access = True
         self.compiler._allow_hidden_member_calls = True
+        self.compiler._outer_scope_read_only = True
+        self.compiler._parent_scope = outer_scope
 
         # Add the type instance to the scope so code can reference it
         inferred_type = value_dict.get('_type_name') if isinstance(
             value_dict, dict) else None
+        type_def = {}
+        if inferred_type:
+            type_def = self.compiler.types_defined.get(
+                str(inferred_type).lower(), {}) or {}
+        self.compiler._type_member_keys = set(
+            type_def.get('_member_keys', set()))
         self.compiler.current_scope().define(
             var_name, value_dict, inferred_type or 'object', preserve_freshness=True)
         # Use lowercase "this"; case-insensitive lookup covers "This".
@@ -348,6 +363,9 @@ class GridLangTypeProcessor:
                 self.compiler._context_grid_stack.pop()
             self.compiler._allow_hidden_field_access = prev_hidden_access
             self.compiler._allow_hidden_member_calls = prev_hidden_member_calls
+            self.compiler._outer_scope_read_only = prev_outer_ro
+            self.compiler._parent_scope = prev_parent_scope
+            self.compiler._type_member_keys = prev_member_keys
             self.compiler.pop_scope()
             if isinstance(value_dict, dict):
                 # The WITH marker only matters while the constructor body runs.
@@ -389,7 +407,7 @@ class GridLangTypeProcessor:
                 assign_line = f"{target} = {value_expr}"
                 self._process_type_assignment(
                     assign_line, value_dict, input_values, line_number, init_fields,
-                    default_fields=default_fields)
+                    default_fields=default_fields, is_push=True)
                 i += 1
                 continue
             if (re.match(r'^for\b', stripped_line, re.I)
@@ -803,6 +821,19 @@ class GridLangTypeProcessor:
             expr = init_expr
             constraints.pop('init', None)
         prev_fields = set(value_dict.keys()) if isinstance(value_dict, dict) else set()
+        field_key = None
+        if isinstance(value_dict, dict):
+            for k in value_dict:
+                if not str(k).startswith('_') and str(k).lower() == str(var).lower():
+                    field_key = k
+                    break
+        if field_key is not None:
+            # Bind the field as a local first so the Let resolves to the
+            # instance's field rather than to an outer/global variable with the
+            # same name (shadowing), keeping builder writes instance-local.
+            self.compiler.current_scope().define(
+                var, value_dict.get(field_key), None, {}, is_uninitialized=False,
+                preserve_freshness=True)
         eval_scope_before = eval_scope
         self.compiler._process_let_binding(
             var, type_name, constraints, expr, line_number,
@@ -810,12 +841,6 @@ class GridLangTypeProcessor:
         # Sync a single-field binding back into the instance (mirrors the
         # plain 'x = value' constructor assignment so 'Let x = value'
         # initialises an existing field rather than only a local variable).
-        field_key = None
-        if isinstance(value_dict, dict):
-            for k in value_dict:
-                if not str(k).startswith('_') and str(k).lower() == str(var).lower():
-                    field_key = k
-                    break
         if field_key is not None:
             bound_value = eval_scope_before.get(var)
             if bound_value is not None:
@@ -919,7 +944,7 @@ class GridLangTypeProcessor:
             return a is None and b is None
         return a == b
 
-    def _process_type_assignment(self, line, value_dict, input_values, line_number, init_fields=None, default_fields=None):
+    def _process_type_assignment(self, line, value_dict, input_values, line_number, init_fields=None, default_fields=None, is_push=False):
         """Handle assignments inside type definitions (e.g., x = in_x)."""
         init_fields = init_fields or set()
         default_fields = default_fields or set()
@@ -1032,8 +1057,29 @@ class GridLangTypeProcessor:
         field_name, value_expr = match.groups()
         if field_name.startswith('$'):
             field_name = field_name[1:]
-        actual_field = get_case_insensitive_key(
-            value_dict, field_name) or field_name
+        builder_member_keys = getattr(
+            self.compiler, '_type_member_keys', None)
+        is_field = None
+        if builder_member_keys is not None:
+            actual_field = get_case_insensitive_key(
+                value_dict, field_name) or field_name
+            is_field = (
+                field_name.lower() in builder_member_keys
+                or (actual_field in value_dict
+                    and not str(actual_field).startswith('_')))
+            if not is_field:
+                # Allowed when the variable is declared locally in the type
+                # body (e.g. Let, Input, loop index) rather than an instance
+                # field or an outer/global variable.
+                def_scope = self.compiler.current_scope().get_defining_scope(
+                    field_name)
+                is_local = (
+                    def_scope is not None
+                    and not self.compiler._is_outer_scope(def_scope))
+                if not is_local:
+                    verb = 'Push' if is_push else 'assign'
+                    raise NameError(
+                        f"Cannot {verb} to '{field_name}': variable is not defined at line {line_number}")
         scope = self._build_type_eval_scope(value_dict, input_values)
         value = self.compiler.expr_evaluator.eval_or_eval_array(
             value_expr.strip(), scope, line_number)

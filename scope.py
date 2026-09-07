@@ -179,6 +179,8 @@ class Scope:
             return value
         if value is None:
             if self.is_uninitialized(name) and not self._has_pending_assignment(name):
+                if self._is_key_not_null_var(name):
+                    return error_value(VALUE_ERROR)
                 return error_value(NA_ERROR)
             return value
         # Lazy conflict validation: check if a pushed value matches its
@@ -410,6 +412,19 @@ class Scope:
               or {}).get(str(type_name).lower(), {})
         return bool(td.get('_keyed'))
 
+    def _is_key_not_null_var(self, name):
+        """True if ``name`` is declared as keyed (not-null): a Keytype variable,
+        an ``as ... key`` variable (e.g. ``x as text key``), or a variable with
+        a ``key`` constraint. Unset keyed variables read as ``#VALUE``."""
+        actual_key = self._get_case_insensitive_key(name, self.types) or name
+        var_type = self.types.get(actual_key)
+        if isinstance(var_type, str) and var_type.strip().lower().endswith(' key'):
+            return True
+        constraints = self.constraints.get(actual_key, {})
+        if constraints.get('key'):
+            return True
+        return self._is_keyed_type(var_type, getattr(self, 'compiler', None))
+
     def _keytype_primitive_base(self, type_name, compiler=None):
         """Return the primitive base type of ``type_name`` if it is a Keytype
         primitive alias (e.g. ``L as Keytype(number)``), else None."""
@@ -570,14 +585,14 @@ class Scope:
             if (getattr(self.compiler, '_outer_scope_read_only', False)
                     and self.compiler._is_outer_scope(defining_scope)):
                 raise RuntimeError(
-                    f"Cannot assign to '{name}': variables in an outer scope are read-only inside a function at line {line_number}")
+                    f"Cannot assign to '{name}': variables in an outer scope are read-only at line {line_number}")
             # Guard against writes routed through the defining scope object
             # itself (whose compiler does not carry the read-only flag).
             for runner in reversed(_ACTIVE_RUNNERS):
                 if (getattr(runner, '_outer_scope_read_only', False)
                         and runner._is_outer_scope(defining_scope)):
                     raise RuntimeError(
-                        f"Cannot assign to '{name}': variables in an outer scope are read-only inside a function at line {line_number}")
+                        f"Cannot assign to '{name}': variables in an outer scope are read-only at line {line_number}")
             # Get the actual key for case-insensitive update
             actual_key = defining_scope._get_case_insensitive_key(
                 name, defining_scope.variables)

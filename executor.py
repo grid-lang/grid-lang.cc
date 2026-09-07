@@ -4612,6 +4612,17 @@ class GridLangExecutor(GridLangBase):
             self._assign_indexed_target(target, value_expr, line_number)
             return
         member_path_match = re.match(r'^[\w_]+(?:\.[\w_]+)+$', target)
+        # A Push to a plain variable that does not exist is an error: variables
+        # must be declared (or otherwise bound) before they can be pushed.
+        if not member_path_match:
+            try:
+                if self.current_scope().get_defining_scope(target) is None:
+                    raise NameError(
+                        f"Cannot Push to '{target}': variable is not defined at line {line_number}")
+            except NameError:
+                raise
+            except Exception:
+                pass
         # Get target's declared unit for LHS-informed conversion (Push/For etc.)
         target_unit = None
         try:
