@@ -1210,6 +1210,7 @@ class ArrayHandler:
             return
         if isinstance(value, dict):
             flattened_values = self.flatten_object_fields(value, line_number)
+            flattened_values = self._resolve_spill_unset(flattened_values, expr_part, line_number)
             for i, val in enumerate(flattened_values):
                 cell_to_assign = offset_cell(target, i, 0)
                 self.compiler._set_grid_cell(cell_to_assign, val)

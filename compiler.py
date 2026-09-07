@@ -1135,6 +1135,16 @@ class GridLangCompiler(GridLangExecutor):
             immk.update(keyed)
         return value_dict
 
+    def _materialize_unset_type_fields(self, value_dict, type_name):
+        """Ensure every declared public field key exists on a fresh instance,
+        leaving any that the constructor did not set as unset (None) so reads
+        wrap to #N/A rather than raising 'field does not exist'."""
+        type_def = self.types_defined.get(str(type_name).lower(), {}) or {}
+        for fname in self._get_public_type_fields(type_def):
+            if fname not in value_dict:
+                value_dict[fname] = None
+        return value_dict
+
     def _instantiate_type(self, type_name, args, line_number, allow_default_if_empty=False, var_name=None, execute_code=True, input_values_out=None):
         """Create an instance dict for a user-defined type, honoring inputs and constructor code."""
         type_def = self.types_defined[type_name.lower()]
@@ -1201,19 +1211,13 @@ class GridLangCompiler(GridLangExecutor):
                     input_values[entry.get('name')] = self.expr_evaluator.eval_or_eval_array(
                         str(default_expr), eval_scope, line_number)
             else:
-                for field_name, field_type in public_fields.items():
-                    if field_type.lower() == 'number':
-                        value_dict[field_name] = 0
-                    elif field_type.lower() == 'text':
-                        value_dict[field_name] = ""
-                    elif field_type.lower() == 'array':
-                        value_dict[field_name] = []
-                    else:
-                        value_dict[field_name] = None
+                for field_name in public_fields:
+                    value_dict[field_name] = None
             value_dict['_type_name'] = type_name.lower()
             hidden_fields = type_def.get('_hidden_fields', set())
             if hidden_fields:
                 value_dict['_hidden_fields'] = set(hidden_fields)
+            self._materialize_unset_type_fields(value_dict, type_name)
             # Wrap Keytype fields (e.g. k as L where L as Keytype(number)) as fresh UnitValue
             self._wrap_keytype_primitive_fields(value_dict, public_fields, type_def)
             if input_values_out is not None:
@@ -1226,9 +1230,10 @@ class GridLangCompiler(GridLangExecutor):
             elif inputs_list:
                 value_dict.update(
                     {name: val for name, val in input_values.items() if name in public_fields})
-                if value_dict:
+                if input_values:
                     immutable = value_dict.setdefault('_immutable_fields', set())
-                    immutable.update(n.lower() for n in value_dict.keys())
+                    immutable.update(n.lower() for n in input_values
+                                     if n in public_fields)
             # Keyed fields are immutable after construction (Push on key → compile error)
             self._mark_keyed_fields_immutable(value_dict, public_fields, type_def)
             if type_def.get('_keyed'):
@@ -1265,6 +1270,7 @@ class GridLangCompiler(GridLangExecutor):
         hidden_fields = type_def.get('_hidden_fields', set())
         if hidden_fields:
             value_dict['_hidden_fields'] = set(hidden_fields)
+        self._materialize_unset_type_fields(value_dict, type_name)
         # Wrap Keytype fields (e.g. k as L where L as Keytype) as fresh UnitValue
         self._wrap_keytype_primitive_fields(value_dict, public_fields, type_def)
         if input_values_out is not None:
@@ -1281,9 +1287,10 @@ class GridLangCompiler(GridLangExecutor):
             # Map inputs directly to matching fields when no executable code is provided
             value_dict.update(
                 {name: val for name, val in input_values.items() if name in public_fields})
-            if value_dict:
+            if input_values:
                 immutable = value_dict.setdefault('_immutable_fields', set())
-                immutable.update(n.lower() for n in value_dict.keys())
+                immutable.update(n.lower() for n in input_values
+                                 if n in public_fields)
 
         # Wrap any remaining Keytype fields that were set via with/args after exec (e.g. k as L with k=5)
         self._wrap_keytype_primitive_fields(value_dict, public_fields, type_def, ensure_fresh=True)

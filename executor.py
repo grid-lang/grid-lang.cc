@@ -2253,7 +2253,8 @@ class GridLangExecutor(GridLangBase):
                 output_values = self._evaluate_push_expression(
                     value_expr, line_number)
                 for output_value in output_values:
-                    self.output_values.setdefault('output', []).append(output_value)
+                    self.output_values.setdefault('output', []).append(
+                        self._snapshot_value(output_value))
                 if 'output' not in self.output_variables:
                     self.output_variables.append('output')
             elif push_match:
@@ -3256,7 +3257,7 @@ class GridLangExecutor(GridLangBase):
                         value_expr, next_executable_line_number)
                     for value in push_values:
                         self.output_values.setdefault(
-                            'output', []).append(value)
+                            'output', []).append(self._snapshot_value(value))
                     if 'output' not in self.output_variables:
                         self.output_variables.append(
                             'output')
@@ -3411,7 +3412,7 @@ class GridLangExecutor(GridLangBase):
                             value_expr, next_executable_line_number)
                         for out_val in push_values:
                             self.output_values.setdefault(
-                                'output', []).append(out_val)
+                                'output', []).append(self._snapshot_value(out_val))
                         if 'output' not in self.output_variables:
                             self.output_variables.append(
                                 'output')
@@ -4159,6 +4160,15 @@ class GridLangExecutor(GridLangBase):
             matrix_data.append(matrix)
         return matrix_data
 
+    def _snapshot_value(self, value):
+        """Snapshot a mutable container so a later mutation of the source
+        object cannot change an earlier Return/Push value. Return and Push
+        store values, not variables: a future change to a variable must not
+        affect what was already pushed."""
+        if isinstance(value, (dict, list)):
+            return copy.deepcopy(value)
+        return value
+
     def _handle_return_statement(self, stripped, line_number):
         m_return = self._match_return_statement(stripped)
         if not m_return:
@@ -4196,7 +4206,7 @@ class GridLangExecutor(GridLangBase):
                         value_expr, line_number)
             for value in values:
                 self.output_values.setdefault(
-                    'output', []).append(value)
+                    'output', []).append(self._snapshot_value(value))
             if 'output' not in self.output_variables:
                 self.output_variables.append('output')
         except Exception as e:
@@ -4311,7 +4321,7 @@ class GridLangExecutor(GridLangBase):
                 value_expr, line_number)
             for value in values:
                 self.output_values.setdefault(
-                    'output', []).append(value)
+                    'output', []).append(self._snapshot_value(value))
             if 'output' not in self.output_variables:
                 self.output_variables.append(
                     'output')
@@ -4651,6 +4661,7 @@ class GridLangExecutor(GridLangBase):
                     value_expr, line_number, target_unit)
             global_scope = self.get_global_scope()
             for value in values:
+                value = self._snapshot_value(value)
                 if member_path_match:
                     self._update_member_path_target(
                         target, value, line_number)

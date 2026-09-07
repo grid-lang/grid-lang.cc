@@ -113,7 +113,10 @@ class GridLangControlFlow:
         values = self.compiler._evaluate_push_expression(
             value_expr, line_number)
         for value in values:
-            self.compiler.output_values.setdefault('output', []).append(value)
+            snapshot = value
+            if hasattr(self.compiler, '_snapshot_output_value'):
+                snapshot = self.compiler._snapshot_output_value(value)
+            self.compiler.output_values.setdefault('output', []).append(snapshot)
         if 'output' not in self.compiler.output_variables:
             self.compiler.output_variables.append('output')
 

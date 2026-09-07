@@ -21,7 +21,7 @@ from utils import (
     format_display_value,
     is_sparse_array,
 )
-from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, REF_ERROR, UNIVERSAL_ZERO, UnitValue, ConstraintError, error_value, is_error_value, apply_conversion
+from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, REF_ERROR, UNIVERSAL_ZERO, VALUE_ERROR, UnitValue, ConstraintError, error_value, is_error_value, apply_conversion
 from type_processor import split_builder_chain
 
 
@@ -1444,6 +1444,19 @@ class ExpressionEvaluator:
 
         return False, None
 
+    def _field_unset_error(self, value_dict, field_name):
+        """Return the error value an unset instance field reads as: #VALUE when
+        the field is declared not null, #N/A otherwise (mirrors unset variables)."""
+        type_name = value_dict.get('_type_name') if isinstance(value_dict, dict) else None
+        if type_name:
+            type_def = self.compiler.types_defined.get(str(type_name).lower(), {}) or {}
+            fcons = (type_def.get('_field_constraints', {}) or {}).get(field_name)
+            if fcons is None:
+                fcons = (type_def.get('_field_constraints', {}) or {}).get(field_name.lower())
+            if isinstance(fcons, dict) and fcons.get('not_null'):
+                return error_value(VALUE_ERROR)
+        return error_value(NA_ERROR)
+
     def _try_eval_field_access(self, expr, scope, line_number):
         if not re.match(r'^[\w_]+\.\w+$', expr):
             return False, None
@@ -1471,7 +1484,10 @@ class ExpressionEvaluator:
                     f"Field '{field}' does not exist on '{var}' at line {line_number}")
             if actual_field not in scope_var and field.lower() == 'grid':
                 return True, {}
-            return True, scope_var.get(actual_field)
+            value = scope_var.get(actual_field)
+            if value is None and scope_var.get('_type_name'):
+                value = self._field_unset_error(scope_var, actual_field)
+            return True, value
         if _err_value(scope_var) is not None:
             return True, _err_value(scope_var)
         try:
@@ -1490,7 +1506,10 @@ class ExpressionEvaluator:
                         f"Field '{field}' does not exist on '{var}' at line {line_number}")
                 if actual_field not in var_value and field.lower() == 'grid':
                     return True, {}
-                return True, var_value.get(actual_field)
+                value = var_value.get(actual_field)
+                if value is None and var_value.get('_type_name'):
+                    value = self._field_unset_error(var_value, actual_field)
+                return True, value
         except NameError:
             pass
         # Primitive grid simulation for field == grid (dim none, rank 0)
