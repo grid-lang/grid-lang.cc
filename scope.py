@@ -179,7 +179,7 @@ class Scope:
             return value
         if value is None:
             if self.is_uninitialized(name) and not self._has_pending_assignment(name):
-                if self._is_key_not_null_var(name):
+                if self._is_not_null_var(name):
                     return error_value(VALUE_ERROR)
                 return error_value(NA_ERROR)
             return value
@@ -412,16 +412,17 @@ class Scope:
               or {}).get(str(type_name).lower(), {})
         return bool(td.get('_keyed'))
 
-    def _is_key_not_null_var(self, name):
-        """True if ``name`` is declared as keyed (not-null): a Keytype variable,
-        an ``as ... key`` variable (e.g. ``x as text key``), or a variable with
-        a ``key`` constraint. Unset keyed variables read as ``#VALUE``."""
+    def _is_not_null_var(self, name):
+        """True if ``name`` must not be null: a Keytype variable, an
+        ``as ... key`` variable (e.g. ``x as text key``), a variable with a
+        ``key`` constraint, or a variable declared ``not null``. Unset
+        not-null variables read as ``#VALUE``."""
         actual_key = self._get_case_insensitive_key(name, self.types) or name
         var_type = self.types.get(actual_key)
         if isinstance(var_type, str) and var_type.strip().lower().endswith(' key'):
             return True
         constraints = self.constraints.get(actual_key, {})
-        if constraints.get('key'):
+        if constraints.get('key') or constraints.get('not_null'):
             return True
         return self._is_keyed_type(var_type, getattr(self, 'compiler', None))
 
@@ -1230,12 +1231,13 @@ class Scope:
             elif constraint_type == 'not_null':
                 if value is None:
                     raise ConstraintError(
-                        NA_ERROR,
+                        VALUE_ERROR,
                         f"'{key_for_constraints}' must not be null at line {line_number}")
-                if isinstance(value, str) and value == '':
+            elif constraint_type == 'null':
+                if value is not None:
                     raise ConstraintError(
-                        NA_ERROR,
-                        f"'{key_for_constraints}' must not be empty at line {line_number}")
+                        VALUE_ERROR,
+                        f"'{key_for_constraints}' must be null at line {line_number}")
             elif constraint_type == 'type':
                 expected_type = constraint_expr.lower()
                 if isinstance(value, dict) and '_type_name' in value:

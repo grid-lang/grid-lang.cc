@@ -85,6 +85,10 @@ class GridLangParser:
                 negated = True
                 i += 1
                 continue
+            if keyword == 'null':
+                constraints['null'] = True
+                i += 1
+                continue
             if keyword == 'as':
                 if negated:
                     constraints['not_type'] = next_part.lower()
@@ -491,12 +495,12 @@ class GridLangParser:
 
     def _split_on_keywords(self, text):
         """Split a variable definition on keywords, skipping quoted sections."""
-        keywords = ['<=', '>=', '<>', '<', '>', '=', 'as', 'of', 'dim', 'in', 'init', 'index', 'and', 'not', 'or']
+        keywords = ['<=', '>=', '<>', '<', '>', '=', 'as', 'of', 'dim', 'in', 'init', 'index', 'and', 'not', 'null', 'or']
         # Soft keywords (constraint clauses and logical connectors) only split
         # the left-hand side of a declaration. Once the first '=' has been seen,
         # the remainder is an arbitrary RHS expression and must be preserved
         # verbatim (e.g. 'x of m = 2.54 of cm' keeps the RHS 'of cm' intact).
-        soft_keywords = {'as', 'of', 'dim', 'init', 'index', 'and', 'not', 'in'}
+        soft_keywords = {'as', 'of', 'dim', 'init', 'index', 'and', 'not', 'null', 'in'}
         parts = []
         current = ""
         in_quote = False
