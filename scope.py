@@ -609,7 +609,7 @@ class Scope:
                     existing_val = defining_scope.variables.get(actual_key)
                     # Allow initial assignment from None (e.g. Let x = new IdKey where x was is_uninitialized with None)
                     # But any subsequent Push/For update where existing already has a non-None, non-error value should error
-                    if existing_val is not None and existing_val is not UNIVERSAL_ZERO and not is_error_value(existing_val):
+                    if existing_val is not None and not is_error_value(existing_val):
                         # Check if this is an update (not initial) - actual_key already exists and has value
                         # For key types, even Push with same value should be considered immutable
                         # However, allow the first builder assignment after Copy where old is None (nulled) -> but old is not None here, it's 5, so need to distinguish
@@ -999,8 +999,7 @@ class Scope:
         objects are validated by custom-type coercion, so only plain scalar
         values fall through to the scalar checks below.
         """
-        if value is None or value == '':
-            # Empty string is used as a placeholder by block predeclaration.
+        if value is None:
             return
         type_key = self._get_case_insensitive_key(name, self.types)
         if not type_key:

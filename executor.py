@@ -279,8 +279,8 @@ class GridLangExecutor(GridLangBase):
                             pass
                         if not is_output_check2:
                             existing_val_check = def_scope_check.variables.get(actual_key_check)
-                            from units import is_error_value, UNIVERSAL_ZERO
-                            if existing_val_check is not None and existing_val_check is not UNIVERSAL_ZERO and not is_error_value(existing_val_check):
+                            from units import is_error_value
+                            if existing_val_check is not None and not is_error_value(existing_val_check):
                                 # Any Push/For update that tries to change a keytype var should error
                                 # Even if value is plain number 6 (not UnitValue), it's still an attempt to modify key
                                 raise ValueError(f"Cannot modify key type '{var_type_check}' at line {line_number}")
@@ -4724,9 +4724,9 @@ class GridLangExecutor(GridLangBase):
             }
             if actual_field.lower() in immutable_fields:
                 # Allow initialisation of a nulled key (None) via builder following Copy
-                from units import is_error_value, UNIVERSAL_ZERO
+                from units import is_error_value
                 existing_val = current_obj.get(actual_field)
-                if existing_val is not None and existing_val is not UNIVERSAL_ZERO and not is_error_value(existing_val):
+                if existing_val is not None and not is_error_value(existing_val):
                     raise ValueError(
                         f"Field '{field_name}' of '{owner_path}' is immutable at line {line_number}")
 
