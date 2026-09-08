@@ -94,6 +94,11 @@ class GridLangParser:
                     constraints['not_type'] = next_part.lower()
                     negated = False
                 else:
+                    # 'single' before the type is a shortcut for "dim none":
+                    # the value must be a scalar (rank 0), never an array.
+                    if re.match(r'^single\s+\S', next_part, re.I):
+                        next_part = next_part[len('single'):].lstrip()
+                        constraints['dim'] = '{}'
                     cleaned_part = re.sub(r'\s+or\s*$', '', next_part, flags=re.I).strip()
                     union_parts = [
                         part.strip().lower()

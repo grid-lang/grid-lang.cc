@@ -279,7 +279,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   (1339, 1390).
 - `_handle_block_*` methods (343–960): per-statement handling inside blocks.
 
-### `scope.py` (1297 lines) — scope + variable semantics
+### `scope.py` (1296 lines) — scope + variable semantics
 - `class Scope` (11119: variable storage with constraints.
   - `define` (489), `update` (582), `get` (732), `is_uninitialized` (753),
     `get_defining_scope` (768).
@@ -294,7 +294,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
     `constraints['default']` (from `or = <expr>`) and evaluates it; falls back
     to `error_value(NA_ERROR)` (`#N/A`).
   - Scoping: `is_shadowed` (884), `get_evaluation_scope` (892),
-    `get_full_scope` (1287), `_coerce_custom_type_value` (240).
+    `get_full_scope` (1286), `_coerce_custom_type_value` (240).
 - `class _GridStore` (36): dict backing `compiler.grid`; every cell write
   calls `compiler._notify_cell_changed` (compiler.py:2707). (The old
   `_ListenerGrid`/`GridLiveView` classes were removed — `_GridStore` is the
@@ -315,15 +315,15 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   `_process_type_assignment` (58581.
 - `_build_type_eval_scope` (70708, `_execute_builder` (1130).
 
-### `parser.py` (643 lines) — variable-definition parsing
+### `parser.py` (648 lines) — variable-definition parsing
 `class GridLangParser`:
 - `_parse_variable_def` (1616: the central parser for `: name [as type] [of
   unit] [dim ...] [constraints] = expr` / `Input`/`Output` lines. Returns
   (parsed_var, parsed_type, constraints, expression).
-- Constraint handling: `_check_comparison_series` (283),
-  `_match_direct_assignment_patterns` (22225, `_apply_with_clause` (320),
-  `_apply_dimension_constraints` (33334, `_merge_custom_type_constraints` (479),
-  `_split_on_keywords` (39390, now `seen_equals`/`seen_init` keep `of`/`as` in RHS `5 of in`/`Init 5 of in`), `_parse_dim_size` (609). The `or` keyword in
+- Constraint handling: `_check_comparison_series` (288),
+  `_match_direct_assignment_patterns` (22225, `_apply_with_clause` (325),
+  `_apply_dimension_constraints` (33334, `_merge_custom_type_constraints` (484),
+  `_split_on_keywords` (39390, now `seen_equals`/`seen_init` keep `of`/`as` in RHS `5 of in`/`Init 5 of in`), `_parse_dim_size` (614). The `or` keyword in
   `_split_on_keywords` extracts `or = <expr>` as `constraints['default']`;
   `not null` sets `constraints['nullable'] = True`. The default value is used
   by `_array_unset_value` when reading unset template array cells.
@@ -342,7 +342,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
 - `format_display_value` (26265: display formatting with float-trimming and
   list/dict-form array support.
 
-### `test_runner.py` (1116 lines) — inline test suite
+### `test_runner.py` (1122 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — now 314 tests (was 263) including 12 new unit tests (`Test 282`–`Test 293` for `UnitSource` constant/numeric, `Output` addition, `Let`/`For`/`Push`/`Init`/`:`, `1` dimensionless, and relaxed unit comparison). At the bottom of the file (~840) it runs itself when executed directly:
 `python test_runner.py [names...]`. Failing names are printed.
 
