@@ -1234,6 +1234,9 @@ class GridLangCompiler(GridLangExecutor):
                     immutable = value_dict.setdefault('_immutable_fields', set())
                     immutable.update(n.lower() for n in input_values
                                      if n in public_fields)
+            # A constructor that hit a conflict invalidates the instance
+            if isinstance(value_dict, dict) and value_dict.pop('_with_conflict', False):
+                return '#VALUE'
             # Keyed fields are immutable after construction (Push on key → compile error)
             self._mark_keyed_fields_immutable(value_dict, public_fields, type_def)
             if type_def.get('_keyed'):
@@ -1291,6 +1294,11 @@ class GridLangCompiler(GridLangExecutor):
                 immutable = value_dict.setdefault('_immutable_fields', set())
                 immutable.update(n.lower() for n in input_values
                                  if n in public_fields)
+
+        # A constructor that hit a conflict (e.g. Push onto an equality-constant
+        # field) invalidates the whole instance: never materialise it.
+        if isinstance(value_dict, dict) and value_dict.pop('_with_conflict', False):
+            return '#VALUE'
 
         # Wrap any remaining Keytype fields that were set via with/args after exec (e.g. k as L with k=5)
         self._wrap_keytype_primitive_fields(value_dict, public_fields, type_def, ensure_fresh=True)
@@ -2723,6 +2731,33 @@ class GridLangCompiler(GridLangExecutor):
                     pass
         finally:
             self._propagating.discard(dep_key)
+
+    def _propagate_transient(self, var_name, error_code):
+        """Emit a transient error to all listeners of var_name.
+
+        The variable's stored value is temporarily replaced with the error,
+        listeners recompute and store the error, then the original value
+        is restored. The constraint enforces the read value on future access.
+        """
+        dep_key = ('var', var_name.lower())
+        entries = self._listeners.get('var', {}).get(var_name.lower(), {})
+        if not entries:
+            return
+        scope = self.current_scope()
+        defining_scope = scope.get_defining_scope(var_name)
+        if defining_scope is None:
+            return
+        actual_key = defining_scope._get_case_insensitive_key(
+            var_name, defining_scope.variables)
+        if actual_key is None:
+            actual_key = var_name
+        original = defining_scope.variables.get(actual_key)
+        from units import error_value
+        defining_scope.variables[actual_key] = error_value(error_code)
+        try:
+            self._propagate(dep_key, error_value(error_code))
+        finally:
+            defining_scope.variables[actual_key] = original
 
     def _recompute_client(self, record):
         """Recompute a client variable from its stored expression."""

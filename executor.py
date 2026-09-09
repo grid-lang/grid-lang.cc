@@ -288,10 +288,66 @@ class GridLangExecutor(GridLangBase):
             raise
         except Exception:
             pass
+        # Check equality constraint before attempting write: a Push onto a
+        # constant-bound variable whose value does not match the constraint
+        # emits a transient #VALUE to listeners instead of overwriting.
+        owner = getattr(self, 'compiler', None) or self
+        def_scope = self.current_scope().get_defining_scope(var_name)
+        has_constant = False
+        if def_scope:
+            actual_key = def_scope._get_case_insensitive_key(
+                var_name, def_scope.variables)
+            if actual_key:
+                constraints = def_scope.constraints.get(actual_key, {})
+                constant_expr = constraints.get('constant')
+                if constant_expr is not None:
+                    has_constant = True
+                    try:
+                        from units import (strip_units, is_error_value,
+                                           VALUE_ERROR)
+                        if isinstance(constant_expr, str):
+                            expected = self.expr_evaluator.eval_or_eval_array(
+                                constant_expr, def_scope.get_full_scope(),
+                                line_number)
+                        else:
+                            expected = constant_expr
+                        if constraints.get('with'):
+                            try:
+                                type_name = None
+                                actual_type_key = def_scope._get_case_insensitive_key(
+                                    actual_key, def_scope.types)
+                                if actual_type_key:
+                                    type_name = def_scope.types.get(
+                                        actual_type_key)
+                                expected = owner._apply_with_constraints(
+                                    expected,
+                                    constraints.get('with', {}),
+                                    def_scope.get_full_scope(),
+                                    None,
+                                    type_name=type_name,
+                                )
+                            except Exception:
+                                pass
+                        if not is_error_value(expected):
+                            expected_stripped = strip_units(expected)
+                            value_stripped = strip_units(value)
+                            if expected_stripped != value_stripped:
+                                owner._propagate_transient(
+                                    var_name, VALUE_ERROR)
+                                ctx = getattr(
+                                    self, '_context_grid_stack', None) or getattr(
+                                    owner, '_context_grid_stack', None)
+                                if ctx:
+                                    raise ValueError(
+                                        f"Cannot modify constant field at line {line_number}")
+                                return
+                    except ValueError:
+                        raise
+                    except Exception:
+                        pass
         # Publisher-side write: a client equality binding wins over the pushed
         # value, so skip the overwrite for client-owned variables.
-        owner = getattr(self, 'compiler', None) or self
-        if owner._set_by.get(('var', var_name.lower())) == 'client':
+        if not has_constant and owner._set_by.get(('var', var_name.lower())) == 'client':
             return
         defining_scope = self.current_scope().get_defining_scope(var_name)
         if defining_scope:

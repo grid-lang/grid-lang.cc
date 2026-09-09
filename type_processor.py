@@ -76,6 +76,7 @@ class GridLangTypeProcessor:
             'computed_fields': {},
             'init_fields': set(),
             'default_fields': set(),
+            'constant_fields': set(),
         }
 
     def _parse_type_def(self, lines, line_number=None, type_name=None):
@@ -257,6 +258,13 @@ class GridLangTypeProcessor:
         if (re.search(r'^\$?[A-Za-z][\w_.]*\s*=', parsed_field['field_line']) and
                 'or =' not in lowered):
             state['executable_code'].append(parsed_field['field_line'])
+            # ``: a = value`` (no ``init``/``or =``) is an equality-constant
+            # field: a later constructor Push that disagrees invalidates the
+            # instance.  ``init``/``or =`` fields stay mutable.
+            if not parsed_field['init_expr']:
+                for fname in parsed_field['var_names']:
+                    clean = fname[1:] if fname.startswith('$') else fname
+                    state['constant_fields'].add(clean.lower())
 
     def _collect_type_computed_fields(self, state):
         """Capture computed fields for reactive recomputation."""
@@ -287,6 +295,8 @@ class GridLangTypeProcessor:
             fields['_init_fields'] = state['init_fields']
         if state['default_fields']:
             fields['_default_fields'] = state['default_fields']
+        if state['constant_fields']:
+            fields['_constant_fields'] = state['constant_fields']
         fields['_member_keys'] = {k.lower() for k in state['fields'].keys()
                                    if not str(k).startswith('_')}
         return fields
@@ -1105,6 +1115,18 @@ class GridLangTypeProcessor:
             except Exception:
                 pass
             value = _strip_init_copy_immutability(value)
+        # A Push onto an equality-constant field (declared ``: f = value``) that
+        # disagrees with the field's current value invalidates the instance.
+        if is_push and isinstance(value_dict, dict):
+            type_def = self.compiler.types_defined.get(
+                str(value_dict.get('_type_name', '')).lower(), {})
+            constant_fields = type_def.get('_constant_fields', set())
+            if actual_field.lower() in constant_fields:
+                existing = value_dict.get(actual_field)
+                if existing is not None and not self._with_value_matches(
+                        existing, value):
+                    value_dict['_with_conflict'] = True
+                    return
         value_dict[actual_field] = value
         if input_values:
             tokens = re.findall(r'\b[\w_]+\b', value_expr)
