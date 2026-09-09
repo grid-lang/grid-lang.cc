@@ -14,6 +14,7 @@ from units import (
 from utils import (
     iter_interpolation_placeholders, is_sparse_array,
 )
+from array_handler import constant_value_matches
 
 # Stack of compiler run contexts: ``run()`` pushes the executing compiler and
 # pops it on exit. Used to detect writes that originate from a read-only
@@ -216,11 +217,19 @@ class Scope:
                             pass
                     if isinstance(expected, dict) and isinstance(value, dict):
                         # Type-instance snapshot: compare only public fields
-                        pub_val = {k: v for k, v in value.items()
-                                   if not str(k).startswith('_')}
-                        if pub_val != expected:
-                            return error_value(VALUE_ERROR)
-                    elif value != expected:
+                        if is_sparse_array(expected) or is_sparse_array(value):
+                            if not constant_value_matches(
+                                    value, expected,
+                                    self.compiler.array_handler.to_display_value):
+                                return error_value(VALUE_ERROR)
+                        else:
+                            pub_val = {k: v for k, v in value.items()
+                                       if not str(k).startswith('_')}
+                            if pub_val != expected:
+                                return error_value(VALUE_ERROR)
+                    elif not constant_value_matches(
+                            value, expected,
+                            self.compiler.array_handler.to_display_value):
                         return error_value(VALUE_ERROR)
                 except Exception:
                     pass
@@ -1113,7 +1122,9 @@ class Scope:
                             value, line_number)
                         if any(is_error_value(e) for e in flat):
                             continue
-                if _strip_meta(value) != _strip_meta(constraint_val):
+                if not constant_value_matches(
+                        value, constraint_val,
+                        self.compiler.array_handler.to_display_value):
                     raise ConstraintError(
                         VALUE_ERROR,
                         f"Cannot change constant '{key_for_constraints}' at line {line_number}")

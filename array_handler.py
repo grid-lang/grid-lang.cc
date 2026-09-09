@@ -14,6 +14,41 @@ import itertools
 from units import DIM_ERROR, NA_ERROR, REF_ERROR, TYPE_ERROR, UNIVERSAL_ZERO, ConstraintError, error_value, is_error_value
 
 
+def _public_eq(a, b):
+    """Recursive equality that ignores underscore-meta keys (like _type_name),
+    strips units, and compares nested arrays element-wise."""
+    from units import strip_units
+    a = strip_units(a)
+    b = strip_units(b)
+    if isinstance(a, dict) and isinstance(b, dict):
+        keys_a = {k for k in a if not str(k).startswith('_')}
+        keys_b = {k for k in b if not str(k).startswith('_')}
+        return keys_a == keys_b and all(
+            _public_eq(a[k], b[k]) for k in keys_a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(
+            _public_eq(x, y) for x, y in zip(a, b))
+    if isinstance(a, tuple) and isinstance(b, tuple):
+        return len(a) == len(b) and all(
+            _public_eq(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def constant_value_matches(a, b, display=None):
+    """Compare two values for an equality (constant) binding.
+
+    Arrays in any internal representation (nested lists, sparse tuple-keyed
+    dicts, ``{'array', 'shape'}`` ND dicts) are reduced through the display
+    normalizer so an identical literal compares equal regardless of storage
+    layout. Units are stripped and object meta keys are ignored on both
+    sides. ``display`` defaults to ``ArrayHandler.to_display_value`` when a
+    callable is not supplied.
+    """
+    if display is None:
+        display = ArrayHandler().to_display_value
+    return _public_eq(display(a), display(b))
+
+
 class ArrayHandler:
     """
     Handler for array-related operations in GridLang, including assignments, indexing,

@@ -2436,8 +2436,6 @@ class GridLangCompiler(GridLangExecutor):
             constraints['constant'] = expr.strip()
         elif (
             expr is not None
-            and type_name
-            and type_name.lower() in self.types_defined
             and isinstance(expr, list)
             and 'constant' not in constraints
             and 'init' not in constraints
@@ -2543,6 +2541,11 @@ class GridLangCompiler(GridLangExecutor):
             search_scope.update(
                 var, error_value(VALUE_ERROR), line_number)
             return 'bound'
+        if isinstance(constraints.get('constant'), (list, tuple, dict)):
+            constraints['constant'] = evaluated_value
+            actual_constraint_key = defining_scope._get_case_insensitive_key(
+                var, defining_scope.constraints) or var
+            defining_scope.constraints[actual_constraint_key] = constraints
         search_scope.update(var, evaluated_value, line_number)
         if scope_dict is not None:
             scope_dict[var] = evaluated_value

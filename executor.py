@@ -4,7 +4,7 @@ import math
 import copy
 from collections import deque
 from expression import ExpressionEvaluator
-from array_handler import ArrayHandler
+from array_handler import ArrayHandler, constant_value_matches
 from control_flow import GridLangControlFlow
 from parser import GridLangParser
 from units import VALUE_ERROR, TYPE_ERROR, ConstraintError, error_value
@@ -329,9 +329,9 @@ class GridLangExecutor(GridLangBase):
                             except Exception:
                                 pass
                         if not is_error_value(expected):
-                            expected_stripped = strip_units(expected)
-                            value_stripped = strip_units(value)
-                            if expected_stripped != value_stripped:
+                            if not constant_value_matches(
+                                    expected, value,
+                                    self.array_handler.to_display_value):
                                 owner._propagate_transient(
                                     var_name, VALUE_ERROR)
                                 ctx = getattr(
@@ -1387,8 +1387,6 @@ class GridLangExecutor(GridLangBase):
             constraints['constant'] = expr.strip()
         elif (
             expr is not None
-            and type_name
-            and type_name.lower() in self.types_defined
             and isinstance(expr, list)
             and 'constant' not in constraints
             and 'init' not in constraints
@@ -1510,6 +1508,14 @@ class GridLangExecutor(GridLangBase):
                 search_scope.update(
                     var, error_value(VALUE_ERROR), line_number)
                 return 'bound'
+            if isinstance(constraints.get('constant'), (list, tuple, dict)):
+                # Array/object literal constant: replace raw parser tokens
+                # (text items arrive quoted) with the evaluated value so
+                # constraint checks compare real values.
+                constraints['constant'] = evaluated_value
+                actual_constraint_key = defining_scope._get_case_insensitive_key(
+                    var, defining_scope.constraints) or var
+                defining_scope.constraints[actual_constraint_key] = constraints
             search_scope.update(var, evaluated_value, line_number)
             if scope_dict is not None:
                 scope_dict[var] = evaluated_value
