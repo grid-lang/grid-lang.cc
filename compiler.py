@@ -2082,6 +2082,8 @@ class GridLangCompiler(GridLangExecutor):
                                     value, constraints.get('with', {}),
                                     scope.get_full_scope(), line_number,
                                     type_name=type_name)
+                            value = self._to_sparse_undimmed(
+                                value, constraints or {})
                             self.current_scope().update(var, value, line_number)
                             del self.pending_assignments[var]
                         else:
@@ -2129,6 +2131,8 @@ class GridLangCompiler(GridLangExecutor):
                                 value, constraints.get('with', {}),
                                 scope.get_full_scope(), line_number,
                                 type_name=type_name)
+                        value = self._to_sparse_undimmed(
+                            value, constraints or {})
                         self.current_scope().update(var, value, line_number)
                         violations = []
                         defining_scope = self.current_scope().get_defining_scope(var)
@@ -2230,6 +2234,8 @@ class GridLangCompiler(GridLangExecutor):
                             value, constraints.get('with', {}),
                             scope.get_full_scope(), line_number,
                             type_name=type_name)
+                    value = self._to_sparse_undimmed(
+                        value, constraints or {})
                     self.current_scope().update(var, value, line_number)
                     del block_pending[var]
                     for scope in self.scopes:
@@ -4095,6 +4101,7 @@ class GridLangCompiler(GridLangExecutor):
             value, line_number)
         if inferred_type == 'int':
             inferred_type = 'number'
+        value = self._to_sparse_undimmed(value, constraints)
         defining_scope = self.current_scope().get_defining_scope(var)
         if defining_scope:
             if constraints:

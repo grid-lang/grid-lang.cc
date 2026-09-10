@@ -1357,6 +1357,35 @@ class GridLangExecutor(GridLangBase):
             return m.group(1)
         return None
 
+    def _literal_rank(self, value):
+        """Rank of a nested-list literal (how many levels hold lists)."""
+        rank = 0
+        node = value
+        while isinstance(node, list) and node:
+            rank += 1
+            if isinstance(node[0], list):
+                node = node[0]
+            else:
+                break
+        return rank
+
+    def _to_sparse_undimmed(self, value, constraints):
+        """Store undimmed rank>=2 array literals as sparse star-dim arrays.
+
+        Rank (from ';' rows / '|' planes), not element count, decides the
+        storage: a literal with no declared dim is an unbounded sparse array
+        like a `dim {*,*}` declaration would produce, so ragged rows are legal.
+        """
+        if not isinstance(value, list):
+            return value
+        constraints = constraints or {}
+        if constraints.get('dim') or constraints.get(
+                'shape') or constraints.get('matrix_data'):
+            return value
+        if self._literal_rank(value) < 2:
+            return value
+        return self.array_handler.materialize_list_array(value)
+
     def _bind_declared_var(
             self,
             var,
@@ -1525,17 +1554,18 @@ class GridLangExecutor(GridLangBase):
                 search_scope.update(
                     var, error_value(VALUE_ERROR), line_number)
                 return 'bound'
+            value = self._to_sparse_undimmed(evaluated_value, constraints)
             if isinstance(constraints.get('constant'), (list, tuple, dict)):
                 # Array/object literal constant: replace raw parser tokens
                 # (text items arrive quoted) with the evaluated value so
                 # constraint checks compare real values.
-                constraints['constant'] = evaluated_value
+                constraints['constant'] = value
                 actual_constraint_key = defining_scope._get_case_insensitive_key(
                     var, defining_scope.constraints) or var
                 defining_scope.constraints[actual_constraint_key] = constraints
-            search_scope.update(var, evaluated_value, line_number)
+            search_scope.update(var, value, line_number)
             if scope_dict is not None:
-                scope_dict[var] = evaluated_value
+                scope_dict[var] = value
             return 'bound'
         except NameError as e:
             missing = self.extract_missing_dependencies(e)
@@ -1834,6 +1864,7 @@ class GridLangExecutor(GridLangBase):
             except Exception:
                 value = raw_value
             value = self._strip_init_copy_immutability(value)
+            value = self._to_sparse_undimmed(value, constraints)
             owner = getattr(self, 'compiler', None) or self
             if actual_key in defining_scope.variables:
                 if owner._set_by.get(('var', actual_key.lower())) == 'client':
@@ -3867,6 +3898,8 @@ class GridLangExecutor(GridLangBase):
                         evaluated_value, line_number)
                     if inferred_type == 'int':
                         inferred_type = 'number'
+                    evaluated_value = self._to_sparse_undimmed(
+                        evaluated_value, constraints)
                     self.current_scope().define(var, evaluated_value, inferred_type,
                                                 constraints, is_uninitialized=False)
                     if var in self.pending_assignments:
