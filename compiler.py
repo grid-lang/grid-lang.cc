@@ -2671,7 +2671,10 @@ class GridLangCompiler(GridLangExecutor):
             base = token.split('.')[0]
             lower = base.lower()
             if lower in _DEPENDENCY_IGNORED_TOKENS:
-                continue
+                # 'e' (exponent notation) is only a real dependency when it
+                # stands alone as a variable reference.
+                if not (lower == 'e' and self._is_standalone_var_ref(cleaned, base)):
+                    continue
             if lower in self.types_defined:
                 continue
             if lower in self.functions or lower in self.subprocesses:
@@ -2695,14 +2698,17 @@ class GridLangCompiler(GridLangExecutor):
         if var_name:
             self._set_by[('var', var_name.lower())] = 'client'
 
-    def _register_cell_spill_listener(self, line, rhs_var, line_number, scope):
+    def _register_cell_spill_listener(self, line, rhs_var, line_number, scope=None):
         """Register a cell-spill := line as a listener on rhs_var.
 
         When rhs_var changes (e.g. via push from a subprocess), the
         entire ``:=`` line is re-evaluated so the cell write sees the
-        updated value.
+        updated value. A ``scope`` of None means the line is a
+        pre-registered constraint whose scope is resolved at recompute
+        time (used so that Push notifies the constraint regardless of
+        statement order).
         """
-        if not rhs_var or scope is None:
+        if not rhs_var:
             return
         cell_refs = self._extract_cell_refs(str(line))
         record = {'var': None, 'expr': rhs_var, 'scope': scope,
@@ -2757,10 +2763,12 @@ class GridLangCompiler(GridLangExecutor):
         original = defining_scope.variables.get(actual_key)
         from units import error_value
         defining_scope.variables[actual_key] = error_value(error_code)
+        self._transient_active = True
         try:
             self._propagate(dep_key, error_value(error_code))
         finally:
             defining_scope.variables[actual_key] = original
+            self._transient_active = False
 
     def _recompute_client(self, record):
         """Recompute a client variable from its stored expression."""
@@ -2768,15 +2776,37 @@ class GridLangCompiler(GridLangExecutor):
         if line:
             scope = record.get('scope')
             if scope is None:
-                return
+                scope = self.current_scope()
+                for dep in record.get('deps', ()):
+                    ds = scope.get_defining_scope(dep)
+                    if ds is not None:
+                        scope = ds
+                        break
             for dep in record.get('deps', ()):
                 if self.has_unresolved_dependency(dep, scope=scope):
                     return
+            # Cell mirrors are equality constraints on their expression: while
+            # the source holds a transient error (a rejected push), the mirror
+            # keeps its last consistent value instead of storing the error.
+            prev_cells = {}
+            if getattr(self, '_transient_active', False):
+                for ref in record.get('cell_refs', ()):
+                    prev_cells[ref] = self.grid.get(ref)
+            was_recomputing = getattr(self, '_in_cell_spill_recompute', False)
+            self._in_cell_spill_recompute = True
             try:
                 self.array_handler.evaluate_line_with_assignment(
                     line, record.get('line_number'), scope.get_evaluation_scope())
             except Exception:
                 pass
+            finally:
+                self._in_cell_spill_recompute = was_recomputing
+            if prev_cells:
+                from units import is_error_value
+                for ref, old in prev_cells.items():
+                    new = self.grid.get(ref)
+                    if is_error_value(new) and not is_error_value(old):
+                        self._set_grid_cell(ref, old)
             return
         var_name = record.get('var')
         expr = record.get('expr')
@@ -3394,7 +3424,7 @@ class GridLangCompiler(GridLangExecutor):
             self._process_cell_binding_declaration(line, line_number)
         for line, line_number in lines:
             if not line.startswith(':') and ':=' not in line and '!' not in line:
-                self._evaluate_cell_var_definition(line, line_number)
+                self._evaluate_cell_var_definition(line, line_number, defer=True)
 
     def _collect_global_declarations(self, line, line_number=None):
 
@@ -3995,7 +4025,7 @@ class GridLangCompiler(GridLangExecutor):
             raise SyntaxError(
                 f"Invalid label assignment syntax: {line} at line {line_number}")
 
-    def _evaluate_cell_var_definition(self, line, line_number=None):
+    def _evaluate_cell_var_definition(self, line, line_number=None, defer=False):
         m = re.match(r'^\[\s*\^?([A-Z]+\d+)\s*\]\s*:\s*(.+)$', line, re.S)
         if not m:
             return
@@ -4020,11 +4050,40 @@ class GridLangCompiler(GridLangExecutor):
                 raise SyntaxError(
                     f"Variable '{var}' already mapped to cell '{c}' at line {line_number}")
 
-        if expr is not None and 'constant' not in constraints:
-            constraints['constant'] = expr
-        value = self.expr_evaluator.eval_or_eval_array(
-                            expr, self.current_scope().get_full_scope(), line_number,
-                            expected_unit=(constraints or {}).get('unit'))
+        deps = self._extract_dependencies_from_expression(expr)
+        if deps:
+            # Cell-bound derived variable like '[A1] : f = eg'. Register f as
+            # a client of its dependencies and make the cell mirror f live.
+            # During the pre-pass (defer=True) the value is resolved later at
+            # runtime; unresolved dependencies are also deferred and filled in
+            # by the notification machinery once they are defined.
+            scope = self.current_scope()
+            self._register_listeners(var, expr, scope)
+            self._register_cell_spill_listener(
+                f'[{cell}] := {var}', var, line_number, scope)
+            self._cell_var_map[cell_key] = var
+            if defer:
+                return
+            try:
+                value = self.expr_evaluator.eval_or_eval_array(
+                    expr, scope.get_full_scope(), line_number,
+                    expected_unit=(constraints or {}).get('unit'))
+            except NameError as e:
+                missing = self.extract_missing_dependencies(e)
+                if not missing or not any(
+                        dep.lower() in expr.lower() for dep in missing):
+                    return
+                for dep in missing:
+                    self.mark_dependency_missing(dep)
+                self.pending_assignments[var] = (
+                    expr, line_number, set(missing), constraints)
+                return
+        else:
+            if 'constant' not in constraints:
+                constraints['constant'] = expr
+            value = self.expr_evaluator.eval_or_eval_array(
+                                expr, self.current_scope().get_full_scope(), line_number,
+                                expected_unit=(constraints or {}).get('unit'))
         value = self.array_handler.check_dimension_constraints(
             var, value, line_number)
         if constraints.get('with'):

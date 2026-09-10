@@ -2212,6 +2212,8 @@ class ExpressionEvaluator:
                     result += part[1:-1].replace('""', '"')
                 else:
                     val = self.eval_expr(part, scope, line_number)
+                    if is_error_value(val):
+                        return True, val
                     result += str(val)
             return True, result
 

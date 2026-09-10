@@ -281,6 +281,18 @@ class ArrayHandler:
 
         return [row_idx, col_idx]
 
+    def _leading_assignment_subprocess(self, expr_part):
+        """Return the subprocess name if expr_part starts with a call to it."""
+        m = re.match(
+            r'^\s*([A-Za-z][A-Za-z0-9_.]*)\s*\(', str(expr_part), re.S)
+        if not m:
+            return None
+        name = m.group(1).lower()
+        subprocesses = getattr(self.compiler, 'subprocesses', {}) or {}
+        if name in subprocesses:
+            return m.group(1)
+        return None
+
     def evaluate_line_with_assignment(self, line, line_number=None, scope=None):
         """
         Evaluate an assignment line (e.g., [A1] := expr), handling various targets like cells,
@@ -305,6 +317,13 @@ class ArrayHandler:
             assignment_op = ':=' if ':=' in line else '='
             raise SyntaxError(
                 f"Missing expression after '{assignment_op}' at line {line_number}")
+
+        # Equality binding to a subprocess result is not allowed; the INIT
+        # keyword materializes subprocess results into a variable instead.
+        sub_root = self._leading_assignment_subprocess(expr_part)
+        if sub_root:
+            raise RuntimeError(
+                f"Equality assignment to subprocess '{sub_root}' is not allowed; use INIT instead at line {line_number}")
 
         # Check for pipe connections: output := input (creates a pipe)
         if self.compiler.current_scope().is_output(target_part) and not target_part.startswith('['):
@@ -690,7 +709,12 @@ class ArrayHandler:
             self.compiler._set_grid_cell(target, value)
             return None
         bound_var = self.compiler._cell_var_map.get(target)
-        if bound_var:
+        # A mirror recompute (executor drives any `:=` line that mirrors a
+        # source variable) must refresh the grid cell only, never write the
+        # value back into the bound variable.
+        is_mirror_recompute = getattr(
+            self.compiler, '_in_cell_spill_recompute', False)
+        if bound_var and not is_mirror_recompute:
             defining_scope = self.compiler.current_scope().get_defining_scope(
                 bound_var)
             if defining_scope:
@@ -704,6 +728,7 @@ class ArrayHandler:
                     bound_var, value, inferred_type, {}, is_uninitialized=False)
         if (assignment_op == ':=' and
                 re.match(r'^[A-Za-z_][\w_]*$', expr_part) and
+                not is_mirror_recompute and
                 not getattr(self.compiler.current_scope(), 'is_private', False)):
             source_var = expr_part
             try:

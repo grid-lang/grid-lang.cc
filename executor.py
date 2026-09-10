@@ -75,6 +75,20 @@ def _filter_var_tokens(tokens):
     return filtered
 
 
+def _extract_spill_root_var(rhs):
+    """Root variable of a cell-spill RHS: a plain identifier ('x'), the
+    base of a dotted member path ('q.x' -> 'q'), or the base of an element
+    access ('arr(1)' / 'm{2,1}' -> 'arr'/'m'). Returns None otherwise."""
+    rhs = rhs.strip()
+    if re.match(r'^[A-Za-z_]\w*(\.[A-Za-z_]\w*)+$', rhs):
+        return rhs.split('.')[0]
+    if re.match(r'^[A-Za-z_]\w*$', rhs):
+        return rhs
+    if re.match(r'^[A-Za-z_]\w*\s*[({]', rhs):
+        return re.match(r'^[A-Za-z_]\w*', rhs).group(0)
+    return None
+
+
 class GridLangExecutor(GridLangBase):
     """Runtime-execution layer of the GridLang engine.
 
@@ -119,6 +133,13 @@ class GridLangExecutor(GridLangBase):
         """Reset dependency graph storage for a new run."""
         self.dependency_graph = {'nodes': [], 'by_variable': {}, 'by_line': {}}
 
+    def _is_standalone_var_ref(self, cleaned, name):
+        """Whether 'name' occurs standalone in an expression (not glued to
+        digits in scientific notation like 2e5, nor inside an identifier)."""
+        return re.search(
+            r'(?<![A-Za-z0-9_])' + re.escape(name) + r'(?![A-Za-z0-9_])',
+            cleaned, re.I) is not None
+
     def _extract_dependencies_from_expression(self, expr):
         """Return identifiers referenced in an expression string."""
         if not expr:
@@ -133,7 +154,10 @@ class GridLangExecutor(GridLangBase):
             base = token.split('.')[0]
             lower = base.lower()
             if lower in DEPENDENCY_IGNORED_TOKENS:
-                continue
+                # 'e' (exponent notation) is only a real dependency when it
+                # stands alone as a variable reference.
+                if not (lower == 'e' and self._is_standalone_var_ref(cleaned, base)):
+                    continue
             if hasattr(self, 'compiler') and getattr(self.compiler, 'types_defined', None):
                 if lower in self.compiler.types_defined:
                     continue
@@ -846,58 +870,11 @@ class GridLangExecutor(GridLangBase):
             return False
         if expr is None:
             return False
-        # Disallow equality binding to a subprocess; require INIT instead
-        call_match = re.match(
-            r'^([A-Za-z][A-Za-z0-9_.]*)\\s*\\(.*\\)$', str(expr))
-        if call_match:
-            call_name = call_match.group(1).lower()
-            if hasattr(self, 'subprocesses') and call_name in getattr(self, 'subprocesses', {}):
-                raise RuntimeError(
-                    f"Equality assignment to subprocess '{call_name}' is not allowed; use INIT instead at line {line_number}")
-        scope = self.current_scope()
-        defining_scope = scope.get_defining_scope(var)
-        if defining_scope and self._is_outer_defining_scope(defining_scope):
-            # Subprocesses/functions shadow caller variables locally.
-            defining_scope = scope
-            defining_scope.define(var, None, type_name or 'unknown',
-                                  constraints, is_uninitialized=True)
-        elif not defining_scope:
-            defining_scope = scope
-            defining_scope.define(var, None, type_name or 'unknown',
-                                  constraints, is_uninitialized=True)
-        full_scope = defining_scope.get_full_scope(
-        ) if hasattr(defining_scope, 'get_full_scope') else scope.get_full_scope()
-        value = self.expr_evaluator.eval_or_eval_array(
-            expr, full_scope, line_number,
-            expected_unit=(constraints or {}).get('unit'))
-        value = self.array_handler.check_dimension_constraints(
-            var, value, line_number)
-        # Infer type for constructor patterns or value shape
-        inferred_type = type_name
-        if not inferred_type:
-            ctor_match = re.match(
-                r'new\s+([A-Za-z][A-Za-z0-9_]*)\s*\(', str(expr), re.I)
-            if ctor_match:
-                inferred_type = ctor_match.group(1)
-        if not inferred_type:
-            from units import UnitValue as _UV
-            if isinstance(value, _UV) and getattr(value, 'key_type', None):
-                inferred_type = value.key_type
-            elif isinstance(value, dict) and value.get('_type_name'):
-                inferred_type = value.get('_type_name')
-        if not inferred_type:
-            inferred_type = self.array_handler.infer_type(value, line_number)
-        try:
-            key = defining_scope._get_case_insensitive_key(
-                var, defining_scope.types)
-            if key:
-                defining_scope.types[key] = inferred_type
-            else:
-                defining_scope.types[var] = inferred_type
-        except Exception:
-            pass
-        defining_scope.update(var, value, line_number)
-        self._register_listeners(var, expr, scope)
+        status = self._bind_declared_var(
+            var, type_name, constraints, expr, line_number)
+        if not status:
+            return False
+        self._register_listeners(var, expr, self.current_scope())
         return True
 
     def _execute_global_for_loops(self, lines):
@@ -1353,6 +1330,33 @@ class GridLangExecutor(GridLangBase):
             return 'number'
         return inferred_type
 
+    def _is_call_expression(self, expr):
+        """Whether expr is a subprocess/function call like 'Name(args)'."""
+        if not isinstance(expr, str):
+            return False
+        m = re.match(
+            r'^([A-Za-z][A-Za-z0-9_]*)\s*\(.*\)\s*$', expr.strip(), re.S)
+        if not m:
+            return False
+        name = m.group(1).lower()
+        return name in (self.subprocesses or {}) or name in (self.functions or {})
+
+    def _leading_subprocess_call(self, expr):
+        """Return the subprocess name if expr starts with a call to it.
+
+        Matches 'SubName(...)' at the start of the expression even when the
+        result is further accessed, e.g. 'SpellReverseSub("DIRG").grid'.
+        """
+        if not isinstance(expr, str):
+            return None
+        m = re.match(r'^\s*([A-Za-z][A-Za-z0-9_.]*)\s*\(', expr, re.S)
+        if not m:
+            return None
+        name = m.group(1).lower()
+        if name in (self.subprocesses or {}):
+            return m.group(1)
+        return None
+
     def _bind_declared_var(
             self,
             var,
@@ -1377,12 +1381,15 @@ class GridLangExecutor(GridLangBase):
         # Declarations with '=' behave like an equality binding, not a mutable
         # assignment. Keep this limited to string expressions to avoid changing
         # literal-list behavior parsed into Python lists by the parser.
+        # Subprocess/function calls are not pinned: the result is a computed
+        # value that may be read through (e.g. myword.grid).
         if (
             expr is not None
             and isinstance(expr, str)
             and expr.strip()
             and 'constant' not in constraints
             and 'init' not in constraints
+            and not self._is_call_expression(expr)
         ):
             constraints['constant'] = expr.strip()
         elif (
@@ -1470,6 +1477,14 @@ class GridLangExecutor(GridLangBase):
         if expr is None:
             return None
 
+        # Equality binding to a subprocess result is not allowed; the INIT
+        # keyword materializes subprocess results into a variable instead.
+        if 'init' not in constraints:
+            sub_name = self._leading_subprocess_call(expr)
+            if sub_name:
+                raise RuntimeError(
+                    f"Equality assignment to subprocess '{sub_name}' is not allowed; use INIT instead at line {line_number}")
+
         # Client-style equality bindings (no INIT) register as listeners so the
         # expression re-evaluates whenever a dependency cell/var is pushed.
         if 'init' not in constraints and expr is not None:
@@ -1480,6 +1495,8 @@ class GridLangExecutor(GridLangBase):
             evaluated_value = self.expr_evaluator.eval_or_eval_array(
                 expr, scope_dict or search_scope.get_evaluation_scope(),
                 line_number, expected_unit=expected_unit)
+            evaluated_value = self.array_handler.check_dimension_constraints(
+                var, evaluated_value, line_number)
             if constraints.get('with'):
                 evaluated_value = self._apply_with_constraints(
                     evaluated_value,
@@ -2623,7 +2640,28 @@ class GridLangExecutor(GridLangBase):
     def _run_main_loop_impl(self, lines, guard_conditions):
         return self._run_main_loop_impl_body(lines, guard_conditions)
 
+    def _pre_register_cell_spill_constraints(self, lines):
+        """Register ``[cell] := expr`` spill constraints before the main loop
+        runs, so that Push statements notify them regardless of statement
+        order. Re-evaluation of a pre-registered line only takes effect once
+        the target cell has been materialized (its write has executed)."""
+        for line, line_number in lines:
+            if ':=' not in line:
+                continue
+            target, rhs = map(str.strip, line.split(':=', 1))
+            if not re.match(r'^\[\^?[A-Za-z{]', target) or not target.endswith(']'):
+                continue
+            root = _extract_spill_root_var(rhs)
+            if not root:
+                continue
+            if root.lower() in (self.functions or {}) or root.lower() in (
+                    self.subprocesses or {}):
+                continue
+            self._register_cell_spill_listener(
+                line, root, line_number, None)
+
     def _run_main_loop_impl_body(self, lines, guard_conditions):
+        self._pre_register_cell_spill_constraints(lines)
         i = 0
         while i < len(lines):
             prep = self._prepare_main_loop_line(lines, i)
@@ -3808,6 +3846,11 @@ class GridLangExecutor(GridLangBase):
             var_def, expr = map(str.strip, line[1:].split("=", 1))
             var, type_name, constraints, value = self._parse_variable_def(
                 var_def, line_number)
+            if 'init' not in (constraints or {}):
+                sub_name = self._leading_subprocess_call(expr)
+                if sub_name:
+                    raise RuntimeError(
+                        f"Equality assignment to subprocess '{sub_name}' is not allowed; use INIT instead at line {line_number}")
             deps = self._compute_assignment_deps(expr)
             if not deps:
                 try:
@@ -3975,15 +4018,13 @@ class GridLangExecutor(GridLangBase):
                         else:
                             self.array_handler.evaluate_line_with_assignment(
                                 line, line_number, scope.get_evaluation_scope())
-                            rhs_simple = re.match(
-                                r'^[A-Za-z]\w*$', rhs.strip())
-                            if rhs_simple and rhs_vars:
-                                for rv in rhs_vars:
-                                    if rv.lower() not in (
-                                            self.functions or {}) and rv.lower() not in (
-                                            self.subprocesses or {}):
-                                        self._register_cell_spill_listener(
-                                            line, rv, line_number, scope)
+                            rhs_root = _extract_spill_root_var(
+                                rhs) if rhs_vars else None
+                            if rhs_root and rhs_root.lower() not in (
+                                    self.functions or {}) and rhs_root.lower() not in (
+                                    self.subprocesses or {}):
+                                self._register_cell_spill_listener(
+                                    line, rhs_root, line_number, scope)
                     except Exception as e:
                         missing = self.extract_missing_dependencies(e)
                         if missing:
@@ -4030,6 +4071,10 @@ class GridLangExecutor(GridLangBase):
         cell_ref = target[1:-1].strip()
         if not re.match(r'^\^?[A-Za-z{]', cell_ref):
             return False, i
+        sub_name = self._leading_subprocess_call(value)
+        if sub_name:
+            raise RuntimeError(
+                f"Equality assignment to subprocess '{sub_name}' is not allowed; use INIT instead at line {line_number}")
         if '{' in cell_ref or ':' in cell_ref:
             scope = self.current_scope()
             self.array_handler.evaluate_line_with_assignment(
@@ -4062,12 +4107,11 @@ class GridLangExecutor(GridLangBase):
         except Exception as e:
             raise RuntimeError(
                 f"Error evaluating '{value}': {e} at line {line_number}")
-        if re.match(r'^[A-Za-z]\w*$', value.strip()):
-            rhs_var = value.strip()
-            if rhs_var.lower() not in (self.functions or {}) and rhs_var.lower() not in (self.subprocesses or {}):
-                scope = self.current_scope()
-                self._register_cell_spill_listener(
-                    line, rhs_var, line_number, scope)
+        rhs_root = _extract_spill_root_var(value)
+        if rhs_root and rhs_root.lower() not in (self.functions or {}) and rhs_root.lower() not in (self.subprocesses or {}):
+            scope = self.current_scope()
+            self._register_cell_spill_listener(
+                line, rhs_root, line_number, scope)
         return True, i + 1
 
     def _handle_when_block(self, lines, i, line, line_number):
@@ -4887,6 +4931,7 @@ class GridLangExecutor(GridLangBase):
                 arr, indices, value, line_number)
             defining_scope.variables[actual_key] = updated_array
         defining_scope.uninitialized.discard(actual_key)
+        self._notify_var_changed(actual_key, defining_scope.variables.get(actual_key))
         return
 
     def _print_outputs(self):
