@@ -163,6 +163,11 @@ def builtin_sum(args):
     return sum([args])
 
 
+@register_builtin("AVERAGE", arg_count=1)
+def builtin_average(args):
+    return builtin_sum(args) / builtin_counta(args)
+
+
 @register_vectorized_builtin("LEN", aliases=["Text.Len"], arg_count=1)
 def builtin_len(val):
     if isinstance(val, str):
@@ -210,7 +215,7 @@ def builtin_counta(val):
     count = 0
     for item in items:
         if isinstance(item, list) or (isinstance(item, dict) and 'array' in item):
-            count += builtin_counta(item, _evaluator=_evaluator)
+            count += builtin_counta(item)
         elif item is None:
             continue
         elif isinstance(item, str) and item == "":
