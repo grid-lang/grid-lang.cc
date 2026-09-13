@@ -9,7 +9,7 @@ from control_flow import GridLangControlFlow
 from parser import GridLangParser
 from units import VALUE_ERROR, TYPE_ERROR, ConstraintError, error_value
 from utils import col_to_num, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array, strip_array_cell_indices, is_wildcard_address
-from grid_lang_common import GridLangBase, _STATEMENT_KEYWORDS, _first_keyword, _DEPENDENCY_IGNORED_TOKENS, _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens
+from grid_lang_common import GridLangBase, _STATEMENT_KEYWORDS, _first_keyword, _DEPENDENCY_IGNORED_TOKENS, _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens, resolve_text_constant_token, mask_text_constant_tokens
 DEPENDENCY_IGNORED_TOKENS = _DEPENDENCY_IGNORED_TOKENS
 
 IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z][A-Za-z0-9_.]*')
@@ -3847,7 +3847,8 @@ class GridLangExecutor(GridLangBase):
                 deps |= compiler._extract_identifier_tokens(base_expr or '')
                 return deps
         return _filter_var_tokens(
-            set(re.findall(r'\b[\w_]+\b', _strip_builder_arrows(expr))))
+            set(re.findall(r'\b[\w_]+\b', _strip_builder_arrows(
+                mask_text_constant_tokens(expr)))))
 
     def _handle_main_loop_post_for_branches(self, lines, i, line, line_number, stripped, stripped_lower):
         if stripped_lower.startswith("if "):
@@ -3948,11 +3949,13 @@ class GridLangExecutor(GridLangBase):
                     clean_ph = ph.lstrip('{')
                     if clean_ph.strip().startswith('*'):
                         continue
+                    if resolve_text_constant_token(clean_ph) is not None:
+                        continue
                     rhs_vars.update(re.findall(
                         r'\b[\w_]+\b', clean_ph))
             if rhs_vars is None:
                 rhs_vars = set(re.findall(
-                    r'\b[\w_]+\b(?=\s*(?:[\[\{]|!\w+\s*\(|(?:\.\w+)?\s*$))', _strip_constraint_operands(rhs)))
+                    r'\b[\w_]+\b(?=\s*(?:[\[\{]|!\w+\s*\(|(?:\.\w+)?\s*$))', _strip_constraint_operands(mask_text_constant_tokens(rhs))))
             field_pairs = re.findall(r'\b([\w_]+)\.\s*([\w_]+)', rhs)
             if field_pairs:
                 base_fields = {base for base, _ in field_pairs}

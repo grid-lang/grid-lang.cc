@@ -22,6 +22,7 @@ from utils import (
     is_sparse_array,
 )
 from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, REF_ERROR, UNIVERSAL_ZERO, VALUE_ERROR, UnitValue, ConstraintError, error_value, is_error_value, apply_conversion
+from grid_lang_common import resolve_text_constant_token
 from type_processor import split_builder_chain
 
 
@@ -2225,7 +2226,12 @@ class ExpressionEvaluator:
         if expr.startswith('"') and expr.endswith('"'):
             return True, expr[1:-1].replace('""', '"')
 
-        # Handle special values (#INF, -#INF, #N/A)
+        # Handle special values (#INF, -#INF, #N/A) and text character
+        # constants (#NL, #NBSP, #QUOT, #APOS, #LB, #MDASH, #NDASH, #TAB,
+        # #SHY, #CR, #U/xxxx).
+        char_val = resolve_text_constant_token(expr)
+        if char_val is not None:
+            return True, char_val
         uexpr = expr.upper()
         if uexpr == '#INF':
             return True, float('inf')
@@ -2286,6 +2292,44 @@ class ExpressionEvaluator:
                     return True, value
         return False, None
 
+    def _protect_interpolated_strings(self, expr):
+        """Mask every $"..." interpolated string with an inert sentinel so the
+        member/array-access/dimension rewrites never misread text inside the
+        string (e.g. 'L1{#nl}', 'L1{a}', 'bo{5}') as an array access or member
+        lookup. Real placeholders are still evaluated later by
+        _process_interpolation, which re-evaluates each {...} via eval_expr."""
+        masked = []
+        replacements = {}
+        i = 0
+        n = len(expr)
+        while i < n:
+            if expr.startswith('$"', i):
+                j = i + 2
+                while j < n:
+                    if expr[j] == '"':
+                        if j + 1 < n and expr[j + 1] == '"':
+                            j += 2
+                            continue
+                        break
+                    j += 1
+                token = expr[i:j + 1]
+                sentinel = f'\x07IQ{len(replacements)}\x07'
+                replacements[sentinel] = token
+                masked.append(sentinel)
+                i = j + 1
+            else:
+                masked.append(expr[i])
+                i += 1
+        return ''.join(masked), replacements
+
+    @staticmethod
+    def _restore_interpolated_strings(expr, replacements):
+        if not replacements:
+            return expr
+        for sentinel, token in replacements.items():
+            expr = expr.replace(sentinel, token)
+        return expr
+
     def _preprocess_expr_before_range_handling(self, expr, scope, line_number, depth):
         expr = self._replace_grid_indexing(expr, scope, line_number)
         expr = self._preprocess_interpolated_cell_refs(
@@ -2295,6 +2339,9 @@ class ExpressionEvaluator:
             expr, scope, line_number, depth)
         if handled:
             return True, indexed_member_result, expr
+
+        masked, replacements = self._protect_interpolated_strings(expr)
+        expr = masked
 
         # Evaluate instance member accesses (e.g., p.grid{1 to 2, 3, *})
         # before the generic array-access replacer sees the bare field{...}.
@@ -2319,10 +2366,12 @@ class ExpressionEvaluator:
             handled, dim_result = self._try_eval_dimension_selector(
                 expr, scope, line_number)
             if handled:
+                expr = self._restore_interpolated_strings(expr, replacements)
                 return True, dim_result, expr
 
             expr = self._replace_paren_access_balanced(expr, scope, line_number)
 
+        expr = self._restore_interpolated_strings(expr, replacements)
         return False, None, expr
 
     def _try_eval_member_array_call(self, expr, scope, line_number):
@@ -3800,7 +3849,8 @@ class ExpressionEvaluator:
                 else:
                     res.append(str(content[i]))
                 i += 1
-        result = ''.join(res).replace('""', '"')
+        result = ''.join(res)
+        result = result.replace('""', '"')
         return result
 
     def _build_sequence(self, expr, line_number=None):

@@ -121,6 +121,59 @@ def _infer_declared_type(value, array_handler=None):
     return 'unknown'
 
 
+# ---------------------------------------------------------------------------
+# Text (character) constants
+#
+# Written outside quotes (`[A1] := #NBSP`) or inside interpolation braces
+# (`$"a{#NL}b"`). `#U/xxxx` is any Unicode code point, up to 4 hex digits.
+# ---------------------------------------------------------------------------
+TEXT_CHARACTER_CONSTANTS = {
+    'NL': '\n',
+    'NBSP': '\u00a0',
+    'QUOT': '"',
+    'APOS': "'",
+    'LB': '{',
+    'MDASH': '\u2014',
+    'NDASH': '\u2013',
+    'TAB': '\t',
+    'SHY': '\u00ad',
+    'CR': '\r',
+}
+_TEXT_NAMED_CHAR_RE = re.compile(r'#(?P<name>[A-Za-z]+)')
+_TEXT_UNICODE_CHAR_RE = re.compile(r'#U/(?P<cp>[0-9a-fA-F]{1,4})', re.I)
+
+
+def resolve_text_constant_token(token):
+    """Resolve a `#...` text constant token to its character, or None."""
+    if not isinstance(token, str) or not token:
+        return None
+    t = token.strip()
+    if t.startswith('#U/') or t.startswith('#u/'):
+        m = re.fullmatch(r'#u?/(?P<cp>[0-9a-fA-F]{1,4})', t, re.I)
+        if m:
+            return chr(int(m.group('cp'), 16))
+        return None
+    if not t.startswith('#'):
+        return None
+    m = re.fullmatch(r'#(?P<name>[A-Za-z]+)', t)
+    if not m:
+        return None
+    name = m.group('name').upper()
+    if name in TEXT_CHARACTER_CONSTANTS:
+        return TEXT_CHARACTER_CONSTANTS[name]
+    return None
+
+
+def mask_text_constant_tokens(expr):
+    """Replace `#...` character-constant tokens with spaces so dependency
+    extraction doesn't mistake their name letters for variable references."""
+    if not isinstance(expr, str) or '#' not in expr:
+        return expr
+    out = _TEXT_NAMED_CHAR_RE.sub(' ', expr)
+    out = _TEXT_UNICODE_CHAR_RE.sub(' ', out)
+    return out
+
+
 class GridLangBase:
     """Shared base for the GridLang engine classes.
 

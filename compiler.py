@@ -24,7 +24,7 @@ from grid_lang_common import (
     _STATEMENT_KEYWORDS, _first_keyword,
     _IDENTIFIER_TOKEN_PATTERN, _STRING_LITERAL_PATTERN, _DEPENDENCY_IGNORED_TOKENS,
     _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens,
-    _is_numeric_token,
+    _is_numeric_token, mask_text_constant_tokens,
 )
 from builtin_functions import BUILTINS, KEYWORDS
 
@@ -2562,6 +2562,7 @@ class GridLangCompiler(GridLangExecutor):
         if not expr:
             return set()
         cleaned = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', ' ', expr)
+        cleaned = mask_text_constant_tokens(cleaned)
         # Remove builder-call names ('-> name(') so they are not treated as deps.
         cleaned = re.sub(r'->\s*\$?[A-Za-z][A-Za-z0-9_.]*\s*\(', '(', cleaned)
         # Remove '<number> of <unit>' RHS literals so the unit name and the
@@ -2671,6 +2672,7 @@ class GridLangCompiler(GridLangExecutor):
             return
         deps = set()
         cleaned = strip_array_cell_indices(_strip_constraint_operands(expr))
+        cleaned = mask_text_constant_tokens(cleaned)
         for token in _IDENTIFIER_TOKEN_PATTERN.findall(cleaned):
             if not token:
                 continue
@@ -3927,6 +3929,7 @@ class GridLangCompiler(GridLangExecutor):
                         r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?',
                         ' ', expr_no_quotes, flags=re.I)
                     expr_no_numbers = re.sub(r'\[[^\]]*\]', ' ', expr_no_numbers)
+                    expr_no_numbers = mask_text_constant_tokens(expr_no_numbers)
                     potential_deps = re.findall(r'\b[\w_]+\b', expr_no_numbers)
                     built_in_functions = set(BUILTINS.keys()) | KEYWORDS
                     known_funcs = set(getattr(self, 'functions', {}).keys())
