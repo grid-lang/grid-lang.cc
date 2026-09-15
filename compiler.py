@@ -64,6 +64,21 @@ class _UnitSourceNamespace:
         return self._fields[name]
 
 
+# Predefined standard-library resources. These are seeded into the engine at
+# startup and can never be redefined by a program (``Define X as Resource`` for
+# one of them is rejected). They rely on the normal Resource machinery, so
+# their field constraints/member sets look exactly like a body-declared
+# resource.
+_PREDEFINED_RESOURCES = {
+    'ticker': {
+        '_constraints': {'is_resource': True},
+        '_field_constraints': {'interval': {'>=': '1', 'type': 'number'}},
+        '_member_keys': {'interval'},
+        'interval': 'number',
+    },
+}
+
+
 class GridLangCompiler(GridLangExecutor):
     def __init__(self):
         super().__init__()
@@ -93,6 +108,7 @@ class GridLangCompiler(GridLangExecutor):
         self._cell_var_map = {}
         self._cell_array_map = {}
         self.types_defined = {}
+        self._seed_predefined_resources()
         self.functions = {}
         self.subprocesses = {}
         self.unit_sources = {}
@@ -2988,6 +3004,13 @@ class GridLangCompiler(GridLangExecutor):
         self.scopes[0].constraints['grid'] = {
             'dim': [('row', None), ('col', None)]}
 
+    def _seed_predefined_resources(self):
+        # Register the standard-library Resource types (e.g. Ticker) so a
+        # program can `Require` them without declaring them. They are seeded
+        # once per engine and survive per-run resets like all type definitions.
+        for name, type_def in _PREDEFINED_RESOURCES.items():
+            self.types_defined[name] = dict(type_def)
+
     def _get_grid_store(self):
         """Return the live grid store (the predefined 'grid' variable)."""
         # Inside a type body, grid operations target the instance grid.
@@ -3125,6 +3148,10 @@ class GridLangCompiler(GridLangExecutor):
         self._cell_array_map.clear()
         if not getattr(self, 'preserve_types_defined', False):
             self.types_defined.clear()
+            # Standard-library Resources (e.g. Ticker) survive the per-run reset
+            # like the 'grid' variable: programs Require them without declaring.
+            if hasattr(self, '_seed_predefined_resources'):
+                self._seed_predefined_resources()
         self.handled_assignments.clear()
         self.root_scope = self.current_scope()  # Always set root scope here
         if hasattr(self, 'output_values'):
@@ -3281,6 +3308,10 @@ class GridLangCompiler(GridLangExecutor):
                 parsed_name, parsed_parent, parsed_constraints = self._parse_type_header(
                     s, line_number)
                 if parsed_name:
+                    if parsed_name.lower() in _PREDEFINED_RESOURCES:
+                        raise SyntaxError(
+                            f"'{parsed_name}' is a predefined resource and cannot "
+                            f"be redefined at line {line_number}")
                     in_type_def = True
                     type_name = parsed_name
                     type_parent = parsed_parent
