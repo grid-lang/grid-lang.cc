@@ -28,6 +28,8 @@ Error values:
     #DIM    value does not match the declared dimensions
     #N/A    value not available (e.g. reading an uninitialized variable)
     #REF    invalid address (index out of range, too many dimensions)
+    #PERM   permission not granted: a required capability was denied, or a
+            resource access exceeded what the user granted
 """
 
 import math
@@ -40,11 +42,16 @@ TYPE_ERROR = '#TYPE/I'
 DIM_ERROR = '#DIM'
 NA_ERROR = '#N/A'
 REF_ERROR = '#REF'
+PERM_ERROR = '#PERM'
 
 ERROR_CODES = frozenset({
     UNIT_ERROR, DIV0_ERROR, NUM_ERROR, VALUE_ERROR, TYPE_ERROR,
-    DIM_ERROR, NA_ERROR, REF_ERROR,
+    DIM_ERROR, NA_ERROR, REF_ERROR, PERM_ERROR,
 })
+
+
+class GrantError(RuntimeError):
+    """Permission grant is invalid or missing required fields during resolution."""
 
 
 # ---------------------------------------------------------------------------

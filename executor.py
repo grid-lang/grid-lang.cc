@@ -116,6 +116,11 @@ class GridLangExecutor(GridLangBase):
         self.when_blocks = []
         self._push_queues = {}
         self._processing_when = False
+        # Periodic-Ticker clock state (see _maybe_fire_tickers): tickers fire
+        # through the ordinary Push/When machinery, they just need a schedule
+        # and a counter so listeners see the tick.
+        self._ticker_last_fire = {}
+        self._loop_iteration = 0
 
     def _is_outer_defining_scope(self, scope):
         """Return True when the given scope belongs to the caller's scope chain."""
@@ -283,6 +288,66 @@ class GridLangExecutor(GridLangBase):
         }
         self.when_blocks.append(entry)
         self._process_when_triggers()
+
+    def _maybe_fire_tickers(self):
+        """Advance periodic-Ticker capabilities and notify their listeners.
+
+        A granted Ticker is a clock object: every ``interval`` main-loop units it
+        increments its ``value`` counter (triggering any reactive binding that
+        reads ``<cap>.value`` through the ordinary listener mechanism) and, when
+        a `When <cap> do` block is registered, enqueues the tick on that
+        capability's Push queue so the *existing* When machinery fires it. No
+        part of When is special-cased for tickers. Denied (#PERM) or invalid
+        tickers never advance (dead blocks).
+        """
+        from units import is_error_value
+        caps = getattr(self, 'require_caps', None) or {}
+        targets = [req for req in caps.values()
+                   if req.get('resource_lower') == 'ticker']
+        if not targets:
+            return
+        now = self._loop_iteration
+        # Lazily compute the set of capability names with a registered When
+        # consumer so we only enqueue ticks someone is waiting for.
+        when_deps = None
+        for req in targets:
+            cap_name = req['var_name'].lower()
+            try:
+                capability = self.current_scope().get(req['var_name'])
+            except Exception:
+                continue
+            if (is_error_value(capability) or not isinstance(capability, dict)
+                    or not capability.get('_capability')):
+                continue
+            params = capability.get('_params') or {}
+            interval = params.get('interval')
+            try:
+                interval = float(interval)
+            except (TypeError, ValueError):
+                continue
+            if not interval or interval < 1:
+                continue
+            last = self._ticker_last_fire.get(cap_name, 0)
+            # A ticker with a fixed interval never fires before the interval
+            # elapses, so short programs simply see no tick.
+            if (now - last) < interval:
+                continue
+            self._ticker_last_fire[cap_name] = now
+            # Rewrite the capability with an incremented counter: this is what
+            # makes listener/reactive bindings that read <cap>.value fire.
+            new_cap = dict(capability)
+            new_cap['value'] = capability.get('value', 0) + 1
+            self._set_var_value(
+                req['var_name'], new_cap, req['line_number'])
+            # Serve `When <cap> do ...`: the ordinary queue-based trigger path
+            # sees the enqueued tick exactly like a Push would.
+            if when_deps is None:
+                when_deps = set()
+                for entry in self.when_blocks:
+                    when_deps.update(entry.get('deps') or [])
+            if cap_name in when_deps:
+                self._enqueue_push(req['var_name'], new_cap)
+            self._process_when_triggers()
 
     def _set_var_value(self, var_name, value, line_number):
         # For key types, even client-owned variables are immutable after first assignment
@@ -1145,6 +1210,9 @@ class GridLangExecutor(GridLangBase):
             return {'action': 'continue', 'next_i': i + 1}
         # Skip global declarations as they're already processed in _process_declarations_and_labels
         if stripped.startswith(':'):
+            return {'action': 'continue', 'next_i': i + 1}
+        # Require lines resolve during preparation; nothing executes at runtime.
+        if stripped_lower.startswith('require '):
             return {'action': 'continue', 'next_i': i + 1}
 
         if line_number in self.global_guard_line_numbers:
@@ -2107,6 +2175,10 @@ class GridLangExecutor(GridLangBase):
             lines, label_lines, dim_lines, args)
         if guard_entries is None:
             return self._build_output_dict()
+        if getattr(self, 'halt_before_main_loop', False):
+            # Host requested stop after preparation (e.g. --list-required):
+            # requirements are collected and parameters evaluated, nothing runs.
+            return self._build_output_dict()
         guard_conditions = {entry['line_number']: entry['condition']
                             for entry in guard_entries}
         self._run_main_loop(lines, guard_conditions)
@@ -2695,6 +2767,8 @@ class GridLangExecutor(GridLangBase):
         self._pre_register_cell_spill_constraints(lines)
         i = 0
         while i < len(lines):
+            self._loop_iteration += 1
+            self._maybe_fire_tickers()
             prep = self._prepare_main_loop_line(lines, i)
             if prep['action'] == 'break':
                 break
@@ -4526,6 +4600,12 @@ class GridLangExecutor(GridLangBase):
         self.collect_input_output_variables()
         prompt_missing = getattr(self, 'prompt_missing_inputs', False)
         self.set_input_values(args, prompt_missing=prompt_missing)
+        # Resolve REQUIRED capabilities (grant/deny/prompt). Capability handles
+        # are always defined - granted with the chosen parameters, or bound to
+        # the sticky #PERM error when denied - so the rest of the dependency
+        # network treats them as resolved and execution continues either way.
+        self._resolve_require_stage(
+            can_prompt=getattr(self, 'prompt_missing_requires', False))
         # Resolve global pending declarations before first INIT materialization.
         self._resolve_ready_pending_vars(None)
         # Materialize INIT values early so they capture pre-execution state
@@ -4547,6 +4627,30 @@ class GridLangExecutor(GridLangBase):
         self._execute_global_for_loops(lines)
         self.needed_line_numbers = self._determine_needed_lines()
         return guard_entries
+
+    # ------------------------------------------------------------------
+    # Required-capability resolution (Require / Grant)
+    # ------------------------------------------------------------------
+
+    def _resolve_require_stage(self, can_prompt=False):
+        """Bind every required capability: granted capabilities hold the chosen
+        resource parameters, denied ones hold the sticky #PERM error value.
+
+        Requirements are never optional and never abort execution; a denied or
+        default-deny capability simply taints every use with #PERM.
+
+        The resolution policy lives in ``permissions.RequirementResolver``; this
+        host supplies its evaluation services and defines the resulting bindings
+        in scope.
+        """
+        from permissions import RequirementResolver
+        grant_map, bindings = RequirementResolver(self).resolve(
+            self.requirements, self.grants, can_prompt=can_prompt)
+        self.grants = grant_map
+        for var_name, value, vtype, line_number in bindings:
+            self.current_scope().define(
+                var_name, value, vtype, {}, is_uninitialized=False,
+                line_number=line_number)
 
     def _evaluate_push_expression(self, value_expr, line_number, expected_unit=None):
         """Evaluate a PUSH expression, expanding generator outputs into a sequence."""

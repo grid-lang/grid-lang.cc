@@ -117,6 +117,23 @@ class GridLangCompiler(GridLangExecutor):
         self.global_for_entries = []
         # Control whether missing inputs should prompt the user (CLI mode only)
         self.prompt_missing_inputs = False
+        # =========================================================================
+        # Required-capability (permission) state. `Require name as Resource` binds
+        # a capability handle: granted at startup it holds the resource parameters
+        # the user chose; denied it holds the sticky #PERM error value.
+        # =========================================================================
+        # Ordered list of requirement entries collected from the program.
+        self.requirements = []
+        # name(lower) -> requirement entry for quick lookup.
+        self.require_caps = {}
+        # name(lower) -> granted parameter dict, or None when denied.
+        # Populated from --grant / interactive prompts before execution.
+        self.grants = {}
+        # Control whether missing requirements should prompt the user (CLI mode)
+        self.prompt_missing_requires = False
+        # When True, `run` halts right after preparation (no main loop, no
+        # outputs) so the host can inspect required capabilities (--list-required).
+        self.halt_before_main_loop = False
 
     def _get_public_type_fields(self, type_name_or_def):
         """Return the declared fields for a type, excluding internal metadata keys."""
@@ -144,14 +161,16 @@ class GridLangCompiler(GridLangExecutor):
         """Parse a type definition header, returning name, parent, and constraints.
 
         Supports `Define X as Type`, `Define X as Type(Parent)`,
-        and `Define X as Keytype` / `Define X as Keytype(Parent)`.
+        `Define X as Keytype` / `Define X as Keytype(Parent)`, and
+        `Define X as Resource` (a capability that can only be acquired
+        with `Require`, never instantiated with `new`).
         """
         m = re.match(
-            r'^\s*define\s+([\w_]+)\s+as\s+(type|keytype)(?:\s*\(\s*([^)]*)\s*\))?\s*(.*)$', line, re.I)
+            r'^\s*define\s+([\w_]+)\s+as\s+(type|keytype|resource)(?:\s*\(\s*([^)]*)\s*\))?\s*(.*)$', line, re.I)
         if not m:
             return None, None, None
         type_name = m.group(1).strip()
-        kind = m.group(2).strip().lower()  # type or keytype
+        kind = m.group(2).strip().lower()  # type, keytype, or resource
         inner = m.group(3).strip() if m.group(3) else ""
         remainder = m.group(4).strip()
         parent = None
@@ -161,6 +180,10 @@ class GridLangCompiler(GridLangExecutor):
             if inner:
                 # Keytype(Parent) -> parent is inner
                 parent = inner.split()[0].strip()
+        elif kind == "resource":
+            if inner:
+                raise SyntaxError(
+                    f"Resource definitions take no parent at line {line_number}: '{line}'")
         else:
             # kind == type, only Type or Type(Parent) - Type(key) removed, use Keytype
             if inner and "key" in inner.lower().split():
@@ -177,6 +200,8 @@ class GridLangCompiler(GridLangExecutor):
                     f"Invalid type constraints in '{line}' at line {line_number}: {exc}")
         if keyed:
             constraints['key'] = True
+        if kind == "resource":
+            constraints['is_resource'] = True
         return type_name, parent, constraints
 
     def _parse_unit_source_header(self, line, line_number=None):
@@ -3147,6 +3172,28 @@ class GridLangCompiler(GridLangExecutor):
             self.global_for_entries.clear()
         else:
             self.global_for_entries = []
+        # Required-capability state is per-run (grants come from the host and
+        # survive across runs so the same grant file can drive multiple programs).
+        if hasattr(self, 'requirements'):
+            self.requirements.clear()
+        else:
+            self.requirements = []
+        if hasattr(self, 'require_caps'):
+            self.require_caps.clear()
+        else:
+            self.require_caps = {}
+        # Ticker firing state (tickers advance via the ordinary When/Push
+        # machinery; only the clock schedule is kept here).
+        if hasattr(self, '_ticker_last_fire'):
+            self._ticker_last_fire.clear()
+        else:
+            self._ticker_last_fire = {}
+        # When-blocks and their Push queues belong to a single run: clear them
+        # so stale entries from a previous program never fire again.
+        self.when_blocks = []
+        self._push_queues = {}
+        self._processing_when = False
+        self._loop_iteration = 0
 
     def _preprocess_code(self, code):
 
@@ -3411,10 +3458,23 @@ class GridLangCompiler(GridLangExecutor):
             is_end = stripped == 'end'
 
             # Track entering/exiting type definitions to avoid treating inner lines as globals
-            if stripped.startswith("define ") and (" as type" in stripped or " as keytype" in stripped):
+            if stripped.startswith("define ") and (" as type" in stripped or " as keytype" in stripped or " as resource" in stripped):
                 type_depth += 1
             elif stripped.startswith("end") and type_depth > 0:
                 type_depth -= 1
+                continue
+
+            # Require is a top-level-only statement: it may not appear inside a
+            # block (loop/condition/when) or inside a type definition.
+            if stripped.startswith("require "):
+                if depth != 0 or type_depth != 0:
+                    raise SyntaxError(
+                        f"Require is only allowed at the top (global) level at line {line_number}")
+                self._collect_global_declarations(lstrip_line, line_number)
+                if is_block_start:
+                    depth += 1
+                elif is_end and depth > 0:
+                    depth -= 1
                 continue
 
             if depth == 0 and type_depth == 0:
@@ -3434,7 +3494,82 @@ class GridLangCompiler(GridLangExecutor):
             if not line.startswith(':') and ':=' not in line and '!' not in line:
                 self._evaluate_cell_var_definition(line, line_number, defer=True)
 
+    def _collect_require_declaration(self, line, line_number=None):
+        """Collect a `Require <name> as <Resource> [with (param = value, ...)]`
+        declaration into the capability registry.
+
+        Requirement capabilities are resolved (granted or denied) during
+        `_resolve_require_stage`; the handle variable is defined either way.
+        """
+        raw = line.lstrip()
+        if raw.lower().startswith('require '):
+            raw = raw[len('require'):].strip()
+        m = re.match(
+            r'^([\w_]+(?:\s*,\s*[\w_]+)*)\s+as\s+([A-Za-z][\w_]*)(?:\s+with\s*\((.*)\)\s*)?$',
+            raw, re.I | re.S)
+        if not m:
+            raise SyntaxError(
+                f"Invalid Require syntax at line {line_number}: '{line}'\n"
+                "Expected: Require <name> as <Resource> [with (param = value, ...)]")
+        names_part = m.group(1).strip()
+        resource_type = m.group(2).strip()
+        with_content = (m.group(3) or '').strip()
+        res_lower = resource_type.lower()
+        type_def = self.types_defined.get(res_lower) if res_lower else None
+        if not type_def:
+            raise SyntaxError(
+                f"Unknown resource type '{resource_type}' in Require at line {line_number}; "
+                "declare it with 'Define <Name> as Resource'")
+        if not (type_def.get('_constraints') or {}).get('is_resource'):
+            raise SyntaxError(
+                f"'{resource_type}' is a Type, not a Resource; only resources declared "
+                f"with 'Define <Name> as Resource' can be required (line {line_number})")
+        params = {}
+        if with_content:
+            field_names = {str(f).lower() for f in type_def.get('_member_keys', set())}
+            with_kind, with_payload = self._parse_with_clause(
+                with_content, line_number)
+            if with_kind != 'named':
+                raise SyntaxError(
+                    f"Invalid parameter in Require at line {line_number}: "
+                    "'with (...)' must list 'field = value' pairs")
+            for field, val_expr in with_payload.items():
+                if field.lower() not in field_names:
+                    raise SyntaxError(
+                        f"Unknown parameter '{field}' for resource '{resource_type}' at line {line_number}; "
+                        f"valid parameters: {', '.join(sorted(field_names)) or '(none)'}")
+                params[field.lower()] = val_expr.strip()
+        var_names = [n.strip() for n in names_part.split(',') if n.strip()]
+        for name in var_names:
+            if not re.match(r'^[\w_]+$', name):
+                raise SyntaxError(
+                    f"Invalid capability name '{name}' in Require at line {line_number}")
+            key = name.lower()
+            if key in self.require_caps:
+                raise SyntaxError(
+                    f"Capability '{name}' already required at line {line_number}")
+            entry = {
+                'var_name': name,
+                'name': name,
+                'resource': resource_type,
+                'resource_lower': res_lower,
+                'type_def': type_def,
+                'params': params,
+                'params_evaluated': None,
+                'line_number': line_number,
+            }
+            self.require_caps[key] = entry
+            self.requirements.append(entry)
+
     def _collect_global_declarations(self, line, line_number=None):
+
+        # Handle REQUIRED (capability) declarations: bind a handle on a resource
+        # as long as the user grants it, otherwise the handle is the sticky
+        # #PERM error value. `Require <name> as <Resource> [with (param = value, ...)]`
+        # is only valid at the top (global) level.
+        if line.lstrip().lower().startswith('require '):
+            self._collect_require_declaration(line, line_number)
+            return
 
         # Handle INPUT and OUTPUT declarations that don't start with ':'
         line_stripped = line.lstrip()
@@ -3929,6 +4064,10 @@ class GridLangCompiler(GridLangExecutor):
                         r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?',
                         ' ', expr_no_quotes, flags=re.I)
                     expr_no_numbers = re.sub(r'\[[^\]]*\]', ' ', expr_no_numbers)
+                    # Remove member accesses like "obj.field" so the field name
+                    # is not treated as a standalone dependency.
+                    expr_no_numbers = re.sub(
+                        r'\.\s*[A-Za-z][A-Za-z0-9_]*', ' ', expr_no_numbers)
                     expr_no_numbers = mask_text_constant_tokens(expr_no_numbers)
                     potential_deps = re.findall(r'\b[\w_]+\b', expr_no_numbers)
                     built_in_functions = set(BUILTINS.keys()) | KEYWORDS

@@ -1116,6 +1116,11 @@ class ExpressionEvaluator:
                         # Effective type for WITH is the source type, not "copy"
                         type_name = base_value.get('_type_name', type_name) if isinstance(base_value, dict) else type_name
                     else:
+                        type_def_check = self.compiler.types_defined.get(type_name.lower())
+                        if type_def_check and (type_def_check.get('_constraints') or {}).get('is_resource'):
+                            raise ValueError(
+                                f"Resource '{type_name}' cannot be created with 'new'; "
+                                f"use Require instead at line {line_number}")
                         with_input_values = {}
                         args_text = (new_ctor_match.group(2) or '').strip()
                         evaluated_args = []
@@ -1175,6 +1180,11 @@ class ExpressionEvaluator:
             if type_name.lower() == "copy":
                 raise ValueError(f"Copy requires an argument at line {line_number}")
             if type_name.lower() in self.compiler.types_defined:
+                type_def_check = self.compiler.types_defined[type_name.lower()]
+                if (type_def_check.get('_constraints') or {}).get('is_resource'):
+                    raise ValueError(
+                        f"Resource '{type_name}' cannot be created with 'new'; "
+                        f"use Require instead at line {line_number}")
                 return True, self.compiler._instantiate_type(
                     type_name, [], line_number, allow_default_if_empty=True)
             raise ValueError(
@@ -1242,6 +1252,11 @@ class ExpressionEvaluator:
             return True, new_obj
 
         if type_name.lower() in self.compiler.types_defined:
+            type_def_check = self.compiler.types_defined[type_name.lower()]
+            if (type_def_check.get('_constraints') or {}).get('is_resource'):
+                raise ValueError(
+                    f"Resource '{type_name}' cannot be created with 'new'; "
+                    f"use Require instead at line {line_number}")
             allow_defaults = len(args_list) == 0 and args_str.strip() == ''
             return True, self.compiler._instantiate_type(
                 type_name, evaluated_args, line_number, allow_default_if_empty=allow_defaults)

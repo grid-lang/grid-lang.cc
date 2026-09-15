@@ -4,7 +4,8 @@ setup(
     name='gridlang',
     version='0.1',
     py_modules=['main', 'compiler', 'expression', 'array_handler', 'utils', 'scope',
-                'control_flow', 'type_processor', 'parser', 'executor'],
+                'control_flow', 'type_processor', 'parser', 'executor', 'units',
+                'builtin_functions', 'grid_lang_common', 'permissions'],
     packages=find_packages(),
     entry_points={
         'console_scripts': [
