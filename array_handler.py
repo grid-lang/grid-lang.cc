@@ -2267,7 +2267,7 @@ class ArrayHandler:
                         value[k] = error_value(TYPE_ERROR)
                     elif var_type == 'text' and actual_type not in ('string', 'text'):
                         value[k] = error_value(TYPE_ERROR)
-                    elif var_type == 'logical' and actual_type not in ('bool', 'logical'):
+                    elif var_type == 'logical' and not isinstance(v, bool):
                         value[k] = error_value(TYPE_ERROR)
 
     def _validate_and_replace_list(self, var, lst, var_type, line_number):
@@ -2288,7 +2288,10 @@ class ArrayHandler:
                 if actual_type not in ('string', 'text'):
                     lst[i] = error_value(TYPE_ERROR)
             elif var_type == 'logical':
-                if actual_type not in ('bool', 'logical'):
+                # infer_type reports bool as 'int' (Python isinstance(True,int)),
+                # so guard on the actual element type; raw numbers must not be
+                # assignable to a logical element.
+                if not isinstance(element, bool):
                     lst[i] = error_value(TYPE_ERROR)
 
     def check_dimension_constraints(self, var, value, line_number=None):

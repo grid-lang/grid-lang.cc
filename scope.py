@@ -1014,7 +1014,7 @@ class Scope:
         if not type_key:
             return
         var_type = self.types.get(type_key)
-        if var_type not in ('number', 'text'):
+        if var_type not in ('number', 'text', 'logical'):
             return
         if hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined') and var_type in self.compiler.types_defined:
             return
@@ -1040,6 +1040,14 @@ class Scope:
             raise ConstraintError(
                 TYPE_ERROR,
                 f"'{name}' must be text, got {actual_type} at line {line_number}")
+        # Logical accepts only booleans: logical->number degradation is allowed
+        # (true becomes 1, false becomes 0) but numbers are never assignable to a
+        # logical variable.  Note: infer_type classifies bool as 'int' (Python
+        # isinstance(True, int)), so we guard on the Python type directly.
+        if var_type == 'logical' and not isinstance(value, bool):
+            raise ConstraintError(
+                TYPE_ERROR,
+                f"'{name}' must be logical, got {actual_type} at line {line_number}")
 
     def _check_constraints(self, name, value, line_number=None):
         # Case-insensitive constraint lookup

@@ -1,7 +1,8 @@
 """
 builtin_functions.py
 
-Predefined GridLang functions (SUM, ROWS, TEXTSPLIT, MID, LEN, etc.).
+Predefined GridLang functions (SUM, ROWS, TEXTSPLIT, MID, LEN, etc.) and
+standard-library Resource type declarations (Ticker).
 
 All builtins are registered in BUILTINS (case-insensitive, so SUM == sum) and
 are exposed to the expression evaluator via get_builtin_functions(evaluator).
@@ -15,6 +16,18 @@ To add a new builtin:
 
 The decorator stores the raw function; get_builtin_functions() wraps it
 when the function is called from GridLang.
+
+To add a standard-library Resource type (declaration only — the engine builds
+the live capability from the metadata):
+    from builtin_functions import register_resource
+
+    @register_resource("MyResource", fields={...}, constraints={...},
+                       hidden={...})
+    def _my_resource_declaration():
+        pass
+
+Registry is in RESOURCES (name.lower() -> type-metadata dict), consumed by
+GridLangCompiler._seed_predefined_resources.
 
 The two scope builders (_build_python_fallback_scope / _get_eval_globals) both
 call get_builtin_functions() so a new function is instantly available in both
@@ -37,6 +50,7 @@ VECTORIZED = set()
 BUILTINS = {}
 ALIASES = {}
 ARG_COUNTS = {}  # name (lower) -> expected argument count (int or (min, max))
+RESOURCES = {}   # resource name (lower) -> type-metadata dict (declarations only)
 
 # All keywords that must be ignored when extracting variable dependencies.
 # Keep this list at a single place – compiler.py and expression.py import it.
@@ -93,6 +107,67 @@ def register_vectorized_builtin(name, aliases=None, func=None, arg_count=None):
         if aliases:
             for a in aliases:
                 VECTORIZED.add(a.lower())
+        return func
+    return decorator
+
+
+def register_resource(name, fields=None, constraints=None, hidden=None,
+                      description=None, func=None):
+    """Register a standard-library Resource *type declaration*.
+
+    Resources are declarations only (no engine code lives here): the compiler
+    seeds the returned metadata and the executor builds the live capability
+    object from it. Use it as a decorator on a placeholder function::
+
+        @register_resource(
+            "Ticker",
+            fields={"interval": "number"},
+            constraints={"interval": {">=": "1", "type": "number"}},
+            hidden={"disabled"},
+        )
+        def _ticker_declaration():
+            \"""Declaration-only annotation target.\"""
+            pass
+
+    Parameters:
+      - ``name``: the resource name used in ``Require X as <Name>``.
+      - ``fields``: ``{field_name: type_str}`` for the public members.
+      - ``constraints``: ``{field_name: {constraint, ...}}`` validated on grant.
+      - ``hidden``: field names that are hidden (private) members. Hidden
+        fields are *accessed without a '$'* (``Require X as Ticker with
+        (disabled = true)``), are never grantable, and are omitted from public
+        member listings.
+      - ``description``: optional human-readable doc text.
+
+    Like register_builtin, ``func=``/direct form is supported for symmetry,
+    but nothing is executed — the metadata is the payload.
+    """
+    def _store():
+        key = name.lower()
+        member_keys = set()
+        field_map = {}
+        for fname, ftype in (fields or {}).items():
+            field_map[str(fname)] = ftype
+            member_keys.add(str(fname).lower())
+        hidden_fields = {str(h).lower() for h in ((hidden or ())
+                                                  if hidden else ())}
+        member_keys |= hidden_fields
+        type_def = {
+            '_constraints': {'is_resource': True},
+            '_field_constraints': dict(constraints or {}),
+            '_hidden_fields': hidden_fields,
+            '_member_keys': member_keys,
+        }
+        if description:
+            type_def['_description'] = description
+        type_def.update(field_map)
+        RESOURCES[key] = type_def
+
+    def decorator(fn):
+        _store()
+        return fn
+    if func is not None:
+        _store()
         return func
     return decorator
 
@@ -319,6 +394,25 @@ for _name in ["str", "int", "float", "abs"]:
     fn = getattr(__builtins__, _name, None)
     if fn:
         register_vectorized_builtin(_name, aliases=["Number." + _name], arg_count=1)(lambda *a, _fn=fn, **kw: _fn(*a))
+
+
+# ---------------------------------------------------------------------------
+# Standard-library Resource types (declarations only)
+# ---------------------------------------------------------------------------
+
+@register_resource(
+    "Ticker",
+    fields={"interval": "number", "disabled": "logical"},
+    constraints={"interval": {">=": "1", "type": "number"},
+                 "disabled": {"type": "logical"}},
+    hidden={"disabled"},
+    description="A reactive clock object: a granted capability increments its "
+                "`value` member every `interval` main-loop units. Stop()/Start() "
+                "toggle the hidden `disabled` field; Reset(n) repositions the "
+                "counter and the tick clock.",
+)
+def _ticker_declaration():
+    pass
 
 
 # ---------------------------------------------------------------------------

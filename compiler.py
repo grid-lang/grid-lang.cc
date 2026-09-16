@@ -26,7 +26,7 @@ from grid_lang_common import (
     _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens,
     _is_numeric_token, mask_text_constant_tokens,
 )
-from builtin_functions import BUILTINS, KEYWORDS
+from builtin_functions import BUILTINS, KEYWORDS, RESOURCES
 
 
 class SubprocessResult:
@@ -64,24 +64,12 @@ class _UnitSourceNamespace:
         return self._fields[name]
 
 
-# Predefined standard-library resources. These are seeded into the engine at
-# startup and can never be redefined by a program (``Define X as Resource`` for
-# one of them is rejected). They rely on the normal Resource machinery, so
-# their field constraints/member sets look exactly like a body-declared
-# resource.
-_PREDEFINED_RESOURCES = {
-    'ticker': {
-        '_constraints': {'is_resource': True},
-        '_field_constraints': {'interval': {'>=': '1', 'type': 'number'}},
-        # `disabled` is a hidden (private) clock attribute: like any hidden
-        # Type field it is *accessed without a '$'* (`Require tick as Ticker
-        # with (disabled = true, interval = 1)`), Ticker.Stop/Start toggle it,
-        # and a host grant can never supply a hidden field.
-        '_hidden_fields': {'disabled'},
-        '_member_keys': {'interval', 'disabled'},
-        'interval': 'number',
-    },
-}
+# Predefined standard-library resources come from builtin_functions.py
+# (RESOURCES, registered via @register_resource). They are seeded into the
+# engine at startup and can never be redefined by a program (``Define X as
+# Resource`` for one of them is rejected). They rely on the normal Resource
+# machinery, so their field constraints/member sets look exactly like a
+# body-declared resource.
 
 
 # Predefined control subprocesses for the standard-library Ticker resource. The
@@ -3035,7 +3023,7 @@ class GridLangCompiler(GridLangExecutor):
         # Register the standard-library Resource types (e.g. Ticker) so a
         # program can `Require` them without declaring them. They are seeded
         # once per engine and survive per-run resets like all type definitions.
-        for name, type_def in _PREDEFINED_RESOURCES.items():
+        for name, type_def in RESOURCES.items():
             self.types_defined[name] = dict(type_def)
 
     def _seed_predefined_subprocesses(self):
@@ -3342,7 +3330,7 @@ class GridLangCompiler(GridLangExecutor):
                 parsed_name, parsed_parent, parsed_constraints = self._parse_type_header(
                     s, line_number)
                 if parsed_name:
-                    if parsed_name.lower() in _PREDEFINED_RESOURCES:
+                    if parsed_name.lower() in RESOURCES:
                         raise SyntaxError(
                             f"'{parsed_name}' is a predefined resource and cannot "
                             f"be redefined at line {line_number}")
