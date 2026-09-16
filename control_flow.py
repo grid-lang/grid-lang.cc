@@ -401,7 +401,8 @@ class GridLangControlFlow:
         if inline_if_match:
             cond, action = inline_if_match.groups()
             try:
-                if self._evaluate_if_condition(cond.strip(), line_number):
+                if self._evaluate_if_condition(
+                        cond.strip(), line_number, warn_boolean=True):
                     action = action.strip()
                     if action.lower().startswith('let '):
                         self._process_let_statement_inline(action, line_number)
@@ -438,7 +439,7 @@ class GridLangControlFlow:
                         cond = re.match(
                             r'^\s*if\s+(.+?)\s*then\s*$', line, re.I).group(1).strip()
                         cond_result = self._evaluate_if_condition(
-                            cond, line_number)
+                            cond, line_number, warn_boolean=True)
                         if cond_result:
                             if next_line.strip().lower() == 'exit for':
                                 self.executor.exit_loop = True
@@ -951,7 +952,8 @@ class GridLangControlFlow:
             return deferred
 
         try:
-            condition_result = self._evaluate_if_condition(condition, line_number)
+            condition_result = self._evaluate_if_condition(
+                condition, line_number, warn_boolean=True)
         except NameError as exc:
             dep_extractor = getattr(
                 self.compiler, 'extract_missing_dependencies', lambda e: set())
@@ -1033,7 +1035,7 @@ class GridLangControlFlow:
                 if elseif_condition:
                     elseif_cond = elseif_condition.group(1).strip()
                     elseif_result = self._evaluate_if_condition(
-                        elseif_cond, next_line_number)
+                        elseif_cond, next_line_number, warn_boolean=True)
                     elseif_blocks.append((elseif_result, []))
                     current_block = elseif_blocks[-1][1]
             elif self.compiler._starts_with_keyword(next_line_clean, "else") and depth == 1:
@@ -1338,7 +1340,7 @@ class GridLangControlFlow:
             return True
         return True
 
-    def _evaluate_if_condition(self, condition, line_number):
+    def _evaluate_if_condition(self, condition, line_number, warn_boolean=False):
         """
         Evaluate an IF condition, handling various types of constraints.
         """
@@ -1446,7 +1448,22 @@ class GridLangControlFlow:
             condition, line_number)
         if handled:
             return result
-        return self._evaluate_if_condition_default(condition, line_number)
+        return self._evaluate_if_condition_default(
+            condition, line_number, warn_boolean=warn_boolean)
+
+    def _warn_boolean_condition(self, line_number):
+        """Warn once per line: a bare boolean condition reads more clearly as an
+        explicit equality ('If <expr> = true') so a boolean value is tested."""
+        warned = getattr(self.compiler, '_bool_condition_warned_lines', None)
+        if warned is None:
+            warned = set()
+            self.compiler._bool_condition_warned_lines = warned
+        if line_number in warned:
+            return
+        warned.add(line_number)
+        print(
+            f"Warning: boolean condition at line {line_number}; "
+            f"use 'If <expr> = true' instead")
 
     def _resolve_implicit_operands(self, parts):
         """Rewrite comparison parts that omit the left operand (e.g. 'x >= 1 and < 8')
@@ -1555,11 +1572,13 @@ class GridLangControlFlow:
         except Exception as e:
             return True, False
 
-    def _evaluate_if_condition_default(self, condition, line_number):
+    def _evaluate_if_condition_default(self, condition, line_number, warn_boolean=False):
         try:
             scope = self.compiler.current_scope().get_evaluation_scope()
             result = self.compiler.expr_evaluator.eval_expr(
                 condition, scope, line_number)
+            if warn_boolean and isinstance(result, bool):
+                self._warn_boolean_condition(line_number)
             return bool(result)
         except Exception as e:
             return False
@@ -1905,7 +1924,7 @@ class GridLangControlFlow:
                     cond = re.match(r'^\s*elseif\s+(.+?)\s+then\s*$',
                                     line, re.I).group(1).strip()
                     cond_result = self._evaluate_if_condition(
-                        cond, line_number)
+                        cond, line_number, warn_boolean=True)
                     if cond_result:
                         in_active_clause = True
                         clause_found = True
@@ -1985,7 +2004,7 @@ class GridLangControlFlow:
         # Evaluate the condition. Missing variables simply yield False.
         try:
             condition_result = self._evaluate_if_condition(
-                condition, line_number)
+                condition, line_number, warn_boolean=True)
         except NameError as exc:
             condition_result = False
 
@@ -2058,7 +2077,8 @@ class GridLangControlFlow:
         has_block = line.lower().strip().endswith('then')
 
         # Evaluate the condition
-        condition_result = self._evaluate_if_condition(condition, line_number)
+        condition_result = self._evaluate_if_condition(
+            condition, line_number, warn_boolean=True)
 
         if has_block:
             # Use pre-scanned block map to find the end of this IF block
