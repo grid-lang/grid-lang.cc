@@ -86,7 +86,8 @@ def format_required_yaml(requirements):
         type_def = entry.get('type_def') or {}
         field_constraints = type_def.get('_field_constraints') or {}
         choices = {}
-        for field in sorted(type_def.get('_member_keys', set())):
+        for field in sorted(type_def.get('_member_keys', set()) -
+                        type_def.get('_hidden_fields', set())):
             cons = field_constraints.get(str(field).lower()) or {}
             if cons.get('in'):
                 choices[str(field)] = list(cons['in'])
@@ -225,7 +226,8 @@ def render_require_prompt(entry):
     field_constraints = type_def.get('_field_constraints') or {}
     requested = entry.get('params_evaluated') or {}
     summary = []
-    for field in sorted(type_def.get('_member_keys', set())):
+    for field in sorted(type_def.get('_member_keys', set()) -
+                    type_def.get('_hidden_fields', set())):
         key = str(field).lower()
         cons = field_constraints.get(key) or {}
         line = str(field)
@@ -364,6 +366,9 @@ class RequirementResolver:
             # the ticks fired so far (0 until the first tick) so bindings that
             # read <cap>.value have a stable value from grant time onward.
             value['value'] = params.get('value') or 0
+        hidden = entry['type_def'].get('_hidden_fields')
+        if hidden:
+            value['_hidden_fields'] = set(hidden)
         value.update(params)
         return value
 
@@ -376,12 +381,15 @@ class RequirementResolver:
         if not isinstance(chosen, dict):
             raise GrantError(
                 f"Grant for '{entry['name']}' must map parameter names to values")
-        unknown = [k for k in chosen if str(k).lower() not in member_keys]
+        hidden_fields = {str(f).lower() for f in
+                         (type_def.get('_hidden_fields') or set())}
+        unknown = [k for k in chosen if str(k).lower() not in member_keys 
+                    or str(k).lower() in hidden_fields]
         if unknown:
             raise GrantError(
                 f"Unknown parameter(s) {', '.join(sorted(unknown))} for resource "
                 f"'{entry['resource']}' (valid: "
-                f"{', '.join(sorted(member_keys)) or 'none'})")
+                f"{', '.join(sorted(member_keys - hidden_fields)) or 'none'})")
         requested = entry.get('params_evaluated') or {}
         params = {}
         for key in member_keys:

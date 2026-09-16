@@ -73,9 +73,25 @@ _PREDEFINED_RESOURCES = {
     'ticker': {
         '_constraints': {'is_resource': True},
         '_field_constraints': {'interval': {'>=': '1', 'type': 'number'}},
-        '_member_keys': {'interval'},
+        # `disabled` is a hidden (private) clock attribute: like any hidden
+        # Type field it is *accessed without a '$'* (`Require tick as Ticker
+        # with (disabled = true, interval = 1)`), Ticker.Stop/Start toggle it,
+        # and a host grant can never supply a hidden field.
+        '_hidden_fields': {'disabled'},
+        '_member_keys': {'interval', 'disabled'},
         'interval': 'number',
     },
+}
+
+
+# Predefined control subprocesses for the standard-library Ticker resource. The
+# resource name is the namespace (``Ticker.Reset``, ``Ticker.Stop``,
+# ``Ticker.Start``); their behavior is engine-built, so they carry a ``_system``
+# marker instead of a body. A program cannot redefine them.
+_PREDEFINED_SUBPROCESSES = {
+    'ticker.reset': {'_system': 'ticker.reset', 'inputs': ['n'], 'outputs': []},
+    'ticker.stop': {'_system': 'ticker.stop', 'inputs': [], 'outputs': []},
+    'ticker.start': {'_system': 'ticker.start', 'inputs': [], 'outputs': []},
 }
 
 
@@ -109,8 +125,8 @@ class GridLangCompiler(GridLangExecutor):
         self._cell_array_map = {}
         self.types_defined = {}
         self._seed_predefined_resources()
-        self.functions = {}
         self.subprocesses = {}
+        self._seed_predefined_subprocesses()
         self.unit_sources = {}
         self._top_level_converts = []
         self.expr_evaluator = ExpressionEvaluator(self)
@@ -897,6 +913,10 @@ class GridLangCompiler(GridLangExecutor):
                 elif def_kind == 'function':
                     functions[func_name.lower()] = entry
                 else:
+                    if func_name.lower() in _PREDEFINED_SUBPROCESSES:
+                        raise SyntaxError(
+                            f"'{func_name}' is a predefined resource subprocess "
+                            f"and cannot be redefined at line {line_number}")
                     subprocesses[func_name.lower()] = entry
                 i += 1
                 continue
@@ -1872,6 +1892,13 @@ class GridLangCompiler(GridLangExecutor):
         sp_def = getattr(self, 'subprocesses', {}).get(name.lower())
         if not sp_def:
             raise NameError(f"Subprocess '{name}' not defined")
+        # Predefined engine subprocesses (Ticker.Reset/Stop/Start) have no body.
+        if sp_def.get('_system'):
+            self._handle_ticker_system_call(
+                name, list(args), line_number)
+            if collect_all:
+                return {}
+            return SubprocessResult(grid=[], variables={}, outputs={})
         sub_compiler = GridLangCompiler()
         sub_compiler.types_defined = getattr(self, 'types_defined', {})
         sub_compiler.functions = getattr(self, 'functions', {})
@@ -3010,6 +3037,13 @@ class GridLangCompiler(GridLangExecutor):
         # once per engine and survive per-run resets like all type definitions.
         for name, type_def in _PREDEFINED_RESOURCES.items():
             self.types_defined[name] = dict(type_def)
+
+    def _seed_predefined_subprocesses(self):
+        # Standard-library resource control subprocesses (Ticker.Reset/Stop/
+        # Start). Seeded once per engine; _extract_functions preserves them and
+        # programs cannot redefine them.
+        for name, defn in _PREDEFINED_SUBPROCESSES.items():
+            self.subprocesses[name] = dict(defn)
 
     def _get_grid_store(self):
         """Return the live grid store (the predefined 'grid' variable)."""

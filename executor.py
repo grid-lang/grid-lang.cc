@@ -327,6 +327,10 @@ class GridLangExecutor(GridLangBase):
                 continue
             if not interval or interval < 1:
                 continue
+            # `disabled` is a hidden ticker attribute, settable from the Require
+            # clause (never from a grant): while true the ticker does not advance.
+            if capability.get('disabled'):
+                continue
             last = self._ticker_last_fire.get(cap_name, 0)
             # A ticker with a fixed interval never fires before the interval
             # elapses, so short programs simply see no tick.
@@ -348,6 +352,64 @@ class GridLangExecutor(GridLangBase):
             if cap_name in when_deps:
                 self._enqueue_push(req['var_name'], new_cap)
             self._process_when_triggers()
+
+    def _handle_ticker_system_call(self, name, args, line_number):
+        """Run the predefined Ticker.Reset/Stop/Start control subprocesses.
+
+        The resource name is used as the namespace: the call applies to every
+        granted Ticker capability. ``Ticker.Reset(n)`` sets the tick counter to
+        ``n`` *and* restarts the tick clock from the reset call (so ``n`` is the
+        value reported until the next tick fires a full interval later).
+        ``Ticker.Stop()`` pauses ticking by setting the ticker's hidden
+        ``disabled`` attribute (settable from a Require clause, never grantable);
+        ``Ticker.Start()`` clears it and resumes with a fresh interval. Denied
+        (#PERM) tickers are left untouched.
+        """
+        from units import UnitValue, is_error_value
+        action = name.lower().rsplit('.', 1)[-1]
+        now = self._loop_iteration
+        caps = getattr(self, 'require_caps', None) or {}
+        targets = [req for req in caps.values()
+                   if req.get('resource_lower') == 'ticker']
+        for req in targets:
+            cap_name = req['var_name'].lower()
+            var_name = req['var_name']
+            try:
+                capability = self.current_scope().get(var_name)
+            except Exception:
+                continue
+            if (is_error_value(capability) or not isinstance(capability, dict)
+                    or not capability.get('_capability')):
+                continue
+            new_cap = dict(capability)
+            if action == 'reset':
+                raw = args[0] if args else 0
+                if is_error_value(raw):
+                    raw = 0
+                elif isinstance(raw, UnitValue):
+                    raw = raw.value
+                try:
+                    count = int(raw)
+                except (TypeError, ValueError):
+                    try:
+                        count = float(raw)
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"Ticker.Reset expects a number at line {line_number}"
+                            f" (got {raw!r})")
+                new_cap['value'] = count
+            elif action == 'stop':
+                new_cap['disabled'] = True
+            elif action == 'start':
+                new_cap['disabled'] = False
+                # A fresh interval: the first resumed tick waits a full
+                # interval after Start instead of catching up instantly.
+                self._ticker_last_fire[cap_name] = now
+            else:
+                continue
+            self._set_var_value(var_name, new_cap, line_number)
+            if action == 'reset':
+                self._ticker_last_fire[cap_name] = now
 
     def _set_var_value(self, var_name, value, line_number):
         # For key types, even client-owned variables are immutable after first assignment
@@ -625,7 +687,9 @@ class GridLangExecutor(GridLangBase):
         arg_parts = self._split_call_arguments(args_str)
         sp_def = subprocess_defs[name.lower()]
         inputs = sp_def.get('inputs', []) or []
-        if len(arg_parts) < len(inputs):
+        # Predefined engine subprocesses may declare optional trailing inputs
+        # (e.g. Ticker.Reset() defaults the counter to 0).
+        if len(arg_parts) < len(inputs) and not sp_def.get('_system'):
             raise ValueError(
                 f"Subprocess '{name}' expects at least {len(inputs)} arguments at line {line_number}")
         input_vals = []
