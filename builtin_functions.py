@@ -51,6 +51,7 @@ BUILTINS = {}
 ALIASES = {}
 ARG_COUNTS = {}  # name (lower) -> expected argument count (int or (min, max))
 RESOURCES = {}   # resource name (lower) -> type-metadata dict (declarations only)
+HANDLES = {}     # handle type name (lower) -> handle-type metadata (declarations only)
 
 # All keywords that must be ignored when extracting variable dependencies.
 # Keep this list at a single place – compiler.py and expression.py import it.
@@ -170,6 +171,56 @@ def register_resource(name, fields=None, constraints=None, hidden=None,
         _store()
         return func
     return decorator
+
+
+def register_handle(name, fields=None, description=None, func=None):
+    """Register a *handle* type (e.g. ``Timer``, ``Counter``).
+
+    Handles are objects derived from a granted resource: a member builtin
+    (registered like any other builtin, e.g. ``Ticker.Timer``) returns a
+    handle value. Handle types are declared here only -- they are never
+    grantable via ``Require``; a handle is produced solely by calling a
+    resource member function. The engine owns every handle's state and
+    advances it entirely on the Python side (see ``executor.notify_...``).
+
+    Parameters:
+      - ``name``: handle type name (e.g. ``"Timer"``).
+      - ``fields``: ``{member: type_str}`` readable on the handle value.
+      - ``description``: optional human-readable doc text.
+    """
+    def _store():
+        key = name.lower()
+        field_map = {}
+        for fname, ftype in (fields or {}).items():
+            field_map[str(fname)] = ftype
+        type_def = {
+            '_constraints': {'is_handle': True},
+            '_member_keys': {str(f).lower() for f in field_map},
+        }
+        if description:
+            type_def['_description'] = description
+        type_def.update(field_map)
+        HANDLES[key] = type_def
+
+    def decorator(fn):
+        _store()
+        return fn
+    if func is not None:
+        _store()
+        return func
+    return decorator
+
+
+def create_handle(handle_type, **state):
+    """Build a handle value dict for the engine to store in scope.
+
+    ``_handle`` and ``_handle_type`` mark the dict as an engine-owned handle;
+    ``_parent`` records the capability variable the handle derives from so the
+    engine can advance it in lockstep with its resource.
+    """
+    value = {'_handle': True, '_handle_type': handle_type}
+    value.update(state)
+    return value
 
 
 def _check_arity(name, nargs, line_number=None):
@@ -413,6 +464,65 @@ for _name in ["str", "int", "float", "abs"]:
 )
 def _ticker_declaration():
     pass
+
+
+@register_handle(
+    "Timer",
+    fields={"interval": "number", "remaining": "number"},
+    description="A one-shot timer derived from a Ticker capability: it counts "
+                "down by one tick each time its parent Ticker fires and signals "
+                "(`When <timer> do ...`) when `remaining` reaches 0. All state is "
+                "engine-owned; the handle value is updated entirely on the "
+                "Python side.",
+)
+def _timer_handle():
+    pass
+
+
+@register_handle(
+    "Counter",
+    fields={"now": "number"},
+    description="A read-only tick counter derived from a Ticker capability: "
+                "`now` equals the number of ticks fired by the parent Ticker "
+                "since the handle was created. Engine-owned and propagated via "
+                "the notify callback.",
+)
+def _counter_handle():
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Ticker member builtins (handles)
+# ---------------------------------------------------------------------------
+# Member dispatch is automatic: `tick.timer(5)` resolves to Ticker.Timer with
+# the receiver prepended -- Ticker.Timer(tick, 5). arg_count therefore counts
+# the receiver + user arguments (2 for Timer, 1 for Counter).
+
+@register_builtin("Ticker.Timer", aliases=["Ticker.timer"], arg_count=2)
+def builtin_ticker_timer(tick, n):
+    """Create a Timer handle from a Ticker capability."""
+    from units import is_error_value
+    if is_error_value(tick):
+        return tick
+    try:
+        rem = int(n)
+    except (TypeError, ValueError):
+        raise TypeError("Ticker.Timer expects a number of ticks")
+    if rem < 1:
+        raise ValueError("Ticker.Timer expects a positive tick count")
+    parent = tick.get('_name') if isinstance(tick, dict) else None
+    return create_handle(
+        "Timer", parent=parent, interval=rem, remaining=rem)
+
+
+@register_builtin("Ticker.Counter", aliases=["Ticker.counter"], arg_count=1)
+def builtin_ticker_counter(tick):
+    """Create a Counter handle from a Ticker capability."""
+    from units import is_error_value
+    if is_error_value(tick):
+        return tick
+    parent = tick.get('_name') if isinstance(tick, dict) else None
+    return create_handle("Counter", parent=parent, now=0)
 
 
 # ---------------------------------------------------------------------------

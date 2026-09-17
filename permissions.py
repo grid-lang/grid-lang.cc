@@ -362,10 +362,13 @@ class RequirementResolver:
             '_name': name,
         }
         if entry.get('resource_lower') == 'ticker':
-            # A Ticker is a clock object: its reactive `value` member counts
-            # the ticks fired so far (0 until the first tick) so bindings that
-            # read <cap>.value have a stable value from grant time onward.
-            value['value'] = params.get('value') or 0
+            # A Ticker is a clock object. The engine counts ticks engine-side
+            # (see executor `_advance_tickers`) but that counter is never
+            # registered as a public Grid member: Grid observes elapsed ticks
+            # only through a derived `tick.counter()`/`tick.timer()` handle
+            # (reading <handle>.now / <handle>.remaining), never through
+            # <cap>.value.
+            pass
         hidden = entry['type_def'].get('_hidden_fields')
         if hidden:
             value['_hidden_fields'] = set(hidden)

@@ -73,11 +73,12 @@ class _UnitSourceNamespace:
 
 
 # Predefined control subprocesses for the standard-library Ticker resource. The
-# resource name is the namespace (``Ticker.Reset``, ``Ticker.Stop``,
-# ``Ticker.Start``); their behavior is engine-built, so they carry a ``_system``
-# marker instead of a body. A program cannot redefine them.
+# resource name is the namespace (``Ticker.Stop``, ``Ticker.Start``); their
+# behavior is engine-built, so they carry a ``_system`` marker instead of a
+# body. A program cannot redefine them. (``Ticker.Reset`` is intentionally not
+# predefined: the tick scalar is engine-private, so there is no counter for a
+# program to reposition.)
 _PREDEFINED_SUBPROCESSES = {
-    'ticker.reset': {'_system': 'ticker.reset', 'inputs': ['n'], 'outputs': []},
     'ticker.stop': {'_system': 'ticker.stop', 'inputs': [], 'outputs': []},
     'ticker.start': {'_system': 'ticker.start', 'inputs': [], 'outputs': []},
 }
@@ -2879,6 +2880,17 @@ class GridLangCompiler(GridLangExecutor):
             return
         defining_scope = scope.get_defining_scope(var_name)
         if defining_scope is None or defining_scope.is_uninitialized(var_name):
+            return
+        # Engine-owned handles hold all their state on the Python side: the
+        # client `Let h = cap.member(...)` only created the handle, so a parent
+        # capability tick must never re-evaluate it as a new handle.
+        try:
+            cur_key = defining_scope._get_case_insensitive_key(
+                var_name, defining_scope.variables)
+            cur_val = defining_scope.variables.get(cur_key)
+        except Exception:
+            cur_val = None
+        if isinstance(cur_val, dict) and cur_val.get('_handle'):
             return
         for dep in record.get('deps', ()):
             if self.has_unresolved_dependency(dep, scope=scope):

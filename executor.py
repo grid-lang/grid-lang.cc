@@ -297,8 +297,10 @@ class GridLangExecutor(GridLangBase):
         reads ``<cap>.value`` through the ordinary listener mechanism) and, when
         a `When <cap> do` block is registered, enqueues the tick on that
         capability's Push queue so the *existing* When machinery fires it. No
-        part of When is special-cased for tickers. Denied (#PERM) or invalid
-        tickers never advance (dead blocks).
+        part of When is special-cased for tickers. Each fire also advances every
+        Timer/Counter handle derived from the ticker (see _advance_handles and
+        notify_resource_updated). Denied (#PERM) or invalid tickers never
+        advance (dead blocks).
         """
         from units import is_error_value
         caps = getattr(self, 'require_caps', None) or {}
@@ -307,8 +309,8 @@ class GridLangExecutor(GridLangBase):
         if not targets:
             return
         now = self._loop_iteration
-        # Lazily compute the set of capability names with a registered When
-        # consumer so we only enqueue ticks someone is waiting for.
+        # Lazily compute the set of capability/handle names with a registered
+        # When consumer so we only enqueue ticks someone is waiting for.
         when_deps = None
         for req in targets:
             cap_name = req['var_name'].lower()
@@ -337,32 +339,119 @@ class GridLangExecutor(GridLangBase):
             if (now - last) < interval:
                 continue
             self._ticker_last_fire[cap_name] = now
-            # Rewrite the capability with an incremented counter: this is what
-            # makes listener/reactive bindings that read <cap>.value fire.
+            # Rewrite the capability with an incremented engine-private counter
+            # (`_ticks`). Public `value` is deliberately not registered (see
+            # permissions build_capability): Grid observes elapsed ticks only
+            # through a derived `tick.counter()`/`tick.timer()` handle. The
+            # rewrite still changes the variable, which is what makes listener /
+            # reactive bindings that depend on the ticker fire.
             new_cap = dict(capability)
-            new_cap['value'] = capability.get('value', 0) + 1
+            new_cap['_ticks'] = capability.get('_ticks', 0) + 1
             self._set_var_value(
                 req['var_name'], new_cap, req['line_number'])
             # Serve `When <cap> do ...`: the ordinary queue-based trigger path
             # sees the enqueued tick exactly like a Push would.
             if when_deps is None:
-                when_deps = set()
-                for entry in self.when_blocks:
-                    when_deps.update(entry.get('deps') or [])
+                when_deps = self._when_dependency_names()
             if cap_name in when_deps:
                 self._enqueue_push(req['var_name'], new_cap)
+            # Engine-owned Timer/Counter handles derived from this ticker
+            # advance in lockstep with the fire.
+            self._advance_handles(cap_name, req['line_number'])
             self._process_when_triggers()
 
+    def _when_dependency_names(self):
+        """Set of variable names that a registered `When <name> do` waits on."""
+        deps = set()
+        for entry in getattr(self, 'when_blocks', []):
+            deps.update(entry.get('deps') or [])
+        return deps
+
+    def _scope_handle_vars(self):
+        """Return {var_lower: (var_name, handle_dict)} for every engine-owned
+        handle stored in the current scope chain."""
+        found = {}
+        scope = self.current_scope()
+        visited = set()
+        while scope is not None and id(scope) not in visited:
+            visited.add(id(scope))
+            variables = getattr(scope, 'variables', None) or {}
+            for name, val in variables.items():
+                low = name.lower()
+                if low in found:
+                    continue
+                if isinstance(val, dict) and val.get('_handle'):
+                    found[low] = (name, val)
+            scope = getattr(scope, 'parent', None)
+        return found
+
+    def _advance_handles(self, parent_cap_name, line_number):
+        """Advance Timer/Counter handles derived from the ticker that just fired.
+
+        A Timer counts down once per parent tick and signals once (via its
+        pending-Push queue when a `When <handle> do` waits on it) when
+        `remaining` reaches 0, then stops. A Counter counts every parent tick
+        into `now` for read-only elapsed-tick measurement. All updates happen
+        engine-side; the notify callback propagates each change to listeners.
+        """
+        when_deps = self._when_dependency_names()
+        for low, (name, value) in self._scope_handle_vars().items():
+            if (value.get('parent') or '').lower() != parent_cap_name:
+                continue
+            htype = (value.get('_handle_type') or '').lower()
+            new_value = dict(value)
+            if htype == 'timer':
+                if new_value.get('_fired'):
+                    continue
+                try:
+                    rem = int(new_value.get('remaining') or 0)
+                except (TypeError, ValueError):
+                    continue
+                rem -= 1
+                if rem <= 0:
+                    new_value['remaining'] = 0
+                    new_value['_fired'] = True
+                else:
+                    new_value['remaining'] = rem
+            elif htype == 'counter':
+                new_value['now'] = (new_value.get('now') or 0) + 1
+            else:
+                continue
+            self._set_var_value(name, new_value, line_number)
+            if low in when_deps:
+                self._enqueue_push(name, new_value)
+
+    def notify_resource_updated(self, var_name, line_number=None):
+        """Notify the engine that an engine-owned handle value changed.
+
+        Builtin resource/member code calls this with the handle's variable name
+        after it rewrites the handle in scope. The value itself never crosses
+        the boundary: the engine reads the updated handle and (a) propagates it
+        to reactive listeners and (b) fires any `When <handle> do ...` block by
+        enqueuing the handle on its Push queue.
+        """
+        if var_name is None:
+            return
+        low = str(var_name).lower()
+        try:
+            value = self.current_scope().get(var_name)
+        except Exception:
+            return
+        self._set_var_value(var_name, value, line_number)
+        if low in self._when_dependency_names():
+            self._enqueue_push(str(var_name), value)
+        self._process_when_triggers()
+
     def _handle_ticker_system_call(self, name, args, line_number):
-        """Run the predefined Ticker.Reset/Stop/Start control subprocesses.
+        """Run the predefined Ticker.Stop/Start control subprocesses.
 
         The resource name is used as the namespace: the call applies to every
-        granted Ticker capability. ``Ticker.Reset(n)`` sets the tick counter to
-        ``n`` *and* restarts the tick clock from the reset call (so ``n`` is the
-        value reported until the next tick fires a full interval later).
-        ``Ticker.Stop()`` pauses ticking by setting the ticker's hidden
-        ``disabled`` attribute (settable from a Require clause, never grantable);
-        ``Ticker.Start()`` clears it and resumes with a fresh interval. Denied
+        granted Ticker capability. ``Ticker.Stop()`` pauses ticking by setting
+        the ticker's hidden ``disabled`` attribute (settable from a Require
+        clause, never grantable); ``Ticker.Start()`` clears it and resumes with
+        a fresh interval. The tick scalar itself is engine-private (``_ticks``)
+        and is never readable from Grid; elapsed ticks are observed only
+        through derived ``tick.counter()``/``tick.timer()`` handles. Denied
         (#PERM) tickers are left untouched.
         """
         from units import UnitValue, is_error_value
@@ -382,23 +471,7 @@ class GridLangExecutor(GridLangBase):
                     or not capability.get('_capability')):
                 continue
             new_cap = dict(capability)
-            if action == 'reset':
-                raw = args[0] if args else 0
-                if is_error_value(raw):
-                    raw = 0
-                elif isinstance(raw, UnitValue):
-                    raw = raw.value
-                try:
-                    count = int(raw)
-                except (TypeError, ValueError):
-                    try:
-                        count = float(raw)
-                    except (TypeError, ValueError):
-                        raise ValueError(
-                            f"Ticker.Reset expects a number at line {line_number}"
-                            f" (got {raw!r})")
-                new_cap['value'] = count
-            elif action == 'stop':
+            if action == 'stop':
                 new_cap['disabled'] = True
             elif action == 'start':
                 new_cap['disabled'] = False
@@ -408,8 +481,6 @@ class GridLangExecutor(GridLangBase):
             else:
                 continue
             self._set_var_value(var_name, new_cap, line_number)
-            if action == 'reset':
-                self._ticker_last_fire[cap_name] = now
 
     def _set_var_value(self, var_name, value, line_number):
         # For key types, even client-owned variables are immutable after first assignment
@@ -497,8 +568,13 @@ class GridLangExecutor(GridLangBase):
                     except Exception:
                         pass
         # Publisher-side write: a client equality binding wins over the pushed
-        # value, so skip the overwrite for client-owned variables.
-        if not has_constant and owner._set_by.get(('var', var_name.lower())) == 'client':
+        # value, so skip the overwrite for client-owned variables. Engine-owned
+        # handles are the exception: their state lives entirely on the Python
+        # side (the client `Let h = cap.member(...)` only created the handle),
+        # so the engine must be able to rewrite them on every update.
+        if (not has_constant
+                and owner._set_by.get(('var', var_name.lower())) == 'client'
+                and not (isinstance(value, dict) and value.get('_handle'))):
             return
         defining_scope = self.current_scope().get_defining_scope(var_name)
         if defining_scope:
@@ -1463,14 +1539,31 @@ class GridLangExecutor(GridLangBase):
         return inferred_type
 
     def _is_call_expression(self, expr):
-        """Whether expr is a subprocess/function call like 'Name(args)'."""
+        """Whether expr is a subprocess/function call like 'Name(args)'.
+
+        Also recognizes dotted capability member calls -- 'Cap.Member(args)'
+        or 'handle.member(args)' -- so handle-producing Let bindings such as
+        ``Let time = tick.counter()`` are never misclassified as constant
+        equality bindings. ``tick` here is a granted capability variable
+        (not a subprocess/function name), so both bare and dotted forms are
+        checked.
+        """
         if not isinstance(expr, str):
             return False
+        stripped = expr.strip()
         m = re.match(
-            r'^([A-Za-z][A-Za-z0-9_]*)\s*\(.*\)\s*$', expr.strip(), re.S)
+            r'^([A-Za-z][A-Za-z0-9_.]*)\s*\(.*\)\s*$', stripped, re.S)
         if not m:
             return False
-        name = m.group(1).lower()
+        full_name = m.group(1)
+        if '.' in full_name:
+            # Dotted capability-member call (e.g. `tick.counter()`).
+            base = full_name.split('.', 1)[0].lower()
+            return bool(self._scope_handle_vars().get(base) or
+                        base in (getattr(self, 'require_caps', None) or {}) or
+                        base in (self.subprocesses or {}) or
+                        base in (self.functions or {}))
+        name = full_name.lower()
         return name in (self.subprocesses or {}) or name in (self.functions or {})
 
     def _leading_subprocess_call(self, expr):
@@ -1687,6 +1780,17 @@ class GridLangExecutor(GridLangBase):
                     var, error_value(VALUE_ERROR), line_number)
                 return 'bound'
             value = self._to_sparse_undimmed(evaluated_value, constraints)
+            if isinstance(value, dict) and value.get('_handle'):
+                # Engine-owned handle: the client binding (`Let h = cap.fn()`) only
+                # minted the handle. It is not an immutable constant — the engine
+                # rewrites it as the handle advances (`\.timer`/`\.counter`) — so
+                # strip any constant pin that the generic equality-binding logic
+                # attached to the member-call expression.
+                constraints = dict(constraints)
+                constraints.pop('constant', None)
+                actual_constraint_key = defining_scope._get_case_insensitive_key(
+                    var, defining_scope.constraints) or var
+                defining_scope.constraints[actual_constraint_key] = constraints
             if isinstance(constraints.get('constant'), (list, tuple, dict)):
                 # Array/object literal constant: replace raw parser tokens
                 # (text items arrive quoted) with the evaluated value so
