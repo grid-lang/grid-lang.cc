@@ -3383,6 +3383,7 @@ class GridLangCompiler(GridLangExecutor):
                     type_parent = parsed_parent
                     type_constraints = parsed_constraints or {}
                     type_def_lines = []
+                    type_inner_requires = []
                     type_block_depth = 0
                     continue
                 # Other definitions (functions/subprocesses) are handled later
@@ -3422,10 +3423,52 @@ class GridLangCompiler(GridLangExecutor):
                             type_def['_constraints'] = type_constraints
                         if type_constraints and type_constraints.get('key'):
                             type_def['_keyed'] = True
+                        if type_inner_requires:
+                            type_def['_inner_requires'] = type_inner_requires
                         self.types_defined[type_name.lower()] = type_def
                         continue
                     if type_block_depth > 0:
                         type_block_depth = max(0, type_block_depth - 1)
+                # Capture inner Require statements inside a Resource definition
+                # as templates (not executable code). They are materialized as
+                # grants when the resource is itself required with parameters.
+                if type_constraints.get('is_resource') and type_block_depth == 0 and stripped_lower.startswith('require '):
+                    raw = stripped[len('Require'):].strip() if stripped.lower().startswith('require ') else stripped[7:].strip()
+                    # Re-use the same Require syntax as top-level
+                    m = re.match(
+                        r'^([\w_]+(?:\s*,\s*[\w_]+)*)\s+as\s+([A-Za-z][\w_]*)(?:\s+with\s*\((.*)\)\s*)?$',
+                        raw, re.I | re.S)
+                    if not m:
+                        raise SyntaxError(
+                            f"Invalid Require syntax inside resource '{type_name}' at line {line_number}: '{s}'\n"
+                            "Expected: Require <name> as <Resource> [with (param = value, ...)]")
+                    names_part = m.group(1).strip()
+                    resource_type = m.group(2).strip()
+                    with_content = (m.group(3) or '').strip()
+                    params = {}
+                    if with_content:
+                        with_kind, with_payload = self._parse_with_clause(
+                            with_content, line_number)
+                        if with_kind != 'named':
+                            raise SyntaxError(
+                                f"Invalid parameter in Require inside resource '{type_name}' at line {line_number}: "
+                                "'with (...)' must list 'field = value' pairs")
+                        for field, val_expr in with_payload.items():
+                            params[field.lower()] = val_expr.strip()
+                    var_names = [n.strip() for n in names_part.split(',') if n.strip()]
+                    for var_name in var_names:
+                        if not re.match(r'^[\w_]+$', var_name):
+                            raise SyntaxError(
+                                f"Invalid capability name '{var_name}' in Require inside resource '{type_name}' at line {line_number}")
+                        type_inner_requires.append({
+                            'var_name': var_name,
+                            'name': var_name,
+                            'resource': resource_type,
+                            'resource_lower': resource_type.lower(),
+                            'params': dict(params),
+                            'line_number': line_number,
+                        })
+                    continue
                 type_def_lines.append(s.lstrip())
                 continue
 

@@ -83,7 +83,18 @@ def run_grid_program(args):
             compiler.prompt_missing_requires = False
             compiler.halt_before_main_loop = True
             compiler.run(code, program_args)
-            print(format_required_yaml(compiler.requirements), end="")
+            # Only predefined resources are grantable — whitelist via RESOURCES
+            # Build list from RESOURCES (source of truth) and filter with compiler.requirements
+            try:
+                from builtin_functions import RESOURCES as _RESOURCES
+            except Exception:
+                _RESOURCES = {}
+            filtered = []
+            for res_lower in _RESOURCES:
+                for r in compiler.requirements:
+                    if (r.get('resource_lower') or str(r.get('resource') or '').lower()) == res_lower:
+                        filtered.append(r)
+            print(format_required_yaml(filtered), end="")
             return
 
         # Prompt for missing inputs when no CLI arguments are provided and stdin

@@ -216,6 +216,8 @@ def format_param_value(value):
         return 'true' if value else 'false'
     if isinstance(value, (list, tuple, dict)):
         return format_yaml_scalar(value)
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
     return str(value)
 
 
@@ -236,8 +238,15 @@ def render_require_prompt(entry):
         if key in requested:
             line += f" = {format_param_value(requested[key])}"
         summary.append(line)
+    # If this is an inner require materialized for a user resource instance,
+    # include the outer context: "for <resource> <handle>"
+    for_prefix = ""
+    if entry.get('for_resource') and entry.get('for_handle'):
+        for_prefix = f" for {str(entry['for_resource']).lower()} {entry['for_handle']}"
     if summary:
-        return f"\n{entry['name']} requires {resource} with {', '.join(summary)}\n"
+        return f"\n{entry['name']} requires {resource}{for_prefix} with {', '.join(summary)}\n"
+    if for_prefix:
+        return f"\n{entry['name']} requires {resource}{for_prefix}\n"
     return f"\n{entry['name']} requires {resource}\n"
 
 
@@ -483,12 +492,81 @@ class RequirementResolver:
         ``(var_name, value, vtype, line_number)`` tuples for the engine to
         define in scope.
         """
+        import re as _re
         from units import PERM_ERROR, error_value
         grant_map = dict(grants or {})
         for entry in requirements:
             self.evaluate_params(entry)
+        # Expand user-defined resources: they are auto-granted and their inner
+        # Require templates are materialized as synthetic requirements with
+        # parameter substitution (e.g. interval = interval / 2 with interval=30
+        # => interval = 15). User resources themselves are skipped by the grant
+        # mechanism (no prompt).
+        try:
+            from builtin_functions import RESOURCES as _RESOURCES
+        except Exception:
+            _RESOURCES = {}
+        expanded = list(requirements)
+        for entry in list(requirements):
+            type_def = entry.get('type_def') or {}
+            constraints = type_def.get('_constraints') or {}
+            is_resource = constraints.get('is_resource')
+            res_lower = entry.get('resource_lower') or str(entry.get('resource') or '').lower()
+            is_user_resource = is_resource and res_lower not in _RESOURCES
+            if not is_user_resource:
+                continue
+            key = entry['var_name'].lower()
+            if key not in grant_map:
+                # Auto-grant all user resources (no prompt, use requested params)
+                # — only predefined resources are grantable. This is the
+                # whitelist logic: include ONLY predefined resources.
+                grant_map[key] = dict(entry.get('params_evaluated') or {})
+            inner_list = type_def.get('_inner_requires') or []
+            for tmpl in inner_list:
+                inner_resource_lower = tmpl.get('resource_lower') or str(tmpl.get('resource') or '').lower()
+                inner_type_def = self.host.types_defined.get(inner_resource_lower)
+                if not inner_type_def:
+                    inner_type_def = _RESOURCES.get(inner_resource_lower)
+                if not inner_type_def:
+                    continue
+                outer_evaluated = entry.get('params_evaluated') or {}
+                substituted = {}
+                for field, expr in (tmpl.get('params') or {}).items():
+                    sub_expr = str(expr)
+                    for ofield, ovalue in outer_evaluated.items():
+                        # Substitute outer param names with their evaluated values (word boundary, case-insensitive)
+                        sub_expr = _re.sub(r'\b' + _re.escape(str(ofield)) + r'\b', str(ovalue), sub_expr, flags=_re.I)
+                    substituted[field.lower()] = sub_expr
+                synthetic = {
+                    'var_name': tmpl['var_name'],
+                    'name': tmpl['var_name'],
+                    'resource': tmpl['resource'],
+                    'resource_lower': inner_resource_lower,
+                    'type_def': inner_type_def,
+                    'params': substituted,
+                    'params_evaluated': None,
+                    'line_number': tmpl.get('line_number') or entry.get('line_number'),
+                    'for_resource': entry['resource'],
+                    'for_handle': entry['var_name'],
+                }
+                self.evaluate_params(synthetic)
+                expanded.append(synthetic)
+        # Persist expanded requirements so --list-required sees materialized inner grants
+        try:
+            self.host.requirements = expanded
+        except Exception:
+            pass
         prompts = []
-        for entry in requirements:
+        for entry in expanded:
+            # Skip prompts for all user resources (already auto-granted) —
+            # whitelist: only predefined resources are grantable.
+            type_def = entry.get('type_def') or {}
+            constraints = type_def.get('_constraints') or {}
+            is_resource = constraints.get('is_resource')
+            res_lower = entry.get('resource_lower') or str(entry.get('resource') or '').lower()
+            is_user_resource = is_resource and res_lower not in _RESOURCES
+            if is_user_resource:
+                continue
             key = entry['var_name'].lower()
             if key not in grant_map:
                 if can_prompt:
@@ -499,7 +577,7 @@ class RequirementResolver:
         for entry in prompts:
             grant_map[entry['var_name'].lower()] = self.prompt_for(entry)
         bindings = []
-        for entry in requirements:
+        for entry in expanded:
             key = entry['var_name'].lower()
             declaration = grant_map.get(key)
             line_number = entry['line_number']
