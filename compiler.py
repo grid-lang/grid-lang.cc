@@ -75,13 +75,19 @@ class _UnitSourceNamespace:
 # Predefined control subprocesses for the standard-library Ticker resource. The
 # resource name is the namespace (``Ticker.Stop``, ``Ticker.Start``); their
 # behavior is engine-built, so they carry a ``_system`` marker instead of a
-# body. A program cannot redefine them. (``Ticker.Reset`` is intentionally not
-# predefined: the tick scalar is engine-private, so there is no counter for a
-# program to reposition.)
+# body. A program cannot redefine them.
 _PREDEFINED_SUBPROCESSES = {
     'ticker.stop': {'_system': 'ticker.stop', 'inputs': [], 'outputs': []},
     'ticker.start': {'_system': 'ticker.start', 'inputs': [], 'outputs': []},
 }
+
+# Dotted capability handle-creators the engine seeds into its callable
+# registry (number.*, text.*, ticker.timer, ticker.counter, ...). They are
+# engine-owned facilities exactly like the system subprocesses above: a
+# program cannot redefine them. Derived from the authoritative BUILTINS
+# registry so it can never drift from what the engine actually installs.
+_DOTTED_ENGINE_CREATORS = frozenset(
+    k.lower() for k in BUILTINS if '.' in k)
 
 
 class GridLangCompiler(GridLangExecutor):
@@ -784,6 +790,7 @@ class GridLangCompiler(GridLangExecutor):
         return result
 
     def _extract_functions(self, lines, label_lines, dim_lines):
+        self._program_defined_names = set()
         """Extract user-defined functions and remove them from main code."""
         functions = getattr(self, 'functions', {}) or {}
         subprocesses = getattr(self, 'subprocesses', {}) or {}
@@ -890,6 +897,35 @@ class GridLangCompiler(GridLangExecutor):
                     'code_lines': code_lines,
                     'defining_scope': self.current_scope()
                 }
+                # Uniform redefinition guard -- applies to EVERY kind by
+                # the time the entry dict is assembled, before any kind
+                # dispatch. A program may not redefine an engine-owned
+                # dotted capability handle-creator (engine dotted creators),
+                # a predefined subprocess, or any name it already defined
+                # elsewhere in the same program (cross-kind uniqueness,
+                # exactly as testredef.grid expects).
+                if func_name:
+                    # Kind-aware redefinition focal: a builder is a
+                    # capability MEMBER of a specific type, so the SAME
+                    # builder name may legitimately serve DIFFERENT types
+                    # (Test 260: 'bump' on A and on B are two distinct
+                    # capabilities and must both be accepted). A builder is
+                    # therefore keyed on BOTH its owner type and its name.
+                    # Every NON-builder Define (Function / Subprocess /
+                    # dotted capability members) is unique program-wide.
+                    if def_kind == 'builder':
+                        redef_key = ((builder_type or '').lower(),
+                                     func_name.lower())
+                    else:
+                        redef_key = func_name.lower()
+                    if (redef_key in _DOTTED_ENGINE_CREATORS
+                            or redef_key in _PREDEFINED_SUBPROCESSES
+                            or redef_key in self._program_defined_names):
+                        raise SyntaxError(
+                            f"'{func_name}' is already defined and cannot be "
+                            f"redefined at line {line_number}. ' not allowed'")
+                    self._program_defined_names.add(redef_key)
+
                 if def_kind == 'builder':
                     type_name = builder_type
                     type_def = self.types_defined.get(type_name.lower())
@@ -902,10 +938,6 @@ class GridLangCompiler(GridLangExecutor):
                 elif def_kind == 'function':
                     functions[func_name.lower()] = entry
                 else:
-                    if func_name.lower() in _PREDEFINED_SUBPROCESSES:
-                        raise SyntaxError(
-                            f"'{func_name}' is a predefined resource subprocess "
-                            f"and cannot be redefined at line {line_number}")
                     subprocesses[func_name.lower()] = entry
                 i += 1
                 continue
@@ -4711,5 +4743,4 @@ class GridLangCompiler(GridLangExecutor):
             except KeyboardInterrupt:
                 print("\nExiting...")
                 sys.exit(1)
-
 
