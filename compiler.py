@@ -807,7 +807,8 @@ class GridLangCompiler(GridLangExecutor):
         return result
 
     def _extract_functions(self, lines, label_lines, dim_lines):
-        self._program_defined_names = set()
+        if not hasattr(self, '_program_defined_names'):
+            self._program_defined_names = set()
         """Extract user-defined functions and remove them from main code."""
         functions = getattr(self, 'functions', {}) or {}
         subprocesses = getattr(self, 'subprocesses', {}) or {}
@@ -3496,6 +3497,8 @@ class GridLangCompiler(GridLangExecutor):
 
     def _preprocess_code(self, code):
 
+        if not hasattr(self, '_program_defined_names'):
+            self._program_defined_names = set()
         lines = []
         label_lines = []
         dim_lines = []
@@ -3584,6 +3587,34 @@ class GridLangCompiler(GridLangExecutor):
                         raise SyntaxError(
                             f"'{parsed_name}' is a predefined resource and cannot "
                             f"be redefined at line {line_number}")
+                    # Early redefinition guard for handles/types with dotted/bang names
+                    # (e.g. ticker.counter / ticker!counter). This catches the
+                    # engine-owned handle before any truncation to the bare
+                    # resource prefix (ticker) could happen. Check both dot and
+                    # bang forms against the engine sets and already-defined names.
+                    _dotted = parsed_name.lower().replace('!', '.')
+                    _bang = parsed_name.lower().replace('.', '!')
+                    _prog = getattr(self, '_program_defined_names', set())
+                    if (_dotted in _DOTTED_ENGINE_CREATORS
+                            or _bang in _DOTTED_ENGINE_CREATORS
+                            or _dotted in _PREDEFINED_SUBPROCESSES
+                            or _bang in _PREDEFINED_SUBPROCESSES
+                            or _dotted in _prog
+                            or _bang in _prog
+                            or parsed_name.lower() in _prog):
+                        raise SyntaxError(
+                            f"'{parsed_name}' is already defined and cannot "
+                            f"be redefined at line {line_number}. ' not allowed'")
+                    # Reserve the name immediately so later defines (type or
+                    # function) see it via _program_defined_names, even though
+                    # the actual storage happens at End.
+                    _prog = getattr(self, '_program_defined_names', set())
+                    if not hasattr(self, '_program_defined_names'):
+                        self._program_defined_names = set()
+                        _prog = self._program_defined_names
+                    _prog.add(_dotted)
+                    _prog.add(_bang)
+                    _prog.add(parsed_name.lower())
                     in_type_def = True
                     type_name = parsed_name
                     type_parent = parsed_parent
@@ -3650,27 +3681,6 @@ class GridLangCompiler(GridLangExecutor):
                             # the dot/bang prefix of the define name)
                             if resource_for_handle and not type_def.get('_constraints', {}).get('handle_resource'):
                                 type_def.setdefault('_constraints', {})['handle_resource'] = resource_for_handle
-                        # Redefinition guard for type/handle declarations —
-                        # mirror of the capability/function guard above. A
-                        # program may not declare a type (or a dotted Handle
-                        # like Resource.Handle) over an engine-owned dotted
-                        # creator (ticker.counter, number.round, ...), over a
-                        # predefined subprocess, or over any name it already
-                        # defined elsewhere. Handles are canonicalized to
-                        # 'Resource!Handle' storage, so derive the dotted
-                        # form too before comparing against the engine sets.
-                        redef_key_t = store_name.lower()
-                        redef_key_dotted = redef_key_t.replace('!', '.')
-                        if (redef_key_t in _DOTTED_ENGINE_CREATORS
-                                or redef_key_t in _PREDEFINED_SUBPROCESSES
-                                or redef_key_dotted in _DOTTED_ENGINE_CREATORS
-                                or redef_key_dotted in _PREDEFINED_SUBPROCESSES
-                                or redef_key_t in self._program_defined_names
-                                or redef_key_dotted in self._program_defined_names):
-                            raise SyntaxError(
-                                f"'{store_name}' is already defined and cannot "
-                                f"be redefined at line {line_number}. ' not allowed'")
-                        self._program_defined_names.add(redef_key_dotted)
                         self.types_defined[store_name.lower()] = type_def
                         continue
                     if type_block_depth > 0:
