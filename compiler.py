@@ -188,16 +188,20 @@ class GridLangCompiler(GridLangExecutor):
         """Parse a type definition header, returning name, parent, and constraints.
 
         Supports `Define X as Type`, `Define X as Type(Parent)`,
-        `Define X as Keytype` / `Define X as Keytype(Parent)`, and
+        `Define X as Keytype` / `Define X as Keytype(Parent)`,
         `Define X as Resource` (a capability that can only be acquired
-        with `Require`, never instantiated with `new`).
+        with `Require`, never instantiated with `new`), and
+        `Define MyRes.Inc as Handle` (a handle type derived from Resource
+        `MyRes`, instantiated via a Resource member function
+        ``MyRes.Inc``; the canonical type name ``MyRes!Inc`` may contain
+        ``!`` to denote Resource!Handle nesting, e.g. ``Input h as MyRes!Inc``).
         """
         m = re.match(
-            r'^\s*define\s+([\w_]+)\s+as\s+(type|keytype|resource)(?:\s*\(\s*([^)]*)\s*\))?\s*(.*)$', line, re.I)
+            r'^\s*define\s+([\w_!\.]+)\s+as\s+(type|keytype|resource|handle)(?:\s*\(\s*([^)]*)\s*\))?\s*(.*)$', line, re.I)
         if not m:
             return None, None, None
         type_name = m.group(1).strip()
-        kind = m.group(2).strip().lower()  # type, keytype, or resource
+        kind = m.group(2).strip().lower()  # type, keytype, resource, or handle
         inner = m.group(3).strip() if m.group(3) else ""
         remainder = m.group(4).strip()
         parent = None
@@ -211,6 +215,11 @@ class GridLangCompiler(GridLangExecutor):
             if inner:
                 raise SyntaxError(
                     f"Resource definitions take no parent at line {line_number}: '{line}'")
+        elif kind == "handle":
+            if '.' not in type_name:
+                raise SyntaxError(
+                    f"Handle definitions require a resource name: 'Define Resource.Handle as Handle' at line {line_number}: '{line}'")
+            parent = type_name.split('.', 1)[0].strip()
         else:
             # kind == type, only Type or Type(Parent) - Type(key) removed, use Keytype
             if inner and "key" in inner.lower().split():
@@ -229,6 +238,14 @@ class GridLangCompiler(GridLangExecutor):
             constraints['key'] = True
         if kind == "resource":
             constraints['is_resource'] = True
+        if kind == "handle":
+            constraints['is_handle'] = True
+            # parent variable holds the resource name for handles; persist it in
+            # constraints and clear the inheritance parent.
+            resource_for_handle = parent
+            if resource_for_handle:
+                constraints['handle_resource'] = resource_for_handle
+            parent = None
         return type_name, parent, constraints
 
     def _parse_unit_source_header(self, line, line_number=None):
@@ -799,7 +816,7 @@ class GridLangCompiler(GridLangExecutor):
         while i < len(lines):
             line, line_number = lines[i]
             m = re.match(
-                r'^\s*define\s+(\$?[\w\.]+)\s+as\s+(function|subprocess|privatehelper)\b', line, re.I)
+                r'^\s*define\s+(\$?[\w\!\.]+)\s+as\s+(function|subprocess|privatehelper|operation)\b', line, re.I)
             m_builder = re.match(
                 r'^\s*define\s+(\$?[\w.]+)\s+as\s+builder\s*\(\s*([A-Za-z][\w]*)\s*\)\s*$', line, re.I)
             if re.search(r'\bas\s+builder\b', line, re.I) and not m_builder:
@@ -935,7 +952,7 @@ class GridLangCompiler(GridLangExecutor):
                     if isinstance(type_def, dict):
                         helpers = type_def.setdefault('_builders', {})
                         helpers[func_name.lower()] = entry
-                elif def_kind == 'function':
+                elif def_kind in ('function', 'operation'):
                     functions[func_name.lower()] = entry
                 else:
                     subprocesses[func_name.lower()] = entry
@@ -945,6 +962,12 @@ class GridLangCompiler(GridLangExecutor):
             i += 1
         self.functions = functions
         self.subprocesses = subprocesses
+        # Register synthetic Resource.Handle factories now that both handle types
+        # and user functions are known.
+        try:
+            self._register_handle_factories()
+        except Exception:
+            pass
         return new_lines, label_lines, dim_lines
 
     def call_function(self, name, args, instance_type=None, collect_all=False, vectorize=True):
@@ -978,6 +1001,16 @@ class GridLangCompiler(GridLangExecutor):
             if inferred_type and not self._is_type_compatible(inferred_type, member_of):
                 raise TypeError(
                     f"Member function '{name}' expects instance of '{member_of}', got '{inferred_type}'")
+        # Handle factory: synthetic Resource.Handle constructor – instantiate handle
+        if func_def.get('is_handle_factory'):
+            handle_type = func_def.get('handle_type')
+            resource_instance = args[0] if args else None
+            handle_args = args[1:] if len(args) > 1 else []
+            # Instantiate handle with privileged resource access
+            handle_val = self._instantiate_handle(
+                handle_type, resource_instance, handle_args, None,
+                var_name=handle_type)
+            return handle_val
 
         input_defs = func_def.get('input_defs') or []
         if vectorize and not collect_all:
@@ -1392,6 +1425,179 @@ class GridLangCompiler(GridLangExecutor):
             value_dict.setdefault('_fresh_key', True)
 
         return value_dict
+
+    def _instantiate_handle(self, handle_type, resource_instance, args, line_number, var_name=None):
+        """Create a handle instance derived from a Resource instance.
+
+        Handle types are declared ``Define Resource.Handle as Handle`` and
+        behave like Type constructors but with privileged access to the parent
+        Resource: bare reads (``x``) resolve to Resource fields, and ``Push``
+        to a Resource field mutates the Resource instance (builder-style).
+        ``args`` are the handle's own Input parameters (excluding the implicit
+        Resource receiver). The handle's ``_type_name`` is the canonical
+        ``resource!handle`` string.
+        """
+        handle_def = self.types_defined.get(handle_type.lower())
+        if not isinstance(handle_def, dict):
+            raise ValueError(f"Handle type '{handle_type}' not defined at line {line_number}")
+        if not (handle_def.get('_constraints') or {}).get('is_handle'):
+            raise ValueError(f"Type '{handle_type}' is not a Handle at line {line_number}")
+        public_fields = self._get_public_type_fields(handle_def)
+        inputs_list = handle_def.get('_inputs', []) or []
+        exec_lines = handle_def.get('_executable_code', []) or []
+        # Normalize inputs
+        def _normalize_inputs(raw):
+            norm = []
+            for entry in raw or []:
+                if isinstance(entry, dict):
+                    norm.append(entry)
+                else:
+                    norm.append({'name': entry, 'default': None, 'type': None})
+            return norm
+        inputs_list = _normalize_inputs(inputs_list)
+        args = list(args or [])
+        if inputs_list and len(args) > len(inputs_list):
+            raise ValueError(
+                f"Expected {len(inputs_list)} values for handle '{handle_type}', got {len(args)} at line {line_number}")
+        if not inputs_list and args:
+            raise ValueError(
+                f"Handle '{handle_type}' has no Input declarations; positional arguments are not allowed at line {line_number}")
+        input_values = {}
+        for idx, entry in enumerate(inputs_list):
+            name = entry.get('name')
+            if idx < len(args):
+                input_values[name] = args[idx]
+            else:
+                default_expr = entry.get('default')
+                if default_expr is None:
+                    raise ValueError(
+                        f"Missing value for input '{name}' in handle '{handle_type}' at line {line_number}")
+                eval_scope = self.current_scope().get_full_scope()
+                # Include resource fields for default expression evaluation
+                if isinstance(resource_instance, dict):
+                    for rk, rv in resource_instance.items():
+                        if not str(rk).startswith('_') and rk not in eval_scope:
+                            eval_scope[rk] = rv
+                input_values[name] = self.expr_evaluator.eval_or_eval_array(
+                    str(default_expr), eval_scope, line_number)
+        # Determine resource type name for dispatch
+        resource_type = handle_type.split('!', 1)[0]
+        # Prepare handle instance dict
+        value_dict = {}
+        value_dict['_type_name'] = handle_type.lower()
+        value_dict['_handle'] = True
+        value_dict['_handle_type'] = handle_type.lower()
+        if isinstance(resource_instance, dict):
+            value_dict['_resource'] = resource_instance
+            # Parent linkage for engine-owned handle tracking (if needed)
+            parent_name = resource_instance.get('_name')
+            if parent_name:
+                value_dict['_parent'] = parent_name
+        hidden_fields = handle_def.get('_hidden_fields', set())
+        if hidden_fields:
+            value_dict['_hidden_fields'] = set(hidden_fields)
+        self._materialize_unset_type_fields(value_dict, handle_type)
+        self._wrap_keytype_primitive_fields(value_dict, public_fields, handle_def)
+        self._init_instance_grid(value_dict, handle_def, line_number)
+        # Execute handle constructor code with resource access
+        handle_resource_type = resource_type or ''
+        prev_res_instance = getattr(self, '_handle_resource_instance', None)
+        prev_res_type = getattr(self, '_handle_resource_type', None)
+        prev_member_keys = getattr(self, '_type_member_keys', None)
+        self._handle_resource_instance = resource_instance
+        self._handle_resource_type = handle_resource_type
+        # Set member keys to handle's keys so _process_type_assignment knows Handle fields
+        self._type_member_keys = set(handle_def.get('_member_keys', set()))
+        # Use a member name that reflects the handle for error messages
+        exec_var_name = 'this'
+        try:
+            if exec_lines:
+                self._execute_type_code(exec_lines, exec_var_name, value_dict, line_number, input_values)
+            else:
+                # No executable code – map inputs directly to matching handle fields
+                if inputs_list:
+                    value_dict.update({name: val for name, val in input_values.items() if name in public_fields})
+                    if input_values:
+                        immutable = value_dict.setdefault('_immutable_fields', set())
+                        immutable.update(n.lower() for n in input_values if n in public_fields)
+            if isinstance(value_dict, dict) and value_dict.pop('_with_conflict', False):
+                return '#VALUE'
+        finally:
+            # Restore previous handle resource context
+            if prev_res_instance is None:
+                try:
+                    delattr(self, '_handle_resource_instance')
+                except AttributeError:
+                    pass
+            else:
+                self._handle_resource_instance = prev_res_instance
+            if prev_res_type is None:
+                try:
+                    delattr(self, '_handle_resource_type')
+                except AttributeError:
+                    pass
+            else:
+                self._handle_resource_type = prev_res_type
+            self._type_member_keys = prev_member_keys
+        self._mark_keyed_fields_immutable(value_dict, public_fields, handle_def)
+        if handle_def.get('_keyed'):
+            value_dict.setdefault('_fresh_key', True)
+        return value_dict
+
+    def _register_handle_factories(self):
+        """Synthesize Resource.Handle factory functions for each Handle type.
+
+        For a handle ``Files!Open`` whose resource is ``Files``, a factory
+        ``Files.Open`` (member_of = Files) is registered. Calling
+        ``file.open(...)`` then dispatches to this factory which instantiates
+        the handle with the resource receiver prepended.
+        """
+        for type_name, type_def in list(self.types_defined.items()):
+            if not isinstance(type_def, dict):
+                continue
+            constraints = type_def.get('_constraints') or {}
+            if not constraints.get('is_handle'):
+                continue
+            handle_type = type_name  # already lower-cased key (e.g. files!open)
+            # Preserve original case for display? Use type_def original if available
+            canonical = type_name
+            # Derive resource and handle suffix
+            resource = constraints.get('handle_resource')
+            if not resource:
+                if '!' in canonical:
+                    resource = canonical.split('!', 1)[0]
+                else:
+                    continue
+            if '!' in canonical:
+                suffix = canonical.split('!', 1)[1]
+            else:
+                suffix = canonical
+                canonical = f"{resource}!{suffix}"
+            factory_name = f"{resource}.{suffix}"
+            key = factory_name.lower()
+            if key in self.functions or key in getattr(self, 'subprocesses', {}):
+                continue
+            input_defs = type_def.get('_inputs', []) or []
+            # Build function entry for factory
+            entry = {
+                'name': factory_name,
+                'original': factory_name,
+                'code': '',
+                'code_lines': [],
+                'inputs': [d.get('name') for d in input_defs if isinstance(d, dict)],
+                'input_defs': list(input_defs),
+                'outputs': [],
+                'member_of': resource,
+                'hidden': False,
+                'is_handle_factory': True,
+                'handle_type': canonical,
+                'defining_scope': self.current_scope(),
+            }
+            # Track as defined name for redefinition guard
+            if not hasattr(self, '_program_defined_names'):
+                self._program_defined_names = set()
+            self._program_defined_names.add(key)
+            self.functions[key] = entry
 
     def _init_instance_grid(self, value_dict, type_def, line_number):
         """Populate an instance's 'grid' field from the type's grid dims.
@@ -3406,6 +3612,7 @@ class GridLangCompiler(GridLangExecutor):
                 stripped = s.strip()
                 stripped_lower = stripped.lower()
                 end_pattern = rf'^\s*end(\s+type|\s+{re.escape(type_name)})?\s*$'
+                is_handle_def = bool(type_constraints and type_constraints.get('is_handle'))
                 if (_first_keyword(stripped) in ('for','while','when') and stripped_lower.endswith('do')) or (
                     _first_keyword(stripped) == 'if' and stripped_lower.endswith('then')
                 ) or (
@@ -3413,7 +3620,12 @@ class GridLangCompiler(GridLangExecutor):
                 ):
                     type_block_depth += 1
                 if stripped_lower.startswith('end'):
-                    if re.match(end_pattern, s, re.I) and type_block_depth == 0:
+                    is_end_match = bool(re.match(end_pattern, s, re.I))
+                    # For handles relax name check: any End at depth 0 closes the handle
+                    if is_handle_def and not is_end_match and type_block_depth == 0:
+                        if stripped_lower == 'end' or stripped_lower.startswith('end '):
+                            is_end_match = True
+                    if is_end_match and type_block_depth == 0:
                         in_type_def = False
                         type_def = self._parse_type_def(
                             type_def_lines, line_number, type_name)
@@ -3425,7 +3637,20 @@ class GridLangCompiler(GridLangExecutor):
                             type_def['_keyed'] = True
                         if type_inner_requires:
                             type_def['_inner_requires'] = type_inner_requires
-                        self.types_defined[type_name.lower()] = type_def
+                        # Handle types: canonicalize to Resource!Handle form for storage
+                        store_name = type_name
+                        if type_constraints and type_constraints.get('is_handle'):
+                            # Canonicalize: Resource.Name -> Resource!Name
+                            resource_for_handle = ""
+                            if '.' in store_name:
+                                parts = store_name.split('.', 1)
+                                resource_for_handle = parts[0]
+                                store_name = f"{parts[0]}!{parts[1]}"
+                            # Ensure handle_resource is persisted (derived from
+                            # the dot/bang prefix of the define name)
+                            if resource_for_handle and not type_def.get('_constraints', {}).get('handle_resource'):
+                                type_def.setdefault('_constraints', {})['handle_resource'] = resource_for_handle
+                        self.types_defined[store_name.lower()] = type_def
                         continue
                     if type_block_depth > 0:
                         type_block_depth = max(0, type_block_depth - 1)
@@ -3598,7 +3823,7 @@ class GridLangCompiler(GridLangExecutor):
             is_end = stripped == 'end'
 
             # Track entering/exiting type definitions to avoid treating inner lines as globals
-            if stripped.startswith("define ") and (" as type" in stripped or " as keytype" in stripped or " as resource" in stripped):
+            if stripped.startswith("define ") and (" as type" in stripped or " as keytype" in stripped or " as resource" in stripped or " as handle" in stripped):
                 type_depth += 1
             elif stripped.startswith("end") and type_depth > 0:
                 type_depth -= 1

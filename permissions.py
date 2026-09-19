@@ -78,6 +78,10 @@ def format_required_yaml(requirements):
     for entry in requirements:
         lines.append(f"- name: {format_yaml_scalar(entry['name'])}")
         lines.append(f"  resource: {format_yaml_scalar(entry['resource'])}")
+        if entry.get('for_resource') and entry.get('for_handle'):
+            lines.append("  for:")
+            lines.append(f"    resource: {format_yaml_scalar(str(entry['for_resource']).lower())}")
+            lines.append(f"    name: {format_yaml_scalar(entry['for_handle'])}")
         params = entry.get('params_evaluated') or {}
         if params:
             lines.append("  params:")
@@ -137,28 +141,52 @@ def parse_grant_yaml(text, source_name):
                 raise GrantError(
                     f"{source_name}: expected 'key: value' at line '{stripped}'")
             k = key.strip().lower()
+            if k == "for" and not val.strip():
+                current_map = "for"
+                continue
             if k in ("params", "parameters"):
                 current_map = "params"
                 if val.strip():
                     current.setdefault("params", {})
                 continue
-            if k in ("name", "resource", "choices", "denied", "granted"):
+            if k == "for" and not val.strip():
+                current_map = "for"
+                current.setdefault("for", {})
+                continue
+            if k in ("name", "resource", "choices", "denied", "granted",
+                     "for_resource", "for_handle", "for"):
                 current_map = None
-                current[k] = parse_yaml_scalar(val)
+                if k == "for":
+                    current["for_handle"] = parse_yaml_scalar(val)
+                else:
+                    current[k] = parse_yaml_scalar(val)
                 continue
             raise GrantError(
                 f"{source_name}: unknown field '{key.strip()}' in capability "
-                f"entry (allowed fields: name, resource, params, choices, denied)")
+                f"entry (allowed fields: name, resource, params, choices, "
+                f"denied, for_resource, for_handle)")
         elif indent == 4:
-            if current_map != "params":
-                raise GrantError(
-                    f"{source_name}: unexpected indentation at '{stripped}'")
-            key, sep, val = stripped.partition(":")
-            if not sep:
-                raise GrantError(
-                    f"{source_name}: expected 'param: value' at '{stripped}'")
-            params = current.setdefault("params", {})
-            params[key.strip()] = parse_yaml_scalar(val)
+            if current_map in ("for", "params"):
+                key, sep, val = stripped.partition(":")
+                if not sep:
+                    raise GrantError(
+                        f"{source_name}: expected 'field: value' at "
+                        f"'{stripped}'")
+                field = key.strip().lower()
+                if current_map == "for":
+                    if field in ("resource", "name"):
+                        current["for_resource" if field == "resource"
+                                 else "for_handle"] = parse_yaml_scalar(val)
+                    else:
+                        raise GrantError(
+                            f"{source_name}: unexpected field '{field}' under "
+                            f"'for:' (allowed fields: resource, name)")
+                else:
+                    params = current.setdefault("params", {})
+                    params[field] = parse_yaml_scalar(val)
+                continue
+            raise GrantError(
+                f"{source_name}: unexpected indentation at '{stripped}'")
         else:
             raise GrantError(
                 f"{source_name}: unexpected indentation in '{line}'")
@@ -382,6 +410,18 @@ class RequirementResolver:
         if hidden:
             value['_hidden_fields'] = set(hidden)
         value.update(params)
+        # Materialize resource defaults (e.g. `: count as number = 10`) by
+        # running the type's constructor code. This mirrors Type initialization
+        # and ensures handles can read resource fields even when no explicit
+        # `with (count=...)` was supplied.
+        exec_lines = entry['type_def'].get('_executable_code') or []
+        if exec_lines:
+            try:
+                # _execute_type_code expects a var name and input values; resource
+                # capabilities have no inputs, just defaults.
+                self.host._execute_type_code(exec_lines, value.get('_name') or res, value, entry.get('line_number'), {})
+            except Exception:
+                pass
         return value
 
     def merge_and_validate(self, entry, chosen, line_number):
@@ -551,6 +591,15 @@ class RequirementResolver:
                 }
                 self.evaluate_params(synthetic)
                 expanded.append(synthetic)
+                # Auto-grant inner resources materialized from a user resource
+                # only when the inner resource is itself user-defined (they
+                # are implementation details, not host-promptable). Inner
+                # requires of predefined resources stay host-promptable.
+                synth_key = synthetic['var_name'].lower()
+                if (synth_key not in grant_map and
+                        inner_resource_lower not in _RESOURCES):
+                    grant_map[synth_key] = dict(
+                        synthetic.get('params_evaluated') or {})
         # Persist expanded requirements so --list-required sees materialized inner grants
         try:
             self.host.requirements = expanded

@@ -1070,11 +1070,20 @@ class GridLangTypeProcessor:
         builder_member_keys = getattr(
             self.compiler, '_type_member_keys', None)
         is_field = None
+        handle_res = getattr(self.compiler, '_handle_resource_instance', None)
+        handle_res_type = getattr(self.compiler, '_handle_resource_type', None)
+        resource_member_keys = set()
+        if isinstance(handle_res, dict) and isinstance(handle_res_type, str):
+            res_def = self.compiler.types_defined.get(handle_res_type.lower(), {}) or {}
+            resource_member_keys = {str(k).lower() for k in res_def.get('_member_keys', set())}
         if builder_member_keys is not None:
             actual_field = get_case_insensitive_key(
                 value_dict, field_name) or field_name
+            # For handles, also consider resource fields as valid targets.
+            resource_field_match = field_name.lower() in resource_member_keys
             is_field = (
                 field_name.lower() in builder_member_keys
+                or resource_field_match
                 or (actual_field in value_dict
                     and not str(actual_field).startswith('_')))
             if not is_field:
@@ -1127,7 +1136,26 @@ class GridLangTypeProcessor:
                         existing, value):
                     value_dict['_with_conflict'] = True
                     return
-        value_dict[actual_field] = value
+        # If we are constructing a Handle and the target field belongs to the
+        # parent Resource (not the Handle), push to the Resource instance
+        # instead – this allows a Handle constructor to modify Resource fields
+        # like a Builder.
+        target_dict = value_dict
+        handle_res = getattr(self.compiler, '_handle_resource_instance', None)
+        handle_res_type = getattr(self.compiler, '_handle_resource_type', None)
+        if isinstance(handle_res, dict) and isinstance(handle_res_type, str):
+            res_def = self.compiler.types_defined.get(handle_res_type.lower(), {}) or {}
+            res_keys = {str(k).lower() for k in res_def.get('_member_keys', set())}
+            handle_keys = {str(k).lower() for k in builder_member_keys} if builder_member_keys else set()
+            if field_name.lower() in res_keys and field_name.lower() not in handle_keys:
+                # Resource field – redirect push/assign to resource instance.
+                # Resolve case-sensitive key for resource dict.
+                for rk in handle_res.keys():
+                    if str(rk).lower() == field_name.lower() and not str(rk).startswith('_'):
+                        actual_field = rk
+                        break
+                target_dict = handle_res
+        target_dict[actual_field] = value
         if input_values:
             tokens = re.findall(r'\b[\w_]+\b', value_expr)
             input_names = {name.lower() for name in input_values.keys()}
@@ -1147,6 +1175,14 @@ class GridLangTypeProcessor:
                     scope[key] = val
             if 'grid' in value_dict:
                 scope['grid'] = value_dict.get('grid', {})
+        # If we are constructing a Handle, also expose the parent Resource
+        # fields for reading (bare `x` or `p.counter()`). The resource instance
+        # is stashed on the compiler during handle construction.
+        handle_res = getattr(self.compiler, '_handle_resource_instance', None)
+        if isinstance(handle_res, dict):
+            for k, v in handle_res.items():
+                if not str(k).startswith('_') and k not in scope:
+                    scope[k] = v
         return scope
 
     def _execute_builder(self, type_name, builder_name, value_dict, line_number, arg_values):
