@@ -3650,6 +3650,27 @@ class GridLangCompiler(GridLangExecutor):
                             # the dot/bang prefix of the define name)
                             if resource_for_handle and not type_def.get('_constraints', {}).get('handle_resource'):
                                 type_def.setdefault('_constraints', {})['handle_resource'] = resource_for_handle
+                        # Redefinition guard for type/handle declarations —
+                        # mirror of the capability/function guard above. A
+                        # program may not declare a type (or a dotted Handle
+                        # like Resource.Handle) over an engine-owned dotted
+                        # creator (ticker.counter, number.round, ...), over a
+                        # predefined subprocess, or over any name it already
+                        # defined elsewhere. Handles are canonicalized to
+                        # 'Resource!Handle' storage, so derive the dotted
+                        # form too before comparing against the engine sets.
+                        redef_key_t = store_name.lower()
+                        redef_key_dotted = redef_key_t.replace('!', '.')
+                        if (redef_key_t in _DOTTED_ENGINE_CREATORS
+                                or redef_key_t in _PREDEFINED_SUBPROCESSES
+                                or redef_key_dotted in _DOTTED_ENGINE_CREATORS
+                                or redef_key_dotted in _PREDEFINED_SUBPROCESSES
+                                or redef_key_t in self._program_defined_names
+                                or redef_key_dotted in self._program_defined_names):
+                            raise SyntaxError(
+                                f"'{store_name}' is already defined and cannot "
+                                f"be redefined at line {line_number}. ' not allowed'")
+                        self._program_defined_names.add(redef_key_dotted)
                         self.types_defined[store_name.lower()] = type_def
                         continue
                     if type_block_depth > 0:
