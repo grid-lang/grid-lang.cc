@@ -70,7 +70,7 @@ are prompted (`compiler.prompt_missing_inputs`).
 
 1. `main.py` reads the file and constructs one `GridLangCompiler` (a fresh one
    per run).
-2. `compiler.run(code, args)` (`compiler.py:759`) is the interpreter entry
+2. `compiler.run(code, args)` (`compiler.py:776`) is the interpreter entry
    point. `GridLangCompiler` is a **single engine class** — it inherits its
    whole runtime loop from `GridLangExecutor` and executes directly on itself.
    There is **no separate executor object and no method/state copy handoff**:
@@ -122,7 +122,7 @@ no duplication to keep in sync across two live objects anymore.
   `1` is special: `UnitValue._is_one`, `__mul__` treats `1` as unitless, `_divide` `m/1→m` `m/m→1`, `__pow__` allows exponent `1`.
 - `UnitValue` overloads: `+`/`-` same unit or one side unitless; `*` with `1`; `/`/`\`/`mod` with `1`; `^` with `1`.
 
-### `compiler.py` (4789 lines) — state + orchestration, public API
+### `compiler.py` (5050 lines) — state + orchestration, public API
 `class GridLangCompiler` is the engine's **state holder and public surface**. It
 is the only class `main.py` constructs. It inherits the runtime loop from
 `GridLangExecutor` and holds nearly all persistent state created in `__init__`:
@@ -143,24 +143,24 @@ Public API (called from `main.py` / tests): `run`, `call_function`,
 `call_subprocess`, `set_input_values`, `export_to_csv`.
 
 Notable methods:
-- `run` (759): engine entry — `_reset_state()` then delegates to the inherited
+- `run` (776): engine entry — `_reset_state()` then delegates to the inherited
   runtime pipeline (no executor handoff).
 - `current_scope`/`push_scope`/`pop_scope` (310/325/331).
-- `_seed_grid_variable` (3047): predefines `grid` in the global scope as a
+- `_seed_grid_variable` (3254): predefines `grid` in the global scope as a
   `_GridStore` (sparse array keyed by 0-based `(row,col)` tuples; aliased as
   `self.grid`), so `grid{row, col}` works at top level. Skipped inside
   read-only function sub-compilers.
-- UnitSource: `_parse_unit_source_header` (234) / `_finalize_unit_source` (247) / `_register_convert_line` (282) / `_infer_convert_target_unit` (262, evaluates RHS with stripped var, falls back to declared units) / `_materialize_unit_source_constants` (389) / `_register_top_level_converts` (383).
-- `_extract_functions` (792): pulls `Function`/`Subprocess` defs out of the
+- UnitSource: `_parse_unit_source_header` (251) / `_finalize_unit_source` (264) / `_register_convert_line` (299) / `_infer_convert_target_unit` (262, evaluates RHS with stripped var, falls back to declared units) / `_materialize_unit_source_constants` (406) / `_register_top_level_converts` (400).
+- `_extract_functions` (809): pulls `Function`/`Subprocess` defs out of the
   main code and registers them.
-- `_instantiate_type` (1230), `_evaluate_with_value` (1465), `_apply_with_clause`
+- `_instantiate_type` (1264), `_evaluate_with_value` (1672), `_apply_with_clause`
   (1246): type/`with` object construction; now handles `:` field unit conversion.
-- `call_subprocess` (1911): runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (3536), `_process_declarations_and_labels` (3548),
-  `_collect_global_declarations` (3704): top-level statement handling; now handles `of 1` and `"ox" of animal`.
-- `export_to_csv` (4583): `--debug` CSV export (grid as matrix, or outputs as
+- `call_subprocess` (2118): runs a sub-`GridLangCompiler` in isolation.
+- `_process_grid_assignment` (3797), `_process_declarations_and_labels` (3809),
+  `_collect_global_declarations` (3965): top-level statement handling; now handles `of 1` and `"ox" of animal`.
+- `export_to_csv` (4844): `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
-- `set_input_values` (4606): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
+- `set_input_values` (4867): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
 - `_seed_globals` (1670): for sub-compilers; **skips redefining `grid`**.
 
 Also defines `SubprocessResult` (32): result container exposing `grid`,
@@ -296,14 +296,14 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   - Scoping: `is_shadowed` (893), `get_evaluation_scope` (901),
     `get_full_scope` (1305), `_coerce_custom_type_value` (249).
 - `class _GridStore` (37): dict backing `compiler.grid`; every cell write
-  calls `compiler._notify_cell_changed` (compiler.py:2821). (The old
+  calls `compiler._notify_cell_changed` (compiler.py:3028). (The old
   `_ListenerGrid`/`GridLiveView` classes were removed — `_GridStore` is the
   single grid store, keyed by 0-based index tuples.)
 - `_ACTIVE_RUNNERS` (22): stack of executing compilers; used with the
   `_outer_scope_read_only` flag to reject writes from read-only function
   sub-compilers to outer scopes.
 
-### `type_processor.py` (1340 lines) — `Define X as Type` handling
+### `type_processor.py` (1376 lines) — `Define X as Type` handling
 `class GridLangTypeProcessor`:
 - Type-def parsing: `_parse_type_def` (82), `_parse_type_def_line` (90),
   `_extract_type_field_line` (9696, `_parse_type_field_constraints` (194),
@@ -313,7 +313,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   `_execute_type_block` (25252, `_process_grid_assignment` (529),
   `_process_type_for_loop` (38389, `_process_type_let_statement` (784),
   `_process_type_assignment` (58581.
-- `_build_type_eval_scope` (70708, `_execute_builder` (1152).
+- `_build_type_eval_scope` (70708, `_execute_builder` (1188).
 
 ### `parser.py` (648 lines) — variable-definition parsing
 `class GridLangParser`:
@@ -342,7 +342,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
 - `format_display_value` (26265: display formatting with float-trimming and
   list/dict-form array support.
 
-### `test_runner.py` (1343 lines) — inline test suite
+### `test_runner.py` (1334 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — runs 372 tests (Tests 282–293 unit tests, Tests 331–349 push/cell-mirror/subprocess semantics). At the bottom of the file (~840) it runs itself when executed directly:
 `python test_runner.py [names...]`. Failing names are printed.
 
@@ -427,6 +427,26 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
 - **Units**: `5 of m`, `"ox" of animal`, `2 of 1` → `UnitValue(value, unit)` via `gridlang_of_unit`; `of 1` is dimensionless. `Define B as UnitSource(Meat)` / `Convert "ox" of animal to "beef"` (constant) or `Convert x as number of cm to x/100` (formula, LHS var stripped). `Convert` target for top-level is inferred by evaluating RHS with stripped var (`compiler.py:273`). `:` fields (`: f of m`) convert on `with` (`compiler.py:1228`). `Push`/`Input` preserve `of` unit. `1` handling: `m*1→m`, `1*1→1`, `m/1→m`, `m/m→1` (`units.py`).
 - **Types**: `Define T as Type ... End T`, `new T with (field = v, ...)`.
   Types carry computed fields and constraints.
+- **Resources / Require**: capabilities are **grants** — `Require name as
+  Ticker` grants a *handle* (Timer/Counter) or the ticker clock itself; the
+  grant is resolved by `permissions.RequirementResolver` (executor.py:4811)
+  and binds `grant_map`/`bindings` in scope. Resources are **declarations
+  only**: `register_resource` (builtin_functions.py:115) seeds the returned
+  metadata into `RESOURCES`; `_seed_predefined_resources` (compiler.py:3273)
+  copies it into `self.types_defined` once per engine, **surviving per-run
+  resets** (`_reset_state`) like type definitions. Handle types (`Timer`,
+  `Counter`) are declared with `register_handle` (builtin_functions.py:176),
+  never grantable — a handle is only produced by calling a resource member
+  (`Ticker.Timer(tick, n)`), and its state is advanced entirely engine-side
+  (`_advance_handles`, executor.py).
+  - **Engine-owned dotted creators are frozen**: names like `ticker.timer`,
+    `ticker.counter`, `number.round` (dots over the pre-seeded `ticker`
+    resource) and the predefined subprocesses `ticker.stop`/`ticker.start`
+    live in `_DOTTED_ENGINE_CREATORS` / `_PREDEFINED_SUBPROCESSES`
+    (compiler.py:79/89, derived from `BUILTINS`) and **cannot be redefined
+    by a program**. `Define ticker.counter as Handle` is rejected at parse
+    (compiler.py:3595-3620) *before* any truncation to the bare resource
+    prefix, so `ticker` itself is never clobbered.
 - **Dependency extraction**: `_DEPENDENCY_IGNORED_TOKENS` / `_strip_constraint_operands`
   live in `grid_lang_common.py` and are re-exported by both layers — single
   source of truth. `_strip_constraint_operands` strips `of`/`as`/`dim`/`not null`/`of 1`/`"ox" of animal`
