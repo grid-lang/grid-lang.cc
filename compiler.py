@@ -3393,6 +3393,11 @@ class GridLangCompiler(GridLangExecutor):
 
     def _reset_state(self):
         self.grid.clear()
+        # Reset the set of program-defined names for this run. Early redefinition
+        # guards (dotted handle/type creators) populate this during preprocessing;
+        # seeding it fresh here keeps names from leaking between runs when a single
+        # compiler instance is reused (as the test runner does).
+        self._program_defined_names = set()
         # This method runs on the executor object (self.compiler is the owning
         # compiler); listener/mechanism state must be reset on the compiler
         # because notification hooks are reached through compiler references.
