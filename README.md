@@ -161,7 +161,7 @@ Create a file named `example.grid` in the `grid-lang.cc` directory:
 ```
 [A1] := 42
 [B2] := "Hello"
-Return [A1]
+Print [A1]
 ```
 
 Then run:
@@ -173,7 +173,7 @@ grid example.grid
 ### Expected Output
 
 ```
-output: 42
+42
 ```
 
 ## Project Structure

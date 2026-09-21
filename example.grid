@@ -1,3 +1,3 @@
 [A1] := 42
 [B2] := "Hello"
-Return [A1]
+Print [A1]

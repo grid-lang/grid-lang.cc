@@ -9,7 +9,7 @@ push high = rows(haystack)
 When low <= high do
   let element = haystack(mid)
   if needle = element then
-    return mid
+    Print mid
   elseif needle < element then
     push low
     push high = mid - 1
@@ -19,4 +19,4 @@ When low <= high do
   end
 end
 
-return $"Finished looking for {needle} in {haystack}."
+Print $"Finished looking for {needle} in {haystack}."

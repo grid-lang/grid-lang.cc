@@ -15,7 +15,7 @@ The **Grid** programming language was created to handle tabular data and complex
 Create a file called _helloworld.grid_ with the contents:
 
 ```vb
-Return "Hello, World!"
+Print "Hello, World!"
 ```
 
 The text is sent to the default output (the console).
@@ -28,7 +28,7 @@ Hello, World!
 You can try to output other things, for example a calculation:
 
 ```vb
-Return (12 ^ 2) / 20
+Print (12 ^ 2) / 20
 ```
 
 The result is 7.2.
@@ -39,7 +39,7 @@ Edit _helloworld.grid_ to add an input:
 
 ```vb
 Input name
-Return $"Hello, {name}!"
+Print $"Hello, {name}!"
 ```
 
 The name is read from the command parameters. If it is missing in the command parameters, it is read from the default input (keyboard entry).
@@ -55,7 +55,7 @@ There can be multiple inputs, for example:
 
 ```vb
 Input a, b
-Return (a ^ 2) / b
+Print (a ^ 2) / b
 ```
 
 ## Type Constraints
@@ -68,7 +68,7 @@ Edit _helloworld.grid_ to add a type constraint for the input:
 
 ```vb
 Input name as text
-Return $"Hello, {name}!"
+Print $"Hello, {name}!"
 ```
 
 Note that **Grid** is case-insensitive.
@@ -87,7 +87,7 @@ That can be changed by providing a default value for the input. Edit _helloworld
 
 ```vb
 Input name as text or = "World"
-Return $"Hello, {name}!"
+Print $"Hello, {name}!"
 ```
 
 Now the name has a default value you can select by pressing Enter.
@@ -162,7 +162,7 @@ Edit _scratch.grid_ to add a calculation of the average order amount:
 [D6] := 49017
 [E2] := "Avg Order"
 [E3:E6] := @ [D] / [C]
-Return [E3]
+Print [E3]
 ```
 
 Two adresses separated with a colon `:` describe a _range_, and `@` before the formula means that the calculation should only use values from current row. It is the _implicit intersection_ operator.
@@ -183,7 +183,7 @@ Edit _scratch.grid_ as follows:
 [A5] := {"Janet", "North", 286, 87858}
 [A6] := {"Martha", "East", 228, 49017}
 [E3:E6] := @ [D] / [C]
-Return [E3]
+Print [E3]
 ```
 
 A list of values inside braces `{}` forms an _array_. If the values are separated with a comma `,` it is a one-dimensional array.
@@ -201,7 +201,7 @@ Edit _scratch.grid_ to use a two-dimensional array:
   "Janet", "North", 286, 87858; _
   "Martha", "East", 228, 49017}
 [E3:E6] := @ [D] / [C]
-Return [E3]
+Print [E3]
 ```
 
 The output should stay the same as before.
@@ -223,7 +223,7 @@ End CookieSales
 Here is a sample use of that custom type:
 
 ```vb
-Return new CookieSales with (SalesRep = "Frank", Region = "West", Orders = 268, Total = 72707)
+Print new CookieSales with (SalesRep = "Frank", Region = "West", Orders = 268, Total = 72707)
 ```
 
 There is a shorter version of the object creation code which we use below. Continue editing _scratch.grid_:
@@ -237,7 +237,7 @@ There is a shorter version of the object creation code which we use below. Conti
   new CookieSales with {"Janet", "North", 286, 87858}, _
   new CookieSales with {"Martha", "East", 228, 49017}, _
 }
-Return [E3]
+Print [E3]
 ```
 
 The hat `^` before an address indicates the start of a range.
@@ -292,7 +292,7 @@ Create a new file called _variables.grid_ with the contents:
 : result = $"The result is {n - value}"
 For n init 5
 Let value = 2
-Return result
+Print result
 ```
 
 That defines three named variables, _result_, _n_ and _value_ using three different ways.
@@ -310,7 +310,7 @@ Edit _variables.grid_ to update _n_ with a new value:
 For n init 5
 Let value = 2
 Push n = n * 2.2
-Return result
+Print result
 ```
 
 The **push** instruction is used to update a variable and all the variables that depend on it.
@@ -326,12 +326,12 @@ Try to output the result before **push**:
 : result = $"The result is {n - value}"
 For n init 5
 Let value = 2
-Return result
+Print result
 Push n = n * 2.2
-Return result
+Print result
 ```
 
-When **return** is used multiple times it gives multiple outputs.
+The output changes.
 
 ```bash
 > grid variables.grid

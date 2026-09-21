@@ -13,7 +13,6 @@ HEADER_IF = re.compile(r'^\s*if\b(.+?)\bthen\s*$', re.I)
 HEADER_ELSEIF = re.compile(r'^\s*elseif\b(.+?)\bthen\s*$', re.I)
 HEADER_ELSE = re.compile(r'^\s*else\s*$', re.I)
 HEADER_FOR = re.compile(r'^\s*for\b(.+?)\bdo\s*$', re.I)
-HEADER_WHILE = re.compile(r'^\s*while\b(.+?)\bdo\s*$', re.I)
 HEADER_WHEN = re.compile(r'^\s*when\b(.+?)\bdo\s*$', re.I)
 TOKEN_END = re.compile(r'^\s*end\s*$', re.I)
 
@@ -35,7 +34,6 @@ class GridLangControlFlow:
         self._header_elseif = HEADER_ELSEIF
         self._header_else = HEADER_ELSE
         self._header_for = HEADER_FOR
-        self._header_while = HEADER_WHILE
         self._header_when = HEADER_WHEN
         self._token_end = TOKEN_END
 
@@ -95,6 +93,16 @@ class GridLangControlFlow:
 
     def _match_return_statement(self, text):
         return re.match(r'^\s*return\s+(.+)$', text, re.I)
+
+    def _match_print_statement(self, text):
+        return re.match(r'^\s*print\s+(.+)$', text, re.I)
+
+    def _handle_print_statement(self, value_expr, line_number):
+        """Print <expr> — ambient console output inside block bodies. Uses the
+        same console channel as Return so both produce output_values['output'];
+        the difference is that Print is legal anywhere while Return is the
+        call-value channel restricted to functions and operations."""
+        self._handle_return_statement(value_expr, line_number)
 
     def _handle_return_statement(self, value_expr, line_number):
         resolver_targets = [self.compiler]
@@ -255,7 +263,6 @@ class GridLangControlFlow:
 
             is_block_if = bool(self._header_if.match(stripped))
             is_block_for = bool(self._header_for.match(stripped))
-            is_block_while = bool(self._header_while.match(stripped))
             is_block_when = bool(self._header_when.match(stripped))
             is_end = bool(self._token_end.match(stripped))
 
@@ -271,7 +278,7 @@ class GridLangControlFlow:
                     })
                 continue
 
-            if is_block_if or is_block_for or is_block_while or is_block_when:
+            if is_block_if or is_block_for or is_block_when:
                 depth += 1
                 continue
 
@@ -292,7 +299,6 @@ class GridLangControlFlow:
 
             is_block_if = bool(self._header_if.match(stripped))
             is_block_for = bool(self._header_for.match(stripped))
-            is_block_while = bool(self._header_while.match(stripped))
             is_block_when = bool(self._header_when.match(stripped))
             is_end = bool(self._token_end.match(stripped))
 
@@ -303,7 +309,7 @@ class GridLangControlFlow:
                 for_entries.append(
                     {'line_number': line_number, 'line': stripped})
 
-            if is_block_if or is_block_for or is_block_while or is_block_when:
+            if is_block_if or is_block_for or is_block_when:
                 depth += 1
             if is_end and depth > 0:
                 depth -= 1
@@ -322,7 +328,6 @@ class GridLangControlFlow:
                 continue
             if (self._header_if.match(line_clean) or
                     self._header_for.match(line_clean) or
-                    self._header_while.match(line_clean) or
                     self._header_when.match(line_clean)):
                 depth += 1
             elif self._token_end.match(line_clean):
@@ -868,6 +873,11 @@ class GridLangControlFlow:
             target, value_expr = self._unpack_push_assignment(push_match)
             self.compiler._handle_push_assignment(
                 target, value_expr, line_number)
+            return True, i + 1, False
+        if self._match_print_statement(line):
+            print_match = self._match_print_statement(line)
+            self._handle_print_statement(
+                print_match.group(1).strip(), line_number)
             return True, i + 1, False
         if self._match_return_statement(line):
             return_match = self._match_return_statement(line)
@@ -1835,12 +1845,6 @@ class GridLangControlFlow:
             # FOR
             if self._header_for.match(line_clean):
                 stack.append({'type': 'for', 'start_i': i,
-                             'start_line': line_number})
-                continue
-
-            # WHILE
-            if self._header_while.match(line_clean):
-                stack.append({'type': 'while', 'start_i': i,
                              'start_line': line_number})
                 continue
 

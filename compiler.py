@@ -249,13 +249,14 @@ class GridLangCompiler(GridLangExecutor):
         return type_name, parent, constraints
 
     def _parse_unit_source_header(self, line, line_number=None):
-        """Parse a ``Define X as UnitSource(TargetUnit)`` header.
+        """Parse a ``Define X as UnitSource of Target`` header.
 
         Returns ``(name, target_unit)`` or ``(None, None)`` when the line is
         not a UnitSource definition.
         """
         m = re.match(
-            r'^\s*define\s+([\w_]+)\s+as\s+unitsource\s*\(\s*(\w+)\s*\)\s*$',
+            r'^\s*define\s+([\w_]+)\s+as\s+unitsource'
+            r'(?:\s+of\s+(\w+))\s*$',
             line, re.I)
         if not m:
             return None, None
@@ -852,7 +853,7 @@ class GridLangCompiler(GridLangExecutor):
                     body_line, body_ln = lines[i]
                     stripped = body_line.strip().lower()
                     # Track nested control blocks so generic END inside the body doesn't terminate the function
-                    if stripped.startswith(('for ', 'while ', 'when ', 'if ')):
+                    if stripped.startswith(('for ', 'when ', 'if ')):
                         block_depth += 1
                     if stripped.startswith('end'):
                         # Named end takes precedence
@@ -1093,6 +1094,9 @@ class GridLangCompiler(GridLangExecutor):
         defining_scope = func_def.get('defining_scope')
         sub_compiler._parent_scope = defining_scope if defining_scope is not None else self.current_scope()
         sub_compiler._outer_scope_read_only = True
+        # Function/operation bodies may use Return (the call-value channel);
+        # the strict top-level Return check is skipped for these runners.
+        sub_compiler._is_operation_runner = True
         # Only compiler-level dimension metadata is copied.
         try:
             if getattr(self, 'scopes', None):
@@ -2138,9 +2142,11 @@ class GridLangCompiler(GridLangExecutor):
         # caller variables and writes (push/assignments) flow through. Only
         # compiler-level dimension metadata is copied.
         sub_compiler._parent_scope = self.current_scope()
+        # Function/operation bodies may use Return (the call-value channel);
+        # the strict top-level Return check is skipped for these runners.
+        sub_compiler._is_operation_runner = True
         try:
             if getattr(self, 'scopes', None):
-                import copy
                 sub_compiler._seed_globals = {
                     'dimensions': copy.deepcopy(getattr(self, 'dimensions', {})),
                     'dim_names': copy.deepcopy(getattr(self, 'dim_names', {})),
@@ -3649,7 +3655,7 @@ class GridLangCompiler(GridLangExecutor):
                 stripped_lower = stripped.lower()
                 end_pattern = rf'^\s*end(\s+type|\s+{re.escape(type_name)})?\s*$'
                 is_handle_def = bool(type_constraints and type_constraints.get('is_handle'))
-                if (_first_keyword(stripped) in ('for','while','when') and stripped_lower.endswith('do')) or (
+                if (_first_keyword(stripped) in ('for','when') and stripped_lower.endswith('do')) or (
                     _first_keyword(stripped) == 'if' and stripped_lower.endswith('then')
                 ) or (
                     re.match(r'^\s*let\b', stripped, re.I) and stripped_lower.endswith('then')
@@ -3853,7 +3859,6 @@ class GridLangCompiler(GridLangExecutor):
             is_block_start = (
                 (stripped.startswith('if ') and stripped.endswith('then')) or
                 (stripped.startswith('for ') and stripped.endswith('do')) or
-                (stripped.startswith('while ') and stripped.endswith('do')) or
                 (stripped.startswith('when ') and stripped.endswith('do'))
             )
             is_end = stripped == 'end'

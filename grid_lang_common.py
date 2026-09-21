@@ -16,7 +16,7 @@ import re
 # ---------------------------------------------------------------------------
 # Statement dispatch — replaces re.match(r'^\s*(input|define|…)\b')
 # ---------------------------------------------------------------------------
-_STATEMENT_KEYWORDS = frozenset(['input','define','output','let','if','for','when','return','push','while','require'])
+_STATEMENT_KEYWORDS = frozenset(['input','define','output','let','if','for','when','return','push','require','print'])
 
 def _first_keyword(line):
     s = line.lstrip()
@@ -33,7 +33,7 @@ _STRING_LITERAL_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 _DEPENDENCY_IGNORED_TOKENS = frozenset({
     'sum', 'rows', 'sqrt', 'min', 'max', 'abs', 'int', 'float', 'str', 'len',
     'textsplit', 'print', 'push', 'true', 'false', 'none', 'nan', 'inf', 'and', 'or', 'not',
-    'if', 'then', 'else', 'elseif', 'end', 'do', 'for', 'while', 'when', 'step', 'return',
+    'if', 'then', 'else', 'elseif', 'end', 'do', 'for', 'when', 'step', 'return',
     'index', 'as', 'dim', 'with', 'grid', 'output', 'input', 'number', 'text',
     'array', 'mod', 'div', 'to', 'by', 'e', 'new', 'in', 'counta', 'rows', 'of', 'null'
 })

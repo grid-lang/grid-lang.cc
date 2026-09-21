@@ -866,10 +866,10 @@ class GridLangExecutor(GridLangBase):
             }
         }
 
-    def _analyze_while_dependencies(self, normalized, original_line, line_number):
-        """Create a dependency node for a WHILE loop header."""
+    def _analyze_when_dependencies(self, normalized, original_line, line_number):
+        """Create a dependency node for a WHEN block header."""
         header_expr = re.split(
-            r'\bdo\b', normalized[5:].strip(), maxsplit=1, flags=re.I)[0].strip()
+            r'\bdo\b', normalized[4:].strip(), maxsplit=1, flags=re.I)[0].strip()
         dependencies = self._extract_dependencies_from_expression(header_expr)
         return {
             'kind': 'loop',
@@ -879,7 +879,7 @@ class GridLangExecutor(GridLangBase):
             'depends_on': list(dependencies),
             'data': {
                 'header': normalized,
-                'loop_type': 'while'
+                'loop_type': 'when'
             }
         }
 
@@ -916,7 +916,6 @@ class GridLangExecutor(GridLangBase):
             is_block_start = (
                 (lowered_clean.startswith('if ') and lowered_clean.endswith('then')) or
                 (lowered_clean.startswith('for ') and lowered_clean.endswith('do')) or
-                (lowered_clean.startswith('while ') and lowered_clean.endswith('do')) or
                 (lowered_clean.startswith('when ') and lowered_clean.endswith('do'))
             )
             is_end = lowered_clean == 'end'
@@ -970,7 +969,7 @@ class GridLangExecutor(GridLangBase):
             if lowered.startswith('dim '):
                 depth = max(0, depth + depth_change)
                 continue
-            if lowered.startswith('push ') or lowered.startswith('push(') or lowered.startswith('return '):
+            if lowered.startswith('push ') or lowered.startswith('return ') or lowered.startswith('print '):
                 depth = max(0, depth + depth_change)
                 continue
             # Skip declarations that appear inside a block; they are handled at runtime.
@@ -984,15 +983,8 @@ class GridLangExecutor(GridLangBase):
                     self._register_dependency_node(node)
                 depth = max(0, depth + depth_change)
                 continue
-            if lowered.startswith('while ') and ' do' in lowered:
-                node = self._analyze_while_dependencies(
-                    normalized, raw_line, line_number)
-                if node:
-                    self._register_dependency_node(node)
-                depth = max(0, depth + depth_change)
-                continue
             if lowered.startswith('when ') and ' do' in lowered:
-                node = self._analyze_while_dependencies(
+                node = self._analyze_when_dependencies(
                     normalized, raw_line, line_number)
                 if node:
                     node['data']['loop_type'] = 'when'
@@ -1342,6 +1334,10 @@ class GridLangExecutor(GridLangBase):
         stripped = line.strip()
         stripped_lower = stripped.lower()
 
+        if _first_keyword(stripped) == 'while':
+            raise SyntaxError(
+                f"'While' is not part of the language at line {line_number}; use 'When <condition> do ... End' instead")
+
         if line_number in self.executed_global_for_lines:
             return {'action': 'continue', 'next_i': i + 1}
         if not stripped:
@@ -1360,7 +1356,7 @@ class GridLangExecutor(GridLangBase):
 
         node = self.dependency_graph['by_line'].get(line_number)
         if node and self.needed_line_numbers and line_number not in self.needed_line_numbers:
-            if not stripped_lower.startswith(('let ', 'for ', 'if ', 'elseif', 'else', 'while ', 'when ')):
+            if not stripped_lower.startswith(('let ', 'for ', 'if ', 'elseif', 'else', 'when ')):
                 return {'action': 'continue', 'next_i': i + 1}
 
         return {
@@ -1380,6 +1376,9 @@ class GridLangExecutor(GridLangBase):
                 return True, i + 1
         elif stripped_lower.startswith("return "):
             self._handle_return_statement(stripped, line_number)
+            return True, i + 1
+        elif stripped_lower == "print" or stripped_lower.startswith("print "):
+            self._handle_print_statement(stripped, line_number)
             return True, i + 1
         elif stripped_lower.startswith("push "):
             self._handle_push_assignment_line(stripped, line_number)
@@ -2198,10 +2197,6 @@ class GridLangExecutor(GridLangBase):
                         if depth == 0:
                             break
                     elif clean.startswith('for ') and ' do' in clean:
-                        depth += 1
-                    elif clean.startswith('while ') and ' do' in clean:
-                        depth += 1
-                    elif clean.startswith('when ') and ' do' in clean:
                         depth += 1
                     elif clean.startswith('when ') and ' do' in clean:
                         depth += 1
@@ -4412,8 +4407,6 @@ class GridLangExecutor(GridLangBase):
                     break
             elif clean.startswith('for ') and ' do' in clean:
                 depth += 1
-            elif clean.startswith('while ') and ' do' in clean:
-                depth += 1
             elif clean.startswith('when ') and ' do' in clean:
                 depth += 1
             elif clean.startswith('if ') and clean.endswith('then'):
@@ -4559,6 +4552,23 @@ class GridLangExecutor(GridLangBase):
             raise SyntaxError(
                 f"Invalid RETURN syntax at line {line_number}")
         value_expr = m_return.group(1).strip()
+        self._append_console_output(value_expr, line_number)
+
+    def _handle_print_statement(self, stripped, line_number):
+        """Print <expr> — ambient console output (the module-level and
+        top-level output statement). Pushes the evaluated value to the
+        console channel."""
+        m_print = re.match(r'^\s*print(?:\s+(.+))?\s*$', stripped, re.I)
+        value_expr = (m_print.group(1) or '').strip() if m_print else ''
+        if not value_expr:
+            raise SyntaxError(
+                f"Invalid PRINT syntax at line {line_number}. Use 'Print <expression>'")
+        self._append_console_output(value_expr, line_number)
+
+    def _append_console_output(self, value_expr, line_number):
+        """Evaluate an expression and append it to the console output channel
+        (output_values['output']). Shared by Return (top level, transitional)
+        and Print (the ambient console statement)."""
         try:
             resolver = getattr(self, 'compiler', None) or self
             pending = getattr(
@@ -4718,6 +4728,21 @@ class GridLangExecutor(GridLangBase):
                 f"Unsupported push syntax in For loop at line {line_number}. Use 'Push var = value' syntax instead.")
         self.pop_scope()
 
+    def _validate_no_top_level_return(self, lines):
+        """Load-time check: ``Return`` is the call-value channel and is only
+        valid inside functions and operations (named subprocesses). Any Return
+        surviving in the top-level program stream is the legacy console-output
+        pattern; reject it as a load error pointing at ``Print`` (the ambient
+        console statement)."""
+        for raw_line, line_number in lines:
+            stripped = raw_line.strip()
+            if re.match(r'return\b', stripped, re.I):
+                raise SyntaxError(
+                    f"Top-level RETURN is not allowed at line {line_number}: "
+                    f"Return may only be used "
+                    f"inside functions and operations. Use "
+                    f"'Print <expression>' for console output.")
+
     def _run_setup(self, code, args):
         self._reset_state()
         self._global_guards_pre_evaluated = False
@@ -4739,6 +4764,10 @@ class GridLangExecutor(GridLangBase):
             self.subprocesses = getattr(self, 'subprocesses', {}) or {}
             self.compiler.functions = self.functions
             self.compiler.subprocesses = self.subprocesses
+        # Return is only legal inside function/operation bodies, which are
+        # extracted above; whatever remains is the top-level program stream.
+        if not getattr(self, '_is_operation_runner', False):
+            self._validate_no_top_level_return(lines)
         self.for_guard_conditions = {}
         normalized_lines = []
         for raw_line, line_number in lines:
@@ -5259,7 +5288,11 @@ class GridLangExecutor(GridLangBase):
                 if condition_result:
                     # Print all collected values for this output variable
                     for value in output_values[output_var]:
-                        print(f"{output_var}: {format_display_value(value)}")
+                        display = format_display_value(value)
+                        if output_var == 'output':
+                            print(display)
+                        else:
+                            print(f"{output_var}: {display}")
         except Exception as e:
             import traceback
             traceback.print_exc()
