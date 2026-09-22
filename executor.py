@@ -634,7 +634,11 @@ class GridLangExecutor(GridLangBase):
         self.control_flow._process_block(entry['block_lines'])
         parent_scope = loop_scope.parent
         if parent_scope:
+            loop_local_lets = getattr(
+                loop_scope, 'local_let_declarations', set())
             for name, val in loop_scope.variables.items():
+                if name.lower() in loop_local_lets:
+                    continue
                 try:
                     parent_scope.update(name, val)
                 except Exception:
@@ -889,6 +893,7 @@ class GridLangExecutor(GridLangBase):
         depends_on = sorted({dep for dep in node.get('depends_on', []) if dep})
         node['defines'] = defines
         node['depends_on'] = depends_on
+        node['depth'] = node.get('depth', 0)
         self.dependency_graph['nodes'].append(node)
         self.dependency_graph['by_line'][node['line']] = node
         for defined in defines:
@@ -936,6 +941,7 @@ class GridLangExecutor(GridLangBase):
                     'depends_on': list(deps),
                     'data': {'condition': condition}
                 }
+                node['depth'] = current_depth
                 self._register_dependency_node(node)
                 depth = max(0, depth + depth_change)
                 continue
@@ -980,6 +986,7 @@ class GridLangExecutor(GridLangBase):
                 node = self._analyze_loop_dependencies(
                     normalized, raw_line, line_number)
                 if node:
+                    node['depth'] = current_depth
                     self._register_dependency_node(node)
                 depth = max(0, depth + depth_change)
                 continue
@@ -988,6 +995,7 @@ class GridLangExecutor(GridLangBase):
                     normalized, raw_line, line_number)
                 if node:
                     node['data']['loop_type'] = 'when'
+                    node['depth'] = current_depth
                     self._register_dependency_node(node)
                 depth = max(0, depth + depth_change)
                 continue
@@ -997,8 +1005,10 @@ class GridLangExecutor(GridLangBase):
                 if isinstance(assignment_node, list):
                     for node in assignment_node:
                         if node:
+                            node['depth'] = current_depth
                             self._register_dependency_node(node)
                 else:
+                    assignment_node['depth'] = current_depth
                     self._register_dependency_node(assignment_node)
             depth = max(0, depth + depth_change)
         for info in self.dependency_graph['by_variable'].values():
@@ -3694,7 +3704,11 @@ class GridLangExecutor(GridLangBase):
             self.control_flow._process_block(for_block_lines)
             parent_scope = loop_scope.parent
             if parent_scope:
+                loop_local_lets = getattr(
+                    loop_scope, 'local_let_declarations', set())
                 for name, val in loop_scope.variables.items():
+                    if name.lower() in loop_local_lets:
+                        continue
                     try:
                         parent_scope.update(name, val)
                     except Exception:
@@ -3937,7 +3951,11 @@ class GridLangExecutor(GridLangBase):
                 self.control_flow._process_block(for_block_lines)
                 parent_scope = loop_scope.parent
                 if parent_scope:
+                    loop_local_lets = getattr(
+                        loop_scope, 'local_let_declarations', set())
                     for name, value in loop_scope.variables.items():
+                        if name.lower() in loop_local_lets:
+                            continue
                         try:
                             parent_scope.update(
                                 name, value)
@@ -5454,6 +5472,11 @@ class GridLangExecutor(GridLangBase):
                     continue
                 current_scope = self.current_scope()
                 if current_scope.get_defining_scope(var_name):
+                    continue
+                if node.get('depth', 0) > 0:
+                    # Nodes inside a block body are executed conditionally by
+                    # the block machinery at runtime; materializing them here
+                    # would ignore If/When gates (e.g. a LET under a false If).
                     continue
                 data = node.get('data') or {}
                 expr = data.get('expression')

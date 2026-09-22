@@ -98,6 +98,9 @@ class Scope:
         self.output_variables = set()  # Variables that can only push values
         self.pipe_connections = {}  # Maps outputs to connected inputs
         self.implicit_let = set()
+        # Variables declared via LET in this scope that were not found in an
+        # outer scope: block-local by design (see _execute_block_with_scope_transfer).
+        self.local_let_declarations = set()
         # Runtime unit of each variable's current value (lowercase keys).
         # Values are stored stripped of the unit wrapper; reads re-wrap.
         self.value_units = {}

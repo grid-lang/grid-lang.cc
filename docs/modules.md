@@ -151,9 +151,12 @@ There are three output channels.
   operations.
 - A top-level `Return` outside a function/operation is a **load error**
   pointing at `Print`. *Implemented: `_run_setup` rejects any `Return` left in
-  the top-level program stream (whole-line forms and single-line
-  `For … do return` / `If … then return` block heads, quote-aware) unless the
-  runner is a function/operation body.*
+  the top-level program stream (`executor._validate_no_top_level_return`).
+  Inline block statements carrying a single-instruction payload (`For … do
+  return …`, `If … then return … [else …]`, `When … do return …`) are first
+  rewritten into real block form by `_normalize_inline_blocks` (compiler.py),
+  so their generated `Return` line is caught by the same whole-line check and
+  the inline spelling behaves exactly like the multi-line one.*
 
 ## 9. Instances
 

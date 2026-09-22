@@ -575,7 +575,12 @@ class GridLangControlFlow:
                         loop_body)
                     parent_scope = self.compiler.current_scope().parent
                     if parent_scope:
+                        loop_local_lets = getattr(
+                            self.compiler.current_scope(),
+                            'local_let_declarations', set())
                         for name, value in self.compiler.current_scope().variables.items():
+                            if name.lower() in loop_local_lets:
+                                continue
                             try:
                                 parent_scope.update(name, value)
                             except Exception:
@@ -606,7 +611,12 @@ class GridLangControlFlow:
                             loop_body, self.compiler.current_scope())
                         parent_scope = self.compiler.current_scope().parent
                         if parent_scope:
+                            loop_local_lets = getattr(
+                                self.compiler.current_scope(),
+                                'local_let_declarations', set())
                             for name, value in self.compiler.current_scope().variables.items():
+                                if name.lower() in loop_local_lets:
+                                    continue
                                 try:
                                     parent_scope.update(name, value)
                                 except Exception:
@@ -687,7 +697,11 @@ class GridLangControlFlow:
                 self._process_block(loop_body)
                 parent_scope = loop_scope.parent
                 if parent_scope:
+                    loop_local_lets = getattr(
+                        loop_scope, 'local_let_declarations', set())
                     for name, value in loop_scope.variables.items():
+                        if name.lower() in loop_local_lets:
+                            continue
                         try:
                             parent_scope.update(name, value)
                         except Exception:
@@ -992,6 +1006,13 @@ class GridLangControlFlow:
             self.compiler.mark_dependency_missing(dep)
         self.compiler.pending_assignments[f"__if_line_{line_number}"] = (
             line, line_number, deps)
+        # Prefer the index-based skip when the block is degenerate (generated
+        # lines share the source line number) so the returned count cannot
+        # collapse to zero or one and re-execute body lines prematurely.
+        if self.if_blocks:
+            for block in self.if_blocks:
+                if block['start_line'] == line_number:
+                    return max(block['end_i'] - block['start_i'] + 1, 1)
         end_line = self.block_map.get(line_number, line_number)
         return max(end_line - line_number + 1, 1)
 
@@ -1135,7 +1156,13 @@ class GridLangControlFlow:
         block_scope = self.compiler.current_scope()
         self.compiler.pop_scope()
         parent_scope = self.compiler.current_scope()
+        local_lets = getattr(
+            block_scope, 'local_let_declarations', set())
         for var_name, var_value in block_scope.variables.items():
+            if var_name.lower() in local_lets:
+                # LET-declared variables are block-local: they must not leak
+                # into the enclosing scope (unlike For and ":" declarations).
+                continue
             parent_scope.variables[var_name] = var_value
             if var_name in parent_scope.uninitialized:
                 parent_scope.uninitialized.remove(var_name)
@@ -1244,6 +1271,9 @@ class GridLangControlFlow:
                         f"Warning: LET defines '{var}' which shadows a variable in an outer scope at line {line_number}")
                 self.compiler.current_scope().define(
                     var, None, type_name, constraints, is_uninitialized=True)
+                if self.compiler.current_scope() is not self.compiler.get_global_scope():
+                    self.compiler.current_scope().local_let_declarations.add(
+                        var.lower())
 
             if expr is not None:
                 try:
@@ -1883,6 +1913,8 @@ class GridLangControlFlow:
                     self.if_blocks.append({
                         'start_line': start_line,
                         'end_line': line_number,
+                        'start_i': block['start_i'],
+                        'end_i': i,
                         'clauses': clause_spans
                     })
                 else:
@@ -2003,7 +2035,7 @@ class GridLangControlFlow:
                 self.compiler.mark_dependency_missing(dep)
             self.compiler.pending_assignments[f"__if_line_{line_number}"] = (
                 line, line_number, deps)
-            return if_block['end_line'] - line_number
+            return if_block['end_i'] - if_block['start_i']
 
         # Evaluate the condition. Missing variables simply yield False.
         try:
@@ -2016,11 +2048,8 @@ class GridLangControlFlow:
         # preprocessed lines so nested IF statements still have access to their
         # ELSEIF/ELSE headers even when we're processing a sliced block.
         if self._preprocessed_lines:
-            block_lines = [
-                (line_content, line_num)
-                for (line_content, line_num) in self._preprocessed_lines
-                if line_number < line_num <= if_block['end_line']
-            ]
+            block_lines = self._preprocessed_lines[
+                if_block['start_i'] + 1: if_block['end_i'] + 1]
         else:
             block_lines = []
             for i in range(current_index + 1, len(lines)):
@@ -2045,7 +2074,7 @@ class GridLangControlFlow:
                 block_lines, condition_result, line_number, if_block)
 
         # Return the number of lines consumed (from start to end of the IF block)
-        return if_block['end_line'] - line_number
+        return if_block['end_i'] - current_index
 
     def _predeclare_block_assignment_targets(self, block_lines):
         """

@@ -89,6 +89,18 @@ _PREDEFINED_SUBPROCESSES = {
 _DOTTED_ENGINE_CREATORS = frozenset(
     k.lower() for k in BUILTINS if '.' in k)
 
+# Inline block statements with a single-instruction payload. They are rewritten
+# into real block form during preprocessing so the standard block machinery
+# handles them: ``For n in 1 to 3 do push x = n`` becomes a For block containing
+# a Push, and ``If a > 2 then return a else return b`` becomes an If block.
+_INLINE_BLOCK_LOOP_RE = re.compile(
+    r'^\s*(for|when)\b(.+?)\bdo\b\s+(.+)$', re.I)
+_INLINE_BLOCK_IF_RE = re.compile(
+    r'^\s*(elseif|if)\b(.+?)\bthen\b\s+(.+)$', re.I)
+_INLINE_ELSE_ACTION_RE = re.compile(r'^\s*else\s+(.+)$', re.I)
+_INLINE_IF_CLAUSE_SPLIT_RE = re.compile(r'\b(elseif|else)\b', re.I)
+_INLINE_IF_THEN_SPLIT_RE = re.compile(r'\b(?:then)\b', re.I)
+
 
 class GridLangCompiler(GridLangExecutor):
     def __init__(self):
@@ -3790,7 +3802,191 @@ class GridLangCompiler(GridLangExecutor):
                 lines.append((s, line_number))
 
         self._resolve_type_inheritance()
+        lines = self._normalize_inline_blocks(lines)
         return lines, label_lines, dim_lines
+
+    def _normalize_inline_blocks(self, lines):
+        """Rewrite inline block statements with a single-instruction payload into
+        real block form so the standard block machinery executes them identically
+        to the multi-line spelling.
+
+        ``For n in 1 to 3 do push x = n`` becomes::
+
+            For n in 1 to 3 do
+              Push x = n
+            End
+
+        and ``If a > 2 then push x = a * 10 else push x = 7`` becomes an If
+        block with Then/Else bodies. Inline If clauses are expanded to full
+        block form, so ``If a > 2 then ... elseif ... then ... else ...`` and
+        the mixed forms where a clause body is inline (``Else push x = 3``, or
+        an inline Then followed by a block ``Else`` terminated by ``End``)
+        reduce to the same canonical ``If / ElseIf / Else / End`` shape. The
+        payload is normalized for any single instruction (Return, Push, ``:=``,
+        Let, Output, ...); the whole line is left untouched when it does not
+        describe a reducible inline block. Generated lines keep the original
+        line number so diagnostics and dependency bookkeeping stay anchored.
+        """
+        normalized = []
+        for raw_line, line_number in lines:
+            expanded = self._expand_inline_block_line(raw_line, line_number)
+            if expanded is None:
+                normalized.append((raw_line, line_number))
+            else:
+                normalized.extend(expanded)
+        return normalized
+
+    def _expand_inline_block_line(self, raw_line, line_number):
+        """Return the block-form lines for an inline block statement with a
+        single-instruction payload, else None."""
+        stripped = raw_line.strip()
+        if not stripped:
+            return None
+        indent = raw_line[:len(raw_line) - len(raw_line.lstrip())]
+        body_indent = indent + '  '
+
+        loop_match = _INLINE_BLOCK_LOOP_RE.match(stripped)
+        if loop_match:
+            keyword, header, action = loop_match.groups()
+            action = action.strip()
+            if not self._is_single_inline_instruction(action):
+                return None
+            return [
+                (f"{indent}{keyword} {header.strip()} do", line_number),
+                (f"{body_indent}{action}", line_number),
+                (f"{indent}End", line_number),
+            ]
+
+        # Standalone inline Else clause: ``Else push x = 3`` closes the If with
+        # an inline body (the grammar puts no End after it).
+        else_match = _INLINE_ELSE_ACTION_RE.match(stripped)
+        if else_match:
+            action = else_match.group(1).strip()
+            if not self._is_single_inline_instruction(action):
+                return None
+            return [
+                (f"{indent}Else", line_number),
+                (f"{body_indent}{action}", line_number),
+                (f"{indent}End", line_number),
+            ]
+
+        if_match = _INLINE_BLOCK_IF_RE.match(stripped)
+        if if_match:
+            keyword, condition, payload = if_match.groups()
+            clauses = self._split_inline_if_clauses(payload)
+            if clauses is None:
+                return None
+            return self._expand_inline_if_clauses(
+                indent, body_indent, keyword, condition, clauses, line_number)
+
+        return None
+
+    def _expand_inline_if_clauses(self, indent, body_indent, keyword,
+                                  condition, clauses, line_number):
+        """Build block-form lines for an inline If/ElseIf chain."""
+        expanded = [(f"{indent}{keyword} {condition.strip()} then",
+                     line_number)]
+        for clause in clauses:
+            kind, cond, action = clause
+            if kind == 'elseif':
+                expanded.append(
+                    (f"{indent}ElseIf {cond.strip()} then", line_number))
+            elif kind == 'else':
+                expanded.append((f"{indent}Else", line_number))
+            if action:
+                expanded.append((f"{body_indent}{action.strip()}", line_number))
+        # An ElseIf is a clause of the enclosing If (its End comes from the
+        # enclosing block), but a top-level inline If chain is closed by an End
+        # only when the last clause body is a block. When the last clause ends
+        # with a bare ``else`` (a block body follows on the next lines), the
+        # End comes from the enclosing block.
+        if keyword.lower() == 'if':
+            last_kind = clauses[-1][0]
+            last_action = clauses[-1][2]
+            has_block_else = last_kind == 'else' and not last_action
+            if not has_block_else:
+                expanded.append((f"{indent}End", line_number))
+        return expanded
+
+    @staticmethod
+    def _is_single_inline_instruction(action):
+        """True when *action* can be a block body: one instruction line that is
+        not itself starting an inline block statement."""
+        return bool(
+            action
+            and not re.match(r'^\s*(for|when)\b', action, re.I)
+            and not re.match(r'^\s*(elseif|if)\b', action, re.I)
+            and not re.match(r'^\s*else\b', action, re.I))
+
+    @classmethod
+    def _split_inline_if_clauses(cls, payload):
+        """Split an inline If payload into clause tuples.
+
+        Returns a list of ``(kind, cond, action)`` where ``kind`` is one of
+        ``'then'``, ``'elseif'`` or ``'else'``. ``cond`` is only set for
+        ``elseif``; ``action`` is the clause body. A trailing bare ``else``
+        (no action) means a block body follows on the next lines. Returns None
+        when the payload is not a reducible inline If chain (for example an
+        action that is itself an inline block statement). Clause separators
+        inside string literals do not split the chain.
+        """
+        pieces = cls._split_clause_keywords(payload)
+        head = pieces[0].strip() if pieces else ''
+        if not cls._is_single_inline_instruction(head):
+            return None
+        clauses = [('then', None, head)]
+        for idx in range(1, len(pieces), 2):
+            sep = pieces[idx].strip().lower()
+            text = pieces[idx + 1].strip()
+            if sep == 'elseif':
+                then_parts = cls._split_after_then(text)
+                if len(then_parts) != 2:
+                    return None
+                cond, action = then_parts
+                if not cls._is_single_inline_instruction(action):
+                    return None
+                clauses.append(('elseif', cond, action))
+            else:
+                if text and not cls._is_single_inline_instruction(text):
+                    return None
+                clauses.append(('else', None, text))
+        return clauses
+
+    @staticmethod
+    def _mask_string_literals(text, mask_char='\x00'):
+        """Replace string literals in *text* with *mask_char* repeats of the same
+        length so keyword splitting never fires on the literal contents and slice
+        positions stay aligned with the original text."""
+        return _STRING_LITERAL_PATTERN.sub(
+            lambda m: mask_char * (m.end() - m.start()), text)
+
+    @classmethod
+    def _split_clause_keywords(cls, payload):
+        """Split *payload* on ``elseif``/``else`` outside string literals,
+        returning a list with the separators at odd indexes (``re.split`` of
+        ``_INLINE_IF_CLAUSE_SPLIT_RE`` shape). Match positions come from a
+        masked copy so literal contents never split the chain; the returned
+        pieces keep the original text."""
+        masked = cls._mask_string_literals(payload)
+        pieces = []
+        start = 0
+        for m in _INLINE_IF_CLAUSE_SPLIT_RE.finditer(masked):
+            pieces.append(payload[start:m.start()])
+            pieces.append(m.group(0))
+            start = m.end()
+        pieces.append(payload[start:])
+        return pieces
+
+    @classmethod
+    def _split_after_then(cls, text):
+        """Split an ElseIf clause on its ``then`` keyword outside string
+        literals, returning ``[cond, action]`` with the original text kept.
+        Returns a single-element list when no ``then`` is found."""
+        masked = cls._mask_string_literals(text)
+        m = _INLINE_IF_THEN_SPLIT_RE.search(masked)
+        if not m:
+            return [text.strip()]
+        return [text[:m.start()].strip(), text[m.end():].strip()]
 
     def _parse_type_def(self, lines, line_number=None, type_name=None):
         """Delegate to type processor."""
