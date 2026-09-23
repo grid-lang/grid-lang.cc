@@ -4863,6 +4863,20 @@ class GridLangExecutor(GridLangBase):
             self.requirements, self.grants, can_prompt=can_prompt)
         self.grants = grant_map
         for var_name, value, vtype, line_number in bindings:
+            # Inner handles of a user resource instance bind as members of the
+            # owning handle (``p.ticks``) instead of global names: the builtin
+            # can be parameterised per owning resource and no two handles
+            # collide in scope. The owner is defined earlier (parent first).
+            # Denied handles still attach, carrying the sticky #PERM value.
+            if '.' in var_name:
+                parent_name, _, member_name = var_name.partition('.')
+                try:
+                    parent_val = self.current_scope().get(parent_name)
+                except NameError:
+                    parent_val = None
+                if parent_val is not None and isinstance(parent_val, dict):
+                    parent_val[str(member_name)] = value
+                    continue
             self.current_scope().define(
                 var_name, value, vtype, {}, is_uninitialized=False,
                 line_number=line_number)

@@ -3534,6 +3534,8 @@ class ExpressionEvaluator:
                     node.args[0], full_scope, globals_dict, line_number)
             func = self._walk_ast_node(
                 node.func, full_scope, globals_dict, line_number)
+            if is_error_value(func):
+                return func
             args = [self._walk_ast_node(
                 a, full_scope, globals_dict, line_number) for a in node.args]
             kwargs = {}

@@ -193,11 +193,27 @@ def parse_grant_yaml(text, source_name):
     return entries
 
 
+def capability_grant_key(entry):
+    """Unique grant/binding key for a requirement entry.
+
+    Top-level requirements key by their variable name. Inner requirements
+    materialized for a user resource instance key by ``<handle>.<var_name>``
+    so each instance's handles are independently grantable (a builtin can be
+    parameterised per owning resource) and never collide in the grant map or
+    the importer scope.
+    """
+    if entry.get('for_handle') and entry.get('for_resource'):
+        return (f"{str(entry['for_handle']).strip().lower()}."
+                f"{str(entry['var_name']).lower()}")
+    return entry['var_name'].lower()
+
+
 def load_grants(spec):
     """Load a granted-capabilities mapping from a file or inline YAML list.
 
     Returns {name(lower): params-dict-or-None}; presence means granted, a
     params mapping means granted with those parameters, None means denied.
+    Inner handles of a user resource instance key as ``<handle>.<name>``.
     """
     if os.path.exists(spec) and os.path.isfile(spec):
         try:
@@ -225,6 +241,8 @@ def load_grants(spec):
         key = str(name).strip().lower()
         if not key:
             raise GrantError(f"{source_name}: grant entry has an empty 'name'")
+        if entry.get('for_handle'):
+            key = capability_grant_key(entry)
         if key in grants:
             raise GrantError(
                 f"{source_name}: duplicate grant entry for '{name}'")
@@ -555,7 +573,7 @@ class RequirementResolver:
             is_user_resource = is_resource and res_lower not in _RESOURCES
             if not is_user_resource:
                 continue
-            key = entry['var_name'].lower()
+            key = capability_grant_key(entry)
             if key not in grant_map:
                 # Auto-grant all user resources (no prompt, use requested params)
                 # — only predefined resources are grantable. This is the
@@ -595,7 +613,7 @@ class RequirementResolver:
                 # only when the inner resource is itself user-defined (they
                 # are implementation details, not host-promptable). Inner
                 # requires of predefined resources stay host-promptable.
-                synth_key = synthetic['var_name'].lower()
+                synth_key = capability_grant_key(synthetic)
                 if (synth_key not in grant_map and
                         inner_resource_lower not in _RESOURCES):
                     grant_map[synth_key] = dict(
@@ -616,7 +634,7 @@ class RequirementResolver:
             is_user_resource = is_resource and res_lower not in _RESOURCES
             if is_user_resource:
                 continue
-            key = entry['var_name'].lower()
+            key = capability_grant_key(entry)
             if key not in grant_map:
                 if can_prompt:
                     prompts.append(entry)
@@ -624,10 +642,10 @@ class RequirementResolver:
                     # Default-deny when no interactive prompt and no grant file.
                     grant_map[key] = None
         for entry in prompts:
-            grant_map[entry['var_name'].lower()] = self.prompt_for(entry)
+            grant_map[capability_grant_key(entry)] = self.prompt_for(entry)
         bindings = []
         for entry in expanded:
-            key = entry['var_name'].lower()
+            key = capability_grant_key(entry)
             declaration = grant_map.get(key)
             line_number = entry['line_number']
             if declaration is None:
@@ -637,5 +655,5 @@ class RequirementResolver:
                 params = self.merge_and_validate(entry, declaration, line_number)
                 value = self.build_capability(entry, params)
                 vtype = 'capability'
-            bindings.append((entry['var_name'], value, vtype, line_number))
+            bindings.append((key, value, vtype, line_number))
         return grant_map, bindings

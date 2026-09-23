@@ -246,6 +246,12 @@ Capabilities flow the other way — from the main program into the module:
 Because grants are always program-side, third-party code cannot bypass the main
 program to obtain access.
 
+*Inner `Require` statements of a user resource bind as namespaced, read-only
+members of the granted instance (`p.ticks`), not as global names: the builtin
+is parameterised per owning resource and nothing leaks into the importer's
+global scope. A missing/denied grant still binds the member as the sticky
+`#PERM` value, so the program continues and the taint propagates.*
+
 *(Not yet implemented.)*
 
 ## 13. Units

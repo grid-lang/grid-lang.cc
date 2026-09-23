@@ -568,6 +568,8 @@ class GridLangCompiler(GridLangExecutor):
         expected = expected_type.lower()
         if actual == expected:
             return True
+        if '.' in actual and actual.rsplit('.', 1)[1] == expected:
+            return True
         visited = set()
         while actual and actual not in visited:
             visited.add(actual)
@@ -4527,7 +4529,8 @@ class GridLangCompiler(GridLangExecutor):
         if raw.lower().startswith('require '):
             raw = raw[len('require'):].strip()
         m = re.match(
-            r'^([\w_]+(?:\s*,\s*[\w_]+)*)\s+as\s+([A-Za-z][\w_]*)(?:\s+with\s*\((.*)\)\s*)?$',
+            r'^([\w_]+(?:\s*,\s*[\w_]+)*)\s+as\s+([A-Za-z][\w]*(?:\.[A-Za-z][\w]*)*)'
+            r'(?:\s+with\s*\((.*)\)\s*)?$',
             raw, re.I | re.S)
         if not m:
             raise SyntaxError(
@@ -4538,6 +4541,13 @@ class GridLangCompiler(GridLangExecutor):
         with_content = (m.group(3) or '').strip()
         res_lower = resource_type.lower()
         type_def = self.types_defined.get(res_lower) if res_lower else None
+        if not type_def and '.' in res_lower:
+            # Dotted resource (e.g. mod.timer): resolve against the
+            # namespaced binding, and if that fails, against the base name
+            # (a flat import of the same physical type).
+            base_lower = res_lower.rsplit('.', 1)[1]
+            if base_lower in self.types_defined:
+                type_def = self.types_defined.get(base_lower)
         if not type_def:
             raise SyntaxError(
                 f"Unknown resource type '{resource_type}' in Require at line {line_number}; "
