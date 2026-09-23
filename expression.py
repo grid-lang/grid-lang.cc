@@ -1099,7 +1099,7 @@ class ExpressionEvaluator:
                 base_expr = expr[:split_pos].strip()
                 with_text = expr[split_pos:].strip()
                 new_ctor_match = re.match(
-                    r'^new\s+(\w+)\s*(?:\(([^)]*)\))?\s*$', base_expr, re.I)
+                    r'^new\s+([\w.]+)\s*(?:\(([^)]*)\))?\s*$', base_expr, re.I)
                 if new_ctor_match:
                     type_name = new_ctor_match.group(1)
                     if type_name.lower() == "copy":
@@ -1174,7 +1174,7 @@ class ExpressionEvaluator:
                             elem.pop('_with_applied_fields', None)
                 return True, result
 
-        bare_new_match = re.match(r'^new\s+(\w+)\s*$', expr)
+        bare_new_match = re.match(r'^new\s+([\w.]+)\s*$', expr)
         if bare_new_match:
             type_name = bare_new_match.group(1)
             if type_name.lower() == "copy":
@@ -1190,7 +1190,7 @@ class ExpressionEvaluator:
             raise ValueError(
                 f"Type '{type_name}' not defined at line {line_number}")
 
-        obj_match = re.match(r'^new\s+(\w+)\s*(\{|\()', expr)
+        obj_match = re.match(r'^new\s+([\w.]+)\s*(\{|\()', expr)
         if not obj_match:
             return False, None
 

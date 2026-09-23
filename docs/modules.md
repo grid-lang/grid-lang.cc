@@ -74,7 +74,10 @@ Version v2 exports bar, bam, woosh
   `Sub()` run interface only.
 - A module with no `Version` blocks has no importable API.
 
-*(Not yet implemented.)*
+*Implemented for definitions: exporting a **function, subprocess, or type**
+binds its definition (see the Load-semantics and binding notes in §5). Unit
+categories export flat via the `of` form (see §13); top-level variable exports
+and namespaced unit-category exports are still deferred.*
 
 ## 5. Import
 
@@ -98,7 +101,13 @@ For B use Mymodule.v1 with (version>=12)   ' namespaced + pin
   a flat binding is a guaranteed collision — this is intentional and safe by
   construction.
 
-*(Not yet implemented.)*
+*Implemented.* `use` is only legal at the top (global) level; a `use` inside a
+block is a load error. Binding is order-independent for flat and namespaced
+imports: you may reference an exported name (or `B.Name`) before its `use`
+line. Load-time checks: unknown module/version-tag, an export not backed by a
+definition, an unsatisfied pin, and a flat name collision are all `ModuleImportError`s.
+Member functions of an exported type travel with the type — name only the type
+in the `Version exports` list, not its members.
 
 ## 6. Load semantics
 
@@ -116,7 +125,8 @@ Loading a module **binds**; it never **runs**.
 - `Input` and `Output` declarations belong to the `Sub(module)` interface and
   never bind on load.
 
-*(Not yet implemented.)*
+*(Top-level variable exports still deferred: the equality family and Push
+  family semantics above describe the intended behavior.)*
 
 ## 7. Run
 
@@ -197,12 +207,38 @@ Foreign modules are **closed**:
   by the module) performs the pushes. Exported subprocesses run against the
   imported module's live instance in the caller's program.
 - No leak through conversions: standalone `Convert` rules are module-local
-  and never cross the module boundary (see §12).
+  and never cross the module boundary (see §13).
 
-*(Type-extension and direct-write rules apply today's * member rules; module
-machinery not yet implemented.)*
+*(Type-extension and direct-write rules apply today's member rules; module
+machinery — instances, `shared`, push channels — not yet implemented.)*
 
-## 12. Units
+## 12. Requirements and capabilities
+
+Modules have no power to acquire capabilities on their own: **module
+requirements are never granted.** A `Require` inside a module does not reserve a
+capability for the importing program and is never satisfied automatically.
+Capabilities flow the other way — from the main program into the module:
+
+- **Define and export a custom `Resource`.** The recommended pattern is for the
+  module to declare a `Resource` type that carries the needed requirements and
+  export it like any other definition. Consumption of that resource stays
+  explicit and program-side.
+- **Pass a handle.** Module-internal access to a resource arrives *only* through
+  explicit parameters: an instance of a granted resource (or a bare handle)
+  passed to the module's functions, subprocesses, type builders, etc.
+- **Runnable modules:** a granted resource or a handle may be passed to the
+  module when it runs (`Sub(module)`); the module never fetches one itself.
+- **Full control stays with the main program.** Nothing in a module can reach a
+  capability the main program has not explicitly handed over. If the module's
+  requirements evolve, the main program must adapt (re-grant, pass a new handle)
+  — the wiring is not automatic.
+
+Because grants are always program-side, third-party code cannot bypass the main
+program to obtain access.
+
+*(Not yet implemented.)*
+
+## 13. Units
 
 ```grid
 Define X as UnitSource of K          ' reuses the "of" pattern (5 of m)
@@ -218,10 +254,13 @@ Define X as UnitSource of K          ' reuses the "of" pattern (5 of m)
   accepted idempotently; a conflicting rule for an occupied pair is a load
   error.
 
-*(The `of` form and the module-local/exportable Convert split are not yet
-implemented; today `Define X as UnitSource(K)` is used.)*
+*Implemented for the `of` form:* `Define X as UnitSource of K` registers the
+category during the loader preprocess, so it is harvestable and a flat export
+binds (results are `UnitValue` objects). The parenthesized spelling
+`Define X as UnitSource(K)` registers the category elsewhere (at run time) and
+is not harvestable today. Namespaced unit-category exports are still deferred.
 
-## 13. Delegation
+## 14. Delegation
 
 Wrapping a foreign type through delegation is shorthand for a forwarding
 member; it is the sanctioned way to reuse a foreign type's behavior without
@@ -245,7 +284,7 @@ delegate Point.move, Point.area to center
 
 *(Not yet implemented.)*
 
-## 14. Versioning / manifest
+## 15. Versioning / manifest
 
 - The **module version** is a build pin (§3). The **API version** is semantic
   and pinned at every `Use` (§5). There is no cross-version migration — vN
@@ -259,7 +298,7 @@ delegate Point.move, Point.area to center
 
 *(Not yet implemented.)*
 
-## 15. Deferred / open
+## 16. Deferred / open
 
 - `shared` modules combined with ordered (`>=`) pins: resolution is settled
   (§10), pending a real use case.
@@ -267,7 +306,7 @@ delegate Point.move, Point.area to center
   list (program directory, then `GRID_PATH`).
 - Diagnostics and error text conventions for load-time failures.
 
-## 16. Syntax glossary
+## 17. Syntax glossary
 
 ```grid
 Module <name> [runnable] [shared]

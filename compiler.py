@@ -27,6 +27,11 @@ from grid_lang_common import (
     _is_numeric_token, mask_text_constant_tokens,
 )
 from builtin_functions import BUILTINS, KEYWORDS, RESOURCES
+from modules import (
+    ModuleImportError, parse_module_header, parse_module_version_line,
+    parse_version_block, parse_use_line, strip_version_tag,
+    version_pin_matches, resolve_module_source,
+)
 
 
 class SubprocessResult:
@@ -173,6 +178,23 @@ class GridLangCompiler(GridLangExecutor):
         # When True, `run` halts right after preparation (no main loop, no
         # outputs) so the host can inspect required capabilities (--list-required).
         self.halt_before_main_loop = False
+        # ------------------------------------------------------------------
+        # Module import state. `module_sources` is host input that survives the
+        # per-run reset (like `grants`); the run-scoped sets below are cleared
+        # in `_reset_state`.
+        # ------------------------------------------------------------------
+        # name(lower) -> module source text provided by the host. Falls back to
+        # filesystem resolution (see modules.resolve_module_source) when empty.
+        self.module_sources = {}
+        # Namespace names introduced by `For <ns> use <module>.<tag>`: tokens
+        # like `B` resolve through here instead of the variable scope.
+        self.module_namespaces = set()
+        # Saved harvested-from-module tables so repeated `use` of a module in
+        # one program shares definitions (per (importer x physical copy)).
+        self._module_harvests = {}
+        # Line numbers of `use`/`For ... use` statements processed during
+        # declaration collection; skipped in the main loop.
+        self.module_use_line_numbers = set()
 
     def _get_public_type_fields(self, type_name_or_def):
         """Return the declared fields for a type, excluding internal metadata keys."""
@@ -3244,6 +3266,11 @@ class GridLangCompiler(GridLangExecutor):
         # User-defined functions are not variable dependencies
         if hasattr(self, 'functions') and normalized in (self.functions or {}):
             return False
+        # Module namespace bases from `For <ns> use <module>.<vN>` are never
+        # variable dependencies: they are dotted-name prefixes (`B.Foo`)
+        # resolved through the function/type tables.
+        if hasattr(self, 'module_namespaces') and normalized in self.module_namespaces:
+            return False
         # Treat direct cell references (e.g., A1, B2) as resolved if the grid
         # already contains the cell value, even though they are not tracked in
         # the variable scope dictionary.
@@ -3517,6 +3544,20 @@ class GridLangCompiler(GridLangExecutor):
         self._push_queues = {}
         self._processing_when = False
         self._loop_iteration = 0
+        # Module-import state is run-scoped except `module_sources` (host input,
+        # preserved across runs like `grants`).
+        if hasattr(self, 'module_namespaces'):
+            self.module_namespaces.clear()
+        else:
+            self.module_namespaces = set()
+        if hasattr(self, '_module_harvests'):
+            self._module_harvests.clear()
+        else:
+            self._module_harvests = {}
+        if hasattr(self, 'module_use_line_numbers'):
+            self.module_use_line_numbers.clear()
+        else:
+            self.module_use_line_numbers = set()
 
     def _preprocess_code(self, code):
 
@@ -4008,7 +4049,247 @@ class GridLangCompiler(GridLangExecutor):
         """Delegate to type processor."""
         return self.type_processor._process_type_let_statement(line, var_name, value_dict, line_number)
 
+    # ======================================================================
+    # Module loading (see docs/modules.md). The "Import/load first (use)"
+    # milestone: `use Module.<tag>` / `For <ns> use Module.<tag>` bind exported
+    # definitions (functions, subprocesses, types, unit categories) at load
+    # time. `use` lines never reach the dependency network, global-for
+    # machinery, or the main loop: they are collected as a pre-pass and
+    # filtered out of the executable line stream.
+    # ======================================================================
+
+    def _load_module_harvest(self, module_name, line_number=None):
+        """Locate, parse and harvest a module's definitions (load, never run).
+
+        The module body is parsed by a fresh compiler that never executes a
+        main loop and never runs `_process_declarations_and_labels`: it only
+        preprocesses (registering types/unit sources) and extracts function
+        and subprocess definitions. Returns a dict with:
+
+          - header: parsed `Module <name>` header or None,
+          - module_version: parsed `: version` entry or None,
+          - exports_by_tag: tag.lower() -> list of exported definition names,
+          - functions / subprocesses: code tables of the module (raw names),
+          - types_defined / unit_sources: type and unit-category tables.
+
+        Results are cached per import (per compiler x physical copy).
+        """
+        key = module_name.lower()
+        if key in self._module_harvests:
+            return self._module_harvests[key]
+
+        if not hasattr(self, '_module_harvests'):
+            self._module_harvests = {}
+        source = resolve_module_source(
+            module_name, getattr(self, 'module_sources', None) or {})
+        if not source or not source.strip():
+            raise ModuleImportError(
+                f"Module '{module_name}' is empty (no source text but an "
+                "empty module cannot export definitions)")
+        metadata = {'header': None, 'module_version': None,
+                    'exports_by_tag': {}}
+        body_source = []
+        for raw_line in source.splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("'"):
+                continue
+            header = parse_module_header(stripped)
+            if header is not None:
+                metadata['header'] = header
+                continue
+            version = parse_module_version_line(stripped)
+            if version is not None:
+                metadata['module_version'] = version
+                continue
+            version_block = parse_version_block(stripped)
+            if version_block is not None:
+                metadata['exports_by_tag'].setdefault(
+                    version_block['tag'].lower(), version_block['exports'])
+                continue
+            body_source.append(raw_line)
+        if not metadata['exports_by_tag']:
+            # A module with no Version blocks exposes no importable API.
+            raise ModuleImportError(
+                f"Module '{module_name}' declares no 'Version' exports; it "
+                "cannot be imported" +
+                (f" at line {line_number}" if line_number else ""))
+
+        # Harvest definitions with a fresh compiler that loads but never runs.
+        loader = GridLangCompiler()
+        loader.module_sources = getattr(self, 'module_sources', None) or {}
+        try:
+            all_lines, label_lines, dim_lines = loader._preprocess_code(
+                "\n".join(body_source))
+            loader._extract_functions(all_lines, label_lines, dim_lines)
+        except ModuleImportError:
+            raise
+        except Exception as exc:
+            raise ModuleImportError(
+                f"Module '{module_name}' is not a valid loadable module: "
+                f"{exc}") from exc
+
+        harvest = dict(metadata)
+        harvest['functions'] = getattr(loader, 'functions', {})
+        harvest['subprocesses'] = getattr(loader, 'subprocesses', {})
+        harvest['types_defined'] = getattr(loader, 'types_defined', {})
+        harvest['unit_sources'] = getattr(loader, 'unit_sources', {})
+        self._module_harvests[key] = harvest
+        return harvest
+
+    def _process_module_imports(self, lines):
+        """Bind `use` / `For <ns> use` statements and drop them from `lines`.
+
+        Processed before any block depth is established here (they are
+        top-level-only, like `Require`); the remaining lines are filtered by
+        line number so downstream machinery never sees an import statement.
+        """
+        remaining = []
+        depth = 0
+        type_depth = 0
+        for line, line_number in lines:
+            stripped = line.strip()
+            lower = stripped.lower()
+            is_block_start = (
+                (lower.startswith('if ') and lower.endswith('then')) or
+                (lower.startswith('for ') and lower.endswith('do')) or
+                (lower.startswith('when ') and lower.endswith('do'))
+            )
+            is_end = lower == 'end'
+            if lower.startswith("define ") and (
+                    " as type" in lower or " as keytype" in lower or
+                    " as resource" in lower or " as handle" in lower):
+                type_depth += 1
+            elif lower.startswith("end") and type_depth > 0:
+                type_depth -= 1
+
+            parsed = parse_use_line(line)
+            if parsed is not None:
+                if depth != 0 or type_depth != 0:
+                    raise ModuleImportError(
+                        f"'use' is only allowed at the top (global) level "
+                        f"at line {line_number}")
+                self.module_use_line_numbers.add(line_number)
+                self._collect_module_import(line, line_number, parsed)
+                continue
+            remaining.append((line, line_number))
+            if is_block_start:
+                depth += 1
+            elif is_end and depth > 0:
+                depth -= 1
+        lines[:] = remaining
+
+    def _collect_module_import(self, line, line_number, parsed):
+        """Bind a single import statement, exporting a whole API version.
+
+        Raises `ModuleImportError` for unknown modules/tags, unsatisfied
+        version pins, collisions, and definitions outside this milestone.
+        """
+        module_name = parsed['module']
+        tag = parsed['tag']
+        namespace = parsed['namespace']
+        harvest = self._load_module_harvest(module_name, line_number)
+
+        if parsed['pin_op'] is not None:
+            matched = version_pin_matches(
+                parsed, harvest['module_version'], line_number)
+            if not matched:
+                raise ModuleImportError(
+                    f"Module '{module_name}' does not satisfy version pin "
+                    f"'version{parsed['pin_op']}{parsed['pin_value']}' at "
+                    f"line {line_number}")
+
+        exports = harvest['exports_by_tag'].get(tag.lower())
+        if exports is None:
+            raise ModuleImportError(
+                f"Module '{module_name}' has no 'Version {tag}' to import at "
+                f"line {line_number}")
+
+        if namespace:
+            self.module_namespaces.add(namespace.lower())
+
+        for export_name in exports:
+            bound_name, _stripped = strip_version_tag(export_name, tag)
+            if namespace:
+                bound_name = f"{namespace}.{bound_name}"
+            raw_key = export_name.lower()
+            if raw_key in harvest['types_defined']:
+                self._bind_module_type(module_name, export_name, bound_name,
+                                       harvest, line_number)
+            elif raw_key in harvest['subprocesses']:
+                self._bind_module_def(module_name, export_name, bound_name,
+                                      harvest, line_number, 'subprocesses')
+            elif raw_key in harvest['functions']:
+                self._bind_module_def(module_name, export_name, bound_name,
+                                      harvest, line_number, 'functions')
+            elif raw_key in harvest['unit_sources']:
+                if namespace:
+                    raise ModuleImportError(
+                        f"Namespaced unit-category export '{export_name}' of "
+                        f"module '{module_name}' is not yet supported at line "
+                        f"{line_number}")
+                self._bind_module_units(module_name, export_name, bound_name,
+                                        harvest, line_number)
+            else:
+                raise ModuleImportError(
+                    f"Module '{module_name}' Version '{tag}' exports "
+                    f"'{export_name}' which is not defined at line "
+                    f"{line_number}")
+
+    def _bind_module_def(self, module_name, raw_name, bound_name, harvest,
+                         line_number, table):
+        """Bind a harvested function/subprocess entry under the export name."""
+        target_table = {'functions': self.functions,
+                        'subprocesses': self.subprocesses}[table]
+        bound_key = bound_name.lower()
+        if bound_key in target_table:
+            raise ModuleImportError(
+                f"Name collision on import at line {line_number}: "
+                f"'{bound_name}' is already defined")
+        entry = dict(harvest[table][raw_name.lower()])
+        # Imported definitions bind at load time and execute against the
+        # importer's scope, like locally-defined ones: drop the loader's
+        # captured defining scope so call_function falls back to the caller.
+        entry['defining_scope'] = None
+        target_table[bound_key] = entry
+
+    def _bind_module_type(self, module_name, raw_name, bound_name, harvest,
+                          line_number):
+        """Bind an exported type and its member functions under one name."""
+        bound_key = bound_name.lower()
+        if bound_key in self.types_defined:
+            raise ModuleImportError(
+                f"Name collision on import at line {line_number}: type "
+                f"'{bound_name}' is already defined")
+        self.types_defined[bound_key] = dict(harvest['types_defined'][raw_name.lower()])
+        raw_key = raw_name.lower()
+        for func_key, entry in harvest['functions'].items():
+            if (entry.get('member_of') or '').lower() != raw_key:
+                continue
+            if not func_key.startswith(raw_key):
+                continue
+            suffix = func_key[len(raw_key):]
+            new_key = f"{bound_key}{suffix}".lower()
+            if new_key in self.functions:
+                raise ModuleImportError(
+                    f"Name collision on import at line {line_number}: member "
+                    f"'{bound_key}{suffix}' is already defined")
+            new_entry = dict(entry)
+            new_entry['defining_scope'] = None
+            new_entry['member_of'] = bound_key
+            self.functions[new_key] = new_entry
+
+    def _bind_module_units(self, module_name, raw_name, bound_name, harvest,
+                           line_number):
+        """Bind an exported unit-category source under its export name."""
+        bound_key = bound_name.lower()
+        if bound_key in self.unit_sources:
+            raise ModuleImportError(
+                f"Name collision on import at line {line_number}: unit "
+                f"category '{bound_name}' is already defined")
+        self.unit_sources[bound_key] = harvest['unit_sources'][raw_name.lower()]
+
     def _process_declarations_and_labels(self, lines, label_lines, dim_lines):
+        self._process_module_imports(lines)
         for line, line_number in dim_lines:
             self._collect_global_declarations(line, line_number)
 
@@ -4663,7 +4944,7 @@ class GridLangCompiler(GridLangExecutor):
                     expr_no_quotes = re.sub(
                         r'->\s*\$?[A-Za-z][A-Za-z0-9_.]*\s*\(', '(', expr_no_quotes)
                     expr_no_numbers = re.sub(
-                        r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?',
+                        r'(?<![\w.])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?(?![\w.])',
                         ' ', expr_no_quotes, flags=re.I)
                     expr_no_numbers = re.sub(r'\[[^\]]*\]', ' ', expr_no_numbers)
                     # Remove member accesses like "obj.field" so the field name
