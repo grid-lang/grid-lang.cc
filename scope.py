@@ -610,6 +610,15 @@ class Scope:
             actual_key = defining_scope._get_case_insensitive_key(
                 name, defining_scope.variables)
             if actual_key:
+                # Module-exported variables are read-only foreign state: the
+                # importer may read them but never assign/push (docs §11).
+                module_export = defining_scope.constraints.get(
+                    actual_key, {}).get('module_export')
+                if module_export and actual_key not in defining_scope.uninitialized:
+                    raise RuntimeError(
+                        f"Cannot assign to '{name}': it is a read-only "
+                        f"module export from module '{module_export}' at "
+                        f"line {line_number}")
                 var_type = defining_scope.types.get(actual_key)
                 constraints = defining_scope.constraints.get(actual_key, {})
                 # Wrap plain primitive values as fresh Keytype instances when dest is a Keytype (e.g. x as L = 5 where L as Keytype(number))

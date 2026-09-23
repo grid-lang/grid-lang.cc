@@ -75,9 +75,11 @@ Version v2 exports bar, bam, woosh
 - A module with no `Version` blocks has no importable API.
 
 *Implemented for definitions: exporting a **function, subprocess, or type**
-binds its definition (see the Load-semantics and binding notes in §5). Unit
-categories export flat via the `of` form (see §13); top-level variable exports
-and namespaced unit-category exports are still deferred.*
+binds its definition (see the Load-semantics and binding notes in §5).
+**Top-level variables** export flat as read-only views of the module instance
+(see §6 and §11). Unit categories export flat via the `of` form (see §13);
+namespaced top-level-variable and namespaced unit-category exports are still
+deferred.*
 
 ## 5. Import
 
@@ -125,8 +127,11 @@ Loading a module **binds**; it never **runs**.
 - `Input` and `Output` declarations belong to the `Sub(module)` interface and
   never bind on load.
 
-*(Top-level variable exports still deferred: the equality family and Push
-  family semantics above describe the intended behavior.)*
+*(Top-level variable exports, flat only, are implemented. Equality-bound
+    (`: x = e`) and `init`-seeded exports instantiate on load as read-only
+    views; push-only exports read `#N/A` until an exported subprocess fills
+    them. Namespaced variable exports, and the `Sub()` run value surface, are
+    still deferred.)*
 
 ## 7. Run
 
@@ -182,7 +187,10 @@ There are three output channels.
   instance; `shared` is the explicit escape hatch for true program-wide
   services.
 
-*(Not yet implemented.)*
+*Instance state is implemented per (importer × physical copy): the module's
+top-level variables live in one instance scope shared by every `use` of the
+module in the consuming program, and exported subprocesses mutate it. The
+`shared` flag itself, and module-private grid state, are still deferred.*
 
 ## 10. Version resolution
 
@@ -209,8 +217,10 @@ Foreign modules are **closed**:
 - No leak through conversions: standalone `Convert` rules are module-local
   and never cross the module boundary (see §13).
 
-*(Type-extension and direct-write rules apply today's member rules; module
-machinery — instances, `shared`, push channels — not yet implemented.)*
+*(Type-extension and direct-write rules apply today's member rules. The
+read-only view of exported variables and the exported-subprocess mutation
+channel against the live instance are implemented; `shared` instances and the
+module-private grid are not yet routed.)*
 
 ## 12. Requirements and capabilities
 

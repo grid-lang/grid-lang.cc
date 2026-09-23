@@ -195,6 +195,13 @@ class GridLangCompiler(GridLangExecutor):
         # Line numbers of `use`/`For ... use` statements processed during
         # declaration collection; skipped in the main loop.
         self.module_use_line_numbers = set()
+        # Live module instances (per importer x physical copy): key ->
+        # {'scope': <module state scope>, 'module_vars': {name: meta},
+        #  'exported': {program_key: instance_var}}.
+        self.module_instances = {}
+        # module_key -> {program_key: instance_var}; refreshed after a module
+        # subprocess call so the importer's bound copies observe mutations.
+        self._module_export_bindings = {}
 
     def _get_public_type_fields(self, type_name_or_def):
         """Return the declared fields for a type, excluding internal metadata keys."""
@@ -2173,9 +2180,14 @@ class GridLangCompiler(GridLangExecutor):
         sub_compiler.preserve_functions = True
         sub_compiler.preserve_subprocesses = True
         # Subprocesses reference the caller's scope chain live: reads resolve to
-        # caller variables and writes (push/assignments) flow through. Only
-        # compiler-level dimension metadata is copied.
-        sub_compiler._parent_scope = self.current_scope()
+        # caller variables and writes (push/assignments) flow through. Module
+        # subprocesses run against the module's live instance scope instead,
+        # so pushes mutate module state (docs §11). Only compiler-level
+        # dimension metadata is copied.
+        defining_scope = sp_def.get('defining_scope')
+        sub_compiler._parent_scope = (
+            defining_scope if defining_scope is not None
+            else self.current_scope())
         # Function/operation bodies may use Return (the call-value channel);
         # the strict top-level Return check is skipped for these runners.
         sub_compiler._is_operation_runner = True
@@ -2191,6 +2203,14 @@ class GridLangCompiler(GridLangExecutor):
         sub_output = sub_compiler.run(
             sp_def['code'], list(args),
             suppress_output=True, return_output=True)
+
+        # A module subprocess may have mutated its instance state; refresh the
+        # importer's copies of the module's exported variables.
+        if sp_def.get('module_key'):
+            try:
+                self._sync_module_export_vars(sp_def['module_key'])
+            except Exception:
+                pass
 
         # Merge declared outputs from subprocess scope when not pushed explicitly.
         merged_outputs = dict(sub_output or {})
@@ -3558,6 +3578,14 @@ class GridLangCompiler(GridLangExecutor):
             self.module_use_line_numbers.clear()
         else:
             self.module_use_line_numbers = set()
+        if hasattr(self, 'module_instances'):
+            self.module_instances.clear()
+        else:
+            self.module_instances = {}
+        if hasattr(self, '_module_export_bindings'):
+            self._module_export_bindings.clear()
+        else:
+            self._module_export_bindings = {}
 
     def _preprocess_code(self, code):
 
@@ -4117,10 +4145,23 @@ class GridLangCompiler(GridLangExecutor):
         # Harvest definitions with a fresh compiler that loads but never runs.
         loader = GridLangCompiler()
         loader.module_sources = getattr(self, 'module_sources', None) or {}
+        loader._is_module_loader = True
         try:
             all_lines, label_lines, dim_lines = loader._preprocess_code(
                 "\n".join(body_source))
-            loader._extract_functions(all_lines, label_lines, dim_lines)
+            remaining, label_lines, dim_lines = loader._extract_functions(
+                all_lines, label_lines, dim_lines)
+            # Instantiate the module's top-level declarations into the loader's
+            # global scope to obtain the per-instance initial state. Blocks and
+            # Push-family statements are left for the (never-run) main loop,
+            # so equality-bound variables get values and push-only ones stay
+            # uninitialized (#N/A), exactly as §6 of docs/modules.md requires.
+            loader._process_declarations_and_labels(
+                remaining, label_lines, dim_lines)
+            try:
+                loader._resolve_pending_assignments()
+            except Exception:
+                pass
         except ModuleImportError:
             raise
         except Exception as exc:
@@ -4133,8 +4174,62 @@ class GridLangCompiler(GridLangExecutor):
         harvest['subprocesses'] = getattr(loader, 'subprocesses', {})
         harvest['types_defined'] = getattr(loader, 'types_defined', {})
         harvest['unit_sources'] = getattr(loader, 'unit_sources', {})
+        harvest['state_scope'] = loader.current_scope()
+        harvest['module_vars'] = self._snapshot_module_vars(loader)
         self._module_harvests[key] = harvest
         return harvest
+
+    def _snapshot_module_vars(self, loader):
+        """Capture the module's top-level variable state for one instance."""
+        scope = loader.current_scope()
+        vars_ = {}
+        for key in list(scope.variables.keys()):
+            if key.lower() == 'grid':
+                continue
+            if scope.is_input(key) or scope.is_output(key):
+                continue
+            try:
+                value = scope.get(key)
+            except Exception:
+                value = None
+            vars_[key.lower()] = {
+                'value': value,
+                'uninitialized': scope.is_uninitialized(key),
+                'type': scope.types.get(
+                    scope._get_case_insensitive_key(key, scope.types) or key),
+            }
+        return vars_
+
+    def _ensure_module_instance(self, module_name, harvest):
+        """Return the live instance scope for a module (created on first use)."""
+        key = module_name.lower()
+        inst = self.module_instances.get(key)
+        if inst is None:
+            inst = {'scope': harvest.get('state_scope'),
+                    'module_vars': harvest.get('module_vars') or {},
+                    'exported': {}}
+            self.module_instances[key] = inst
+        return inst
+
+    def _sync_module_export_vars(self, module_key):
+        """Refresh the importer's copies of a module's exported variables."""
+        inst = self.module_instances.get(module_key)
+        bindings = self._module_export_bindings.get(module_key)
+        if not inst or not bindings or inst['scope'] is None:
+            return
+        scope = self.current_scope()
+        for program_key, instance_var in bindings.items():
+            if inst['scope'].is_uninitialized(instance_var):
+                continue
+            try:
+                value = inst['scope'].get(instance_var)
+            except Exception:
+                value = None
+            if value is None:
+                continue
+            actual = scope._get_case_insensitive_key(program_key, scope.variables)
+            if actual:
+                scope.variables[actual] = value
 
     def _process_module_imports(self, lines):
         """Bind `use` / `For <ns> use` statements and drop them from `lines`.
@@ -4146,6 +4241,13 @@ class GridLangCompiler(GridLangExecutor):
         remaining = []
         depth = 0
         type_depth = 0
+        if getattr(self, '_is_module_loader', False):
+            for line, line_number in lines:
+                if parse_use_line(line) is not None:
+                    raise ModuleImportError(
+                        f"A module cannot import another module yet; 'use' "
+                        f"inside module source at line {line_number} is not "
+                        f"supported")
         for line, line_number in lines:
             stripped = line.strip()
             lower = stripped.lower()
@@ -4229,6 +4331,14 @@ class GridLangCompiler(GridLangExecutor):
                         f"{line_number}")
                 self._bind_module_units(module_name, export_name, bound_name,
                                         harvest, line_number)
+            elif raw_key in harvest['module_vars']:
+                if namespace:
+                    raise ModuleImportError(
+                        f"Namespaced top-level variable export '{export_name}' "
+                        f"of module '{module_name}' is not yet supported at "
+                        f"line {line_number}")
+                self._bind_module_var(module_name, export_name, bound_name,
+                                      harvest, line_number)
             else:
                 raise ModuleImportError(
                     f"Module '{module_name}' Version '{tag}' exports "
@@ -4246,11 +4356,40 @@ class GridLangCompiler(GridLangExecutor):
                 f"Name collision on import at line {line_number}: "
                 f"'{bound_name}' is already defined")
         entry = dict(harvest[table][raw_name.lower()])
-        # Imported definitions bind at load time and execute against the
-        # importer's scope, like locally-defined ones: drop the loader's
-        # captured defining scope so call_function falls back to the caller.
-        entry['defining_scope'] = None
+        if table == 'subprocesses':
+            # Subprocesses are the module's mutation channel: they run against
+            # the module's live instance so `Push`/assignments modify module
+            # state (docs §11). Functions keep caller-scope resolution.
+            inst = self._ensure_module_instance(module_name, harvest)
+            entry['defining_scope'] = inst['scope']
+            entry['module_key'] = module_name.lower()
+        else:
+            # Imported definitions bind at load time and execute against the
+            # importer's scope, like locally-defined ones: drop the loader's
+            # captured defining scope so call_function falls back to the caller.
+            entry['defining_scope'] = None
         target_table[bound_key] = entry
+
+    def _bind_module_var(self, module_name, raw_name, bound_name, harvest,
+                         line_number):
+        """Bind an exported top-level variable read-only into the scope."""
+        inst = self._ensure_module_instance(module_name, harvest)
+        bound_key = bound_name.lower()
+        scope = self.current_scope()
+        defining = scope.get_defining_scope(bound_key)
+        if defining is not None and not self._is_outer_scope(defining):
+            raise ModuleImportError(
+                f"Name collision on import at line {line_number}: "
+                f"'{bound_name}' is already defined")
+        meta = inst['module_vars'][raw_name.lower()]
+        self._module_export_bindings.setdefault(
+            module_name.lower(), {})[bound_key] = raw_name.lower()
+        inst.setdefault('exported', {})[bound_key] = raw_name.lower()
+        scope.define(
+            bound_key, meta.get('value'), meta.get('type') or 'unknown',
+            {'module_export': module_name.lower()},
+            is_uninitialized=bool(meta.get('uninitialized')),
+            line_number=line_number)
 
     def _bind_module_type(self, module_name, raw_name, bound_name, harvest,
                           line_number):
