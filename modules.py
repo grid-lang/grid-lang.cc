@@ -25,9 +25,12 @@ _VERSION_LINE_RE = re.compile(
 _VERSION_BLOCK_RE = re.compile(
     r'^\s*Version\s+([A-Za-z_][A-Za-z0-9_]*)\s+exports\s+(.+)$', re.I)
 _USE_RE = re.compile(
-    r'^\s*(?:for\s+([A-Za-z_][A-Za-z0-9_]*)\s+)?'
+    r'^\s*(?:(?:for|let)\s+|:\s*)?'
+    r'([A-Za-z_][A-Za-z0-9_]*\s+)?'
+    r'(?:as\s+([A-Za-z_][A-Za-z0-9_]*)\s+)?'
     r'use\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)'
     r'((?:\s+with\s*\(.*?\))?)\s*$', re.I)
+_USE_LEAD_RE = re.compile(r'^\s*(?:(?:for|let)\s+|:\s*)', re.I)
 _PIN_RE = re.compile(r'\s*version\s*([<>=]+)\s*(.+)$', re.I)
 _RE_NUMBER = re.compile(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', re.I)
 
@@ -99,7 +102,12 @@ def strip_version_tag(name, tag):
 
 
 def parse_use_line(line):
-    """Parse a ``use`` / ``For B use`` import statement.
+    """Parse a ``use`` import statement.
+
+    The instruction lead and namespace stay in sync across ``For``, ``Let``
+    and ``:``; all three accept ``<lead> <ns> [as ModuleVersion] use M.v``,
+    and a bare ``use M.v`` performs a flat import. A lead without a namespace
+    (``For use M.v``) is not an import statement.
 
     Returns a dict with keys:
       - namespace: bound namespace name or None (flat import),
@@ -112,7 +120,14 @@ def parse_use_line(line):
     m = _USE_RE.match(line)
     if not m:
         return None
-    namespace, module, tag, with_clause = m.groups()
+    ns, as_name, module, tag, with_clause = m.groups()
+    namespace = ns.strip() if ns else None
+    if namespace is None and _USE_LEAD_RE.match(line):
+        return None
+    if as_name is not None and as_name.lower() != 'moduleversion':
+        raise ModuleImportError(
+            f"Invalid module import type in '{line.strip()}'; "
+            "only 'as ModuleVersion' is supported")
     pin_op = None
     pin_value = None
     if with_clause:

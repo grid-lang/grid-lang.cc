@@ -93,6 +93,12 @@ For B use Mymodule.v1                      ' namespaced: B.Foo, B.bar
 For B use Mymodule.v1 with (version>=12)   ' namespaced + pin
 ```
 
+The instruction lead and namespace stay in sync across `For`, `Let` and `:`:
+all three accept `B as ModuleVersion use <module>.<vN>`, and each may be
+omitted — `B use <module>.<vN>` or a bare `use <module>.<vN>` (flat) work too.
+`Let B as ModuleVersion Use Mymodule.v1` and `: B as ModuleVersion Use Mymodule.v1`
+bind exactly like `For B use Mymodule.v1`.
+
 - Flat bind injects the version's exported names into the current scope; a
   name collision is a load error.
 - `For B use ...` binds the version as a namespace reachable by dotted paths
@@ -331,7 +337,7 @@ Module <name> [runnable] [shared]
 Version <vN> exports <names...>
 
 use <module>.<vN> [with (version=<pin>)]
-For <ns> use <module>.<vN> [with (version=<pin>)]
+[For | Let | :] <ns> as ModuleVersion use <module>.<vN> [with (version=<pin>)]
 
 Print <expr>
 Return <expr>            ' functions and operations only
