@@ -99,6 +99,17 @@ omitted — `B use <module>.<vN>` or a bare `use <module>.<vN>` (flat) work too.
 `Let B as ModuleVersion Use Mymodule.v1` and `: B as ModuleVersion Use Mymodule.v1`
 bind exactly like `For B use Mymodule.v1`.
 
+**`use` returns a `ModuleVersion`.** A namespaced import binds the namespace
+name (e.g. `B`) to a `ModuleVersion` value at the top level. The value is
+assignable (`Let alias as ModuleVersion = B`) and passable to functions whose
+inputs are typed `ModuleVersion` (the function reads `m.module` for the bound
+namespace name). Member/type access still goes through dotted names
+(`B.Foo`, `alias.foo`), which resolve regardless of aliasing. Two caveats:
+`Require` names the real namespaced type directly (`Require p as B.timer`) — an
+alias is not resolved there — and namespaces whose name collides with the
+`mod` modulo-operator keyword (e.g. `mod`) work in dotted form but not as a
+bare operand.
+
 - Flat bind injects the version's exported names into the current scope; a
   name collision is a load error.
 - `For B use ...` binds the version as a namespace reachable by dotted paths

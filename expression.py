@@ -1310,20 +1310,35 @@ class ExpressionEvaluator:
             func_defs = getattr(self.compiler, 'functions', {}) or {}
             base_name = func_name.split('.')[0]
             is_scope_var = False
+            base_value = None
             try:
                 if hasattr(self.compiler, 'current_scope'):
-                    self.compiler.current_scope().get(base_name)
+                    base_value = self.compiler.current_scope().get(base_name)
                     is_scope_var = True
             except Exception:
                 is_scope_var = False
-            if func_name.lower() in func_defs and not is_scope_var:
+            is_module_version = (
+                isinstance(base_value, dict)
+                and str(base_value.get('_type_name', '')).lower() == 'moduleversion')
+            # ModuleVersion bases (mod.func, and aliases like copy.func when a
+            # ModuleVersion value holds namespace 'mod') resolve through the
+            # dotted flat key, like bare function exports.
+            call_name = func_name if func_name.lower() in func_defs else None
+            if call_name is None and is_module_version:
+                ns_key = base_value.get('module')
+                if ns_key and '.' in func_name:
+                    alias_key = f"{ns_key}.{func_name.split('.', 1)[1]}"
+                    if alias_key.lower() in func_defs:
+                        call_name = alias_key
+            if call_name and (not is_scope_var or is_module_version):
                 args_list = []
                 if arg_text.strip():
                     args_list = [a.strip()
                                  for a in re.split(r',(?![^{]*})', arg_text) if a.strip()]
                 evaluated_args = [self.eval_or_eval_array(
                     a, scope, line_number) for a in args_list]
-                return True, self.compiler.call_function(func_name, evaluated_args)
+                return True, self.compiler.call_function(
+                    call_name, evaluated_args)
 
         return False, None
 
@@ -3576,6 +3591,17 @@ class ExpressionEvaluator:
                         raise AttributeError(f"'{type(obj).__name__}' object has no attribute '{node.attr}'")
                 return result
             except AttributeError:
+                if isinstance(obj, dict) and str(obj.get('_type_name', '')).lower() == 'moduleversion':
+                    # ModuleVersion values alias a bound namespace: member
+                    # access resolves through the underlying dotted flat key
+                    # (e.g. copy.func -> mod.func when copy is 'mod').
+                    ns_key = obj.get('module')
+                    if ns_key:
+                        try:
+                            return self._resolve_fallback_name(
+                                f"{ns_key}.{node.attr}", full_scope, globals_dict)
+                        except NameError:
+                            pass
                 if isinstance(node.value, ast.Name):
                     dotted = f"{node.value.id}.{node.attr}"
                     try:
@@ -3910,7 +3936,7 @@ class ExpressionEvaluator:
         :param line_number: Line number.
         :return: Modified expression.
         """
-        expr = re.sub(r'\bmod\b', '%', expr, flags=re.I)
+        expr = re.sub(r'\bmod\b(?![\w.])', '%', expr, flags=re.I)
         expr = expr.replace('\\', '//')
         expr = expr.replace('^', '**')
         expr = re.sub(r'\btrue\b', 'True', expr, flags=re.I)

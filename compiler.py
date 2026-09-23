@@ -137,6 +137,7 @@ class GridLangCompiler(GridLangExecutor):
         self._cell_array_map = {}
         self.types_defined = {}
         self._seed_predefined_resources()
+        self._seed_moduleversion()
         self.subprocesses = {}
         self._seed_predefined_subprocesses()
         self.unit_sources = {}
@@ -3344,6 +3345,19 @@ class GridLangCompiler(GridLangExecutor):
         for name, type_def in RESOURCES.items():
             self.types_defined[name] = dict(type_def)
 
+    def _seed_moduleversion(self):
+        # The type returned by a 'use' import binding (a ModuleVersion value):
+        # seeded so 'as ModuleVersion' annotations and function inputs that
+        # take a namespace type-check like any custom type. Survives per-run
+        # resets alongside the predefined Resources.
+        self.types_defined['moduleversion'] = {
+            '_name': 'moduleversion',
+            '_fields': {},
+            '_member_keys': set(),
+            '_constraints': {},
+            '_builtin': True,
+        }
+
     def _seed_predefined_subprocesses(self):
         # Standard-library resource control subprocesses (Ticker.Reset/Stop/
         # Start). Seeded once per engine; _extract_functions preserves them and
@@ -3497,6 +3511,7 @@ class GridLangCompiler(GridLangExecutor):
             # like the 'grid' variable: programs Require them without declaring.
             if hasattr(self, '_seed_predefined_resources'):
                 self._seed_predefined_resources()
+            self._seed_moduleversion()
         self.handled_assignments.clear()
         self.root_scope = self.current_scope()  # Always set root scope here
         if hasattr(self, 'output_values'):
@@ -4309,7 +4324,19 @@ class GridLangCompiler(GridLangExecutor):
                 f"line {line_number}")
 
         if namespace:
-            self.module_namespaces.add(namespace.lower())
+            ns = namespace.lower()
+            self.module_namespaces.add(ns)
+            # Faces of a namespaced import: types/functions bind as dotted
+            # flat keys (mod.timer, mod.func), and the namespace name itself
+            # binds as a ModuleVersion value so it can be assigned
+            # (Let copy as ModuleVersion = mod) and passed to functions that
+            # take a ModuleVersion input.
+            scope = self.current_scope()
+            existing = scope._get_case_insensitive_key(ns, scope.variables)
+            if not existing:
+                scope.define(ns, None, 'ModuleVersion', {},
+                             is_uninitialized=True)
+            scope.update(ns, {'_type_name': 'moduleversion', 'module': ns})
 
         for export_name in exports:
             bound_name, _stripped = strip_version_tag(export_name, tag)
