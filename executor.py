@@ -2685,6 +2685,8 @@ class GridLangExecutor(GridLangBase):
                 index_var = index_match.group(1)
 
             step = int(step_str) if step_str else 1
+            start_expr = None
+            end_expr = None
             if ' to ' in range_expr:
                 range_parts = range_expr.split(' to ')
                 start_expr = range_parts[0].strip()
@@ -2712,8 +2714,14 @@ class GridLangExecutor(GridLangBase):
                         except ValueError:
                             values.append(v_clean)
             else:
-                raise SyntaxError(
-                    f"Invalid range expression: {range_expr} at line {line_number}")
+                try:
+                    values = self._evaluate_for_range_values(
+                        range_expr, step, line_number)
+                except SyntaxError:
+                    raise
+                except Exception:
+                    raise SyntaxError(
+                        f"Invalid range expression: {range_expr} at line {line_number}")
 
             if ' to ' not in range_expr:
                 is_dynamic = False
