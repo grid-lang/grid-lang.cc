@@ -4636,12 +4636,12 @@ class GridLangExecutor(GridLangBase):
         if not value_expr:
             raise SyntaxError(
                 f"Invalid PRINT syntax at line {line_number}. Use 'Print <expression>'")
-        self._append_console_output(value_expr, line_number)
+        self._append_console_output(value_expr, line_number, channel='_console')
 
-    def _append_console_output(self, value_expr, line_number):
-        """Evaluate an expression and append it to the console output channel
-        (output_values['output']). Shared by Return (top level, transitional)
-        and Print (the ambient console statement)."""
+    def _append_console_output(self, value_expr, line_number, channel='output'):
+        """Evaluate an expression and append it to the given output channel
+        (default output_values['output']). Print targets the ambient '_console'
+        channel; Return (top level, transitional) uses 'output'."""
         try:
             resolver = getattr(self, 'compiler', None) or self
             pending = getattr(
@@ -4673,9 +4673,9 @@ class GridLangExecutor(GridLangBase):
                         value_expr, line_number)
             for value in values:
                 self.output_values.setdefault(
-                    'output', []).append(self._snapshot_value(value))
-            if 'output' not in self.output_variables:
-                self.output_variables.append('output')
+                    channel, []).append(self._snapshot_value(value))
+            if channel not in self.output_variables:
+                self.output_variables.append(channel)
         except Exception as e:
             raise ValueError(
                 f"Failed to evaluate return expression at line {line_number}: {e}")
@@ -5376,7 +5376,7 @@ class GridLangExecutor(GridLangBase):
                     # Print all collected values for this output variable
                     for value in output_values[output_var]:
                         display = format_display_value(value)
-                        if output_var == 'output':
+                        if output_var in ('output', '_console'):
                             print(display)
                         else:
                             print(f"{output_var}: {display}")

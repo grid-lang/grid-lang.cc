@@ -1157,6 +1157,15 @@ class GridLangCompiler(GridLangExecutor):
             suppress_output=True, return_output=True)
         outputs = func_result or {}
 
+        # Propagate the function console channel (Print) up to the caller; the
+        # 'output' channel (the Return call value) must not leak to console.
+        func_console = outputs.get('_console') or []
+        if func_console:
+            self.output_values.setdefault('_console', []).extend(
+                list(func_console))
+            if '_console' not in self.output_variables:
+                self.output_variables.append('_console')
+
         # Merge declared outputs from function scope when not pushed explicitly.
         try:
             last_scope_vars = getattr(sub_compiler, '_last_scope_vars', {}) or {}
@@ -1181,6 +1190,8 @@ class GridLangCompiler(GridLangExecutor):
         # Normalize outputs to lists to preserve all pushed values
         normalized_outputs = {}
         for k, v in outputs.items():
+            if k == '_console':
+                continue
             if isinstance(v, list):
                 normalized_outputs[k] = v
             elif v is None:
@@ -2222,6 +2233,16 @@ class GridLangCompiler(GridLangExecutor):
             sp_def['code'], list(args),
             suppress_output=True, return_output=True)
 
+        # Propagate the subprocess/function console channel (Print) up to the
+        # caller: the sub-call runs on its own compiler whose output_values
+        # (including the ambient '_console' channel) would otherwise be discarded.
+        sub_console = (sub_output or {}).get('_console') or []
+        if sub_console:
+            self.output_values.setdefault('_console', []).extend(
+                list(sub_console))
+            if '_console' not in self.output_variables:
+                self.output_variables.append('_console')
+
         # A module subprocess may have mutated its instance state; refresh the
         # importer's copies of the module's exported variables.
         if sp_def.get('module_key'):
@@ -2271,6 +2292,8 @@ class GridLangCompiler(GridLangExecutor):
         normalized_outputs = {}
         if merged_outputs:
             for k, v in merged_outputs.items():
+                if k == '_console':
+                    continue
                 if isinstance(v, list):
                     normalized_outputs[k] = v
                 elif v is None:

@@ -206,12 +206,13 @@ There are three output channels.
 
 | Channel      | Destination            | Legal in                                  |
 |--------------|------------------------|-------------------------------------------|
-| `Print x`    | ambient output (console)| any scope                               |
+| `Print x`    | ambient console (`_console`)| any scope                          |
 | `Return x`   | the caller (value)     | functions and operations (subprocesses)   |
 | `Output` vars| the module-run interface | runnable modules' body / module head |
 
-- `Print` pushes a value to the **ambient output**, which is the console
-  today (conceptually redirectable later).
+- `Print` pushes a value to the **`_console` channel** — the ambient console.
+  Users cannot declare variables beginning with `_`, so the channel key can
+  never collide with a user output variable or return channel.
 - `Return` is the **call-return channel** — the value passed back from a
   function or subprocess to its caller. It is legal only inside functions and
   operations.

@@ -99,10 +99,32 @@ class GridLangControlFlow:
 
     def _handle_print_statement(self, value_expr, line_number):
         """Print <expr> — ambient console output inside block bodies. Uses the
-        same console channel as Return so both produce output_values['output'];
-        the difference is that Print is legal anywhere while Return is the
+        dedicated '_console' channel (distinct from the 'output' call-value
+        channel used by Return) so prints survive the sub-call boundary; the
+        difference is that Print is legal anywhere while Return is the
         call-value channel restricted to functions and operations."""
-        self._handle_return_statement(value_expr, line_number)
+        resolver_targets = [self.compiler]
+        if hasattr(self.compiler, 'compiler'):
+            resolver_targets.append(self.compiler.compiler)
+        for target in resolver_targets:
+            pending = getattr(target, 'pending_assignments', {}) or {}
+            pending_vars = [
+                pending_var for pending_var in list(pending.keys())
+                if not pending_var.startswith('__line_')
+            ]
+            for pending_var in pending_vars:
+                target._resolve_global_dependency(
+                    pending_var, line_number,
+                    target_scope=self.compiler.current_scope())
+        values = self.compiler._evaluate_push_expression(
+            value_expr, line_number)
+        for value in values:
+            snapshot = value
+            if hasattr(self.compiler, '_snapshot_value'):
+                snapshot = self.compiler._snapshot_value(value)
+            self.compiler.output_values.setdefault('_console', []).append(snapshot)
+        if '_console' not in self.compiler.output_variables:
+            self.compiler.output_variables.append('_console')
 
     def _handle_return_statement(self, value_expr, line_number):
         resolver_targets = [self.compiler]

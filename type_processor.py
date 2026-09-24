@@ -420,6 +420,16 @@ class GridLangTypeProcessor:
                     default_fields=default_fields, is_push=True)
                 i += 1
                 continue
+            if stripped_line.lower().startswith('print'):
+                print_match = re.match(
+                    r'^\s*print(?:\s+(.+))?\s*$', stripped_line, re.I)
+                if not print_match or not (print_match.group(1) or '').strip():
+                    raise SyntaxError(
+                        f"Invalid PRINT syntax at line {line_number}. Use 'Print <expression>'")
+                self.compiler.control_flow._handle_print_statement(
+                    print_match.group(1).strip(), line_number)
+                i += 1
+                continue
             if (re.match(r'^for\b', stripped_line, re.I)
                     and not re.search(r'\bdo\b', stripped_line, re.I)
                     and not re.search(r'\bthen\b', stripped_line, re.I)
