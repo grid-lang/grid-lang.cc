@@ -4347,7 +4347,54 @@ class GridLangExecutor(GridLangBase):
         if self._maybe_handle_subprocess_call(line, line_number):
             return i + 1
 
+        self._reject_unknown_call(line, line_number)
         return i + 1
+
+    def _reject_unknown_call(self, line, line_number):
+        """Turn a bare call to a non-existent subprocess/function into an error.
+
+        A statement of the exact shape ``Name(args)`` reached the end of the
+        main-loop dispatch with no handler: either it names nothing the engine
+        knows (typo, missing ``use``/``Require``) or it is a call-shaped read
+        that produces no value. Names that resolve to a function, subprocess,
+        granted capability handle, or any in-scope variable keep today's
+        no-op behavior; truly unknown callees raise instead of failing
+        silently.
+        """
+        m = re.match(
+            r'^\s*([A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)*)\s*\(.*\)\s*$',
+            line, re.S)
+        if not m:
+            return
+        name = m.group(1)
+        base = name.split('.')[0].lower()
+        try:
+            func_defs = getattr(self, 'functions', {}) or {}
+            sp_defs = getattr(self, 'subprocesses', {}) or {}
+            compiler = getattr(self, 'compiler', None)
+            if compiler is not None:
+                func_defs = getattr(compiler, 'functions', {}) or {}
+                sp_defs = getattr(compiler, 'subprocesses', {}) or {}
+            if name.lower() in func_defs or name.lower() in sp_defs:
+                return
+            scope = self.current_scope()
+            if scope is not None:
+                if scope._get_case_insensitive_key(base, scope.variables):
+                    return
+            if base in (getattr(self, '_scope_handle_vars', lambda: {})()):
+                return
+            if base in (getattr(self, 'require_caps', {}) or {}):
+                return
+            try:
+                from builtin_functions import BUILTINS
+                if base in (BUILTINS or {}):
+                    return
+            except ImportError:
+                pass
+        except Exception:
+            return
+        raise NameError(
+            f"Name '{name}' is not defined at line {line_number}")
 
     def _handle_main_loop_grid_assignment(self, line, line_number, i):
         if ':=' not in line:

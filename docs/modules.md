@@ -20,7 +20,10 @@ header and the export surface.
 Two operations on a module are distinct:
 
 - **Load** (`use`) — binds the module's definitions into the current program.
-- **Run** (`Sub(module)`) — executes the module's body in isolation.
+- **Run** (the module-run subprocess, `ModuleName(...)`) — executes the
+  module's body in isolation when the module is `runnable`; importing a
+  runnable module (with or without a version) exposes it as a subprocess
+  named after the module (§7).
 
 ## 2. Module header
 
@@ -28,8 +31,10 @@ Two operations on a module are distinct:
 Module Mymodule [runnable] [shared]
 ```
 
-- `runnable`: the module has a body that may be invoked with `Sub(module)`.
-  Absent, any body is inert and `Sub(module)` fails at the call site.
+- `runnable`: the module has a body that may be invoked by importing it and
+  calling its module-run subprocess (`Mymodule(...)`, see §7). Absent, any body
+  is inert and a versionless `use Mymodule` fails at the import line — a
+  versioned `use Mymodule.v1` is required instead.
 - `shared`: the module is instantiated **once per program** instead of once per
   importer. Importing the same `shared` module must always resolve to the same
   physical copy; a version pin selecting a different copy is a load error.
@@ -71,8 +76,9 @@ Version v2 exports bar, bam, woosh
 - Exports may be **definitions** (function, subprocess, type, unit category)
   **or top-level variables** (see §6 for what binds on load).
 - `Input` / `Output` variables are **never** exportable — they belong to the
-  `Sub()` run interface only.
-- A module with no `Version` blocks has no importable API.
+  module-run interface only (§7).
+- A module with no `Version` blocks has no importable API unless it is
+  `runnable` (a versionless `use` then runs its body without binding exports).
 
 *Implemented for definitions: exporting a **function, subprocess, or type**
 binds its definition (see the Load-semantics and binding notes in §5).
@@ -83,7 +89,10 @@ deferred.*
 
 ## 5. Import
 
-API version is **always required**; there is no default/latest.
+API version is **not required for runnable modules**: a versionless
+`use Mymodule` imports a runnable module as its module-run subprocess (§7) and
+binds nothing else. Any module whose API is imported needs a `Version` tag;
+there is no default/latest.
 
 ```grid
 use Mymodule.v1                            ' flat: exports land in scope
@@ -91,13 +100,15 @@ use Mymodule.v1 with (version="rel12.3-5") ' module pin (module version)
 use Mymodule.v1 with (version>=12.3)       ' ordered pin (Number/Date)
 For B use Mymodule.v1                      ' namespaced: B.Foo, B.bar
 For B use Mymodule.v1 with (version>=12)   ' namespaced + pin
+use Mymodule                               ' runnable modules only (§7)
 ```
 
 The instruction lead and namespace stay in sync across `For`, `Let` and `:`:
 all three accept `B as ModuleVersion use <module>.<vN>`, and each may be
 omitted — `B use <module>.<vN>` or a bare `use <module>.<vN>` (flat) work too.
 `Let B as ModuleVersion Use Mymodule.v1` and `: B as ModuleVersion Use Mymodule.v1`
-bind exactly like `For B use Mymodule.v1`.
+bind exactly like `For B use Mymodule.v1`. A versionless import is flat only:
+a namespaced versionless `use` (e.g. `For B use Mymodule`) is a load error.
 
 **`use` returns a `ModuleVersion`.** A namespaced import binds the namespace
 name (e.g. `B`) to a `ModuleVersion` value at the top level. The value is
@@ -138,33 +149,56 @@ Loading a module **binds**; it never **runs**.
 - The *Push family* — `Push`, `Init` (deferred push), `For ... init` — never
   fires on load. An exported variable that is only ever pushed reads `#N/A`
   unless it carries an `or = <default>`.
-- Consistent contract: **exports intended to be consumed before any `Sub()`
-  must be equality-bound or carry a default.** Push-only exports are state
+- Consistent contract: **exports intended to be consumed before the module is
+  run must be equality-bound or carry a default.** Push-only exports are state
   slots — meaningful after a run has filled them.
-- `Input` and `Output` declarations belong to the `Sub(module)` interface and
+- `Input` and `Output` declarations belong to the module-run interface and
   never bind on load.
 
 *(Top-level variable exports, flat only, are implemented. Equality-bound
-    (`: x = e`) and `init`-seeded exports instantiate on load as read-only
-    views; push-only exports read `#N/A` until an exported subprocess fills
-    them. Namespaced variable exports, and the `Sub()` run value surface, are
-    still deferred.)*
+    (`: x = e`) exports instantiate on load as read-only views; `init`-seeded
+    and push-only exports read `#N/A` until a run — or an exported subprocess
+    push — fills them. Because `init` is a shortcut for `Push` (it never fires
+    on load), a module that wants a stateful counter should export an
+    initializer subprocess that pushes the seed value. Namespaced variable
+    exports, and the run-result `SubprocessResult` value surface, are still
+    deferred.)*
 
 ## 7. Run
 
+A `runnable` module's body runs in isolation through the **module-run
+subprocess**: *importing* the module — `use Mymodule` (no version) or
+`use Mymodule.v1` — makes a subprocess named after the module available, and
+calling it executes the module body exactly like a subprocess call:
+
 ```grid
-Sub(Mymodule)         ' runnable modules only; fails at the call site otherwise
+use Mymodule                    ' runnable modules only; binds no exports
+Mymodule(3, out)                ' runs the module body: Inputs are arguments,
+                                ' Outputs flow back through the trailing bindings
 ```
 
-- A `runnable` module's body executes **in isolation**, exactly like a
-  subprocess call today. Its `Input` variables are the parameters; its
-  `Output` variables are the returned interface; the result is a
-  `SubprocessResult`.
+- A versionless `use Mymodule` imports only the module-run subprocess; nothing
+  is bound into scope. The module must declare `runnable` — otherwise the
+  import fails at the `use` line (`use Mymodule.<tag>` is required instead).
+- A versioned `use Mymodule.v1` of a `runnable` module binds the tag's exports
+  *and* exposes the module-run subprocess, so the same program can use the
+  module's API and run its body.
+- The module body's `Input` declarations are the call parameters; its `Output`
+  declarations are the returned interface, bound to the trailing call
+  arguments. The run is **in isolation**: the body executes on a fresh
+  compiler, like a subprocess call today, and re-derives the module's own
+  definitions from its body text — so a versionless `use` can run a body whose
+  `Input`/`Output` reference module-private types that were never bound into
+  scope.
 - A module body is **Print-only** section: `Return` is not allowed there. The
   body may use `Print` (console) and `Output` declarations (the run result);
   `Return` is reserved for functions and named subprocesses.
 
-*(Not yet implemented.)*
+*Implemented. Importing a runnable module (with or without a version) registers
+the module-run subprocess under the module's own name — the `Sub(module)`
+primitive of the original §7 note remains deferred, and the module name itself
+is the run handle today. A bare statement calling a name that is neither a
+subprocess nor a function is now a `NameError` (no more silent no-ops).*
 
 ## 8. Channels: Print, Return, Output
 
@@ -174,7 +208,7 @@ There are three output channels.
 |--------------|------------------------|-------------------------------------------|
 | `Print x`    | ambient output (console)| any scope                               |
 | `Return x`   | the caller (value)     | functions and operations (subprocesses)   |
-| `Output` vars| the `Sub()` interface  | runnable control-flow / module head       |
+| `Output` vars| the module-run interface | runnable modules' body / module head |
 
 - `Print` pushes a value to the **ambient output**, which is the console
   today (conceptually redirectable later).
@@ -254,7 +288,7 @@ Capabilities flow the other way — from the main program into the module:
   explicit parameters: an instance of a granted resource (or a bare handle)
   passed to the module's functions, subprocesses, type builders, etc.
 - **Runnable modules:** a granted resource or a handle may be passed to the
-  module when it runs (`Sub(module)`); the module never fetches one itself.
+  module when it runs (`Mymodule(...)`); the module never fetches one itself.
 - **Full control stays with the main program.** Nothing in a module can reach a
   capability the main program has not explicitly handed over. If the module's
   requirements evolve, the main program must adapt (re-grant, pass a new handle)
@@ -347,12 +381,13 @@ Module <name> [runnable] [shared]
 
 Version <vN> exports <names...>
 
+use <module>                                 ' runnable modules (§7); no exports bound
 use <module>.<vN> [with (version=<pin>)]
 [For | Let | :] <ns> as ModuleVersion use <module>.<vN> [with (version=<pin>)]
 
 Print <expr>
 Return <expr>            ' functions and operations only
-Sub(<module>)            ' runnable modules
+<module>(...)            ' run the module body as the module-run subprocess (§7)
 
 Define <X> as UnitSource of <K>
 delegate <member...> to <field>

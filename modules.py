@@ -28,7 +28,7 @@ _USE_RE = re.compile(
     r'^\s*(?:(?:for|let)\s+|:\s*)?'
     r'([A-Za-z_][A-Za-z0-9_]*\s+)?'
     r'(?:as\s+([A-Za-z_][A-Za-z0-9_]*)\s+)?'
-    r'use\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)'
+    r'use\s+([A-Za-z_][A-Za-z0-9_]*)(?:\.([A-Za-z_][A-Za-z0-9_]*))?'
     r'((?:\s+with\s*\(.*?\))?)\s*$', re.I)
 _USE_LEAD_RE = re.compile(r'^\s*(?:(?:for|let)\s+|:\s*)', re.I)
 _PIN_RE = re.compile(r'\s*version\s*([<>=]+)\s*(.+)$', re.I)
@@ -107,12 +107,14 @@ def parse_use_line(line):
     The instruction lead and namespace stay in sync across ``For``, ``Let``
     and ``:``; all three accept ``<lead> <ns> [as ModuleVersion] use M.v``,
     and a bare ``use M.v`` performs a flat import. A lead without a namespace
-    (``For use M.v``) is not an import statement.
+    (``For use M.v``) is not an import statement. The API version tag is
+    optional: a bare ``use M`` (no tag) imports a *runnable* module and
+    exposes it as the module-run subprocess ``M`` (see docs §7).
 
     Returns a dict with keys:
       - namespace: bound namespace name or None (flat import),
       - module:    module name,
-      - tag:       API version tag,
+      - tag:       API version tag or None (versionless runnable import),
       - pin_op:    '=' / '>=' / ... or None,
       - pin_value: raw pin expression or None,
     or None when the line is not a use statement.
@@ -138,6 +140,14 @@ def parse_use_line(line):
                 "expected 'with (version<op>value)'")
         pin_op = pm.group(1).strip()
         pin_value = pm.group(2).strip().rstrip(')').strip()
+    if pin_op is not None and tag is None:
+        raise ModuleImportError(
+            f"Version pin 'version{pin_op}{pin_value}' in '{line.strip()}' "
+            "requires a 'use M.<tag>' version tag")
+    if namespace and tag is None:
+        raise ModuleImportError(
+            f"Versionless 'use {module}' in '{line.strip()}' cannot bind a "
+            "namespace; use '<ns> use M.<tag>'")
     return {
         'namespace': namespace,
         'module': module,

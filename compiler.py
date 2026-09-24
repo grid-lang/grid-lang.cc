@@ -2182,6 +2182,21 @@ class GridLangCompiler(GridLangExecutor):
         sub_compiler.preserve_types_defined = True
         sub_compiler.preserve_functions = True
         sub_compiler.preserve_subprocesses = True
+        if sp_def.get('module_run'):
+            # A module run executes the module's whole body in isolation: the
+            # body text re-derives the module's own definitions (types,
+            # functions, subprocesses) inside this runner, so it must start
+            # from fresh tables instead of the importer's live ones. The
+            # module's Input/Output declarations may reference its own types
+            # (e.g. `Input g as A`), which a versionless import never binds
+            # into the importer; defining them from the body text resolves that.
+            sub_compiler.types_defined = {}
+            if hasattr(sub_compiler, '_seed_predefined_resources'):
+                sub_compiler._seed_predefined_resources()
+            sub_compiler._seed_moduleversion()
+            sub_compiler.functions = {}
+            sub_compiler.subprocesses = {}
+            sub_compiler.unit_sources = {}
         # Subprocesses reference the caller's scope chain live: reads resolve to
         # caller variables and writes (push/assignments) flow through. Module
         # subprocesses run against the module's live instance scope instead,
@@ -3652,12 +3667,6 @@ class GridLangCompiler(GridLangExecutor):
             if not s:
                 continue
 
-            # Normalize INIT statements into LET assignments.
-            init_match = re.match(r'^(\s*)init\b(.*)$', s, re.I)
-            if init_match:
-                leading_ws, rest = init_match.groups()
-                s = f"{leading_ws}Let{rest}"
-
             # Preserve WHEN blocks for runtime handling.
 
             # Normalize brackets like [ A 12 ] → [A12]
@@ -4107,9 +4116,10 @@ class GridLangCompiler(GridLangExecutor):
         """Locate, parse and harvest a module's definitions (load, never run).
 
         The module body is parsed by a fresh compiler that never executes a
-        main loop and never runs `_process_declarations_and_labels`: it only
-        preprocesses (registering types/unit sources) and extracts function
-        and subprocess definitions. Returns a dict with:
+        main loop: it preprocesses (registering types/unit sources), extracts
+        function and subprocess definitions, and instantiates top-level
+        declarations to obtain the per-instance initial state. Returns a dict
+        with:
 
           - header: parsed `Module <name>` header or None,
           - module_version: parsed `: version` entry or None,
@@ -4152,8 +4162,10 @@ class GridLangCompiler(GridLangExecutor):
                     version_block['tag'].lower(), version_block['exports'])
                 continue
             body_source.append(raw_line)
-        if not metadata['exports_by_tag']:
-            # A module with no Version blocks exposes no importable API.
+        header = metadata['header'] or {}
+        if not metadata['exports_by_tag'] and not header.get('runnable'):
+            # A module with no Version blocks exposes no importable API unless
+            # it is a runnable module (which can be imported without a version).
             raise ModuleImportError(
                 f"Module '{module_name}' declares no 'Version' exports; it "
                 "cannot be imported" +
@@ -4168,6 +4180,13 @@ class GridLangCompiler(GridLangExecutor):
                 "\n".join(body_source))
             remaining, label_lines, dim_lines = loader._extract_functions(
                 all_lines, label_lines, dim_lines)
+            # Capture the module's runnable body for the module-run subprocess
+            # (docs §7). The full body, including the module's own definitions,
+            # is kept: a module run re-derives them inside its fresh runner, so
+            # runnable Inputs may reference module-private types even when the
+            # import did not bind them. Input / Output declarations belong to
+            # this body and bind call arguments.
+            body_text = "\n".join(body_source)
             # Instantiate the module's top-level declarations into the loader's
             # global scope to obtain the per-instance initial state. Blocks and
             # Push-family statements are left for the (never-run) main loop,
@@ -4179,6 +4198,14 @@ class GridLangCompiler(GridLangExecutor):
                 loader._resolve_pending_assignments()
             except Exception:
                 pass
+            # The Push family never fires on load (docs/modules.md §6); `Init`
+            # is a shortcut for `Push`. Declared state slots therefore stay
+            # uninitialized (#N/A) in the imported instance. Drop the lazy
+            # `init` constraints so neither the module-var snapshot nor a later
+            # definition-subprocess run against the instance can materialize
+            # them: only the module body's own run (module-run, which re-derives
+            # declarations in a fresh runner) may fire them.
+            loader._detach_module_inits()
         except ModuleImportError:
             raise
         except Exception as exc:
@@ -4187,6 +4214,7 @@ class GridLangCompiler(GridLangExecutor):
                 f"{exc}") from exc
 
         harvest = dict(metadata)
+        harvest['body'] = body_text
         harvest['functions'] = getattr(loader, 'functions', {})
         harvest['subprocesses'] = getattr(loader, 'subprocesses', {})
         harvest['types_defined'] = getattr(loader, 'types_defined', {})
@@ -4195,6 +4223,25 @@ class GridLangCompiler(GridLangExecutor):
         harvest['module_vars'] = self._snapshot_module_vars(loader)
         self._module_harvests[key] = harvest
         return harvest
+
+    def _detach_module_inits(self):
+        """Remove lazy INIT constraints from a freshly loaded module's scope.
+
+        Loading a module binds definitions and snapshots state; it never runs
+        anything. `Init` is a shortcut for `Push`, so an init-seeded state slot
+        stays uninitialized (#N/A) in the imported instance and is only given a
+        value when the module body's own run executes. Without this, any later
+        read of the instance scope (the module-var snapshot or an exported
+        subprocess running against the instance) would materialize the INIT
+        lazily and mutate module state at load time - a state change.
+        """
+        scope = self.current_scope()
+        for key, constraints in list(scope.constraints.items()):
+            if not constraints or 'init' not in constraints:
+                continue
+            if not scope.is_uninitialized(key):
+                continue
+            constraints.pop('init', None)
 
     def _snapshot_module_vars(self, loader):
         """Capture the module's top-level variable state for one instance."""
@@ -4205,10 +4252,10 @@ class GridLangCompiler(GridLangExecutor):
                 continue
             if scope.is_input(key) or scope.is_output(key):
                 continue
-            try:
-                value = scope.get(key)
-            except Exception:
+            if scope.is_uninitialized(key):
                 value = None
+            else:
+                value = scope.variables.get(key)
             vars_[key.lower()] = {
                 'value': value,
                 'uninitialized': scope.is_uninitialized(key),
@@ -4300,6 +4347,12 @@ class GridLangCompiler(GridLangExecutor):
     def _collect_module_import(self, line, line_number, parsed):
         """Bind a single import statement, exporting a whole API version.
 
+        A versioned ``use M.<tag>`` binds the tag's exports (and registers the
+        module-run subprocess when the module is runnable). A versionless
+        ``use M`` requires a runnable module and registers only the
+        module-run subprocess, which executes the module body as a subprocess
+        call (docs §7).
+
         Raises `ModuleImportError` for unknown modules/tags, unsatisfied
         version pins, collisions, and definitions outside this milestone.
         """
@@ -4307,6 +4360,7 @@ class GridLangCompiler(GridLangExecutor):
         tag = parsed['tag']
         namespace = parsed['namespace']
         harvest = self._load_module_harvest(module_name, line_number)
+        header = harvest.get('header') or {}
 
         if parsed['pin_op'] is not None:
             matched = version_pin_matches(
@@ -4316,6 +4370,17 @@ class GridLangCompiler(GridLangExecutor):
                     f"Module '{module_name}' does not satisfy version pin "
                     f"'version{parsed['pin_op']}{parsed['pin_value']}' at "
                     f"line {line_number}")
+
+        if tag is None:
+            # Versionless import: only a runnable module can be brought in,
+            # and it is exposed solely as the module-run subprocess.
+            if not header.get('runnable'):
+                raise ModuleImportError(
+                    f"Module '{module_name}' is not runnable, so 'use "
+                    f"{module_name}' needs a version tag: 'use {module_name}."
+                    f"<tag>' at line {line_number}")
+            self._register_module_run(module_name, harvest, line_number)
+            return
 
         exports = harvest['exports_by_tag'].get(tag.lower())
         if exports is None:
@@ -4373,6 +4438,80 @@ class GridLangCompiler(GridLangExecutor):
                     f"Module '{module_name}' Version '{tag}' exports "
                     f"'{export_name}' which is not defined at line "
                     f"{line_number}")
+
+        if header.get('runnable'):
+            # A runnable module is also available as the module-run subprocess
+            # under its own name (docs §7), even when imported with a version.
+            self._register_module_run(module_name, harvest, line_number)
+
+    def _register_module_run(self, module_name, harvest, line_number):
+        """Register the module-run subprocess for a runnable module.
+
+        The subprocess is named after the module (case-insensitive) and
+        executes the module's runnable body as a subprocess call: top-level
+        ``Input`` declarations bind the call arguments and ``Output``
+        declarations flow back to the call's output bindings. Registration is
+        idempotent per module so the same program (or a re-used compiler) can
+        import a runnable module more than once.
+        """
+        key = module_name.lower()
+        existing = self.subprocesses.get(key)
+        if existing is not None:
+            if existing.get('module_run') == key:
+                return
+            raise ModuleImportError(
+                f"Module '{module_name}' cannot expose its run subprocess at "
+                f"line {line_number}: '{module_name}' is already defined as a "
+                f"subprocess")
+        body = harvest.get('body') or ''
+        inputs, input_defs, outputs = [], [], []
+        parser = getattr(self, 'parser', None)
+        for raw_line in body.splitlines():
+            stripped = raw_line.strip()
+            if re.match(r'^\s*input\s+(.+)$', stripped, re.I):
+                try:
+                    parsed_var, parsed_type, parsed_constraints, _ = (
+                        parser._parse_variable_def(stripped, line_number)
+                        if parser is not None else (None, None, {}, None))
+                except Exception:
+                    parsed_var, parsed_type, parsed_constraints = None, None, {}
+                if parser is None or parsed_var is None:
+                    continue
+                var_list = ((parsed_constraints or {}).get('var_list')
+                            if parsed_constraints else None)
+                names = var_list if var_list else [parsed_var]
+                inputs.extend(names)
+                for name in names:
+                    input_defs.append({'name': name,
+                                       'type': parsed_type,
+                                       'constraints': parsed_constraints or {}})
+            elif re.match(r'^\s*output\s+(.+)$', stripped, re.I):
+                try:
+                    parsed_var, _parsed_type, parsed_constraints, _ = (
+                        parser._parse_variable_def(stripped, line_number)
+                        if parser is not None else (None, None, {}, None))
+                except Exception:
+                    parsed_var, parsed_constraints = None, {}
+                if parser is None or parsed_var is None:
+                    continue
+                var_list = ((parsed_constraints or {}).get('var_list')
+                            if parsed_constraints else None)
+                names = var_list if var_list else [parsed_var]
+                outputs.extend(names)
+        entry = {
+            'name': module_name,
+            'code': body,
+            'outputs': outputs,
+            'inputs': inputs,
+            'input_defs': input_defs,
+            'member_of': None,
+            'original': module_name,
+            'hidden': False,
+            'code_lines': [ln for ln in body.splitlines()],
+            'defining_scope': None,
+            'module_run': key,
+        }
+        self.subprocesses[key] = entry
 
     def _bind_module_def(self, module_name, raw_name, bound_name, harvest,
                          line_number, table):
