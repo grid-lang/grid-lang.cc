@@ -1283,6 +1283,16 @@ class Scope:
                 if isinstance(value, dict) and '_type_name' in value:
                     # Custom-type instances bypass scalar base-type checks.
                     continue
+                if isinstance(value, (list, tuple)) or (
+                        isinstance(value, dict) and (
+                            'array' in value or is_sparse_array(value))):
+                    # Arrays are accepted regardless of a declared dim:
+                    # a dim-less variable may hold an array (par the ':'
+                    # binding), and a no-dim input receives the array whole
+                    # rather than being coerced to a scalar. Element-type
+                    # validation happens in array_handler when a dim is
+                    # declared.
+                    continue
                 actual_type = self.compiler.array_handler.infer_type(
                     value, line_number)
                 if expected_type == 'number' and actual_type not in ('number', 'float64', 'int', 'int64'):

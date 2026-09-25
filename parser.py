@@ -105,6 +105,19 @@ class GridLangParser:
                         for part in re.split(r'\s+or\s+', cleaned_part, flags=re.I)
                         if part.strip()
                     ]
+                    for _part in union_parts or [next_part.strip().lower()]:
+                        # A type name is a single identifier token, optionally
+                        # followed by a `Use <version>` clause (module imports,
+                        # e.g. 'as ModuleVersion Use M.v'). Anything else is an
+                        # unexpected token and rejects the declaration.
+                        if not re.match(
+                                r'^\$?[a-zA-Z_][\w.!*]*'
+                                r'(?:\s+use\s+[\w.\-+]+|\s+key)?$',
+                                _part, re.I):
+                            raise SyntaxError(
+                                f"Invalid type declaration for '{var}': "
+                                f"unexpected token '{_part}' after type name "
+                                f"at line {line_number}")
                     if union_parts:
                         type_union.extend(union_parts)
                     else:

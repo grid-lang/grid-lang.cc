@@ -1058,6 +1058,10 @@ class GridLangCompiler(GridLangExecutor):
                         try:
                             parsed_var, parsed_type, parsed_constraints, _ = self.parser._parse_variable_def(
                                 decl_text, body_ln)
+                        except SyntaxError:
+                            # A malformed declaration is a parse failure and
+                            # must reject the program, not be skipped silently.
+                            raise
                         except Exception:
                             parsed_var, parsed_type, parsed_constraints = None, None, {}
                         if parsed_var:
@@ -1080,6 +1084,8 @@ class GridLangCompiler(GridLangExecutor):
                         try:
                             parsed_var, parsed_type, parsed_constraints, _ = self.parser._parse_variable_def(
                                 decl_text, body_ln)
+                        except SyntaxError:
+                            raise
                         except Exception:
                             parsed_var, parsed_type, parsed_constraints = None, None, {}
                         if parsed_var:
@@ -1237,10 +1243,16 @@ class GridLangCompiler(GridLangExecutor):
                     dim_spec = None
                     if idx < len(input_defs):
                         dim_spec = input_defs[idx].get('constraints', {}).get('dim')
-                    if isinstance(dim_spec, str) and dim_spec.replace(' ', '') == '{}':
-                        continue
-                    should_vectorize = True
-                    break
+                    # Element-wise mapping only when the input is declared
+                    # 'single' (a 0-D scalar; 'single' before the type parses
+                    # to the empty dim '{}', as do 'dim none'/'dim {}'). A
+                    # missing dim (None) or a real array dim ('dim 2',
+                    # 'dim {2}', 'dim *') means the argument IS the whole
+                    # array, so the function is not mapped (like a
+                    # non-vectorized builtin).
+                    if dim_spec == '{}':
+                        should_vectorize = True
+                        break
                 if should_vectorize:
                     lengths = {len(vals) for _, vals in array_args}
                     if len(lengths) > 1:
@@ -4714,6 +4726,8 @@ class GridLangCompiler(GridLangExecutor):
                     parsed_var, parsed_type, parsed_constraints, _ = (
                         parser._parse_variable_def(stripped, line_number)
                         if parser is not None else (None, None, {}, None))
+                except SyntaxError:
+                    raise
                 except Exception:
                     parsed_var, parsed_type, parsed_constraints = None, None, {}
                 if parser is None or parsed_var is None:
@@ -4736,6 +4750,8 @@ class GridLangCompiler(GridLangExecutor):
                     parsed_var, _parsed_type, parsed_constraints, _ = (
                         parser._parse_variable_def(stripped, line_number)
                         if parser is not None else (None, None, {}, None))
+                except SyntaxError:
+                    raise
                 except Exception:
                     parsed_var, parsed_constraints = None, {}
                 if parser is None or parsed_var is None:
