@@ -427,11 +427,19 @@ class GridLangControlFlow:
         return True, i + 1
 
     def _handle_block_if_dispatch(self, block_lines, i, line, line_number, line_clean):
-        # Inline IF with single statement on the same line
+        if not line_clean.lower().startswith('if '):
+            return False, i
+
+        # Inline guard:  if <cond> then <action>  (single line, no block).
+        # The guard is evaluated first; if its dependencies still need
+        # evaluating, it is deferred without running any of the action.
         inline_if_match = re.match(
             r'^\s*if\s+(.+?)\s+then\s+(.+)$', line, re.I)
         if inline_if_match:
             cond, action = inline_if_match.groups()
+            if self._block_if_guard_deferred(
+                    cond.strip(), line, line_number):
+                return True, i + 1
             try:
                 if self._evaluate_if_condition(
                         cond.strip(), line_number, warn_boolean=True):
@@ -458,59 +466,76 @@ class GridLangControlFlow:
                         elif return_match:
                             self._handle_return_statement(
                                 return_match.group(1).strip(), line_number)
+            except NameError:
                 return True, i + 1
             except Exception as e:
                 return True, i + 1
-        # Simple IF-THEN single-block pattern: if <cond> then\n  <LET/assignment>\nend
-        if line_clean.lower().startswith('if ') and line_clean.lower().endswith('then'):
-            if i + 2 < len(block_lines):
-                next_line, next_ln_no = block_lines[i + 1]
-                end_line, end_ln_no = block_lines[i + 2]
-                if end_line.strip().lower() == 'end':
-                    try:
-                        cond = re.match(
-                            r'^\s*if\s+(.+?)\s*then\s*$', line, re.I).group(1).strip()
-                        cond_result = self._evaluate_if_condition(
-                            cond, line_number, warn_boolean=True)
-                        if cond_result:
-                            if next_line.strip().lower() == 'exit for':
-                                self.executor.exit_loop = True
-                            elif next_line.strip().lower().startswith('let '):
-                                self._process_let_statement_inline(
-                                    next_line, next_ln_no)
-                            elif next_line.strip().lower().startswith('output '):
-                                try:
-                                    def_str = next_line.strip(
-                                    )[len('output '):].strip()
-                                    self._process_output_statement(
-                                        def_str, next_ln_no)
-                                except Exception as e:
-                                    raise
-                            elif ':=' in next_line:
-                                self.compiler.array_handler.evaluate_line_with_assignment(
-                                    next_line, next_ln_no, self.compiler.current_scope().get_evaluation_scope())
-                            else:
-                                push_match = self._match_push_assignment(
-                                    next_line)
-                                return_match = self._match_return_statement(
-                                    next_line)
-                                if push_match:
-                                    target, value_expr = self._unpack_push_assignment(push_match)
-                                    self.compiler._handle_push_assignment(
-                                        target, value_expr, next_ln_no)
-                                elif return_match:
-                                    self._handle_return_statement(
-                                        return_match.group(1).strip(), next_ln_no)
-                        return True, i + 3
-                    except Exception as e:
-                        pass
+            return True, i + 1
+
+        # Block form:  if <cond> then <body> end
+        if line_clean.lower().endswith('then'):
+            cond_match = re.match(
+                r'^\s*if\s+(.+?)\s*then\s*$', line, re.I)
+            if not cond_match:
+                return True, i + 1
+            condition = cond_match.group(1).strip()
+
+            # Locate the whole block so the enclosing walker skips it
+            # entirely (the body is executed exactly once here).
+            body_lines, end_index = self._extract_block_body(
+                block_lines, i)
+
+            # Blocks with ELSEIF / ELSE clauses keep the rich handler.
+            if_block = next(
+                (block for block in self.if_blocks
+                 if block.get('start_line') == line_number),
+                None)
+            if if_block and len(if_block.get('clauses', [])) > 1:
+                try:
+                    consumed = self._process_if_statement_rich(
+                        line, line_number, block_lines, i)
+                    return True, i + consumed + 1
+                except Exception as e:
+                    return True, end_index + 1
+
+            # Guard first: when a dependency is defined but still pending,
+            # defer the whole block without running any push.
+            if self._block_if_guard_deferred(
+                    condition, line, line_number):
+                return True, end_index + 1
+
             try:
-                consumed = self._process_if_statement_rich(
-                    line, line_number, block_lines, i)
-                return True, i + consumed + 1
-            except Exception as e:
-                return True, i + 1
-        if re.match(r'^if\b.+\bthen\b', line_clean, re.I) and not line_clean.lower().endswith('then'):
+                condition_result = self._evaluate_if_condition(
+                    condition, line_number, warn_boolean=True)
+            except NameError as exc:
+                dep_extractor = getattr(
+                    self.compiler, 'extract_missing_dependencies',
+                    lambda e: set())
+                missing = dep_extractor(exc)
+                if missing:
+                    current_scope = self.compiler.current_scope()
+                    pending_deps = [
+                        dep for dep in missing
+                        if self.compiler.has_unresolved_dependency(
+                            dep, scope=current_scope)
+                        and dep in getattr(
+                            self.compiler, 'pending_assignments', {})
+                    ]
+                    if pending_deps:
+                        self._defer_pending_if(
+                            line, line_number,
+                            set(missing) | set(pending_deps))
+                        return True, end_index + 1
+                # A dependency that will never resolve simply reads as False.
+                condition_result = False
+
+            if condition_result:
+                self._process_block(
+                    body_lines, self.compiler.current_scope())
+            return True, end_index + 1
+
+        # Inline THEN without a terminating END: legacy single-line IF.
+        if re.match(r'^if\b.+\bthen\b', line_clean, re.I):
             try:
                 consumed = self._process_if_statement(
                     line, line_number, block_lines, i)
@@ -1059,6 +1084,31 @@ class GridLangControlFlow:
         if unresolved:
             return self._defer_pending_if(line, line_number, deps)
         return None
+
+    def _block_if_guard_deferred(self, condition, line, line_number):
+        """Conservative dependency check for a block IF guard.
+
+        Defers the guard (without running any push) only when a dependency is
+        a *defined* variable with a pending assignment — i.e. it genuinely
+        needs evaluating.  Undefined names and builtins are not treated as
+        unresolved here: an undefined name simply evaluates to False, while
+        a builtin (mid, sin, ...) resolves against the expression globals.
+        """
+        dep_extractor = getattr(
+            self.compiler, '_extract_dependencies_from_expression', None)
+        deps = set(dep_extractor(condition)) if callable(
+            dep_extractor) else set()
+        current_scope = self.compiler.current_scope()
+        for dep in deps:
+            defining_scope = current_scope.get_defining_scope(dep)
+            if defining_scope and dep in getattr(
+                    self.compiler, 'pending_assignments', {}):
+                for pending_dep in deps:
+                    self.compiler.mark_dependency_missing(pending_dep)
+                self.compiler.pending_assignments[
+                    f'__if_line_{line_number}'] = (line, line_number, deps)
+                return True
+        return False
 
     def _process_if_block_statement(self, condition_result, lines, current_index, line_number):
         if_block_lines, else_block_lines, elseif_blocks, block_i = self._collect_if_blocks(

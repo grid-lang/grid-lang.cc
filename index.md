@@ -12,7 +12,7 @@ must respect. Read this before editing; don't rediscover the codebase.
 2. **Skim File-by-file only as needed** — `compiler.py`/`executor.py` are the
    engine, `expression.py`/`array_handler.py`/`scope.py` own semantics,
    `units.py` owns units, `test_runner.py` is the spec.
-3. **Run `python3 test_runner.py` (462 tests) and `python3 main.py test_convert.grid`**
+3. **Run `python3 test_runner.py` (463 tests) and `python3 main.py test_convert.grid`**
    before and after any change. Use `python3` only; temp files only in `.oc_tmp/`.
 4. **Edit, then re-sync line numbers**: `python3 update_index_lines.py` (or
    `python3 update_index_lines.py --check` in CI). Only the numbers are
@@ -49,7 +49,7 @@ Language reference: `Documentation.md` (tutorial style). Install/usage docs:
 python main.py example.grid 42
 python main.py example.grid --debug   # also exports <file>.csv
 
-# Run the inline test suite (462 tests)
+# Run the inline test suite (463 tests)
 python test_runner.py                 # all tests
 python test_runner.py 1 2 4           # subset by number
 python test_runner.py 282 289         # unit tests
@@ -265,18 +265,18 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
 - Grid-as-array: `get_grid_row` (2639), `get_grid_column` (2668); generic
   `get_array_element`/`set_array_element` handle `_GridStore` like any sparse array.
 
-### `control_flow.py` (2195 lines) — blocks: For / If / Let / When
+### `control_flow.py` (2245 lines) — blocks: For / If / Let / When
 `class GridLangControlFlow` executes block constructs. Module-level regexes
 (9–16) define `if...then`, `elseif...then`, `else`, `for...do`,
 `when...do`, `end`.
 - `process_for_statement` (11118: For-loop handling (ranges, init, arrays).
-- Block engine: `_process_block` (930), `_extract_block_body` (345),
+- Block engine: `_process_block` (955), `_extract_block_body` (345),
   `pre_scan_blocks` (181833, `_prepare_block_line` (374).
-- If: `_process_if_statement` (991) and the "new"/"rich" variants (2011,
-  2113), `_parse_if_header` (1025), `_collect_if_blocks` (1070),
-  `_execute_if_block_choice` (111186, `_process_if_elseif_else_block` (1963);
-  condition evaluation helpers `_evaluate_if_*` (1413–1785).
-- Let: `_process_let_statement_inline` (1251), field/index assignment helpers
+- If: `_process_if_statement` (1016) and the "new"/"rich" variants (2011,
+  2113), `_parse_if_header` (1050), `_collect_if_blocks` (1120),
+  `_execute_if_block_choice` (111186, `_process_if_elseif_else_block` (2013);
+  condition evaluation helpers `_evaluate_if_*` (1463–1835).
+- Let: `_process_let_statement_inline` (1301), field/index assignment helpers
   (1339, 1390).
 - `_handle_block_*` methods (343–960): per-statement handling inside blocks.
 
@@ -343,8 +343,8 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
 - `format_display_value` (26265: display formatting with float-trimming and
   list/dict-form array support.
 
-### `test_runner.py` (2097 lines) — inline test suite
-`class GridLangTestRunner` with `run_tests_independent(tests)` — runs 462 tests (Tests 282–293 unit tests, Tests 331–349 push/cell-mirror/subprocess semantics, Tests 350–357d resource/`Require`/grant semantics, Tests 385–405b module/`use`/instance-state/dotted-Require/ModuleVersion/runnable-module-run/unknown-call/init-never-fires-on-import semantics, Tests 452–464 live pipes + user-function vectorization/element-access). At the bottom of the file (~840) it runs itself when executed directly:
+### `test_runner.py` (2105 lines) — inline test suite
+`class GridLangTestRunner` with `run_tests_independent(tests)` — runs 462 tests (Tests 282–293 unit tests, Tests 331–349 push/cell-mirror/subprocess semantics, Tests 350–357d resource/`Require`/grant semantics, Tests 385–405b module/`use`/instance-state/dotted-Require/ModuleVersion/runnable-module-run/unknown-call/init-never-fires-on-import semantics, Tests 452–465 live pipes + user-function vectorization/element-access). At the bottom of the file (~840) it runs itself when executed directly:
 `python test_runner.py [names...]`. Failing names are printed.
 
 ## Language conventions to remember when editing
