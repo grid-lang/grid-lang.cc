@@ -208,23 +208,23 @@ live entry. Key methods (the `compiler.py`/`grid_lang_common.py` layers call
 both the compiler and executor layers here. (Note: `error_value`/`UNIVERSAL_ZERO`
 live in `units.py`, not here.)
 
-### `expression.py` (4004 lines) — expression evaluation
+### `expression.py` (4006 lines) — expression evaluation
 `class ExpressionEvaluator` evaluates RHS expressions, arrays, ranges, sums,
 dimension selectors, interpolations, member/field access, and Python-fallback
 evaluation.
-- Entry points: `eval_or_eval_array` (116, now `expected_unit`), `eval_expr` (2454), and for
+- Entry points: `eval_or_eval_array` (116, now `expected_unit`), `eval_expr` (2456), and for
   assignments `_evaluate_array` (547).
 - LHS-informed: `_apply_expected_unit` (79) + `_formula_eval` (97, strips LHS var) threaded via `expected_unit`.
 - `eval_expr` is the big recursive dispatcher: array literals `{}`, pipes `|`,
   interpolated cell refs, paren/curly indexing, member calls, user function
   calls, object creation, field access, address-indexed access, then scalar
   constructs, then simple variables.
-- Python fallback: `_evaluate_with_python_fallback` (2889) builds a scope and
+- Python fallback: `_evaluate_with_python_fallback` (2891) builds a scope and
   `eval()`s complex arithmetic (`_build_fallback_cell_scope` 2254,
   `_eval_python_fallback_result` 2501, `_get_eval_globals` 2937). Now includes
-  `_replace_of_unit_literals` (3934) for `"ox" of animal`/`5 of in`/`2 of 1` → `gridlang_of_unit` and `Attribute` flat-key `SILength.inch` + case-insensitive `_resolve_fallback_name` (3476).
-- Interpolation: `_process_interpolation` (3805). Operators:
-  `_replace_operators` (3949).
+  `_replace_of_unit_literals` (3936) for `"ox" of animal`/`5 of in`/`2 of 1` → `gridlang_of_unit` and `Attribute` flat-key `SILength.inch` + case-insensitive `_resolve_fallback_name` (3478).
+- Interpolation: `_process_interpolation` (3807). Operators:
+  `_replace_operators` (3951).
 - Grid indexing: `_replace_grid_indexing` (864) — rewrites bare `grid{...}`
   when the predefined `grid` variable is in scope; otherwise falls through to
   the generic array-access path (ranges, `*` selectors, `#N/A` for unset cells).
@@ -232,7 +232,7 @@ evaluation.
   eval scopes.
 
 ### `builtin_functions.py` (611 lines) — builtin registry + predefined functions
-Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`/`ROWS`/`ABS`/`LEN`/`TEXTSPLIT`/`TRANSPOSE`/math, …). Both evaluation paths (`ExpressionEvaluator._build_python_fallback_scope` (`expression.py:3325`) and `_get_eval_globals` (`expression.py:3963`)) call `get_builtin_functions()` so a new builtin is instantly available everywhere.
+Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`/`ROWS`/`ABS`/`LEN`/`TEXTSPLIT`/`TRANSPOSE`/math, …). Both evaluation paths (`ExpressionEvaluator._build_python_fallback_scope` (`expression.py:3327`) and `_get_eval_globals` (`expression.py:3965`)) call `get_builtin_functions()` so a new builtin is instantly available everywhere.
 - Registry (37): `BUILTINS`/`ALIASES`/`ARG_COUNTS`/`VECTORIZED` plus `KEYWORDS` (43, re-exported by `compiler.py`/`expression.py` for dependency stripping). `register_builtin` (65) and `register_vectorized_builtin` (95) are decorators (`@register_builtin("MIN", aliases=["Number.Min"], arg_count=1)`); non-vectorized by default, vectorized ones broadcast element-wise.
 - Arity + helpers: `_check_arity` (226) / `_resolve_builtin` (246) / `_to_list` (129, normalizes sparse `dict`, `{'array':…}`, `list` → flat list).
 - Builtins (143): `ROWS` (143) / `SUM` (155) / `LEN` (166, `Text.Len`) / `ABS` (174, `Number.Abs`) / `POWER` (179) / `INT` (184) / `MID` (189, `Text.Mid`) / `TEXTSPLIT` (199, `Text.Split`) / `COUNTA` (207) / `RANDARRAY` (223) / `SORTBY` (229) / `TRANSPOSE` (240) / `MIN` (291, `Number.Min`) / `MAX` (299, `Number.Max`) plus math shims (`sqrt`/`sin`/… → `Number.<name>`, 306) and `str`/`int`/`float`/`abs` (313). `MIN`/`MAX` flatten via `_to_list` before `min`/`max`.
@@ -343,7 +343,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
 - `format_display_value` (26265: display formatting with float-trimming and
   list/dict-form array support.
 
-### `test_runner.py` (2079 lines) — inline test suite
+### `test_runner.py` (2085 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — runs 456 tests (Tests 282–293 unit tests, Tests 331–349 push/cell-mirror/subprocess semantics, Tests 350–357d resource/`Require`/grant semantics, Tests 385–405b module/`use`/instance-state/dotted-Require/ModuleVersion/runnable-module-run/unknown-call/init-never-fires-on-import semantics, Tests 452–458 live pipes). At the bottom of the file (~840) it runs itself when executed directly:
 `python test_runner.py [names...]`. Failing names are printed.
 

@@ -2160,7 +2160,9 @@ class ExpressionEvaluator:
         if hasattr(self.compiler, 'subprocesses'):
             callable_names.update({n.lower() for n in self.compiler.subprocesses.keys()})
         if var_name.lower() in callable_names:
-            return match.group(0)
+            inner = self._replace_paren_access_balanced(
+                index_expr, scope, line_number)
+            return f"{var_name}({inner})"
         if '!' in var_name:
             return match.group(0)
         return self._paren_access_replacer(match, scope, line_number)
