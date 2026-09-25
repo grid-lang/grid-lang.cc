@@ -890,19 +890,32 @@ class GridLangCompiler(GridLangExecutor):
             return None
         inputs = def_entry.get('inputs') or []
         input_idx = {n.lower(): i for i, n in enumerate(inputs)}
+        out_all = [e['name'] for e in signature
+                   if e['kind'] == 'output']
         live_out_names = [e['name'] for e in signature
                           if e['kind'] == 'output' and e['live']]
-        if len(arg_raws) > len(inputs) + len(live_out_names):
+        # A subprocess has no return channel: every declared output consumes a
+        # caller binding (live or not).  A function reserves its non-live
+        # outputs as the return channel, so only its live outputs take an
+        # argument.  Hence the two kinds count arguments differently.
+        def_kind = (def_entry.get('def_kind') or '').lower()
+        is_streaming = def_kind in ('subprocess', 'module_run', 'operation')
+        binder_names = out_all
+        max_args = (
+            len(inputs) + len(out_all) if is_streaming
+            else len(inputs) + len(live_out_names))
+        if len(arg_raws) > max_args:
             raise ValueError(
                 f"Too many arguments for '{def_entry.get('name') or ''}' at "
-                f"line {line_number}: expected at most "
-                f"{len(inputs) + len(live_out_names)} argument(s)")
+                f"line {line_number}: expected at most {max_args} argument(s)")
         input_vals = [None] * len(inputs)
         live_input_sources = {}
-        output_bindings = [None] * len(live_out_names)
+        binder_idx = {n.lower(): i for i, n in enumerate(binder_names)}
+        output_bindings = [None] * len(binder_names)
         pending = list(signature)
         for raw in arg_raws:
-            while pending and pending[0]['kind'] == 'output' and not pending[0]['live']:
+            while pending and pending[0]['kind'] == 'output' \
+                    and not pending[0]['live'] and not is_streaming:
                 pending.pop(0)
             if not pending:
                 raise ValueError(
@@ -923,7 +936,7 @@ class GridLangCompiler(GridLangExecutor):
                             f"'{def_entry.get('name') or ''}' at line "
                             f"{line_number}: {exc}")
             else:
-                output_bindings[live_out_names.index(slot['name'])] = raw
+                output_bindings[binder_idx[slot['name'].lower()]] = raw
         return input_vals, live_input_sources, output_bindings
 
     def _refresh_live_inputs(self):
@@ -1117,6 +1130,7 @@ class GridLangCompiler(GridLangExecutor):
                     'signature': signature,
                     'live_outputs': live_outputs,
                     'live_inputs': live_inputs,
+                    'def_kind': def_kind,
                 }
                 # Uniform redefinition guard -- applies to EVERY kind by
                 # the time the entry dict is assembled, before any kind
@@ -1337,12 +1351,12 @@ class GridLangCompiler(GridLangExecutor):
                 for k, v in live_input_sources.items()}
         caller_scope = caller_scope or self.current_scope()
         if live_output_bindings:
-            live_out_names = [e['name'] for e in (func_def.get('signature') or [])
-                              if e['kind'] == 'output' and e['live']]
+            out_all = [e['name'] for e in (func_def.get('signature') or [])
+                       if e['kind'] == 'output']
             sub_compiler.live_output_targets = {}
             for _i, _b in enumerate(live_output_bindings):
-                if _i < len(live_out_names) and _b:
-                    sub_compiler.live_output_targets[live_out_names[_i].lower()] = {
+                if _i < len(out_all) and _b:
+                    sub_compiler.live_output_targets[out_all[_i].lower()] = {
                         'compiler': self, 'scope': caller_scope, 'binding': _b}
         func_result = sub_compiler.run(
             func_def['code'], list(args),
@@ -2449,12 +2463,12 @@ class GridLangCompiler(GridLangExecutor):
                 for k, v in live_input_sources.items()}
         caller_scope = caller_scope or self.current_scope()
         if live_output_bindings:
-            live_out_names = [e['name'] for e in (sp_def.get('signature') or [])
-                              if e['kind'] == 'output' and e['live']]
+            out_all = [e['name'] for e in (sp_def.get('signature') or [])
+                       if e['kind'] == 'output']
             sub_compiler.live_output_targets = {}
             for _i, _b in enumerate(live_output_bindings):
-                if _i < len(live_out_names) and _b:
-                    sub_compiler.live_output_targets[live_out_names[_i].lower()] = {
+                if _i < len(out_all) and _b:
+                    sub_compiler.live_output_targets[out_all[_i].lower()] = {
                         'compiler': self, 'scope': caller_scope, 'binding': _b}
         sub_output = sub_compiler.run(
             sp_def['code'], list(args),
@@ -4778,6 +4792,7 @@ class GridLangCompiler(GridLangExecutor):
             'original': module_name,
             'hidden': False,
             'code_lines': [ln for ln in body.splitlines()],
+            'def_kind': 'subprocess',
             'defining_scope': None,
             'module_run': key,
         }

@@ -123,7 +123,7 @@ no duplication to keep in sync across two live objects anymore.
   `1` is special: `UnitValue._is_one`, `__mul__` treats `1` as unitless, `_divide` `m/1→m` `m/m→1`, `__pow__` allows exponent `1`.
 - `UnitValue` overloads: `+`/`-` same unit or one side unitless; `*` with `1`; `/`/`\`/`mod` with `1`; `^` with `1`.
 
-### `compiler.py` (6141 lines) — state + orchestration, public API
+### `compiler.py` (6156 lines) — state + orchestration, public API
 `class GridLangCompiler` is the engine's **state holder and public surface**. It
 is the only class `main.py` constructs. It inherits the runtime loop from
 `GridLangExecutor` and holds nearly all persistent state created in `__init__`:
@@ -147,21 +147,21 @@ Notable methods:
 - `run` (821): engine entry — `_reset_state()` then delegates to the inherited
   runtime pipeline (no executor handoff).
 - `current_scope`/`push_scope`/`pop_scope` (310/325/331).
-- `_seed_grid_variable` (3587): predefines `grid` in the global scope as a
+- `_seed_grid_variable` (3601): predefines `grid` in the global scope as a
   `_GridStore` (sparse array keyed by 0-based `(row,col)` tuples; aliased as
   `self.grid`), so `grid{row, col}` works at top level. Skipped inside
   read-only function sub-compilers.
 - UnitSource: `_parse_unit_source_header` (293) / `_finalize_unit_source` (307) / `_register_convert_line` (342) / `_infer_convert_target_unit` (262, evaluates RHS with stripped var, falls back to declared units) / `_materialize_unit_source_constants` (449) / `_register_top_level_converts` (443).
-- `_extract_functions` (985): pulls `Function`/`Subprocess` defs out of the
+- `_extract_functions` (998): pulls `Function`/`Subprocess` defs out of the
   main code and registers them.
-- `_instantiate_type` (1524), `_evaluate_with_value` (1932), `_apply_with_clause`
+- `_instantiate_type` (1538), `_evaluate_with_value` (1946), `_apply_with_clause`
   (1246): type/`with` object construction; now handles `:` field unit conversion.
-- `call_subprocess` (2378): runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (4344), `_process_declarations_and_labels` (4868),
-  `_collect_global_declarations` (5032): top-level statement handling; now handles `of 1` and `"ox" of animal`.
-- `export_to_csv` (5928): `--debug` CSV export (grid as matrix, or outputs as
+- `call_subprocess` (2392): runs a sub-`GridLangCompiler` in isolation.
+- `_process_grid_assignment` (4358), `_process_declarations_and_labels` (4883),
+  `_collect_global_declarations` (5047): top-level statement handling; now handles `of 1` and `"ox" of animal`.
+- `export_to_csv` (5943): `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
-- `set_input_values` (5951): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
+- `set_input_values` (5966): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
 - `_seed_globals` (1670): for sub-compilers; **skips redefining `grid`**.
 
 Also defines `SubprocessResult` (37): result container exposing `grid`,
@@ -297,7 +297,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   - Scoping: `is_shadowed` (915), `get_evaluation_scope` (923),
     `get_full_scope` (1337), `_coerce_custom_type_value` (252).
 - `class _GridStore` (37): dict backing `compiler.grid`; every cell write
-  calls `compiler._notify_cell_changed` (compiler.py:3356). (The old
+  calls `compiler._notify_cell_changed` (compiler.py:3370). (The old
   `_ListenerGrid`/`GridLiveView` classes were removed — `_GridStore` is the
   single grid store, keyed by 0-based index tuples.)
 - `_ACTIVE_RUNNERS` (22): stack of executing compilers; used with the
@@ -450,7 +450,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   grant is resolved by `permissions.RequirementResolver` (executor.py:4811)
   and binds `grant_map`/`bindings` in scope. Resources are **declarations
   only**: `register_resource` (builtin_functions.py:115) seeds the returned
-  metadata into `RESOURCES`; `_seed_predefined_resources` (compiler.py:3606)
+  metadata into `RESOURCES`; `_seed_predefined_resources` (compiler.py:3620)
   copies it into `self.types_defined` once per engine, **surviving per-run
   resets** (`_reset_state`) like type definitions. Handle types (`Timer`,
   `Counter`) are declared with `register_handle` (builtin_functions.py:176),
