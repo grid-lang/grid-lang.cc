@@ -1300,6 +1300,23 @@ class ExpressionEvaluator:
                 else:
                     args_list = [a.strip()
                                  for a in re.split(r',(?![^{]*})', arg_text) if a.strip()] if arg_text.strip() else []
+                # Live signatures route in declaration order: live inputs keep
+                # their raw expression (lazily re-evaluated in the caller's
+                # scope) and live outputs consume write-through bindings.
+                route_fn = getattr(self.compiler, '_route_live_call', None)
+                if route_fn is not None:
+                    live_route = route_fn(
+                        func_defs[func_name.lower()], args_list,
+                        lambda raw: self.eval_or_eval_array(
+                            raw, scope, line_number),
+                        line_number)
+                    if live_route is not None:
+                        input_vals, live_sources, live_bindings = live_route
+                        return True, self.compiler.call_function(
+                            func_name, input_vals,
+                            live_input_sources=live_sources,
+                            live_output_bindings=live_bindings,
+                            caller_scope=self.compiler.current_scope())
                 evaluated_args = [self.eval_or_eval_array(
                     a, scope, line_number) for a in args_list] if args_list else []
                 return True, self.compiler.call_function(func_name, evaluated_args)

@@ -772,6 +772,32 @@ class GridLangExecutor(GridLangBase):
         if len(arg_parts) < len(inputs) and not sp_def.get('_system'):
             raise ValueError(
                 f"Subprocess '{name}' expects at least {len(inputs)} arguments at line {line_number}")
+        call_fn = getattr(self, 'call_subprocess', None) or getattr(
+            getattr(self, 'compiler', None), 'call_subprocess', None)
+        if not call_fn:
+            raise AttributeError("call_subprocess not available on executor")
+        # Live signatures map args in declaration order: live inputs keep their
+        # raw expression (lazily re-evaluated) and live outputs become
+        # write-through bindings. Non-live-only subprocesses keep the legacy
+        # count-then-bind handling below.
+        route_fn = getattr(self, '_route_live_call', None) or getattr(
+            getattr(self, 'compiler', None), '_route_live_call', None)
+        if route_fn is not None:
+            live_route = route_fn(
+                sp_def, arg_parts,
+                lambda raw: self.expr_evaluator.eval_or_eval_array(
+                    raw, self.current_scope().get_evaluation_scope(),
+                    line_number),
+                line_number)
+            if live_route is not None:
+                input_vals, live_sources, live_bindings = live_route
+                call_fn(
+                    name, input_vals,
+                    live_input_sources=live_sources,
+                    live_output_bindings=live_bindings,
+                    caller_scope=self.current_scope(),
+                    line_number=line_number)
+                return True
         input_vals = []
         for idx, raw in enumerate(arg_parts):
             if idx < len(inputs):
@@ -781,10 +807,6 @@ class GridLangExecutor(GridLangBase):
             else:
                 break
         output_bindings = [a for a in arg_parts[len(inputs):]]
-        call_fn = getattr(self, 'call_subprocess', None) or getattr(
-            getattr(self, 'compiler', None), 'call_subprocess', None)
-        if not call_fn:
-            raise AttributeError("call_subprocess not available on executor")
         sp_result = call_fn(
             name, input_vals, output_bindings, line_number=line_number)
         # Fallback: bind subprocess outputs from the returned result if they were not applied.
@@ -2950,6 +2972,12 @@ class GridLangExecutor(GridLangBase):
         while i < len(lines):
             self._loop_iteration += 1
             self._maybe_fire_tickers()
+            # Live inputs are lazily re-evaluated in the caller's scope before
+            # each statement the callee runs, so mid-run reads observe the
+            # caller's current state (feedback loop).
+            refresh = getattr(self, '_refresh_live_inputs', None)
+            if refresh is not None:
+                refresh()
             prep = self._prepare_main_loop_line(lines, i)
             if prep['action'] == 'break':
                 break
@@ -5066,7 +5094,44 @@ class GridLangExecutor(GridLangBase):
                             except Exception:
                                 pass
             else:
-                if call['name'].lower() in func_defs:
+                live_route = None
+                route_fn = getattr(self, '_route_live_call', None)
+                if route_fn is not None:
+                    live_route = route_fn(
+                        def_entry, args_parts,
+                        lambda raw, _parts=args_parts, _vals=eval_args:
+                        _vals[_parts.index(raw)] if raw in _parts else None,
+                        line_number)
+                if live_route is not None:
+                    input_vals, live_sources, live_bindings = live_route
+                    if call['name'].lower() in func_defs:
+                        outputs_map = self.call_function(
+                            call['name'], input_vals, instance_type=member_of, collect_all=True,
+                            live_input_sources=live_sources,
+                            live_output_bindings=live_bindings,
+                            caller_scope=self.current_scope()) or {}
+                        seq = _pick_sequence(def_entry, outputs_map)
+                    else:
+                        try:
+                            outputs_map = self.call_subprocess(
+                                call['name'], input_vals, collect_all=True, line_number=line_number,
+                                live_input_sources=live_sources,
+                                live_output_bindings=live_bindings,
+                                caller_scope=self.current_scope()) or {}
+                        except Exception:
+                            outputs_map = {}
+                        seq = _pick_sequence(def_entry, outputs_map)
+                        if not seq:
+                            try:
+                                sp_result = self.call_subprocess(
+                                    call['name'], input_vals, collect_all=False, line_number=line_number,
+                                    live_input_sources=live_sources,
+                                    live_output_bindings=live_bindings,
+                                    caller_scope=self.current_scope())
+                                seq = [sp_result]
+                            except Exception:
+                                seq = []
+                elif call['name'].lower() in func_defs:
                     outputs_map = self.call_function(
                         call['name'], eval_args, instance_type=member_of, collect_all=True) or {}
                     seq = _pick_sequence(def_entry, outputs_map)
@@ -5202,6 +5267,9 @@ class GridLangExecutor(GridLangBase):
                 if (target.lower() in global_scope.output_variables) and not collecting_via_compiler:
                     self.output_values.setdefault(
                         target.lower(), []).append(value)
+                # Live outputs stream their value to the caller's binding
+                # immediately (write-through), not only when the call returns.
+                self._maybe_publish_live_output(target, value, line_number)
                 self._enqueue_push(target, value)
                 self._process_when_triggers()
         except Exception as e:

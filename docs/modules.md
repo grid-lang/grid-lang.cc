@@ -225,6 +225,65 @@ There are three output channels.
   so their generated `Return` line is caught by the same whole-line check and
   the inline spelling behaves exactly like the multi-line one.*
 
+### 8.1 Live pipes: `Input … live` and `Output … live`
+
+`live` is a trailing marker on an `Input` or `Output` declaration. It turns
+that parameter into a **live pipe** between the callee and its caller:
+arguments are matched **in declaration order** for any function or subprocess
+whose signature contains at least one live slot.
+
+| Declaration            | Semantics |
+|------------------------|-----------|
+| `Output x … live`      | **Write-through**: every push to `x` (and its `init` value) is streamed immediately into the caller's bound cell/variable. Live outputs are excluded from the call value. |
+| `Input y … live`       | **Lazy**: the caller's argument is kept as a raw expression and re-evaluated in the caller's scope right before each callee statement, so mid-run changes propagate into the callee's `y`. |
+| `Input z` (no `live`)  | Ordinary argument, evaluated once at call time. |
+| `Output w` (no `live`) | Return channel: its values form the call-return value when there is no explicit `Return`. |
+
+- A callee whose signature has **no** live slots is routed exactly as before
+  (positional inputs, trailing output bindings); `live` only takes effect when
+  the signature actually contains live slots.
+- In a live signature the argument list is one-per-declaration: an input slot
+  consumes the next argument as its value/source, an output slot consumes the
+  next argument as its write-through target.
+- Live input arguments are not evaluated eagerly at the call — the caller must
+  pass a variable name or expression that is valid when it is read. A
+  not-yet-initialized source is skipped until it resolves.
+- Live output targets must be variables holding a target (a cell reference or
+  a valid assignment target), because the callee writes straight into them.
+
+Used together, live pipes give callbacks: a function can emit candidate values
+through live outputs while a live input re-runs a predicate the caller supplied
+with the *latest* candidates, and a non-live output still carries a final
+result back.
+
+```grid
+Define k as function
+  Input a, b as text
+  Return ? mid(a, 2, 1) = mid(b, 2, 1)
+End k
+
+Define FindMatches as Function
+  Input data as text dim *
+  Output a, b as text live
+  Input pred as logical live
+  For r in data index i and s in data index j do
+    If j > i then
+      Push a = r
+      Push b = s
+      If pred = true then Print {r, s}
+    End
+  End
+  return 1
+End FindMatches
+
+FindMatches(liste, c, d, k(c, d))
+```
+
+*Implemented. The write-through path runs through the push funnel
+(`_handle_push_assignment`) and the live-input refresh through the statement
+loop (`_refresh_live_inputs`); both are bypassed by signed-off scope write
+guards.*
+
 ## 9. Instances
 
 - Each importer context instantiates each module once: **per (importer ×

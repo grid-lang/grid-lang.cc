@@ -81,6 +81,11 @@ class GridLangControlFlow:
             value = self.compiler.expr_evaluator.eval_or_eval_array(
                 expr, current_scope.get_evaluation_scope(), line_number)
             defining_scope.update(var, value, line_number)
+            # A live output's init seeds the write-through binding so the
+            # caller observes the value without an explicit Push.
+            live_pub = getattr(self.compiler, '_maybe_publish_live_output', None)
+            if live_pub is not None:
+                live_pub(var, value, line_number)
 
     def _match_push_assignment(self, text):
         return re.match(r"^\s*push\s+([^=]+)(=\s.+)?", text, re.I)
@@ -928,6 +933,9 @@ class GridLangControlFlow:
         while i < len(block_lines):
             if self._should_break_block_processing():
                 break
+            refresh = getattr(self.compiler, '_refresh_live_inputs', None)
+            if refresh is not None:
+                refresh()
             line, line_number, line_clean = self._prepare_block_line(
                 block_lines, i)
             if not line_clean:

@@ -604,6 +604,14 @@ class Scope:
             for runner in reversed(_ACTIVE_RUNNERS):
                 if (getattr(runner, '_outer_scope_read_only', False)
                         and runner._is_outer_scope(defining_scope)):
+                    # A live output write-through by a callee is an explicit
+                    # feed-forward to its caller binding, matching the declared
+                    # 'live' slot; allow only that exact binding.
+                    lwt = getattr(runner, '_live_write_through', None)
+                    if (isinstance(lwt, dict)
+                            and lwt.get('scope') is defining_scope
+                            and lwt.get('binding') == name.lower()):
+                        continue
                     raise RuntimeError(
                         f"Cannot assign to '{name}': variables in an outer scope are read-only at line {line_number}")
             # Get the actual key for case-insensitive update
@@ -681,8 +689,10 @@ class Scope:
                     defining_scope.constraints[actual_key] = constraints
                 # Prevent updating input variables once initialized
                 if defining_scope.constraints.get(actual_key, {}).get('input') and actual_key not in defining_scope.uninitialized:
-                    raise ValueError(
-                        f"Input variable '{actual_key}' cannot be updated at line {line_number}")
+                    live = getattr(defining_scope.compiler, 'live_input_sources', None) or {}
+                    if actual_key.lower() not in live:
+                        raise ValueError(
+                            f"Input variable '{actual_key}' cannot be updated at line {line_number}")
                 if not is_error_value(value) and defining_scope.constraints.get(actual_key, {}).get('dim'):
                     try:
                         value = self.compiler.array_handler.check_dimension_constraints(

@@ -851,6 +851,137 @@ class GridLangCompiler(GridLangExecutor):
 
         return result
 
+    _LIVE_SUFFIX_RE = re.compile(r'(?i)\s+live\s*$')
+
+    def _carve_live_suffix(self, text):
+        """Strip a trailing `live` marker from an Input/Output declaration.
+
+        Returns (declaration_text, is_live). Used when collecting function /
+        subprocess signatures: a trailing ``live`` marks the slot as a live
+        pipe (lazy caller-side re-evaluation for inputs, write-through
+        streaming for outputs).
+        """
+        text = text.strip()
+        if not text:
+            return text, False
+        if self._LIVE_SUFFIX_RE.search(text):
+            return self._LIVE_SUFFIX_RE.sub('', text, count=1).strip(), True
+        return text, False
+
+    def _route_live_call(self, def_entry, arg_raws, eval_fn, line_number):
+        """Map positional args against a live declaration-order signature.
+
+        Only signatures containing live slots are routed this way: ``Input
+        ... live`` slots keep their raw source expression for later lazy
+        re-evaluation in the caller's scope, and ``Output ... live`` slots
+        consume an argument that becomes a write-through binding. Non-live
+        Output slots never consume an argument (they neither stream nor bind
+        positionally). Signatures without live slots return None, so callers
+        keep the legacy subprocess/function argument handling.
+
+        Returns a tuple ``(input_vals, live_input_sources, live_output_bindings)``
+        or None when the entry has no live slots.
+        """
+        signature = def_entry.get('signature') or []
+        if not any(e.get('live') for e in signature):
+            return None
+        if def_entry.get('member_of'):
+            # Live routing does not (yet) apply to member functions.
+            return None
+        inputs = def_entry.get('inputs') or []
+        input_idx = {n.lower(): i for i, n in enumerate(inputs)}
+        live_out_names = [e['name'] for e in signature
+                          if e['kind'] == 'output' and e['live']]
+        if len(arg_raws) > len(inputs) + len(live_out_names):
+            raise ValueError(
+                f"Too many arguments for '{def_entry.get('name') or ''}' at "
+                f"line {line_number}: expected at most "
+                f"{len(inputs) + len(live_out_names)} argument(s)")
+        input_vals = [None] * len(inputs)
+        live_input_sources = {}
+        output_bindings = [None] * len(live_out_names)
+        pending = list(signature)
+        for raw in arg_raws:
+            while pending and pending[0]['kind'] == 'output' and not pending[0]['live']:
+                pending.pop(0)
+            if not pending:
+                raise ValueError(
+                    f"Too many arguments for '{def_entry.get('name') or ''}' "
+                    f"at line {line_number}")
+            slot = pending.pop(0)
+            if slot['kind'] == 'input':
+                pos = input_idx[slot['name'].lower()]
+                if slot['live']:
+                    live_input_sources[slot['name'].lower()] = raw
+                    input_vals[pos] = None
+                else:
+                    try:
+                        input_vals[pos] = eval_fn(raw)
+                    except Exception as exc:
+                        raise ValueError(
+                            f"Failed to evaluate argument for "
+                            f"'{def_entry.get('name') or ''}' at line "
+                            f"{line_number}: {exc}")
+            else:
+                output_bindings[live_out_names.index(slot['name'])] = raw
+        return input_vals, live_input_sources, output_bindings
+
+    def _refresh_live_inputs(self):
+        """Re-evaluate live input expressions in the caller's scope.
+
+        Live inputs (``Input ... live``) are lazy: their value is recomputed
+        from the caller-side source expression before each statement the
+        callee executes, so the callee observes the caller's current state
+        mid-run.
+        """
+        sources = getattr(self, 'live_input_sources', None) or {}
+        if not sources:
+            return
+        try:
+            scope = self.current_scope()
+        except Exception:
+            return
+        for name_lower, info in sources.items():
+            raw = info.get('raw')
+            caller = info.get('compiler')
+            if not raw or not caller:
+                continue
+            try:
+                cscope = caller.current_scope()
+                if hasattr(cscope, 'get_evaluation_scope'):
+                    ev_scope = cscope.get_evaluation_scope()
+                else:
+                    ev_scope = cscope.get_full_scope()
+                value = caller.expr_evaluator.eval_or_eval_array(
+                    raw, ev_scope, None)
+                scope.update(name_lower, value, None)
+            except Exception:
+                pass
+
+    def _maybe_publish_live_output(self, out_name, value, line_number):
+        """Write-through: forward a live output's value to its caller binding.
+
+        Called from the push funnel so every ``Push <live output> = ...`` (and
+        live output ``init`` seeding) streams to the caller's binding
+        immediately, not only when the call returns.
+        """
+        targets = getattr(self, 'live_output_targets', None) or {}
+        info = targets.get(out_name.lower())
+        if not info:
+            return
+        caller = info.get('compiler')
+        binding = info.get('binding')
+        scope = info.get('scope')
+        if not caller or not binding:
+            return
+        saved = getattr(self, '_live_write_through', None)
+        self._live_write_through = {'scope': scope, 'binding': binding.lower()}
+        try:
+            caller._apply_single_binding(binding, value, scope,
+                                         line_number=line_number)
+        finally:
+            self._live_write_through = saved
+
     def _extract_functions(self, lines, label_lines, dim_lines):
         if not hasattr(self, '_program_defined_names'):
             self._program_defined_names = set()
@@ -912,16 +1043,21 @@ class GridLangCompiler(GridLangExecutor):
                         continue
                     body_lines.append(body_line)
                     i += 1
-                func_code = "\n".join(body_lines)
-                code_lines = [ln for ln in body_lines
-                              if not ln.strip().lower().startswith(('input ', 'output '))]
+                # Strip a trailing `live` marker on Input/Output declarations
+                # and record which signature slots are live pipes.
+                sanitized_body_lines = []
                 inputs, input_defs, outputs = [], [], []
+                signature = []
+                live_outputs = []
+                live_inputs = []
                 for b in body_lines:
-                    m_in = re.match(r'^\s*input\s+(.+)$', b, re.I)
+                    decl_text, b_live = self._carve_live_suffix(b.strip())
+                    sanitized_body_lines.append(decl_text if b_live else b)
+                    m_in = re.match(r'^\s*input\s+(.+)$', decl_text, re.I)
                     if m_in:
                         try:
                             parsed_var, parsed_type, parsed_constraints, _ = self.parser._parse_variable_def(
-                                b.strip(), body_ln)
+                                decl_text, body_ln)
                         except Exception:
                             parsed_var, parsed_type, parsed_constraints = None, None, {}
                         if parsed_var:
@@ -932,19 +1068,32 @@ class GridLangCompiler(GridLangExecutor):
                                 input_defs.append({
                                     'name': name,
                                     'type': parsed_type,
-                                    'constraints': parsed_constraints or {}
+                                    'constraints': parsed_constraints or {},
+                                    'live': b_live
                                 })
-                    m_out = re.match(r'^\s*output\s+(.+)$', b, re.I)
+                                signature.append(
+                                    {'name': name, 'kind': 'input', 'live': b_live})
+                                if b_live:
+                                    live_inputs.append(name)
+                    m_out = re.match(r'^\s*output\s+(.+)$', decl_text, re.I)
                     if m_out:
                         try:
                             parsed_var, parsed_type, parsed_constraints, _ = self.parser._parse_variable_def(
-                                b.strip(), body_ln)
+                                decl_text, body_ln)
                         except Exception:
                             parsed_var, parsed_type, parsed_constraints = None, None, {}
                         if parsed_var:
                             var_list = (parsed_constraints or {}).get('var_list') if parsed_constraints else None
                             names = var_list if var_list else [parsed_var]
                             outputs.extend(names)
+                            for name in names:
+                                signature.append(
+                                    {'name': name, 'kind': 'output', 'live': b_live})
+                                if b_live:
+                                    live_outputs.append(name)
+                func_code = "\n".join(sanitized_body_lines)
+                code_lines = [ln for ln in sanitized_body_lines
+                              if not ln.strip().lower().startswith(('input ', 'output '))]
                 member_of = (builder_type if def_kind == 'builder'
                              else (func_name.split('.')[0] if '.' in func_name else None))
                 entry = {
@@ -958,7 +1107,10 @@ class GridLangCompiler(GridLangExecutor):
                     'original': func_name,
                     'hidden': hidden,
                     'code_lines': code_lines,
-                    'defining_scope': self.current_scope()
+                    'defining_scope': self.current_scope(),
+                    'signature': signature,
+                    'live_outputs': live_outputs,
+                    'live_inputs': live_inputs,
                 }
                 # Uniform redefinition guard -- applies to EVERY kind by
                 # the time the entry dict is assembled, before any kind
@@ -1016,11 +1168,18 @@ class GridLangCompiler(GridLangExecutor):
             pass
         return new_lines, label_lines, dim_lines
 
-    def call_function(self, name, args, instance_type=None, collect_all=False, vectorize=True):
+    def call_function(self, name, args, instance_type=None, collect_all=False, vectorize=True,
+                      live_input_sources=None, live_output_bindings=None, caller_scope=None):
         """Invoke a user-defined function by name with the given arguments.
 
         When collect_all is True, return all pushed output values (as lists)
         instead of collapsing to the last pushed value.
+
+        Live signatures add optional resolution data: ``live_input_sources``
+        maps live input names to their raw caller-side source expressions
+        (re-evaluated lazily in the caller's scope during the run) and
+        ``live_output_bindings`` lists caller bindings receiving write-through
+        pushes for the declared live outputs (in declaration order).
         """
         func_def = getattr(self, 'functions', {}).get(name.lower())
         if not func_def:
@@ -1029,6 +1188,12 @@ class GridLangCompiler(GridLangExecutor):
             raise PermissionError(
                 f"Hidden member function '{name}' cannot be called here")
         member_of = func_def.get('member_of')
+        sig_live = any(e.get('live') for e in (func_def.get('signature') or []))
+        if sig_live and not (live_input_sources or live_output_bindings):
+            raise ValueError(
+                f"Function '{name}' declares live signature slots; it must be "
+                f"called with live resolution (live inputs keep their source "
+                f"expression and live outputs consume write-through bindings)")
         if member_of:
             if not args:
                 raise ValueError(
@@ -1099,6 +1264,8 @@ class GridLangCompiler(GridLangExecutor):
                                 collect_all=False, vectorize=False))
                         return results
         for idx, input_def in enumerate(input_defs):
+            if input_def.get('live'):
+                continue
             if idx >= len(args):
                 break
             expected_type = input_def.get('type')
@@ -1152,6 +1319,19 @@ class GridLangCompiler(GridLangExecutor):
                 }
         except Exception:
             pass
+        if live_input_sources:
+            sub_compiler.live_input_sources = {
+                k.lower(): {'raw': v, 'compiler': self}
+                for k, v in live_input_sources.items()}
+        caller_scope = caller_scope or self.current_scope()
+        if live_output_bindings:
+            live_out_names = [e['name'] for e in (func_def.get('signature') or [])
+                              if e['kind'] == 'output' and e['live']]
+            sub_compiler.live_output_targets = {}
+            for _i, _b in enumerate(live_output_bindings):
+                if _i < len(live_out_names) and _b:
+                    sub_compiler.live_output_targets[live_out_names[_i].lower()] = {
+                        'compiler': self, 'scope': caller_scope, 'binding': _b}
         func_result = sub_compiler.run(
             func_def['code'], list(args),
             suppress_output=True, return_output=True)
@@ -1187,10 +1367,17 @@ class GridLangCompiler(GridLangExecutor):
         except Exception:
             pass
 
-        # Normalize outputs to lists to preserve all pushed values
+        live_out_set = {o.lower() for o in (func_def.get('live_outputs') or [])}
+
+        # Normalize outputs to lists to preserve all pushed values. Live
+        # outputs are stream-only: they never form the call's return channel
+        # (their values flow to caller bindings during the run instead) so
+        # they are excluded here.
         normalized_outputs = {}
         for k, v in outputs.items():
             if k == '_console':
+                continue
+            if k in live_out_set:
                 continue
             if isinstance(v, list):
                 normalized_outputs[k] = v
@@ -1200,7 +1387,9 @@ class GridLangCompiler(GridLangExecutor):
                 normalized_outputs[k] = [v]
 
         def _pick_default():
-            target_names = func_def['outputs'] if func_def['outputs'] else ['output']
+            all_outputs = func_def['outputs'] or []
+            target_names = [o for o in all_outputs
+                            if o.lower() not in live_out_set] or ['output']
             for out_name in target_names:
                 if out_name in normalized_outputs:
                     return normalized_outputs[out_name]
@@ -2174,11 +2363,24 @@ class GridLangCompiler(GridLangExecutor):
             self._apply_single_binding(
                 binding, outputs.get(out_key), scope, line_number=line_number)
 
-    def call_subprocess(self, name, args, output_bindings=None, line_number=None, collect_all=False):
-        """Invoke a user-defined subprocess by name with the given arguments."""
+    def call_subprocess(self, name, args, output_bindings=None, line_number=None, collect_all=False,
+                        live_input_sources=None, live_output_bindings=None, caller_scope=None):
+        """Invoke a user-defined subprocess by name with the given arguments.
+
+        Live signatures accept ``live_input_sources`` (live input names mapped
+        to raw caller-side source expressions, lazily re-evaluated during the
+        run) and ``live_output_bindings`` (caller bindings receiving
+        write-through pushes for the declared live outputs, in declaration
+        order).
+        """
         sp_def = getattr(self, 'subprocesses', {}).get(name.lower())
         if not sp_def:
             raise NameError(f"Subprocess '{name}' not defined")
+        sig_live = any(e.get('live') for e in (sp_def.get('signature') or []))
+        if sig_live and not (live_input_sources or live_output_bindings):
+            raise ValueError(
+                f"Subprocess '{name}' declares live signature slots; it must "
+                f"be called with live resolution")
         # Predefined engine subprocesses (Ticker.Reset/Stop/Start) have no body.
         if sp_def.get('_system'):
             self._handle_ticker_system_call(
@@ -2229,6 +2431,19 @@ class GridLangCompiler(GridLangExecutor):
                 }
         except Exception:
             pass
+        if live_input_sources:
+            sub_compiler.live_input_sources = {
+                k.lower(): {'raw': v, 'compiler': self}
+                for k, v in live_input_sources.items()}
+        caller_scope = caller_scope or self.current_scope()
+        if live_output_bindings:
+            live_out_names = [e['name'] for e in (sp_def.get('signature') or [])
+                              if e['kind'] == 'output' and e['live']]
+            sub_compiler.live_output_targets = {}
+            for _i, _b in enumerate(live_output_bindings):
+                if _i < len(live_out_names) and _b:
+                    sub_compiler.live_output_targets[live_out_names[_i].lower()] = {
+                        'compiler': self, 'scope': caller_scope, 'binding': _b}
         sub_output = sub_compiler.run(
             sp_def['code'], list(args),
             suppress_output=True, return_output=True)
@@ -4488,9 +4703,12 @@ class GridLangCompiler(GridLangExecutor):
                 f"subprocess")
         body = harvest.get('body') or ''
         inputs, input_defs, outputs = [], [], []
+        signature = []
+        live_outputs = []
+        live_inputs = []
         parser = getattr(self, 'parser', None)
         for raw_line in body.splitlines():
-            stripped = raw_line.strip()
+            stripped, b_live = self._carve_live_suffix(raw_line.strip())
             if re.match(r'^\s*input\s+(.+)$', stripped, re.I):
                 try:
                     parsed_var, parsed_type, parsed_constraints, _ = (
@@ -4507,7 +4725,12 @@ class GridLangCompiler(GridLangExecutor):
                 for name in names:
                     input_defs.append({'name': name,
                                        'type': parsed_type,
-                                       'constraints': parsed_constraints or {}})
+                                       'constraints': parsed_constraints or {},
+                                       'live': b_live})
+                    signature.append(
+                        {'name': name, 'kind': 'input', 'live': b_live})
+                    if b_live:
+                        live_inputs.append(name)
             elif re.match(r'^\s*output\s+(.+)$', stripped, re.I):
                 try:
                     parsed_var, _parsed_type, parsed_constraints, _ = (
@@ -4521,12 +4744,20 @@ class GridLangCompiler(GridLangExecutor):
                             if parsed_constraints else None)
                 names = var_list if var_list else [parsed_var]
                 outputs.extend(names)
+                for name in names:
+                    signature.append(
+                        {'name': name, 'kind': 'output', 'live': b_live})
+                    if b_live:
+                        live_outputs.append(name)
         entry = {
             'name': module_name,
             'code': body,
             'outputs': outputs,
             'inputs': inputs,
             'input_defs': input_defs,
+            'signature': signature,
+            'live_outputs': live_outputs,
+            'live_inputs': live_inputs,
             'member_of': None,
             'original': module_name,
             'hidden': False,
@@ -4862,6 +5093,23 @@ class GridLangCompiler(GridLangExecutor):
                         self.pending_assignments[var_name] = (
                             init_expr, line_number, deps, constraints)
                     elif getattr(self, '_parent_scope', None) is not None:
+                        live_targets = getattr(self, 'live_output_targets', None)
+                        if live_targets and var_name.lower() in live_targets:
+                            # Live outputs seed immediately so the write-through
+                            # binding observes the init value during the run.
+                            try:
+                                eval_scope = self.current_scope().get_full_scope()
+                                init_val = self.expr_evaluator.eval_expr(
+                                    init_expr, eval_scope, line_number)
+                                self.current_scope().update(
+                                    var_name, init_val, line_number)
+                                live_pub = getattr(
+                                    self, '_maybe_publish_live_output', None)
+                                if live_pub is not None:
+                                    live_pub(var_name, init_val, line_number)
+                            except Exception:
+                                pass
+                            continue
                         # In subprocess context, defer OUTPUT init to output
                         # collection time so body statements (For/Let) can
                         # shadow variables first.
@@ -5691,7 +5939,14 @@ class GridLangCompiler(GridLangExecutor):
             args = []
         can_prompt = prompt_missing and sys.stdin and sys.stdin.isatty()
 
+        live_sources = getattr(self, 'live_input_sources', None) or {}
+        live_names = set(live_sources)
+
         for i, input_var in enumerate(self.input_variables):
+            if input_var.lower() in live_names:
+                # Live inputs are lazily refreshed during the run; bound to
+                # nothing here.
+                continue
             value_assigned = False
             provided_arg = i < len(args)
             if provided_arg:
