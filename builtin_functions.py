@@ -499,7 +499,7 @@ def _counter_handle():
 # the receiver prepended -- Ticker.Timer(tick, 5). arg_count therefore counts
 # the receiver + user arguments (2 for Timer, 1 for Counter).
 
-@register_builtin("Ticker.Timer", aliases=["Ticker.timer"], arg_count=2)
+@register_builtin("Ticker.Timer", arg_count=2)
 def builtin_ticker_timer(tick, n):
     """Create a Timer handle from a Ticker capability."""
     from units import is_error_value
@@ -516,7 +516,7 @@ def builtin_ticker_timer(tick, n):
         "Timer", parent=parent, interval=rem, remaining=rem)
 
 
-@register_builtin("Ticker.Counter", aliases=["Ticker.counter"], arg_count=1)
+@register_builtin("Ticker.Counter", arg_count=1)
 def builtin_ticker_counter(tick):
     """Create a Counter handle from a Ticker capability."""
     from units import is_error_value
@@ -573,10 +573,24 @@ def _net_declaration():
                 "`conn.headers`; send with the verb members (`conn.Get()`, "
                 "`conn.Post(body)`, `conn.Put(body)`, `conn.Patch(body)`, "
                 "`conn.Delete()`, `conn.Head()`), each of which runs only if "
-                "the grant allows that method. The pinned headers attached "
-                "automatically cannot be shadowed by any extra.",
+                "the grant allows that method and returns a `net!response` "
+                "handle (`resp.status`, `resp.readall()`). The pinned headers "
+                "attached automatically cannot be shadowed by any extra.",
 )
 def _connection_handle():
+    pass
+
+
+@register_handle(
+    "net!response",
+    fields={"status": "number"},
+    description="A `net!response` handle is what every `net!connection` verb "
+                "returns. Its public member `status` is the HTTP status code "
+                "(e.g. 200); the body is read lazily with the `ReadAll()` "
+                "operation (`resp.ReadAll()` or `resp.readall()`), which "
+                "returns the response body as text (empty for `Head()`).",
+)
+def _response_handle():
     pass
 
 
@@ -625,7 +639,8 @@ def builtin_net_connect(net_cap, address, headers=None):
 def _conn_send(conn, method, body, headers):
     """Perform one verb against a `net!connection` handle, gated by the grant.
 
-    Returns the response body text on success, or a sticky #PERM/#N/A value.
+    Returns a `net!response` handle with the `status` member and the body
+    (readable via `ReadAll()`) on success, or a sticky #PERM/#N/A value.
     """
     from units import is_error_value
     if is_error_value(conn):
@@ -639,43 +654,60 @@ def _conn_send(conn, method, body, headers):
         headers = net.compose_headers(
             conn.get('headers') or [], conn.get('_pinned') or [],
             net.parse_header_list(headers))
-        _, text = net.request(
+        status, text = net.request(
             method, conn['address'], headers, body,
             int(conn.get('redirects') or 3))
     except net.NetError as exc:
         return error_value(exc.code)
     except Exception:
         return error_value(NA_ERROR)
-    return text
+    return create_handle(
+        "net!response",
+        _type_name="net!response",
+        status=status,
+        _body=text,
+    )
 
 
-@register_builtin("net!connection.Get", aliases=["net!connection.get"], arg_count=(1, 2))
+@register_builtin("net!response.ReadAll", arg_count=(1, 1))
+def builtin_resp_readall(resp):
+    """Return the response body as text (empty for `Head()`)."""
+    from units import is_error_value
+    if is_error_value(resp):
+        return resp
+    if not (isinstance(resp, dict)
+            and str(resp.get('_handle_type', '')).lower() == 'net!response'):
+        raise TypeError("a net!response handle is required")
+    return resp.get('_body') or ''
+
+
+@register_builtin("net!connection.Get", arg_count=(1, 2))
 def builtin_conn_get(conn, headers=None):
     return _conn_send(conn, 'GET', None, headers)
 
 
-@register_builtin("net!connection.Delete", aliases=["net!connection.delete", "net!connection.del"],
+@register_builtin("net!connection.Delete", aliases=["net!connection.del"],
                   arg_count=(1, 2))
 def builtin_conn_delete(conn, headers=None):
     return _conn_send(conn, 'DELETE', None, headers)
 
 
-@register_builtin("net!connection.Head", aliases=["net!connection.head"], arg_count=(1, 2))
+@register_builtin("net!connection.Head", arg_count=(1, 2))
 def builtin_conn_head(conn, headers=None):
     return _conn_send(conn, 'HEAD', None, headers)
 
 
-@register_builtin("net!connection.Post", aliases=["net!connection.post"], arg_count=(2, 3))
+@register_builtin("net!connection.Post", arg_count=(2, 3))
 def builtin_conn_post(conn, body, headers=None):
     return _conn_send(conn, 'POST', body, headers)
 
 
-@register_builtin("net!connection.Put", aliases=["net!connection.put"], arg_count=(2, 3))
+@register_builtin("net!connection.Put", arg_count=(2, 3))
 def builtin_conn_put(conn, body, headers=None):
     return _conn_send(conn, 'PUT', body, headers)
 
 
-@register_builtin("net!connection.Patch", aliases=["net!connection.patch"], arg_count=(2, 3))
+@register_builtin("net!connection.Patch", arg_count=(2, 3))
 def builtin_conn_patch(conn, body, headers=None):
     return _conn_send(conn, 'PATCH', body, headers)
 
