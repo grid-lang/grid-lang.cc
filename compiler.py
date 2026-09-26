@@ -3623,6 +3623,10 @@ class GridLangCompiler(GridLangExecutor):
         # once per engine and survive per-run resets like all type definitions.
         for name, type_def in RESOURCES.items():
             self.types_defined[name] = dict(type_def)
+        # Handle types (Ticker.Timer/Counter, Net.connection) are NOT seeded
+        # into types_defined: a module may legitimately export a user type whose
+        # name matches a handle (e.g. 'timer'), and members of a handle value
+        # dispatch via the value's own _type_name instead of declared types.
 
     def _seed_moduleversion(self):
         # The type returned by a 'use' import binding (a ModuleVersion value):

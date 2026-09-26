@@ -2248,24 +2248,80 @@ class ExpressionEvaluator:
             i += 1
         return ''.join(out)
 
+    @staticmethod
+    def _concat_parts_outside_quotes(expr):
+        """Split an expression on '&' tiles that sit OUTSIDE quoted string
+        literals. Returns the parts, or None when every '&' is inside a quoted
+        string (or quotes are unbalanced) so the caller does not treat it as a
+        text concatenation at all. Handles doubled-quote escapes ("" '') and
+        $-prefixed interpolated strings (again via "...")."""
+        parts = []
+        buf = []
+        in_dbl = False
+        in_sgl = False
+        i = 0
+        n = len(expr)
+        while i < n:
+            ch = expr[i]
+            if in_dbl:
+                if ch == '"':
+                    if i + 1 < n and expr[i + 1] == '"':
+                        buf.append(ch)
+                        buf.append(ch)
+                        i += 2
+                        continue
+                    in_dbl = False
+                buf.append(ch)
+                i += 1
+                continue
+            if in_sgl:
+                if ch == "'":
+                    if i + 1 < n and expr[i + 1] == "'":
+                        buf.append(ch)
+                        buf.append(ch)
+                        i += 2
+                        continue
+                    in_sgl = False
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == '"':
+                in_dbl = True
+            elif ch == "'":
+                in_sgl = True
+            elif ch == '&':
+                parts.append(''.join(buf))
+                buf = []
+                i += 1
+                continue
+            buf.append(ch)
+            i += 1
+        if in_dbl or in_sgl:
+            return None
+        parts.append(''.join(buf))
+        return parts if len(parts) > 1 else None
+
     def _try_eval_scalar_constructs(self, expr, scope, line_number):
-        # Handle text concatenation with & operator
+        # Handle text concatenation with & operator, but only when the '&' sits
+        # OUTSIDE quoted string literals: a quoted URL query ("?q=a&v=2") must
+        # not be split into a spurious concatenation.
         if '&' in expr:
-            parts = expr.split('&')
-            result = ''
-            for part in parts:
-                part = part.strip()
-                if part.startswith('$"') and part.endswith('"'):
-                    result += self._process_interpolation(
-                        part, scope, line_number)
-                elif part.startswith('"') and part.endswith('"'):
-                    result += part[1:-1].replace('""', '"')
-                else:
-                    val = self.eval_expr(part, scope, line_number)
-                    if is_error_value(val):
-                        return True, val
-                    result += str(val)
-            return True, result
+            parts = self._concat_parts_outside_quotes(expr)
+            if parts is not None:
+                result = ''
+                for part in parts:
+                    part = part.strip()
+                    if part.startswith('$"') and part.endswith('"'):
+                        result += self._process_interpolation(
+                            part, scope, line_number)
+                    elif part.startswith('"') and part.endswith('"'):
+                        result += part[1:-1].replace('""', '"')
+                    else:
+                        val = self.eval_expr(part, scope, line_number)
+                        if is_error_value(val):
+                            return True, val
+                        result += str(val)
+                return True, result
 
         # Handle interpolated strings ($"...")
         if expr.startswith('$"') and expr.endswith('"'):
@@ -3583,16 +3639,36 @@ class ExpressionEvaluator:
         if node_type is ast.Attribute:
             # Support flat dotted keys like 'SILength.inch' stored as a single
             # scope entry: resolve 'Block.field' directly before walking.
+            bound_obj = False
             if isinstance(node.value, ast.Name):
                 dotted = f"{node.value.id}.{node.attr}"
-                # case-insensitive lookup for flat key
-                for k in full_scope:
-                    if k.lower() == dotted.lower():
-                        return self._resolve_fallback_name(k, full_scope, globals_dict)
+                # A bound variable must take precedence over any flat dotted
+                # name with the same base: 'net.Connect(...)' or 'foo.get(...)'
+                # is a member call on the variable's value, never a bare
+                # function name (which would drop the receiver). Only resolve
+                # the flat dotted key when the base is NOT a bound variable
+                # (e.g. module functions via a ModuleVersion alias like
+                # 'copy.func'); unbound bases fall through to the flat key,
+                # while a bound UnitSource namespace resolves constants through
+                # its own __getattr__ path below.
                 try:
-                    return self._resolve_fallback_name(dotted, full_scope, globals_dict)
+                    self._resolve_fallback_name(
+                        node.value.id, full_scope, globals_dict)
+                    # Bound when the base resolves to anything at all — the
+                    # value itself is irrelevant here (a bound variable can
+                    # hold a falsy value like 0), only its name presence.
+                    bound_obj = True
                 except NameError:
                     pass
+                if not bound_obj:
+                    # case-insensitive lookup for flat key
+                    for k in full_scope:
+                        if k.lower() == dotted.lower():
+                            return self._resolve_fallback_name(k, full_scope, globals_dict)
+                    try:
+                        return self._resolve_fallback_name(dotted, full_scope, globals_dict)
+                    except NameError:
+                        pass
             obj = self._walk_ast_node(
                 node.value, full_scope, globals_dict, line_number)
             if is_error_value(obj):
@@ -3621,7 +3697,7 @@ class ExpressionEvaluator:
                                 f"{ns_key}.{node.attr}", full_scope, globals_dict)
                         except NameError:
                             pass
-                if isinstance(node.value, ast.Name):
+                if isinstance(node.value, ast.Name) and not bound_obj:
                     dotted = f"{node.value.id}.{node.attr}"
                     try:
                         return self._resolve_fallback_name(dotted, full_scope, globals_dict)

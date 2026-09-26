@@ -35,11 +35,12 @@ evaluation paths.
 """
 
 import math
+import net
 import random
 import re
 
 from utils import is_sparse_array
-from units import error_value, TYPE_ERROR
+from units import error_value, TYPE_ERROR, NA_ERROR, PERM_ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +524,160 @@ def builtin_ticker_counter(tick):
         return tick
     parent = tick.get('_name') if isinstance(tick, dict) else None
     return create_handle("Counter", parent=parent, now=0)
+
+
+# ---------------------------------------------------------------------------
+# Net resource: granted network access
+# ---------------------------------------------------------------------------
+# A Net capability starts with `Require net as Net with (address = "...",
+# methods = {...}, redirects = N, headers = {...})`. `net.connection(<address>, ...)`
+# validates the URL against the granted address template (with no I/O) and
+# returns a `net!connection` handle; the verb members (Get/Post/...) send with
+# the granted method set, pinned grant headers and redirect cap enforced.
+#
+# Member builtins run under expression._try_eval_member_function_call, which
+# swallows raised exceptions. All Net failures are therefore *returned* as
+# sticky error values (#PERM for policy violations, #N/A for network/redirect
+# failures) rather than raised.
+
+@register_resource(
+    "Net",
+    fields={"address": "text", "methods": "text", "redirects": "number",
+            "headers": "text"},
+    constraints={"address": {"type": "text"},
+                 "redirects": {">=": "0", "type": "number"}},
+    description="A network capability. `address` is a URL template whose fixed "
+                "parts are locked, `*` stands for one path segment and `**` "
+                "for the rest of the path; `methods` limits the verbs a Send "
+                "may use; `redirects` caps same-origin redirects (default 3); "
+                "`headers` are pinned request headers the program can neither "
+                "omit nor forge. Connect with `net.connection(<address>)`, then "
+                "send through the returned `net!connection` handle with "
+                "`conn.Get()`, `conn.Post(body)` and friends.",
+)
+def _net_declaration():
+    pass
+
+
+@register_handle(
+    "net!connection",
+    fields={"address": "text", "methods": "text", "redirects": "number",
+            "headers": "text"},
+    description="A `net!connection` handle carries the granted Net params as "
+                "its members: `address` (the validated concrete address), "
+                "`methods` (granted verbs), `redirects` (redirect cap) and "
+                "`headers` (the effective request headers: the pinned grant "
+                "headers merged with the extras passed to the connection; "
+                "mirrors the pinned set privately via `_pinned`). Read them as "
+                "`conn.address`, `conn.methods`, `conn.redirects`, "
+                "`conn.headers`; send with the verb members (`conn.Get()`, "
+                "`conn.Post(body)`, `conn.Put(body)`, `conn.Patch(body)`, "
+                "`conn.Delete()`, `conn.Head()`), each of which runs only if "
+                "the grant allows that method. The pinned headers attached "
+                "automatically cannot be shadowed by any extra.",
+)
+def _connection_handle():
+    pass
+
+
+@register_builtin("Net.connection", arg_count=(2, 3))
+def builtin_net_connect(net_cap, address, headers=None):
+    """Validate an address against the granted Net template and open a `net!connection`.
+
+    The whole address (scheme, host, port, path, query) is validated here, with
+    no network I/O; violations surface as the sticky #PERM value in the cell.
+    """
+    from units import is_error_value
+    if is_error_value(net_cap):
+        return net_cap
+    if not (isinstance(net_cap, dict) and net_cap.get('_capability')
+            and str(net_cap.get('_resource')).lower() == 'net'):
+        raise TypeError("Net.connection expects a Net capability as its subject")
+    params = net_cap.get('_params') or {}
+    grant_address = params.get('address') or ''
+    if not grant_address or not isinstance(address, str):
+        return error_value(PERM_ERROR)
+    try:
+        net.validate_address(grant_address, address)
+        pinned = net.parse_header_list(params.get('headers'))
+        extras = net.parse_header_list(headers)
+        effective = net.merge_headers(pinned, [], extras)
+    except net.NetError as exc:
+        return error_value(exc.code)
+    raw = params.get('methods')
+    methods = [raw.strip().upper()] if isinstance(raw, str) else [
+        str(m).strip().upper() for m in (raw or []) if m]
+    try:
+        redirects = max(0, int(float(params.get('redirects') or 3)))
+    except (TypeError, ValueError):
+        redirects = 3
+    return create_handle(
+        "net!connection",
+        _type_name="net!connection",
+        address=address,
+        methods=methods,
+        redirects=redirects,
+        _pinned=pinned,
+        headers=effective,
+    )
+
+
+def _conn_send(conn, method, body, headers):
+    """Perform one verb against a `net!connection` handle, gated by the grant.
+
+    Returns the response body text on success, or a sticky #PERM/#N/A value.
+    """
+    from units import is_error_value
+    if is_error_value(conn):
+        return conn
+    if not (isinstance(conn, dict)
+            and str(conn.get('_handle_type', '')).lower() == 'net!connection'):
+        raise TypeError("a net!connection handle is required")
+    if method not in (conn.get('methods') or []):
+        return error_value(PERM_ERROR)
+    try:
+        headers = net.compose_headers(
+            conn.get('headers') or [], conn.get('_pinned') or [],
+            net.parse_header_list(headers))
+        _, text = net.request(
+            method, conn['address'], headers, body,
+            int(conn.get('redirects') or 3))
+    except net.NetError as exc:
+        return error_value(exc.code)
+    except Exception:
+        return error_value(NA_ERROR)
+    return text
+
+
+@register_builtin("net!connection.Get", aliases=["net!connection.get"], arg_count=(1, 2))
+def builtin_conn_get(conn, headers=None):
+    return _conn_send(conn, 'GET', None, headers)
+
+
+@register_builtin("net!connection.Delete", aliases=["net!connection.delete", "net!connection.del"],
+                  arg_count=(1, 2))
+def builtin_conn_delete(conn, headers=None):
+    return _conn_send(conn, 'DELETE', None, headers)
+
+
+@register_builtin("net!connection.Head", aliases=["net!connection.head"], arg_count=(1, 2))
+def builtin_conn_head(conn, headers=None):
+    return _conn_send(conn, 'HEAD', None, headers)
+
+
+@register_builtin("net!connection.Post", aliases=["net!connection.post"], arg_count=(2, 3))
+def builtin_conn_post(conn, body, headers=None):
+    return _conn_send(conn, 'POST', body, headers)
+
+
+@register_builtin("net!connection.Put", aliases=["net!connection.put"], arg_count=(2, 3))
+def builtin_conn_put(conn, body, headers=None):
+    return _conn_send(conn, 'PUT', body, headers)
+
+
+@register_builtin("net!connection.Patch", aliases=["net!connection.patch"], arg_count=(2, 3))
+def builtin_conn_patch(conn, body, headers=None):
+    return _conn_send(conn, 'PATCH', body, headers)
 
 
 # ---------------------------------------------------------------------------
