@@ -3675,6 +3675,22 @@ class ExpressionEvaluator:
                 if isinstance(obj, UnitValue):
                     return obj
                 return error_value(obj)
+            # A bound handle's member verbs must win over Python's native dict
+            # methods: 'conn.get' is the net!connection verb, never dict.get
+            # (which needs a key argument and would shadow the builtin for
+            # lowercase names like get/items/keys). Try the type-member
+            # builtin before attribute access.
+            if bound_obj and isinstance(obj, dict) and obj.get('_type_name'):
+                try:
+                    member = self._resolve_fallback_name(
+                        f"{obj.get('_type_name')}.{node.attr}".lower(),
+                        full_scope, globals_dict)
+                    if callable(member):
+                        def _member_wrapper(*a, _m=member, _o=obj, **kw):
+                            return _m(_o, *a, **kw)
+                        return _member_wrapper
+                except NameError:
+                    pass
             try:
                 result = getattr(obj, node.attr)
                 # DotDict returns None for missing keys instead of raising;
