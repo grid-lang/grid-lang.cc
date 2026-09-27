@@ -121,6 +121,10 @@ class GridLangExecutor(GridLangBase):
         # and a counter so listeners see the tick.
         self._ticker_last_fire = {}
         self._loop_iteration = 0
+        # Started net!server transports (see _pump_server_requests): accept
+        # threads append parsed requests to a plain deque; the main thread
+        # drains it and fires matched `When <route> do` blocks.
+        self._net_servers = []
 
     def _is_outer_defining_scope(self, scope):
         """Return True when the given scope belongs to the caller's scope chain."""
@@ -239,7 +243,7 @@ class GridLangExecutor(GridLangBase):
     def _unpack_push_assignment(self, push_match):
         target, value_expr = push_match.groups()
         if value_expr is None:
-            value_expr = target.strip()
+            return None, target.strip()
         return target.strip(), value_expr[1:]
 
     def _match_return_statement(self, text):
@@ -384,6 +388,135 @@ class GridLangExecutor(GridLangBase):
                     found[low] = (name, val)
             scope = getattr(scope, 'parent', None)
         return found
+
+    def _net_server_entry(self, server_id):
+        """The started-server entry for ``server_id`` or None."""
+        for entry in getattr(self, '_net_servers', []) or []:
+            if entry.get('server_id') == server_id:
+                return entry
+        return None
+
+    def _register_net_server(self, server_id, pinned):
+        """Register a started net!server so _pump_server_requests drains it.
+
+        Accept threads only append to the entry's plain ``queue`` deque (GIL
+        makes single append/popleft atomic); every other field is owned by the
+        main thread. Returns the entry for the Start builtin to plug its
+        listener into.
+        """
+        entry = {
+            'server_id': server_id,
+            'queue': deque(),
+            'listener': None,
+            'started': True,
+            'stopped': False,
+            'pinned': list(pinned or ()),
+        }
+        self._net_servers.append(entry)
+        return entry
+
+    def _match_route(self, server_id, req, line_number):
+        """Find the most-specific registered route for a request.
+
+        Walks the scope chain for ``net!route`` handles belonging to that
+        server, keeps those whose method/path template match, and returns the
+        winning ``(var_name, route_handle)`` — or None (auto-404).
+        """
+        import net
+        method = (req.get('method') or '').upper()
+        path = req.get('raw_path') or req.get('path') or '/'
+        best = None
+        best_score = None
+        for low, (name, value) in self._scope_handle_vars().items():
+            if (value.get('_handle_type') or '').lower() != 'net!route':
+                continue
+            if str(value.get('_server_id') or '') != server_id:
+                continue
+            template = value.get('_template')
+            if template is None:
+                continue
+            allowed = value.get('_methods') or []
+            if not net.route_matches(template, path, method, allowed):
+                continue
+            score = net.route_specificity(template)
+            if best_score is None or score > best_score:
+                best = (name, value)
+                best_score = score
+        return best
+
+    def _reply_unmatched(self, req, pinned):
+        """Answer a request that matched no route with an automatic 404."""
+        import net
+        conn = req.get('conn')
+        if conn is None:
+            return
+        try:
+            conn.write(net.make_response(404, 'Not found', None, pinned))
+            try:
+                conn.flush()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _pump_server_requests(self):
+        """Deliver queued inbound requests to their matching route When blocks.
+
+        Runs every main-loop unit next to ``_maybe_fire_tickers``. For each
+        started server, every queued request is matched against the registered
+        routes (most-specific wins); on a match the route handle is rewritten
+        with a fresh ``net!request`` handle under its ``request`` member and
+        enqueued on the route variable's Push queue so the ordinary When
+        machinery fires it. Unmatched requests are answered 404 automatically.
+        """
+        from builtin_functions import create_handle
+        fired = False
+        for entry in list(getattr(self, '_net_servers', []) or []):
+            if entry.get('stopped'):
+                continue
+            queue = entry.get('queue')
+            pinned = entry.get('pinned') or []
+            while queue:
+                try:
+                    req = queue.popleft()
+                except IndexError:
+                    break
+                import sys as _sys
+                try:
+                    hit = self._match_route(entry['server_id'], req, 0)
+                except Exception as e:
+                    hit = None
+                if hit is None:
+                    self._reply_unmatched(req, pinned)
+                    continue
+                name, route_val = hit
+                request_handle = create_handle(
+                    "net!request",
+                    _type_name="net!request",
+                    method=req.get('method'),
+                    path=req.get('path'),
+                    headers='\n'.join(
+                        f"{k}: {v}" for k, v in (req.get('headers') or {}).items()),
+                    _body=req.get('body') or '',
+                    _conn=req.get('conn'),
+                    _pinned=pinned,
+                    _replied=False,
+                )
+                new_route = dict(route_val)
+                new_route['request'] = request_handle
+                self._set_var_value(name, new_route, 0)
+                self._enqueue_push(name, new_route)
+                fired = True
+        if fired:
+            try:
+                self._process_when_triggers()
+            except Exception as e:
+                import sys as _sys, traceback as _tb
+                _tb.print_exc(file=_sys.stderr)
 
     def _advance_handles(self, parent_cap_name, line_number):
         """Advance Timer/Counter handles derived from the ticker that just fired.
@@ -763,6 +896,8 @@ class GridLangExecutor(GridLangBase):
         if (not subprocess_defs or name.lower() not in subprocess_defs) and hasattr(self, 'compiler'):
             subprocess_defs = getattr(self.compiler, 'subprocesses', {}) or {}
         if name.lower() not in subprocess_defs:
+            if self._bare_handle_member_call(name, args_str, line, line_number):
+                return True
             return False
         arg_parts = self._split_call_arguments(args_str)
         sp_def = subprocess_defs[name.lower()]
@@ -835,6 +970,41 @@ class GridLangExecutor(GridLangBase):
                                 binding, val, self.current_scope(), line_number=line_number)
             except Exception:
                 pass
+        return True
+
+    def _bare_handle_member_call(self, name, args_str, line, line_number):
+        """Run a stand-alone ``handle.Method(args)`` statement.
+
+        Engine handles own their members, so a bare call on one is a
+        side-effecting subprocess call (``srv.Start()``, ``srv.Stop()``,
+        ``rq.Reply(...)``), not a no-op read. Resolves the base variable to
+        its handle, verifies the member is a real engine builtin for that
+        handle type, then evaluates the line and discards the value.
+        """
+        if '.' not in name:
+            return False
+        base, _, member = name.partition('.')
+        if not member or '.' in member:
+            return False
+        handles = self._scope_handle_vars()
+        handle = handles.get(base.lower())
+        if handle is None:
+            return False
+        htype = str(handle[1].get('_handle_type') or '').lower()
+        if not htype:
+            return False
+        try:
+            from builtin_functions import BUILTINS
+            key = f"{htype}.{member}".lower()
+            if key not in BUILTINS:
+                return False
+        except ImportError:
+            return False
+        try:
+            self.expr_evaluator.eval_or_eval_array(
+                line, self.current_scope().get_evaluation_scope(), line_number)
+        except Exception:
+            return False
         return True
 
     def _analyze_loop_dependencies(self, normalized, original_line, line_number):
@@ -2972,6 +3142,7 @@ class GridLangExecutor(GridLangBase):
         while i < len(lines):
             self._loop_iteration += 1
             self._maybe_fire_tickers()
+            self._pump_server_requests()
             # Live inputs are lazily re-evaluated in the caller's scope before
             # each statement the callee runs, so mid-run reads observe the
             # caller's current state (feedback loop).
@@ -3071,6 +3242,7 @@ class GridLangExecutor(GridLangBase):
             line_number,
             var_defs,
             is_block):
+        import sys as _sys
         var_list = self._parse_for_declaration_var_list(var_defs, line_number)
 
         next_i = self._try_handle_for_declaration_special_cases(
@@ -3450,6 +3622,7 @@ class GridLangExecutor(GridLangBase):
                 f"Unclosed FOR block starting at line {line_number}")
         init_entry = next(
             ((v, t, c) for v, t, c, _ in var_list if c and 'init' in c), None)
+        import sys as _sys
         if init_entry:
             init_expr = init_entry[2].get('init')
             values = []
@@ -5180,6 +5353,7 @@ class GridLangExecutor(GridLangBase):
         return results
 
     def _handle_push_assignment(self, target, value_expr, line_number):
+        import sys as _sys
         # Key type variables are immutable: Push to a stored keytype var is forbidden
         try:
             compiler = getattr(self, 'compiler', None) or self

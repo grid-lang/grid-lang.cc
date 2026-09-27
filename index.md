@@ -123,7 +123,7 @@ no duplication to keep in sync across two live objects anymore.
   `1` is special: `UnitValue._is_one`, `__mul__` treats `1` as unitless, `_divide` `m/1→m` `m/m→1`, `__pow__` allows exponent `1`.
 - `UnitValue` overloads: `+`/`-` same unit or one side unitless; `*` with `1`; `/`/`\`/`mod` with `1`; `^` with `1`.
 
-### `compiler.py` (6160 lines) — state + orchestration, public API
+### `compiler.py` (6177 lines) — state + orchestration, public API
 `class GridLangCompiler` is the engine's **state holder and public surface**. It
 is the only class `main.py` constructs. It inherits the runtime loop from
 `GridLangExecutor` and holds nearly all persistent state created in `__init__`:
@@ -157,42 +157,42 @@ Notable methods:
 - `_instantiate_type` (1538), `_evaluate_with_value` (1946), `_apply_with_clause`
   (1246): type/`with` object construction; now handles `:` field unit conversion.
 - `call_subprocess` (2392): runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (4362), `_process_declarations_and_labels` (4887),
-  `_collect_global_declarations` (5051): top-level statement handling; now handles `of 1` and `"ox" of animal`.
-- `export_to_csv` (5947): `--debug` CSV export (grid as matrix, or outputs as
+- `_process_grid_assignment` (4379), `_process_declarations_and_labels` (4904),
+  `_collect_global_declarations` (5068): top-level statement handling; now handles `of 1` and `"ox" of animal`.
+- `export_to_csv` (5964): `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
-- `set_input_values` (5970): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
+- `set_input_values` (5987): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
 - `_seed_globals` (1670): for sub-compilers; **skips redefining `grid`**.
 
 Also defines `SubprocessResult` (37): result container exposing `grid`,
 `variables`, `outputs`, and `_UnitSourceNamespace` (52) the UnitSource lookups.
 
-### `executor.py` (5719 lines) — the runtime loop
+### `executor.py` (5882 lines) — the runtime loop
 `class GridLangExecutor` is the **base class that owns the interpreter's
 dispatch loop and its per-run runtime state**. It is not instantiated directly
 as a facade (the old compiler→executor copy handoff was removed); `run` is the
 live entry. Key methods (the `compiler.py`/`grid_lang_common.py` layers call
 `super()`/override these):
-- `run` (2367): top-level sequence (acts on `self`; see Architecture).
-- `_run_setup` (4847), `_run_prepare_execution` (4886), `_print_outputs`
-  (4716), `_materialize_inits` (5455), `_process_deferred_assignments` (5594).
+- `run` (2529): top-level sequence (acts on `self`; see Architecture).
+- `_run_setup` (5010), `_run_prepare_execution` (5049), `_print_outputs`
+  (4716), `_materialize_inits` (5618), `_process_deferred_assignments` (5757).
   `_run_prepare_execution` now calls `_materialize_unit_source_constants` + `_register_top_level_converts`.
-- Main loop: `_run_main_loop` (2401) → `_run_main_loop_impl` (2946) →
-  `_run_main_loop_impl_body` (2969). `_handle_main_loop_*` methods dispatch
+- Main loop: `_run_main_loop` (2563) → `_run_main_loop_impl` (3108) →
+  `_run_main_loop_impl_body` (3131). `_handle_main_loop_*` methods dispatch
   statement kinds: `Let` (1128), `For` (1752 fallback), grid assignment (3903),
   `When` blocks (3956), `Push` (4152), `Return` (4108), misc (3724).
-- Dependency/guard machinery: `_build_dependency_network` (932),
+- Dependency/guard machinery: `_build_dependency_network` (1094),
   `_determine_needed_lines`, `_evaluate_guard_conditions`,
   `_evaluate_global_guards_pre_execution`, `_execute_global_for_loops`,
   `_attempt_resolve_pending_var`, `_resolve_ready_pending_vars`.
-- `Let` semantics: first pass `_process_let_first_pass` (1463), binding
+- `Let` semantics: first pass `_process_let_first_pass` (1625), binding
   `_bind_declared_var` (1255, now `expected_unit`), standard assignment,
   second pass, generator values, `_materialize_inits`.
 - `For`: `_execute_simple_for_assignment` (749, now `expected_unit`), `Push` via `target_unit`.
-- `Push` semantics: `_handle_push_assignment` (5182), `_evaluate_push_expression`
+- `Push` semantics: `_handle_push_assignment` (5345), `_evaluate_push_expression`
   (4345, now `expected_unit`), `_handle_push_assignment_line`.
-- `When` blocks: `_register_when_block` (280), `_process_when_triggers` (597),
-  `_run_when_block` (613).
+- `When` blocks: `_register_when_block` (284), `_process_when_triggers` (722),
+  `_run_when_block` (738).
 - Shared helpers (from `grid_lang_common.py`): `_strip_constraint_operands` and
   `_DEPENDENCY_IGNORED_TOKENS` (re-exported here as `DEPENDENCY_IGNORED_TOKENS` for
   back-compat; compiler.py imports the same `_DEPENDENCY_IGNORED_TOKENS`). They are
@@ -208,35 +208,35 @@ live entry. Key methods (the `compiler.py`/`grid_lang_common.py` layers call
 both the compiler and executor layers here. (Note: `error_value`/`UNIVERSAL_ZERO`
 live in `units.py`, not here.)
 
-### `expression.py` (4098 lines) — expression evaluation
+### `expression.py` (4108 lines) — expression evaluation
 `class ExpressionEvaluator` evaluates RHS expressions, arrays, ranges, sums,
 dimension selectors, interpolations, member/field access, and Python-fallback
 evaluation.
-- Entry points: `eval_or_eval_array` (116, now `expected_unit`), `eval_expr` (2512), and for
+- Entry points: `eval_or_eval_array` (116, now `expected_unit`), `eval_expr` (2522), and for
   assignments `_evaluate_array` (547).
 - LHS-informed: `_apply_expected_unit` (79) + `_formula_eval` (97, strips LHS var) threaded via `expected_unit`.
 - `eval_expr` is the big recursive dispatcher: array literals `{}`, pipes `|`,
   interpolated cell refs, paren/curly indexing, member calls, user function
   calls, object creation, field access, address-indexed access, then scalar
   constructs, then simple variables.
-- Python fallback: `_evaluate_with_python_fallback` (2947) builds a scope and
+- Python fallback: `_evaluate_with_python_fallback` (2957) builds a scope and
   `eval()`s complex arithmetic (`_build_fallback_cell_scope` 2254,
   `_eval_python_fallback_result` 2501, `_get_eval_globals` 2937). Now includes
-  `_replace_of_unit_literals` (4028) for `"ox" of animal`/`5 of in`/`2 of 1` → `gridlang_of_unit` and `Attribute` flat-key `SILength.inch` + case-insensitive `_resolve_fallback_name` (3534).
-- Interpolation: `_process_interpolation` (3899). Operators:
-  `_replace_operators` (4043).
+  `_replace_of_unit_literals` (4038) for `"ox" of animal`/`5 of in`/`2 of 1` → `gridlang_of_unit` and `Attribute` flat-key `SILength.inch` + case-insensitive `_resolve_fallback_name` (3544).
+- Interpolation: `_process_interpolation` (3909). Operators:
+  `_replace_operators` (4053).
 - Grid indexing: `_replace_grid_indexing` (864) — rewrites bare `grid{...}`
   when the predefined `grid` variable is in scope; otherwise falls through to
   the generic array-access path (ranges, `*` selectors, `#N/A` for unset cells).
 - Also `CaseInsensitiveDict` (29): case-insensitive dict used for
   eval scopes.
 
-### `builtin_functions.py` (799 lines) — builtin registry + predefined functions
-Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`/`ROWS`/`ABS`/`LEN`/`TEXTSPLIT`/`TRANSPOSE`/math, …). Both evaluation paths (`ExpressionEvaluator._build_python_fallback_scope` (`expression.py:3383`) and `_get_eval_globals` (`expression.py:4057`)) call `get_builtin_functions()` so a new builtin is instantly available everywhere.
+### `builtin_functions.py` (1108 lines) — builtin registry + predefined functions
+Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`/`ROWS`/`ABS`/`LEN`/`TEXTSPLIT`/`TRANSPOSE`/math, …). Both evaluation paths (`ExpressionEvaluator._build_python_fallback_scope` (`expression.py:3393`) and `_get_eval_globals` (`expression.py:4067`)) call `get_builtin_functions()` so a new builtin is instantly available everywhere.
 - Registry (37): `BUILTINS`/`ALIASES`/`ARG_COUNTS`/`VECTORIZED` plus `KEYWORDS` (43, re-exported by `compiler.py`/`expression.py` for dependency stripping). `register_builtin` (66) and `register_vectorized_builtin` (96) are decorators (`@register_builtin("MIN", aliases=["Number.Min"], arg_count=1)`); non-vectorized by default, vectorized ones broadcast element-wise.
 - Arity + helpers: `_check_arity` (227) / `_resolve_builtin` (247) / `_to_list` (129, normalizes sparse `dict`, `{'array':…}`, `list` → flat list).
 - Builtins (143): `ROWS` (143) / `SUM` (155) / `LEN` (166, `Text.Len`) / `ABS` (174, `Number.Abs`) / `POWER` (179) / `INT` (184) / `MID` (189, `Text.Mid`) / `TEXTSPLIT` (199, `Text.Split`) / `COUNTA` (207) / `RANDARRAY` (223) / `SORTBY` (229) / `TRANSPOSE` (240) / `MIN` (291, `Number.Min`) / `MAX` (299, `Number.Max`) plus math shims (`sqrt`/`sin`/… → `Number.<name>`, 306) and `str`/`int`/`float`/`abs` (313). `MIN`/`MAX` flatten via `_to_list` before `min`/`max`.
-- Public API (323): `_is_array_arg` (720) / `_broadcast_builtin` (326, only for `VECTORIZED`; detects `list`/`{'array':…}`/sparse, checks equal lengths, applies scalar broadcast, otherwise returns `None` to fall back to normal call) / `get_builtin_functions` (373, builds `name→wrapped` dict; wrapper does `_check_arity`, then `_broadcast_builtin`, then `fn(*args)` with `TypeError→#TYPE/I`; injects `math`).
+- Public API (323): `_is_array_arg` (1029) / `_broadcast_builtin` (326, only for `VECTORIZED`; detects `list`/`{'array':…}`/sparse, checks equal lengths, applies scalar broadcast, otherwise returns `None` to fall back to normal call) / `get_builtin_functions` (373, builds `name→wrapped` dict; wrapper does `_check_arity`, then `_broadcast_builtin`, then `fn(*args)` with `TypeError→#TYPE/I`; injects `math`).
 
 ### `array_handler.py` (3057 lines) — grid/array/tensor operations
 `class ArrayHandler` centralizes all array knowledge:
@@ -343,8 +343,8 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
 - `format_display_value` (26265: display formatting with float-trimming and
   list/dict-form array support.
 
-### `test_runner.py` (2430 lines) — inline test suite
-`class GridLangTestRunner` with `run_tests_independent(tests)` — runs 462 tests (Tests 282–293 unit tests, Tests 331–349 push/cell-mirror/subprocess semantics, Tests 350–357d resource/`Require`/grant semantics, Tests 385–405b module/`use`/instance-state/dotted-Require/ModuleVersion/runnable-module-run/unknown-call/init-never-fires-on-import semantics, Tests 452–465 live pipes + user-function vectorization/element-access). At the bottom of the file (~840) it runs itself when executed directly:
+### `test_runner.py` (2732 lines) — inline test suite
+`class GridLangTestRunner` with `run_tests_independent(tests)` — runs 491 tests (Tests 282–293 unit tests, Tests 331–349 push/cell-mirror/subprocess semantics, Tests 350–357d resource/`Require`/grant semantics, Tests 385–405b module/`use`/instance-state/dotted-Require/ModuleVersion/runnable-module-run/unknown-call/init-never-fires-on-import semantics, Tests 452–465 live pipes + user-function vectorization/element-access, Tests 479–487 Net LISTEN/server routing + Reply semantics via the fake listener transport). At the bottom of the file it runs itself when executed directly:
 `python test_runner.py [names...]`. Failing names are printed.
 
 ## Language conventions to remember when editing
@@ -465,6 +465,32 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
     by a program**. `Define ticker.counter as Handle` is rejected at parse
     (compiler.py:3595-3620) *before* any truncation to the bare resource
     prefix, so `ticker` itself is never clobbered.
+- **Net resource** (builtin_functions.py): a grant whose `methods` are exactly
+  `{"LISTEN"}` is a **server** grant — mixing LISTEN with client verbs is
+  refused at grant-merge time (permissions.py). The granted address is the
+  bind target; no path template is needed for serving (`/**` is meaningless),
+  routing lives entirely in `Route` templates. `web.server()` validates the
+  address, checks LISTEN-only mode (`net.check_server_mode`) and returns a
+  `net!server` handle carrying the granted headers as *pinned* response
+  headers. `srv.Route("/path")` registers a template (`*`/`**` wildcards);
+  `route.endpoint("doc")` pins the first wildcard (`/search/*` + `doc` =>
+  `/search/doc`, appended when no wildcard exists). A bare
+  `srv.Start()`/`srv.Stop()` statement is a side-effecting subprocess call
+  (`executor._bare_handle_member_call`): engine handles own their members, so
+  such calls execute instead of being no-op reads (same for `rq.Reply(...)`). `Start()` binds and hands inbound requests to the
+  engine's queue (`executor._pump_server_requests`, drained each main-loop
+  unit), `Serve()` blocks pumping until `Stop()`. Matching requests re-write
+  the route handle with a `net!request` under `r.request` and fire the
+  route's `When r do ... End`; `rq.Reply(status, body, headers)` answers the
+  request and unmatched requests get an automatic 404. The handle exposes a
+  `started` logical field mirroring Start/Stop. A member call that mutates a
+  handle notifies the base variable (`expression._try_eval_member_function_call`
+  → `_notify_var_changed`), so equality-bound cells (`[C1] := srv.started`)
+  re-derive live and always read the field's current state. Pinned grant headers
+  are protected case-insensitively (RFC 7230) — an override of any naming is
+  #PERM — and header names go on the wire with the case the author gave them.
+  The real transport is `net.bind_server`/`_TCPServerListener`; tests replace
+  it with a synchronous fake (test_runner `_FakeServerListener`).
 - **Dependency extraction**: `_DEPENDENCY_IGNORED_TOKENS` / `_strip_constraint_operands`
   live in `grid_lang_common.py` and are re-exported by both layers — single
   source of truth. `_strip_constraint_operands` strips `of`/`as`/`dim`/`not null`/`of 1`/`"ox" of animal`

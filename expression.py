@@ -1482,7 +1482,17 @@ class ExpressionEvaluator:
                     if arg_text.strip():
                         args_list = [a.strip() for a in re.split(r',(?![^{]*})', arg_text) if a.strip()]
                     evaluated_args = [self.eval_or_eval_array(a, scope, line_number) for a in args_list]
-                    return True, wrapped(obj_value, *evaluated_args)
+                    result = wrapped(obj_value, *evaluated_args)
+                    # Engine handles hold their mutable state on the Python side;
+                    # a member call may have changed the handle in place. Notify the
+                    # base variable so equality-bound cells ([cell] := base.field)
+                    # re-derive from the new state.
+                    if isinstance(obj_value, dict) and obj_value.get('_handle'):
+                        try:
+                            self.compiler._notify_var_changed(obj_name, obj_value)
+                        except Exception:
+                            pass
+                    return True, result
                 else:
                     # Bare field access like 'numbers.Min' without () -> return the builtin itself? Not needed.
                     # Prefer to return the wrapped function so fallback can call it
@@ -2249,16 +2259,21 @@ class ExpressionEvaluator:
         return ''.join(out)
 
     @staticmethod
+    @staticmethod
     def _concat_parts_outside_quotes(expr):
         """Split an expression on '&' tiles that sit OUTSIDE quoted string
-        literals. Returns the parts, or None when every '&' is inside a quoted
-        string (or quotes are unbalanced) so the caller does not treat it as a
-        text concatenation at all. Handles doubled-quote escapes ("" '') and
-        $-prefixed interpolated strings (again via "...")."""
+        literals AND at parenthesis/bracket depth 0. Returns the parts, or
+        None when every '&' is inside a quoted string, inside a call's/array
+        literal's brackets (an arg like ``f(1, "a" & "b")`` must not be split
+        into a spurious top-level concatenation), or quotes are unbalanced, so
+        the caller does not treat it as a text concatenation at all. Handles
+        doubled-quote escapes ("" '') and $-prefixed interpolated strings
+        (again via "...") and builder chains containing '&'."""
         parts = []
         buf = []
         in_dbl = False
         in_sgl = False
+        depth = 0
         i = 0
         n = len(expr)
         while i < n:
@@ -2289,7 +2304,11 @@ class ExpressionEvaluator:
                 in_dbl = True
             elif ch == "'":
                 in_sgl = True
-            elif ch == '&':
+            elif ch in '([{':
+                depth += 1
+            elif ch in ')]}':
+                depth = max(depth - 1, 0)
+            elif ch == '&' and depth == 0:
                 parts.append(''.join(buf))
                 buf = []
                 i += 1

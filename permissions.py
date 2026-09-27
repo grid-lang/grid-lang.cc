@@ -488,6 +488,19 @@ class RequirementResolver:
             self.validate_param(
                 key, val, field_constraints.get(key) or {},
                 line_number, entry['resource'])
+        # LISTEN is exclusive for Net servers: a grant that mixes LISTEN with
+        # client verbs is refused here so a --grant file cannot hide a server
+        # capability among Get/Post calls (mirrors Net.Server's own check).
+        res_lower = str(entry.get('resource_lower') or entry.get('resource') or '').lower()
+        if res_lower == 'net':
+            methods = params.get('methods')
+            if methods is not None:
+                raw_methods = methods if not isinstance(methods, str) else [methods]
+                lst = [str(m).strip().upper() for m in raw_methods if m]
+                if 'LISTEN' in lst and len(lst) != 1:
+                    raise GrantError(
+                        f"Grant for '{entry['name']}': LISTEN is exclusive, a "
+                        f"server grant cannot mix it with other methods")
         return params
 
     def validate_param(self, field, value, cons, line_number, resource):
@@ -523,12 +536,12 @@ class RequirementResolver:
         sys.stdout.write(render_require_prompt(entry))
         while True:
             answer = input(
-                "Grant? (y/n, or 'edit' to change parameters): ").strip().lower()
-            if answer in ('n', 'no'):
+                "Grant? (yes/no, or 'edit' to change parameters): ").strip().lower()
+            if answer in ('n', 'no', ''):
                 return None
-            if answer in ('y', 'yes', ''):
+            if answer in ('y', 'yes'):
                 return dict(entry.get('params_evaluated') or {})
-            if answer == 'edit':
+            if answer in ('e', 'edit'):
                 try:
                     overrides = parse_grant_clause(
                         input("Parameters (field = value, ...): ").strip(),
@@ -539,7 +552,7 @@ class RequirementResolver:
                 merged = dict(entry.get('params_evaluated') or {})
                 merged.update({k.lower(): v for k, v in overrides.items()})
                 return merged
-            sys.stdout.write("  Please answer y/n/edit.\n")
+            sys.stdout.write("  Please answer y/n/e.\n")
 
     def resolve(self, requirements, grants, can_prompt=False):
         """Resolve requirement entries into capability bindings.

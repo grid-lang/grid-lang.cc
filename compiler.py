@@ -3864,6 +3864,23 @@ class GridLangCompiler(GridLangExecutor):
         self._push_queues = {}
         self._processing_when = False
         self._loop_iteration = 0
+        # Server transports belong to a single run: stop any listener left
+        # running by an earlier program, then clear the registry so stale
+        # requests never fire Again. The module-level engine hook lets server
+        # member builtins reach this run's pump.
+        import net
+        net.ENGINE = self
+        if hasattr(self, '_net_servers'):
+            for entry in self._net_servers:
+                listener = entry.get('listener')
+                if listener is not None:
+                    try:
+                        listener.stop()
+                    except Exception:
+                        pass
+            self._net_servers.clear()
+        else:
+            self._net_servers = []
         # Module-import state is run-scoped except `module_sources` (host input,
         # preserved across runs like `grants`).
         if hasattr(self, 'module_namespaces'):

@@ -553,7 +553,11 @@ def builtin_ticker_counter(tick):
                 "`headers` are pinned request headers the program can neither "
                 "omit nor forge. Connect with `net.connection(<address>)`, then "
                 "send through the returned `net!connection` handle with "
-                "`conn.Get()`, `conn.Post(body)` and friends.",
+                "`conn.Get()`, `conn.Post(body)` and friends. A grant whose "
+                "methods are exactly `{\"LISTEN\"}` instead creates a server: "
+                "`web.server()` returns a `net!server` handle that binds the "
+                "granted address and answers requests routed by "
+                "`srv.Route(path)`.",
 )
 def _net_declaration():
     pass
@@ -591,6 +595,56 @@ def _connection_handle():
                 "returns the response body as text (empty for `Head()`).",
 )
 def _response_handle():
+    pass
+
+
+@register_handle(
+    "net!server",
+    fields={"address": "text", "methods": "text", "redirects": "number",
+            "headers": "text"},
+    description="A `net!server` handle is what `web.server()` returns from a "
+                "grant whose methods are exactly `{\"LISTEN\"}`. The granted "
+                "`address` is the bind target. `srv.Start()` binds and starts "
+                "accepting immediately; `srv.Serve()` blocks until `srv.Stop()` "
+                "(useful for a program whose only job is serving); "
+                "`srv.Route(path, methods?)` registers a route and returns a "
+                "`net!route` handle. Requests that reach a matching route fire "
+                "the route's `When <route> do ... End` block with the request "
+                "available as `route.request`; unmatched requests are answered "
+                "404 automatically.",
+)
+def _server_handle():
+    pass
+
+
+@register_handle(
+    "net!route",
+    fields={"path": "text"},
+    description="A `net!route` handle is returned by `srv.Route(path, methods?)`. "
+                "Its public `path` member is the route template (`*` = one path "
+                "segment, `**` = the rest). `route.endpoint(path, methods?)` "
+                "nests a sub-route from the first wildcard (`search/*` + `doc` "
+                "=> `search/*/doc`). Registering a `When <route> do ... End` "
+                "block makes the route answer its requests; most-specific path "
+                "wins when several routes match.",
+)
+def _route_handle():
+    pass
+
+
+@register_handle(
+    "net!request",
+    fields={"method": "text", "path": "text", "headers": "text"},
+    description="A `net!request` handle is delivered to a route's `When` block "
+                "as `route.request` for each inbound request. It exposes "
+                "`method` (e.g. \"GET\"), `path` (the raw request path, query "
+                "included) and `headers` (the request headers, one \"Name: value\" "
+                "per line). The body is read with `ReadAll()`/`readall()`. The "
+                "request is answered with `req.Reply(status, body?, headers?)`, "
+                "which sends the HTTP response (the pinned grant headers are "
+                "attached and unforgeable) and returns the status number.",
+)
+def _request_handle():
     pass
 
 
@@ -679,6 +733,262 @@ def builtin_resp_readall(resp):
             and str(resp.get('_handle_type', '')).lower() == 'net!response'):
         raise TypeError("a net!response handle is required")
     return resp.get('_body') or ''
+
+
+# ---------------------------------------------------------------------------
+# Net server member builtins
+# ---------------------------------------------------------------------------
+# A Net grant grants either client verbs (Get/Post/...) or the exclusive
+# LISTEN method (a server). `web.server()` returns a `net!server` handle;
+# per-server Start/Serve/Stop/Route are member builtins on that handle. The
+# executor's `_pump_server_requests` delivers matching requests to the route's
+# When block with a `net!request` handle under `route.request`; `Reply` sends
+# the HTTP response back over the connection the accept thread handed over.
+
+import itertools as _itertools
+_SERVER_SEQ = _itertools.count(1)
+
+
+@register_builtin("Net.Server", arg_count=(1, 1))
+def builtin_net_server(net_cap):
+    """Create a `net!server` handle from a LISTEN-granted Net capability."""
+    from units import is_error_value
+    if is_error_value(net_cap):
+        return net_cap
+    if not (isinstance(net_cap, dict) and net_cap.get('_capability')
+            and str(net_cap.get('_resource')).lower() == 'net'):
+        raise TypeError("Net.Server expects a Net capability as its subject")
+    params = net_cap.get('_params') or {}
+    try:
+        net.check_server_mode(params.get('methods'))
+        net.validate_server_address(params.get('address'))
+        pinned = net.parse_header_list(params.get('headers'))
+    except net.NetError as exc:
+        return error_value(exc.code)
+    if 'LISTEN' not in net.normalize_methods(params.get('methods')):
+        return error_value(PERM_ERROR)
+    redirects = params.get('redirects') or 3
+    try:
+        redirects = max(0, int(float(redirects)))
+    except (TypeError, ValueError):
+        redirects = 3
+    return create_handle(
+        "net!server",
+        _type_name="net!server",
+        address=params.get('address'),
+        methods=['LISTEN'],
+        redirects=redirects,
+        headers=pinned,
+        _server_id=f"net!server:{next(_SERVER_SEQ)}",
+        _started=False,
+        _stopped=False,
+        started=False,
+    )
+
+
+def _server_handle_of(srv):
+    """Validate a `net!server` handle (or propagate an error value)."""
+    from units import is_error_value
+    if is_error_value(srv):
+        return srv, False
+    if not (isinstance(srv, dict)
+            and str(srv.get('_handle_type', '')).lower() == 'net!server'):
+        raise TypeError("a net!server handle is required")
+    return srv, True
+
+
+@register_builtin("net!server.Start", arg_count=(1, 1))
+def builtin_server_start(srv):
+    """Bind the granted address, spawn the accept thread and return
+    immediately. Later main-loop units drain inbound requests (or `Serve`
+    blocks with its own pump). """
+    import threading
+    srv, ok = _server_handle_of(srv)
+    if not ok:
+        return srv
+    if srv.get('_started'):
+        return False
+    engine = getattr(net, 'ENGINE', None)
+    if engine is None:
+        return error_value(NA_ERROR)
+    try:
+        template = net.validate_server_address(srv.get('address'))
+        listener = net.bind_server(template['host'], template['port'])
+    except net.NetError as exc:
+        return error_value(exc.code)
+    except OSError as exc:
+        return error_value(NA_ERROR)
+    entry = engine._register_net_server(srv['_server_id'], srv.get('headers') or [])
+    entry['listener'] = listener
+
+    def on_request(req):
+        entry['queue'].append(req)
+
+    if getattr(listener, 'synchronous', False):
+        listener.serve_forever(on_request)
+    else:
+        threading.Thread(
+            target=listener.serve_forever, args=(on_request,), daemon=True).start()
+    srv['_started'] = True
+    srv['started'] = True
+    return True
+
+
+@register_builtin("net!server.Serve", arg_count=(1, 1))
+def builtin_server_serve(srv):
+    """Block, pumping inbound requests until `Stop`. Meant for a program whose
+    only job is to serve (a `net!server.Start` returns immediately)."""
+    import time
+    srv, ok = _server_handle_of(srv)
+    if not ok:
+        return srv
+    if not srv.get('_started'):
+        started = builtin_server_start(srv)
+        if started is not True:
+            return started
+    engine = getattr(net, 'ENGINE', None)
+    if engine is None:
+        return error_value(NA_ERROR)
+    while True:
+        engine._pump_server_requests()
+        entry = engine._net_server_entry(srv['_server_id'])
+        if entry is None or entry.get('stopped'):
+            break
+        time.sleep(0.01)
+    return True
+
+
+@register_builtin("net!server.Stop", arg_count=(1, 1))
+def builtin_server_stop(srv):
+    """Stop accepting, remove the server from the engine and return True."""
+    srv, ok = _server_handle_of(srv)
+    if not ok:
+        return srv
+    engine = getattr(net, 'ENGINE', None)
+    entry = engine._net_server_entry(srv['_server_id']) if engine else None
+    if entry is None:
+        srv['_started'] = False
+        srv['started'] = False
+        return False
+    entry['stopped'] = True
+    listener = entry.get('listener')
+    if listener is not None:
+        try:
+            listener.stop()
+        except Exception:
+            pass
+    try:
+        engine._net_servers.remove(entry)
+    except ValueError:
+        pass
+    srv['_started'] = False
+    srv['started'] = False
+    return True
+
+
+@register_builtin("net!server.Route", arg_count=(2, 3))
+def builtin_server_route(srv, path, methods=None):
+    """Register a route template on the server and return a `net!route` handle.
+    ``methods`` defaults to every supported verb."""
+    srv, ok = _server_handle_of(srv)
+    if not ok:
+        return srv
+    if not isinstance(path, str):
+        return error_value(PERM_ERROR)
+    allowed = net.normalize_methods(methods) or list(net._STANDARD_VERBS)
+    if any(m not in net._STANDARD_VERBS for m in allowed):
+        return error_value(PERM_ERROR)
+    return create_handle(
+        "net!route",
+        _type_name="net!route",
+        path=path,
+        _template=path,
+        _methods=allowed,
+        _server_id=srv['_server_id'],
+    )
+
+
+@register_builtin("net!route.endpoint", arg_count=(2, 3))
+def builtin_route_endpoint(route, path, methods=None):
+    """Derive a nested `net!route` by pinning the first wildcard of a parent
+    template (``search/*`` + ``doc`` => ``search/doc``)."""
+    from units import is_error_value
+    if is_error_value(route):
+        return route
+    if not (isinstance(route, dict)
+            and str(route.get('_handle_type', '')).lower() == 'net!route'):
+        raise TypeError("a net!route handle is required")
+    if not isinstance(path, str):
+        return error_value(PERM_ERROR)
+    allowed = net.normalize_methods(methods) or list(net._STANDARD_VERBS)
+    if any(m not in net._STANDARD_VERBS for m in allowed):
+        return error_value(PERM_ERROR)
+    template = net.extend_route(route.get('_template'), path)
+    return create_handle(
+        "net!route",
+        _type_name="net!route",
+        path=template,
+        _template=template,
+        _methods=allowed,
+        _server_id=route['_server_id'],
+    )
+
+
+@register_builtin("net!request.ReadAll", aliases=["net!request.readall"],
+                  arg_count=(1, 1))
+def builtin_request_readall(req):
+    """Return the request body as text."""
+    from units import is_error_value
+    if is_error_value(req):
+        return req
+    if not (isinstance(req, dict)
+            and str(req.get('_handle_type', '')).lower() == 'net!request'):
+        raise TypeError("a net!request handle is required")
+    return req.get('_body') or ''
+
+
+@register_builtin("net!request.Reply", arg_count=(2, 4))
+def builtin_request_reply(req, status, body=None, headers=None):
+    """Send the HTTP response for an inbound request and return its status.
+
+    ``status`` is the numeric status code, ``body`` the response body text
+    (default empty) and ``headers`` optional \"Name: value\" entries. The
+    pinned grant headers are attached automatically and cannot be shadowed.
+    """
+    from units import is_error_value
+    if is_error_value(req):
+        return req
+    if not (isinstance(req, dict)
+            and str(req.get('_handle_type', '')).lower() == 'net!request'):
+        raise TypeError("a net!request handle is required")
+    if req.get('_replied'):
+        return error_value(NA_ERROR)
+    try:
+        status_i = int(float(status))
+    except (TypeError, ValueError):
+        return error_value(VALUE_ERROR)
+    conn = req.get('_conn')
+    if conn is None:
+        return error_value(NA_ERROR)
+    try:
+        payload = net.make_response(
+            status_i, body, net.parse_header_list(headers),
+            req.get('_pinned') or [])
+        conn.write(payload)
+        try:
+            conn.flush()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+        req['_replied'] = True
+    except net.NetError as exc:
+        return error_value(exc.code)
+    except Exception as exc:
+        return error_value(NA_ERROR)
+    return status_i
 
 
 @register_builtin("net!connection.Get", arg_count=(1, 2))

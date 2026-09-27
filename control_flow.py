@@ -93,7 +93,7 @@ class GridLangControlFlow:
     def _unpack_push_assignment(self, push_match):
         target, value_expr = push_match.groups()
         if value_expr is None:
-            value_expr = target.strip()
+            return None, target.strip()
         return target.strip(), value_expr[1:]
 
     def _match_return_statement(self, text):
@@ -466,6 +466,19 @@ class GridLangControlFlow:
                         elif return_match:
                             self._handle_return_statement(
                                 return_match.group(1).strip(), line_number)
+                        else:
+                            # Any other single-line action (bare subprocess or
+                            # engine-handle member call, plain expression) runs
+                            # like a normal block line
+                            callable_fn = getattr(
+                                self.compiler, '_maybe_handle_subprocess_call', None)
+                            if callable_fn is not None and callable_fn(
+                                    action, line_number):
+                                return True, i + 1
+                            self.compiler.expr_evaluator.eval_expr(
+                                action,
+                                self.compiler.current_scope().get_evaluation_scope(),
+                                line_number)
             except NameError:
                 return True, i + 1
             except Exception as e:
@@ -829,7 +842,7 @@ class GridLangControlFlow:
             '=' in line
             and ':=' not in line
             and not line_clean.lower().startswith((
-                'if ', 'for ', 'when ', 'let ', 'output ', 'input ', 'define ', 'return ', 'push '))
+                'if ', 'for ', 'when ', 'let ', 'output ', 'input ', 'define ', 'return ', 'push ', 'print '))
             and not line.strip().startswith(': ')
             and not re.match(r'^\[\s*\^?[A-Za-z]+\d+\s*\]\s*:\s*', line)
         )):
@@ -1007,6 +1020,11 @@ class GridLangControlFlow:
 
             self.compiler.expr_evaluator.eval_expr(
                 line, self.compiler.current_scope().get_evaluation_scope(), line_number)
+            if line_clean.lower().startswith('let '):
+                try:
+                    _bv = self.compiler.current_scope().get('count')
+                except Exception:
+                    _bv = '<err>'
 
             i += 1
         if block_pending:
@@ -1297,6 +1315,12 @@ class GridLangControlFlow:
             self._handle_return_statement(
                 return_match.group(1).strip(), line_number)
             return
+
+        # Any other single-line action (bare subprocess/handle member call,
+        # plain expression) is evaluated like a normal block line.
+        self.compiler.expr_evaluator.eval_expr(
+            action, self.compiler.current_scope().get_evaluation_scope(),
+            line_number)
 
     def _process_let_statement_inline(self, line, line_number):
         """

@@ -15,12 +15,18 @@ error value, so policy decisions are observable in cells.
 """
 
 import re
+import socket
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 
 PERM = '#PERM'
 IOERR = '#N/A'
+
+# The host engine sets this to the running compiler so server member builtins
+# (Start/Serve/Stop) can reach the executor's request pump.
+ENGINE = None
 
 
 class NetError(Exception):
@@ -319,3 +325,245 @@ def request(method, url, headers, body, max_redirects):
     except OSError as exc:
         raise NetError(f'Request failed: {exc}', IOERR) from exc
     return status, raw.decode('utf-8', 'replace')
+
+
+# ---------------------------------------------------------------------------
+# Server engine: LISTEN grants, route matching, HTTP/1.1 responses,
+# and the pluggable bind/acceptor transport.
+# ---------------------------------------------------------------------------
+
+_STANDARD_VERBS = ('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD')
+
+_REASON_TEXT = {
+    200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently',
+    302: 'Found', 400: 'Bad Request', 403: 'Forbidden', 404: 'Not Found',
+    405: 'Method Not Allowed', 500: 'Internal Server Error',
+}
+
+
+def normalize_methods(raw):
+    """Collapse a granted/route method set into a list of uppercase verbs."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw.strip().upper()] if raw.strip() else []
+    return [str(m).strip().upper() for m in (raw or []) if m]
+
+
+def check_server_mode(methods):
+    """LISTEN is exclusive: a grant granting any other verb alongside it is
+    refused (#PERM). Returns ``['LISTEN']`` when granted."""
+    methods = normalize_methods(methods)
+    if 'LISTEN' in methods and len(methods) != 1:
+        raise NetError(
+            'LISTEN is exclusive: a server grant may grant only LISTEN', PERM)
+    return methods
+
+
+def validate_server_address(pattern):
+    """The server grant's address is the bind target: an http(s) URL template
+    whose authority (host/port) is concrete (wildcards already rejected by
+    parse_address)."""
+    template = parse_address(pattern)
+    if template['base'] not in ('http', 'https'):
+        raise NetError(
+            'A server grant must bind an http(s) address', PERM)
+    return template
+
+
+def route_matches(template, path, method, allowed):
+    """Whether a request (method + path) matches a route template.
+
+    ``allowed`` restricts the verbs that route serves; the path template uses
+    the same segment/glob rules as the granted address.
+    """
+    if method.upper() not in [m.upper() for m in (allowed or [])]:
+        return False
+    return _segments_match(_norm_path(template), _norm_path(path))
+
+
+def route_specificity(template):
+    """Most-specific-wins score: (literal segments, total segments). More
+    literals beats fewer; ties go to the longer template."""
+    segs = _norm_path(template)
+    literals = sum(1 for s in segs if s not in ('*', '**'))
+    return (literals, len(segs))
+
+
+def extend_route(template, endpoint):
+    """Derive a nested sub-route template by pinning the first wildcard.
+
+    ``search/*`` plus ``doc`` becomes ``search/doc``: the wildcard is replaced
+    by the endpoint's segments (which may themselves be a path). A template
+    with no wildcard appends the endpoint at the end.
+    """
+    base = [seg for seg in (template or '').split('/') if seg]
+    extra = [seg for seg in (endpoint or '').split('/') if seg]
+    for i, seg in enumerate(base):
+        if seg in ('*', '**'):
+            return '/' + '/'.join(base[:i] + extra + base[i + 1:])
+    return '/' + '/'.join(base + extra)
+
+
+def make_response(status, body, headers=None, pinned=None):
+    """Build the raw HTTP/1.1 response bytes for a ``Reply`` or an automatic
+    404. Pinned grant headers are protected case-insensitively — RFC 7230
+    field names — so a per-reply header whose lower-cased name matches a
+    pinned one is refused (NetError(#PERM)), matching the client side. Header
+    names are written back with the case the author gave them."""
+    if body is None:
+        body = ''
+    data = str(body).encode('utf-8')
+    pinned_items = parse_header_list(pinned)
+    pin = {name.lower() for name, _ in pinned_items}
+    merged = list(pinned_items)
+    for name, value in parse_header_list(headers):
+        if name.lower() in pin:
+            raise NetError(
+                f"Cannot override the pinned header '{name}'", PERM)
+        merged.append((name, value))
+    have = {name.lower() for name, _ in merged}
+    if 'content-type' not in have:
+        merged.append(('Content-Type', 'text/plain; charset=utf-8'))
+    if 'content-length' not in have:
+        merged.append(('Content-Length', str(len(data))))
+    reason = _REASON_TEXT.get(int(status), '')
+    out = [f"HTTP/1.1 {int(status)} {reason}\r\n"]
+    for name, value in merged:
+        out.append(f"{name}: {value}\r\n")
+    out.append("Connection: close\r\n\r\n")
+    return ''.join(out).encode('latin-1', 'replace') + data
+
+
+def parse_http_request(rfile):
+    """Read one HTTP/1.1 request from a file-like object.
+
+    Returns a dict {method, path, raw_path, headers, body} or None at EOF.
+    ``raw_path`` strips a trailing query string; ``headers`` are lower-cased.
+    """
+    line = rfile.readline()
+    if not line:
+        return None
+    parts = line.decode('latin-1', 'replace').rstrip('\r\n').split(' ', 2)
+    if len(parts) < 2:
+        return None
+    method = parts[0].upper()
+    path = parts[1]
+    headers = {}
+    while True:
+        raw = rfile.readline()
+        if not raw or raw in (b'\r\n', b'\n'):
+            break
+        key, _, val = raw.decode('latin-1', 'replace').partition(':')
+        headers[key.strip().lower()] = val.strip()
+    try:
+        length = int(headers.get('content-length') or 0)
+    except ValueError:
+        length = 0
+    body = (rfile.read(max(length, 0)).decode('utf-8', 'replace')
+            if length else '')
+    return {'method': method, 'path': path, 'raw_path': path.split('?', 1)[0],
+            'headers': headers, 'body': body}
+
+
+class _SocketConn:
+    """File-like peer over a raw TCP socket: the engine's reply paths call
+    ``write``/``flush``/``close`` (mirroring the fake-listener contract).
+    ``close`` also signals the ``done`` event so a connection-handler thread
+    can stop waiting once the engine has replied."""
+
+    def __init__(self, sock, done=None):
+        self._sock = sock
+        self._done = done
+
+    def write(self, data):
+        self._sock.sendall(data)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        if self._sock.fileno() >= 0:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        if self._done is not None:
+            self._done.set()
+
+
+class _TCPServerListener:
+    """Blocking TCP acceptor; call ``serve_forever(on_request)`` on a daemon
+    thread. Each accepted connection gets its own handler thread which parses
+    the request (10 s socket timeout), hands it to the main thread via
+    ``on_request`` (which only appends to a plain queue), then waits for the
+    main thread to Reply()/close the ``_SocketConn``. The accept loop never
+    blocks on a client, so many connections can be in flight. ``stop()``
+    closes the listening socket and any in-flight connections."""
+
+    def __init__(self, host, port):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind((host, int(port)))
+        self._sock.listen(8)
+        self._stopped = False
+        self._conns = set()
+        self._lock = threading.Lock()
+
+    def serve_forever(self, on_request):
+        while not self._stopped:
+            try:
+                conn, _addr = self._sock.accept()
+            except OSError:
+                break
+            t = threading.Thread(
+                target=self._handle_conn, args=(conn, on_request), daemon=True)
+            t.start()
+
+    def _handle_conn(self, conn, on_request):
+        conn.settimeout(10)
+        done = threading.Event()
+        with self._lock:
+            self._conns.add(conn)
+        try:
+            conn_request = parse_http_request(conn.makefile('rb'))
+            if conn_request is None:
+                return
+            conn_request['conn'] = _SocketConn(conn, done)
+            on_request(conn_request)
+            # Wait until the main thread replies and closes (or timeout, as a
+            # safety valve if the engine stalls).
+            done.wait(timeout=10)
+        except (OSError, ValueError, AttributeError):
+            pass
+        finally:
+            with self._lock:
+                self._conns.discard(conn)
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def stop(self):
+        self._stopped = True
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        with self._lock:
+            conns = list(self._conns)
+        for conn in conns:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def bind_server(host, port):
+    """Create a listening server transport bound to ``host:port``.
+
+    Test hosts may replace this with a synchronous fake transport (see the
+    test suite); a real listener starts accepting only from a daemon thread
+    spawned by the engine's ``net!server.Start`` builtin.
+    """
+    return _TCPServerListener(host, port)
