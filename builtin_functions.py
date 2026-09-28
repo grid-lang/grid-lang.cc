@@ -40,7 +40,7 @@ import random
 import re
 
 from utils import is_sparse_array
-from units import error_value, TYPE_ERROR, NA_ERROR, PERM_ERROR
+from units import error_value, is_error_value, TYPE_ERROR, NA_ERROR, PERM_ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +320,9 @@ def builtin_int(n):
 
 @register_vectorized_builtin("MID", aliases=["Text.Mid"], arg_count=(2, 3))
 def builtin_mid(text, start, length=1):
+    from units import is_error_value
+    if is_error_value(text):
+        return text
     if isinstance(text, str):
         start_idx = max(int(start) - 1, 0)
         length = int(length)
@@ -1091,6 +1094,13 @@ def get_builtin_functions(evaluator, scope=None, line_number=None):
                 # (a single bracket array/range argument counts as one).
                 _check_arity(fn_name, len(args), line_number)
                 try:
+                    # A sticky error value (e.g. #PERM from a denied capability
+                    # or an #N/A network failure) cannot be meaningfully
+                    # operated on: propagate it instead of degrading to #TYPE/I
+                    # from a TypeError deep inside the builtin.
+                    for arg in args:
+                        if is_error_value(arg):
+                            return arg
                     # Array broadcasting: if any arg is array, apply element-wise
                     # (except for reductions like SUM).
                     array_result = _broadcast_builtin(
