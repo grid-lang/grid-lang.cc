@@ -394,6 +394,20 @@ class Scope:
         self.uninitialized.discard(actual_key)
         if hasattr(self.compiler, 'mark_dependency_resolved'):
             self.compiler.mark_dependency_resolved(actual_key)
+        # An 'init' default is a form of Push: materializing it propagates
+        # the value to listeners exactly like a store + enqueue + When sweep.
+        compiler_ref = getattr(self, 'compiler', None)
+        if compiler_ref is not None:
+            if hasattr(compiler_ref, '_sync_cell_bindings'):
+                compiler_ref._sync_cell_bindings(actual_key, materialized)
+            if hasattr(compiler_ref, '_record_output_value'):
+                compiler_ref._record_output_value(actual_key, materialized)
+            if hasattr(compiler_ref, '_notify_var_changed'):
+                compiler_ref._notify_var_changed(actual_key, materialized)
+            if hasattr(compiler_ref, '_enqueue_push'):
+                compiler_ref._enqueue_push(actual_key, materialized)
+            if hasattr(compiler_ref, '_process_when_triggers'):
+                compiler_ref._process_when_triggers()
         return materialized
 
     def _validate_variable_name(self, name, line_number=None, internal=False):

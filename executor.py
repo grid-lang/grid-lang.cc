@@ -5417,6 +5417,22 @@ class GridLangExecutor(GridLangBase):
                             break
         except Exception:
             pass
+        if not member_path_match and t_scope is None:
+            t_scope = self.current_scope().get_defining_scope(target)
+        if not member_path_match and t_scope is not None:
+            # Materialize a declared-but-uninitialized target's 'init' default
+            # before evaluating the RHS: the RHS reads run against the merged
+            # evaluation-scope dict (which stores the raw None), so an init
+            # value like `Push count = count + 1` would otherwise evaluate
+            # None + 1. The scope-chain get() applies lazy init and stores it.
+            ak = t_scope._get_case_insensitive_key(target, t_scope.variables)
+            if ak and t_scope.variables.get(ak) is None:
+                try:
+                    init_constraints = t_scope.constraints.get(ak, {}) or {}
+                    if init_constraints.get('init') is not None:
+                        t_scope.get(target)
+                except Exception:
+                    pass
         try:
             if self._is_bare_subprocess_call(value_expr):
                 values = [self.expr_evaluator.eval_or_eval_array(

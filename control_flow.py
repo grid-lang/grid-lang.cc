@@ -4,7 +4,7 @@ Handles FOR loops, IF statements, LET statements, and block processing.
 """
 
 import re
-from units import UNIVERSAL_ZERO
+from units import UNIVERSAL_ZERO, is_error_value
 from utils import num_to_col, split_var_defs, is_sparse_array
 from grid_lang_common import _STATEMENT_KEYWORDS, _first_keyword
 
@@ -1020,11 +1020,6 @@ class GridLangControlFlow:
 
             self.compiler.expr_evaluator.eval_expr(
                 line, self.compiler.current_scope().get_evaluation_scope(), line_number)
-            if line_clean.lower().startswith('let '):
-                try:
-                    _bv = self.compiler.current_scope().get('count')
-                except Exception:
-                    _bv = '<err>'
 
             i += 1
         if block_pending:
@@ -1565,6 +1560,27 @@ class GridLangControlFlow:
             value = defining_scope.get(var_name)
             return value is not None
 
+        # A bare variable condition tests presence, not truthiness: a falsy
+        # value (0, "") still triggers, equivalent to '<var> not null'. For a
+        # logical variable this is ambiguous, so warn once suggesting an
+        # explicit '<var> = true' or '<var> not null'.
+        bare_match = re.match(r'^([\w_.]+)$', condition.strip(), re.I)
+        if bare_match:
+            var_name = bare_match.group(1)
+            defining_scope = self.compiler.current_scope().get_defining_scope(
+                var_name)
+            if defining_scope:
+                value = defining_scope.get(var_name)
+                present = value is not None and not is_error_value(value)
+                actual_key = defining_scope._get_case_insensitive_key(
+                    var_name, defining_scope.types)
+                var_type = defining_scope.types.get(
+                    actual_key) if actual_key else None
+                if present and (var_type == 'logical'
+                                or isinstance(value, bool)):
+                    self._warn_boolean_condition(var_name, line_number)
+                return present
+
         # Handle negated comparisons (e.g., "x not <= 10")
         not_cmp_match = re.match(
             r'^(.+?)\s+not\s*(<=|>=|<|>|=)\s*(.+)$', condition.strip(), re.I)
@@ -1595,9 +1611,11 @@ class GridLangControlFlow:
         return self._evaluate_if_condition_default(
             condition, line_number, warn_boolean=warn_boolean)
 
-    def _warn_boolean_condition(self, line_number):
-        """Warn once per line: a bare boolean condition reads more clearly as an
-        explicit equality ('If <expr> = true') so a boolean value is tested."""
+    def _warn_boolean_condition(self, expr, line_number):
+        """Warn once per line: a bare variable condition tests presence (any
+        value, including falsy 0/""/false, satisfies it), which reads like a
+        truthiness test for a boolean value; suggest an explicit equality or a
+        'not null' presence test."""
         warned = getattr(self.compiler, '_bool_condition_warned_lines', None)
         if warned is None:
             warned = set()
@@ -1607,7 +1625,8 @@ class GridLangControlFlow:
         warned.add(line_number)
         print(
             f"Warning: boolean condition at line {line_number}; "
-            f"use 'If <expr> = true' instead")
+            f"use '{expr} = true' to test the value, or '{expr} not null' "
+            f"to test presence (any value, including {expr} = false)")
 
     def _resolve_implicit_operands(self, parts):
         """Rewrite comparison parts that omit the left operand (e.g. 'x >= 1 and < 8')
@@ -1722,7 +1741,7 @@ class GridLangControlFlow:
             result = self.compiler.expr_evaluator.eval_expr(
                 condition, scope, line_number)
             if warn_boolean and isinstance(result, bool):
-                self._warn_boolean_condition(line_number)
+                self._warn_boolean_condition(condition, line_number)
             return bool(result)
         except Exception as e:
             return False

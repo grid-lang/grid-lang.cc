@@ -277,6 +277,8 @@ def render_require_prompt(entry):
     for field in sorted(type_def.get('_member_keys', set()) -
                     type_def.get('_hidden_fields', set())):
         key = str(field).lower()
+        if not key in requested:
+            continue
         cons = field_constraints.get(key) or {}
         line = str(field)
         if 'in' in cons:
