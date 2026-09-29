@@ -568,7 +568,7 @@ class GridLangControlFlow:
         if not line.strip().lower().startswith("for "):
             return False, i
 
-        if '=' in line and not any(keyword in line.lower() for keyword in ['in', 'as', 'dim']):
+        if '=' in line and not re.search(r'\bin\b|\bas\b|\bdim\b', line.lower()):
             try:
                 self.process_for_statement(
                     line, line_number, self.compiler.current_scope())
