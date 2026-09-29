@@ -2,6 +2,7 @@
 import re
 import math
 import copy
+import time
 from collections import deque
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler, constant_value_matches
@@ -121,6 +122,10 @@ class GridLangExecutor(GridLangBase):
         # and a counter so listeners see the tick.
         self._ticker_last_fire = {}
         self._loop_iteration = 0
+        # Ticker clock source: 'wall' fires on elapsed seconds (real programs);
+        # 'loop' fires per main-loop iteration (deterministic test clock). The
+        # test runner opts the latter in; production keeps the default.
+        self._ticker_timebase = 'wall'
         # Started net!server transports (see _pump_server_requests): accept
         # threads append parsed requests to a plain deque; the main thread
         # drains it and fires matched `When <route> do` blocks.
@@ -293,17 +298,29 @@ class GridLangExecutor(GridLangBase):
         self.when_blocks.append(entry)
         self._process_when_triggers()
 
+    def _ticker_now(self):
+        """Current Ticker clock value for the active time base.
+
+        'wall' (the default, used by real programs) returns elapsed monotonic
+        seconds so a Ticker interval is a real duration; 'loop' (selected by
+        the test runner for deterministic tests) returns the running main-loop
+        iteration counter so an interval is a number of statements executed.
+        """
+        if getattr(self, '_ticker_timebase', 'wall') == 'loop':
+            return self._loop_iteration
+        return time.monotonic()
+
     def _maybe_fire_tickers(self):
         """Advance periodic-Ticker capabilities and notify their listeners.
 
-        A granted Ticker is a clock object: every ``interval`` main-loop units it
+        A granted Ticker is a clock object: every ``interval`` clock units it
         increments its ``value`` counter (triggering any reactive binding that
         reads ``<cap>.value`` through the ordinary listener mechanism) and, when
         a `When <cap> do` block is registered, enqueues the tick on that
         capability's Push queue so the *existing* When machinery fires it. No
-        part of When is special-cased for tickers. Each fire also advances every
-        Timer/Counter handle derived from the ticker (see _advance_handles and
-        notify_resource_updated). Denied (#PERM) or invalid tickers never
+        part of When is special-cased for tickers. Each fire also advances
+        every Timer/Counter handle derived from the ticker (see _advance_handles
+        and notify_resource_updated). Denied (#PERM) or invalid tickers never
         advance (dead blocks).
         """
         from units import is_error_value
@@ -312,7 +329,9 @@ class GridLangExecutor(GridLangBase):
                    if req.get('resource_lower') == 'ticker']
         if not targets:
             return
-        now = self._loop_iteration
+        now = self._ticker_now()
+        loop_units = getattr(self, '_ticker_timebase', 'wall') == 'loop'
+        min_interval = 1 if loop_units else 0.001
         # Lazily compute the set of capability/handle names with a registered
         # When consumer so we only enqueue ticks someone is waiting for.
         when_deps = None
@@ -331,15 +350,24 @@ class GridLangExecutor(GridLangBase):
                 interval = float(interval)
             except (TypeError, ValueError):
                 continue
-            if not interval or interval < 1:
+            if not interval or interval < min_interval:
                 continue
             # `disabled` is a hidden ticker attribute, settable from the Require
             # clause (never from a grant): while true the ticker does not advance.
             if capability.get('disabled'):
                 continue
-            last = self._ticker_last_fire.get(cap_name, 0)
+            if loop_units:
+                # Loop clock: first fire as soon as one iteration elapses
+                # (interval units are whole statements), then every interval.
+                last = self._ticker_last_fire.get(cap_name, 0)
+            else:
+                # Wall clock: first observation fires immediately, then every
+                # `interval` seconds (fractional values allowed). Start()/Reset
+                # reposition the clock so a resumed ticker waits a full interval
+                # instead of catching up instantly.
+                last = self._ticker_last_fire.get(cap_name, now - interval)
             # A ticker with a fixed interval never fires before the interval
-            # elapses, so short programs simply see no tick.
+            # elapses, so short programs simply see no extra tick.
             if (now - last) < interval:
                 continue
             self._ticker_last_fire[cap_name] = now
@@ -546,13 +574,20 @@ class GridLangExecutor(GridLangBase):
                     new_value['_fired'] = True
                 else:
                     new_value['remaining'] = rem
+                self._set_var_value(name, new_value, line_number)
+                # A Timer is a one-shot: its `When <timer> do ...` signals only
+                # once, when `remaining` reaches 0 (the timeout). Intermediate
+                # countdown updates still propagate to reactive listeners but
+                # are not enqueued as triggers.
+                if new_value.get('_fired') and low in when_deps:
+                    self._enqueue_push(name, new_value)
             elif htype == 'counter':
                 new_value['now'] = (new_value.get('now') or 0) + 1
+                self._set_var_value(name, new_value, line_number)
+                if low in when_deps:
+                    self._enqueue_push(name, new_value)
             else:
                 continue
-            self._set_var_value(name, new_value, line_number)
-            if low in when_deps:
-                self._enqueue_push(name, new_value)
 
     def notify_resource_updated(self, var_name, line_number=None):
         """Notify the engine that an engine-owned handle value changed.
@@ -589,7 +624,7 @@ class GridLangExecutor(GridLangBase):
         """
         from units import UnitValue, is_error_value
         action = name.lower().rsplit('.', 1)[-1]
-        now = self._loop_iteration
+        now = self._ticker_now()
         caps = getattr(self, 'require_caps', None) or {}
         targets = [req for req in caps.values()
                    if req.get('resource_lower') == 'ticker']

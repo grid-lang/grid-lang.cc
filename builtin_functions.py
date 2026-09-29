@@ -124,7 +124,8 @@ def register_resource(name, fields=None, constraints=None, hidden=None,
         @register_resource(
             "Ticker",
             fields={"interval": "number"},
-            constraints={"interval": {">=": "1", "type": "number"}},
+            constraints={"interval": {">=": "0.1", "type": "number",
+                                      "default": "1"}},
             hidden={"disabled"},
         )
         def _ticker_declaration():
@@ -458,13 +459,16 @@ for _name in ["str", "int", "float", "abs"]:
 @register_resource(
     "Ticker",
     fields={"interval": "number", "disabled": "logical"},
-    constraints={"interval": {">=": "1", "type": "number"},
+    constraints={"interval": {">=": "0.1", "type": "number",
+                              "default": "1"},
                  "disabled": {"type": "logical"}},
     hidden={"disabled"},
     description="A reactive clock object: a granted capability increments its "
-                "`value` member every `interval` main-loop units. Stop()/Start() "
-                "toggle the hidden `disabled` field; Reset(n) repositions the "
-                "counter and the tick clock.",
+                "`value` member every `interval` seconds of engine wall-clock "
+                "time (default 1 second; fractional values allowed, e.g. "
+                "0.5 = 500 ms). "
+                "Stop()/Start() toggle the hidden `disabled` field; Reset(n) "
+                "repositions the counter and the tick clock.",
 )
 def _ticker_declaration():
     pass
@@ -854,6 +858,9 @@ def builtin_server_serve(srv):
         return error_value(NA_ERROR)
     while True:
         engine._pump_server_requests()
+        # Keep tickers/timers alive during serve: the main loop is blocked
+        # here, so this loop is their only schedule.
+        engine._maybe_fire_tickers()
         entry = engine._net_server_entry(srv['_server_id'])
         if entry is None or entry.get('stopped'):
             break

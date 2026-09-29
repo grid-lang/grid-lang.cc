@@ -255,8 +255,15 @@ class GridLangControlFlow:
                     value, line_number)
                 if inferred_type == 'int':
                     inferred_type = 'number'
+                constraints = {'constant': value}
+                if isinstance(value, dict) and value.get('_handle'):
+                    # Engine-owned handle (e.g. `For t = clock.timer(3)`):
+                    # the engine rewrites it as it advances (`\.timer` /
+                    # `\.counter`), so it is not an immutable constant -
+                    # mirror the LET-handle binding which strips the pin.
+                    constraints = {}
                 scope.define(var_name, value, inferred_type,
-                             {'constant': value}, False)
+                             constraints, False)
 
             pending = list(scope.pending_assignments.items())
             for key, (expr, ln, deps) in pending:
