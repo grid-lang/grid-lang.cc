@@ -102,6 +102,8 @@ _INLINE_BLOCK_LOOP_RE = re.compile(
     r'^\s*(for|when)\b(.+?)\bdo\b\s+(.+)$', re.I)
 _INLINE_BLOCK_IF_RE = re.compile(
     r'^\s*(elseif|if)\b(.+?)\bthen\b\s+(.+)$', re.I)
+_INLINE_BLOCK_LET_RE = re.compile(
+    r'^\s*let\b(.+?)\bthen\b\s+(.+)$', re.I)
 _INLINE_ELSE_ACTION_RE = re.compile(r'^\s*else\s+(.+)$', re.I)
 _INLINE_IF_CLAUSE_SPLIT_RE = re.compile(r'\b(elseif|else)\b', re.I)
 _INLINE_IF_THEN_SPLIT_RE = re.compile(r'\b(?:then)\b', re.I)
@@ -4229,6 +4231,9 @@ class GridLangCompiler(GridLangExecutor):
         if loop_match:
             keyword, header, action = loop_match.groups()
             action = action.strip()
+            action, found_end = self._strip_trailing_end_marker(action)
+            if found_end:
+                self._raise_inline_end_error(keyword.capitalize(), line_number)
             if not self._is_single_inline_instruction(action):
                 return None
             return [
@@ -4242,6 +4247,9 @@ class GridLangCompiler(GridLangExecutor):
         else_match = _INLINE_ELSE_ACTION_RE.match(stripped)
         if else_match:
             action = else_match.group(1).strip()
+            action, found_end = self._strip_trailing_end_marker(action)
+            if found_end:
+                self._raise_inline_end_error('Else', line_number)
             if not self._is_single_inline_instruction(action):
                 return None
             return [
@@ -4250,9 +4258,27 @@ class GridLangCompiler(GridLangExecutor):
                 (f"{indent}End", line_number),
             ]
 
+        let_match = _INLINE_BLOCK_LET_RE.match(stripped)
+        if let_match:
+            header, action = let_match.groups()
+            action = action.strip()
+            action, found_end = self._strip_trailing_end_marker(action)
+            if found_end:
+                self._raise_inline_end_error('Let', line_number)
+            if not self._is_single_inline_instruction(action):
+                return None
+            return [
+                (f"{indent}Let {header.strip()} then", line_number),
+                (f"{body_indent}{action}", line_number),
+                (f"{indent}End", line_number),
+            ]
+
         if_match = _INLINE_BLOCK_IF_RE.match(stripped)
         if if_match:
             keyword, condition, payload = if_match.groups()
+            payload, found_end = self._strip_trailing_end_marker(payload)
+            if found_end:
+                self._raise_inline_end_error('If', line_number)
             clauses = self._split_inline_if_clauses(payload)
             if clauses is None:
                 return None
@@ -4274,6 +4300,9 @@ class GridLangCompiler(GridLangExecutor):
             elif kind == 'else':
                 expanded.append((f"{indent}Else", line_number))
             if action:
+                action, found_end = self._strip_trailing_end_marker(action)
+                if found_end:
+                    self._raise_inline_end_error('If', line_number)
                 expanded.append((f"{body_indent}{action.strip()}", line_number))
         # An ElseIf is a clause of the enclosing If (its End comes from the
         # enclosing block), but a top-level inline If chain is closed by an End
@@ -4287,6 +4316,30 @@ class GridLangCompiler(GridLangExecutor):
             if not has_block_else:
                 expanded.append((f"{indent}End", line_number))
         return expanded
+
+    @staticmethod
+    def _raise_inline_end_error(construct, line_number):
+        """Inline block instructions are single-line only: a trailing ``End``
+        on the same line is invalid syntax."""
+        raise SyntaxError(
+            f"'End' is not allowed after an inline '{construct}' "
+            f"instruction at line {line_number}")
+
+    @classmethod
+    def _strip_trailing_end_marker(cls, text):
+        """Remove a trailing ``End`` token on *text*, which belongs on its own
+        line, so an inline clause never emits ``<instruction> End``.
+
+        Returns ``(text, found)``. String literals are masked so an ``End``
+        inside quotes is left untouched.
+        """
+        if not text:
+            return text, False
+        masked = cls._mask_string_literals(text)
+        m = re.search(r'\bEnd\s*$', masked, re.I)
+        if not m:
+            return text, False
+        return text[:m.start()].rstrip(), True
 
     @staticmethod
     def _is_single_inline_instruction(action):

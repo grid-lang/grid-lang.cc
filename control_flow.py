@@ -4,7 +4,7 @@ Handles FOR loops, IF statements, LET statements, and block processing.
 """
 
 import re
-from units import UNIVERSAL_ZERO, is_error_value
+from units import UNIVERSAL_ZERO, ERROR_CODES, is_error_value
 from utils import num_to_col, split_var_defs, is_sparse_array
 from grid_lang_common import _STATEMENT_KEYWORDS, _first_keyword
 
@@ -284,6 +284,23 @@ class GridLangControlFlow:
             return
 
         raise SyntaxError(f"Invalid FOR syntax at line {line_number}")
+
+    def _is_error_literal_for_header(self, line):
+        """True when a block ``For x = <expr> do`` header uses an error code
+        literal on the right side (e.g. ``For x = #N/A do``)."""
+        m_eq = re.match(
+            r'^\s*For\s+[\w_]+\s*=\s*(.+?)\s+do\s*$', line, re.I)
+        if not m_eq:
+            return False
+        return m_eq.group(1).strip() in ERROR_CODES
+
+    def _skip_equal_for_block_body(self, block_lines, i):
+        """Skip the body of a ``For x = <expr> do ... End`` block and return
+        the next index past its matching End."""
+        _, end_index = self._extract_block_body(block_lines, i)
+        next_index = end_index + 1 if end_index < len(
+            block_lines) else len(block_lines)
+        return True, next_index
 
     def identify_global_guard_lines(self, lines):
         """Return metadata for IF guard statements at global scope (no THEN)."""
@@ -572,12 +589,31 @@ class GridLangControlFlow:
             try:
                 self.process_for_statement(
                     line, line_number, self.compiler.current_scope())
+                # ``For x = <expr> do ... End`` inside a block: when the loop
+                # variable holds an error value, skip the block body.
+                if line.strip().lower().endswith('do'):
+                    m_var = re.match(
+                        r'^\s*For\s+([\w_]+)\s*=', line, re.I)
+                    if m_var:
+                        var_name = m_var.group(1)
+                        def_scope = self.compiler.current_scope(
+                        ).get_defining_scope(var_name)
+                        if def_scope is not None and is_error_value(
+                                def_scope.get(var_name)):
+                            return self._skip_equal_for_block_body(
+                                block_lines, i)
                 return True, i + 1
             except ValueError as e:
                 if "already declared in an outer scope" in str(e):
                     raise e
+                if self._is_error_literal_for_header(line):
+                    return self._skip_equal_for_block_body(
+                        block_lines, i)
                 return True, i + 1
-            except Exception as e:
+            except Exception:
+                if self._is_error_literal_for_header(line):
+                    return self._skip_equal_for_block_body(
+                        block_lines, i)
                 return True, i + 1
 
         m = re.match(r'^\s*FOR\s+(.+?)(?:\s+do\s*$|\s*$)', line, re.I)
@@ -632,6 +668,9 @@ class GridLangControlFlow:
             if 'in' in constraints:
                 values = constraints['in']
                 for val in values:
+                    if is_error_value(val):
+                        # Skip error elements in the loop
+                        continue
                     try:
                         if val.isdigit():
                             val = int(val)

@@ -8,7 +8,7 @@ from expression import ExpressionEvaluator
 from array_handler import ArrayHandler, constant_value_matches
 from control_flow import GridLangControlFlow
 from parser import GridLangParser
-from units import VALUE_ERROR, TYPE_ERROR, ConstraintError, error_value
+from units import VALUE_ERROR, TYPE_ERROR, ConstraintError, error_value, is_error_value
 from utils import col_to_num, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array, strip_array_cell_indices, is_wildcard_address
 from grid_lang_common import GridLangBase, _STATEMENT_KEYWORDS, _first_keyword, _DEPENDENCY_IGNORED_TOKENS, _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens, resolve_text_constant_token, mask_text_constant_tokens
 DEPENDENCY_IGNORED_TOKENS = _DEPENDENCY_IGNORED_TOKENS
@@ -1370,8 +1370,23 @@ class GridLangExecutor(GridLangBase):
                             # Define the loop variable in current scope
                             self.control_flow.process_for_statement(
                                 line, line_number, self.current_scope())
+                            # Do not execute the block when the loop
+                            # variable holds an error value
+                            # (``For x = <error> do ... End``).
+                            m_var = re.match(
+                                r'^\s*For\s+([\w_]+)\s*=', line, re.I)
+                            skip_block = False
+                            if m_var:
+                                var_name = m_var.group(1)
+                                def_scope = self.current_scope(
+                                ).get_defining_scope(var_name)
+                                if def_scope is not None:
+                                    var_value = def_scope.get(var_name)
+                                    if is_error_value(var_value):
+                                        skip_block = True
                             # Execute the block body once
-                            self.control_flow._process_block(body_lines)
+                            if not skip_block:
+                                self.control_flow._process_block(body_lines)
                             # Mark body lines as executed so main loop skips them
                             for _, body_ln in body_lines:
                                 self.executed_global_for_lines.add(body_ln)
@@ -2170,6 +2185,19 @@ class GridLangExecutor(GridLangBase):
                     except ValueError as e:
                         self.pop_scope()
                         return block_end_i + 1
+        # Skip the block when any declared variable holds an error value
+        # (``Let x = <error> then ... End`` must not execute its body).
+        for var, _, _, _ in var_list:
+            defining_scope = self.current_scope(
+            ).get_defining_scope(var) or self.current_scope()
+            var_value = self._resolve_pending_let_var(
+                var, defining_scope)
+            if var_value is None:
+                var_value = defining_scope.variables.get(var)
+            if is_error_value(var_value):
+                self.pop_scope()
+                return block_end_i + 1
+
         # Collect Let-defined variable names so we can exclude them from
         # promotion.  For and : define in the enclosing scope; only Let
         # is truly local to the block.
@@ -2822,7 +2850,7 @@ class GridLangExecutor(GridLangBase):
         if not self._has_push_action(executable_part):
             return True, i + 1
 
-        for idx, value in enumerate(values):
+        for idx, value in self._iter_for_values_skipping_errors(values):
             self.push_scope(is_private=True, is_loop_scope=True)
             self.current_scope().define(var_name, value, 'number')
             if index_var:
@@ -2857,6 +2885,8 @@ class GridLangExecutor(GridLangBase):
         variable and optional index variable before evaluating the line.
         """
         for combo in value_combinations:
+            if self._combo_has_error(combo):
+                continue
             self.push_scope(is_private=True, is_loop_scope=True)
             for loop_idx, (var_name, index_var) in enumerate(var_specs):
                 self.current_scope().define(
@@ -3007,6 +3037,8 @@ class GridLangExecutor(GridLangBase):
 
             value_combinations = list(generate_combinations())
             for combo in value_combinations:
+                if self._combo_has_error(combo):
+                    continue
                 self.push_scope(is_private=True, is_loop_scope=True)
                 for loop_idx, loop in enumerate(and_loops):
                     self.current_scope().define(
@@ -3119,7 +3151,7 @@ class GridLangExecutor(GridLangBase):
                 vals2 = nested_for_loops[1]['values']
                 var1 = nested_for_loops[0]['var_name']
                 var2 = nested_for_loops[1]['var_name']
-                for a, b in zip(vals1, vals2):
+                for a, b in self._iterate_for_zip(vals1, vals2):
                     self.push_scope(is_private=True, is_loop_scope=True)
                     self.current_scope().define(var1, a, 'number')
                     self.current_scope().define(var2, b, 'number')
@@ -3856,7 +3888,7 @@ class GridLangExecutor(GridLangBase):
         if not next_executable_line:
             return None
 
-        for left_value, right_value in zip(values, vals2):
+        for left_value, right_value in self._iterate_for_zip(values, vals2):
             self.push_scope(
                 is_private=True, is_loop_scope=True)
             self.current_scope().define(var_name, left_value, 'number')
@@ -3893,6 +3925,28 @@ class GridLangExecutor(GridLangBase):
             self.pop_scope()
         return j + 1
 
+    def _iter_for_values_skipping_errors(self, values):
+        """Yield ``(idx, value)`` for For-loop iteration. Error elements are
+        skipped, but the index still counts all elements (its position in the
+        full value list)."""
+        for idx, value in enumerate(values):
+            if is_error_value(value):
+                continue
+            yield idx, value
+
+    def _combo_has_error(self, combo):
+        """True when any element of an ``and``-joined For combination is an
+        error value (the whole combination is skipped)."""
+        return any(is_error_value(item) for item in combo)
+
+    def _iterate_for_zip(self, values_a, values_b):
+        """Yield aligned ``(a, b)`` pairs from consecutive For loops, skipping
+        pairs where either element is an error value."""
+        for a, b in zip(values_a, values_b):
+            if is_error_value(a) or is_error_value(b):
+                continue
+            yield a, b
+
     def _execute_range_for_block(
             self,
             lines,
@@ -3927,7 +3981,7 @@ class GridLangExecutor(GridLangBase):
             raise SyntaxError(
                 f"Unclosed FOR block starting at line {line_number}")
 
-        for idx, value in enumerate(values):
+        for idx, value in self._iter_for_values_skipping_errors(values):
             self.push_scope(is_private=True,
                             is_loop_scope=True)
             loop_scope = self.current_scope()
@@ -3979,6 +4033,8 @@ class GridLangExecutor(GridLangBase):
             use_when_push = self._has_when_dependency(index_var)
         if use_when_push:
             for idx, value in enumerate(values):
+                # Push updates to listeners even for error elements; the
+                # When guards filter them out.
                 self._set_var_value(var_name, value, line_number)
                 self._enqueue_push(var_name, value)
                 if index_var:
@@ -4001,7 +4057,7 @@ class GridLangExecutor(GridLangBase):
 
         if next_executable_line:
             if ':=' in next_executable_line:
-                for idx, value in enumerate(values):
+                for idx, value in self._iter_for_values_skipping_errors(values):
                     self.push_scope(
                         is_private=True, is_loop_scope=True)
                     self.current_scope().define(var_name, value, 'number')
@@ -4018,7 +4074,7 @@ class GridLangExecutor(GridLangBase):
                     self.pop_scope()
                 return i + skip_lines + 1
             if self._has_push_action(next_executable_line):
-                for idx, value in enumerate(values):
+                for idx, value in self._iter_for_values_skipping_errors(values):
                     self.push_scope(
                         is_private=True, is_loop_scope=True)
                     self.current_scope().define(var_name, value, 'number')
@@ -4173,6 +4229,8 @@ class GridLangExecutor(GridLangBase):
                 if self.exit_loop:
                     self.exit_loop = False
                     break
+                if self._combo_has_error(combo):
+                    continue
                 loop_scope = self.current_scope()
                 for var_idx, (var_name, _, index_var, _, _, _, _) in enumerate(loop_configs):
                     defining_scope = loop_scope.get_defining_scope(
