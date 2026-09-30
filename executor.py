@@ -2623,6 +2623,13 @@ class GridLangExecutor(GridLangBase):
         # Process any remaining deferred assignments
         self._process_deferred_assignments()
 
+        # A deferred IF whose dependencies never resolved is still a failure.
+        # It is only reported here, after the retry pass had its chance.
+        still_deferred = [key for key in (self.pending_assignments or {})
+                          if key.startswith('__if_line_')]
+        if still_deferred:
+            raise RuntimeError(f"Unresolved assignments: {still_deferred}")
+
         # Print all output variables
         if not suppress_output:
             self._print_outputs()

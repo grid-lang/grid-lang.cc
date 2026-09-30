@@ -2637,9 +2637,13 @@ class GridLangCompiler(GridLangExecutor):
     def _resolve_pending_assignments(self):
         self._resolve_pending_assignments_main_loop()
         block_pending = self._resolve_block_pending_assignments()
-        if self.pending_assignments or block_pending:
-            unresolved = list(self.pending_assignments.keys()
-                              ) + list(block_pending.keys())
+        # Deferred IF lines are retried by _process_deferred_assignments, which
+        # runs after this call, so they must not be reported as failures here.
+        # run() re-checks whatever is still deferred once that pass is done.
+        unresolved = [key for key in self.pending_assignments
+                      if not key.startswith('__if_line_')]
+        unresolved = unresolved + list(block_pending.keys())
+        if unresolved:
             raise RuntimeError(f"Unresolved assignments: {unresolved}")
 
     def _resolve_pending_assignments_main_loop(self):
