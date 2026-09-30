@@ -3227,6 +3227,11 @@ class GridLangExecutor(GridLangBase):
             stripped = prep['stripped']
             stripped_lower = prep['stripped_lower']
 
+            row_stream_next = self._try_execute_row_stream_group(lines, i)
+            if row_stream_next is not None:
+                i = row_stream_next
+                continue
+
             if stripped_lower.startswith("when ") and stripped_lower.endswith("do"):
                 handled, i = self._handle_when_block(
                     lines, i, line, line_number)
@@ -3764,17 +3769,9 @@ class GridLangExecutor(GridLangBase):
         )
 
 
-        next_i = self._try_handle_consecutive_for_zip(
-            lines,
-            i,
-            line_number,
-            var_name,
-            values,
-        )
-        if next_i is not None:
-            return next_i
-
         if is_block:
+            # A block FOR owns the lines that follow it up to its END, so its
+            # body is never zipped with the producers that come after it.
             return self._execute_range_for_block(
                 lines,
                 i,
@@ -3784,6 +3781,16 @@ class GridLangExecutor(GridLangBase):
                 values,
                 guard_condition,
             )
+
+        next_i = self._try_handle_consecutive_for_zip(
+            lines,
+            i,
+            line_number,
+            var_name,
+            values,
+        )
+        if next_i is not None:
+            return next_i
 
         return self._execute_range_for_single_line(
             lines,
@@ -3843,6 +3850,157 @@ class GridLangExecutor(GridLangBase):
         if evaluated is None:
             return []
         return [evaluated]
+
+    def _try_execute_row_stream_group(self, lines, i):
+        """Execute a contiguous run of standalone For-in producers through the
+        row-stream model, applying consumers (dynamic cell rules, Push, or
+        Return) to every merged row and honoring standalone If guards.
+
+        Producers run in order and their row streams zip together; each merged
+        row is executed against the consumers with the row variables in scope.
+        Consumers and guards may sit before or after their producers (bindings
+        and guards may be out of order). Returns the next index to continue
+        from, or None so the legacy dispatch handles the line.
+        """
+        if i >= len(lines):
+            return None
+        from row_stream import (parse_cell_rule, parse_guard, parse_producer,
+                                row_sequences, zip_rows)
+        group = []
+        ptr = i
+        while ptr < len(lines):
+            line, line_number = lines[ptr]
+            stripped = line.strip()
+            if not stripped:
+                break
+            producer = parse_producer(stripped)
+            if producer is not None:
+                group.append(
+                    {'kind': 'producer', 'data': producer, 'ln': line_number})
+            else:
+                rule = parse_cell_rule(stripped)
+                if rule is not None:
+                    group.append(
+                        {'kind': 'rule', 'data': rule, 'ln': line_number})
+                else:
+                    push_match = self._match_push_assignment(stripped)
+                    return_match = (
+                        None if push_match is not None
+                        else self._match_return_statement(stripped))
+                    if push_match is not None:
+                        group.append({
+                            'kind': 'push',
+                            'data': self._unpack_push_assignment(push_match),
+                            'ln': line_number})
+                    elif return_match is not None:
+                        group.append({
+                            'kind': 'return',
+                            'data': return_match.group(1).strip(),
+                            'ln': line_number})
+                    else:
+                        guard = parse_guard(stripped)
+                        if guard is not None:
+                            group.append(
+                                {'kind': 'guard', 'data': guard,
+                                 'ln': line_number})
+                        else:
+                            break
+            ptr += 1
+        producers = [e for e in group if e['kind'] == 'producer']
+        consumers = [e for e in group
+                     if e['kind'] in ('rule', 'push', 'return')]
+        guards = [e for e in group if e['kind'] == 'guard']
+        if len(group) < 2 or not producers or not consumers:
+            return None
+        if guards:
+            # A stream guard filters rows inside the group; it is not a
+            # whole-program output guard, so drop it from the global guard
+            # bookkeeping (which re-evaluates guards after the loop and would
+            # clear the grid, because the row variables do not exist globally).
+            stream_guard_lines = {guard['ln'] for guard in guards}
+            self.global_guard_line_numbers -= stream_guard_lines
+            entries = getattr(self, 'global_guard_entries', None)
+            if entries is not None:
+                entries[:] = [
+                    entry for entry in entries
+                    if entry.get('line_number') not in stream_guard_lines]
+        env = self.current_scope().get_evaluation_scope()
+        stream_rows = []
+        for producer in producers:
+            rows = row_sequences(
+                producer['data'], env=env,
+                resolve=self._resolve_stream_range)
+            if rows is None:
+                return None
+            stream_rows.append(rows)
+        for row in zip_rows(stream_rows):
+            if any(is_error_value(value) for value in row.values()):
+                continue
+            self.push_scope(is_private=True, is_loop_scope=True)
+            try:
+                scope = self.current_scope()
+                for var, value in row.items():
+                    vtype = self.array_handler.infer_type(value, 0)
+                    if vtype == 'int':
+                        vtype = 'number'
+                    scope.define(var, value, vtype)
+                eval_scope = scope.get_evaluation_scope()
+                if guards:
+                    row_blocked = False
+                    for guard in guards:
+                        condition = self.control_flow._evaluate_if_condition(
+                            guard['data'], guard['ln'])
+                        if not condition:
+                            row_blocked = True
+                            break
+                    if row_blocked:
+                        continue
+                for consumer in consumers:
+                    if consumer['kind'] == 'rule':
+                        target, value_expr = consumer['data']
+                        self.array_handler.evaluate_line_with_assignment(
+                            f'[{target}] := {value_expr}',
+                            consumer['ln'], eval_scope)
+                    elif consumer['kind'] == 'push':
+                        target, value_expr = consumer['data']
+                        self._handle_push_assignment(
+                            target, value_expr, consumer['ln'])
+                    else:
+                        push_values = self._evaluate_push_expression(
+                            consumer['data'], consumer['ln'])
+                        for value in push_values:
+                            self.output_values.setdefault(
+                                'output', []).append(
+                                self._snapshot_value(value))
+                        if 'output' not in self.output_variables:
+                            self.output_variables.append('output')
+            finally:
+                self.pop_scope()
+        return ptr
+
+    def _resolve_stream_range(self, range_expr, row):
+        """Resolve a producer range that is a bare identifier to an array of
+        values (a plain list/tuple or a grid-array dict flattened), used when
+        ``iter_range`` rejects it."""
+        range_expr = range_expr.strip()
+        if not re.match(r'^[A-Za-z_]\w*$', range_expr):
+            return None
+        value = row.get(range_expr)
+        if value is None:
+            try:
+                value = self.current_scope().get(range_expr)
+            except Exception:
+                value = None
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        if isinstance(value, dict):
+            try:
+                return self.array_handler.flatten_array(value, 0)
+            except Exception:
+                return None
+        if value is None:
+            return None
+        return [value]
 
     def _try_handle_consecutive_for_zip(
             self,

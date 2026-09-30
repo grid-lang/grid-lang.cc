@@ -3418,6 +3418,19 @@ class GridLangCompiler(GridLangExecutor):
             defining_scope.variables[actual_key] = original
             self._transient_active = False
 
+    def _block_guards_hold(self, guard_entries):
+        """True when every recorded block guard currently holds."""
+        for condition, line_number in guard_entries:
+            try:
+                if not self.control_flow._evaluate_if_condition(
+                        condition, line_number):
+                    return False
+                if self.control_flow._guard_dependencies_are_errors(condition):
+                    return False
+            except Exception:
+                return False
+        return True
+
     def _recompute_client(self, record):
         """Recompute a client variable from its stored expression."""
         line = record.get('line')
@@ -3433,6 +3446,12 @@ class GridLangCompiler(GridLangExecutor):
             for dep in record.get('deps', ()):
                 if self.has_unresolved_dependency(dep, scope=scope):
                     return
+            # A guarded block's bindings follow its guards: a cell constraint
+            # inside a block whose guard does not hold is not recomputed.
+            guard_entries = getattr(
+                self, '_block_guards_by_line', {}).get(record.get('line_number'))
+            if guard_entries and not self._block_guards_hold(guard_entries):
+                return
             # Cell mirrors are equality constraints on their expression: while
             # the source holds a transient error (a rejected push), the mirror
             # keeps its last consistent value instead of storing the error.
@@ -3832,6 +3851,10 @@ class GridLangCompiler(GridLangExecutor):
             self.global_guard_entries.clear()
         else:
             self.global_guard_entries = []
+        if hasattr(self, '_block_guards_by_line'):
+            self._block_guards_by_line.clear()
+        else:
+            self._block_guards_by_line = {}
         if hasattr(self, 'global_for_line_numbers'):
             self.global_for_line_numbers.clear()
         else:

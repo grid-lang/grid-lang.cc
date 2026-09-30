@@ -14,6 +14,7 @@ HEADER_ELSEIF = re.compile(r'^\s*elseif\b(.+?)\bthen\s*$', re.I)
 HEADER_ELSE = re.compile(r'^\s*else\s*$', re.I)
 HEADER_FOR = re.compile(r'^\s*for\b(.+?)\bdo\s*$', re.I)
 HEADER_WHEN = re.compile(r'^\s*when\b(.+?)\bdo\s*$', re.I)
+HEADER_LET = re.compile(r'^\s*let\b(.+?)\bthen\s*$', re.I)
 TOKEN_END = re.compile(r'^\s*end\s*$', re.I)
 
 
@@ -35,12 +36,32 @@ class GridLangControlFlow:
         self._header_else = HEADER_ELSE
         self._header_for = HEADER_FOR
         self._header_when = HEADER_WHEN
+        self._header_let = HEADER_LET
         self._token_end = TOKEN_END
 
     def _strip_inline_comment(self, s: str) -> str:
-        """Strip inline comments (//... or #...) if not in quotes"""
-        s = re.split(r'(?<!["\'])\s//', s, maxsplit=1)[0]
-        s = re.split(r'(?<!["\'])\s#',  s, maxsplit=1)[0]
+        """Strip an inline comment.
+
+        A comment starts with an apostrophe: the syntax is VB-based and
+        there are no single-quoted string literals, so the first apostrophe
+        outside a double-quoted string begins the comment.
+
+        '#' is *not* a comment marker -- it is the error-literal sigil
+        ('#N/A', '#DIV/0', ...).  '//' is integer division, not a comment.
+        """
+        in_string = False
+        i = 0
+        n = len(s)
+        while i < n:
+            ch = s[i]
+            if ch == '\\':
+                i += 2
+                continue
+            if ch == '"':
+                in_string = not in_string
+            elif ch == "'" and not in_string:
+                return s[:i].rstrip()
+            i += 1
         return s.rstrip()
 
     def _get_parser(self):
@@ -566,6 +587,11 @@ class GridLangControlFlow:
                 # A dependency that will never resolve simply reads as False.
                 condition_result = False
 
+            # The clause condition guards its body for reactive
+            # recomputation too, not just for this walk, so it is recorded
+            # whether or not the clause runs this time.
+            self._add_block_guard_entries(
+                body_lines, [(condition, line_number)])
             if condition_result:
                 self._process_block(
                     body_lines, self.compiler.current_scope())
@@ -1011,8 +1037,135 @@ class GridLangControlFlow:
             return True, i + 1, False
         return False, i, False
 
+    def _block_header(self, line_clean):
+        """True when the line opens a nested block (If/For/When/Let)."""
+        return bool(
+            self._header_if.match(line_clean)
+            or self._header_for.match(line_clean)
+            or self._header_when.match(line_clean)
+            or self._header_let.match(line_clean))
+
+    def _collect_block_guards(self, block_lines):
+        """Return the standalone ``If <cond>`` guards of a block body.
+
+        A guard belongs to the block that contains it, so a guard inside a
+        nested block is left to that block. Guards are position-independent:
+        one gates the whole body, whether it is written before or after the
+        statements it guards.
+        """
+        guards = []
+        depth = 0
+        for index, (line, line_number) in enumerate(block_lines):
+            line_clean = self._strip_inline_comment(line).strip()
+            if not line_clean:
+                continue
+            if self._block_header(line_clean):
+                # Some callers hand over a body that starts with its own header
+                # line, which opens no nested block for this body.
+                if index == 0 and depth == 0:
+                    continue
+                depth += 1
+                continue
+            if self._token_end.match(line_clean):
+                if depth > 0:
+                    depth -= 1
+                continue
+            if depth > 0:
+                continue
+            if re.match(r'^\s*if\s+\S', line_clean, re.I) and \
+                    not re.search(r'\bthen\b', line_clean, re.I):
+                condition = re.match(
+                    r'^\s*if\s+(.+?)\s*$', line_clean, re.I).group(1).strip()
+                if condition:
+                    guards.append((line_clean, line_number, condition))
+        return guards
+
+    def _evaluate_block_guards(self, guards):
+        """Evaluate a block's guards before any of its statements run.
+
+        Returns True when the body may run. A guard whose dependency is still
+        pending defers the whole body through the deferred-assignment machinery
+        (the If line is retried once the binding resolves); a guard that is
+        false - including one naming something that never resolves - skips the
+        body.
+        """
+        pending_assignments = getattr(self.compiler, 'pending_assignments', {})
+        for guard_line, line_number, condition in guards:
+            dep_extractor = getattr(
+                self.compiler, '_extract_dependencies_from_expression', None)
+            deps = set(dep_extractor(condition)) if callable(
+                dep_extractor) else set()
+            current_scope = self.compiler.current_scope()
+            if any(dep in pending_assignments for dep in deps
+                   if current_scope.get_defining_scope(dep)):
+                for dep in deps:
+                    self.compiler.mark_dependency_missing(dep)
+                pending_assignments[f"__if_line_{line_number}"] = (
+                    guard_line, line_number, deps)
+                return False
+            try:
+                result = self._evaluate_if_condition(
+                    condition, line_number, warn_boolean=True)
+            except NameError:
+                result = False
+            if not result or self._guard_dependencies_are_errors(condition):
+                return False
+        return True
+
+    def _register_block_guards(self, block_lines, guards):
+        """Record a block's guards for every line of its body.
+
+        The reactive machinery re-evaluates a ``:=`` line whenever one of its
+        dependencies changes, which can happen outside the block walk (when the
+        loop variable is set). Recording the guards per line lets that
+        recomputation honor the same guards.
+        """
+        entries = [(condition, guard_line_number)
+                   for _, guard_line_number, condition in guards]
+        self._add_block_guard_entries(block_lines, entries)
+
+    def _add_block_guard_entries(self, block_lines, entries):
+        """Extend the guards recorded for each line of a block body."""
+        target = getattr(self.compiler, '_block_guards_by_line', None)
+        if target is None or not entries:
+            return
+        for _line, line_number in block_lines:
+            existing = target.setdefault(line_number, [])
+            for entry in entries:
+                if entry not in existing:
+                    existing.append(entry)
+
+    def _guard_dependencies_are_errors(self, condition):
+        """True when a condition reads a value that is an error.
+
+        A guard over an error cannot hold, so the guarded body is skipped.
+        """
+        from units import is_error_value
+        dep_extractor = getattr(
+            self.compiler, '_extract_dependencies_from_expression', None)
+        if not callable(dep_extractor):
+            return False
+        current_scope = self.compiler.current_scope()
+        for dep in dep_extractor(condition) or ():
+            try:
+                defining_scope = current_scope.get_defining_scope(dep)
+                if defining_scope is None:
+                    continue
+                if is_error_value(defining_scope.get(dep)):
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _process_block(self, block_lines, current_scope=None):
         block_pending = {}
+        # Guards come first: they gate every statement of this body, so they
+        # are evaluated before the walk and skipped during it.
+        guards = self._collect_block_guards(block_lines)
+        self._register_block_guards(block_lines, guards)
+        guard_line_numbers = {line_number for _, line_number, _ in guards}
+        if guards and not self._evaluate_block_guards(guards):
+            return block_pending
         i = 0
         while i < len(block_lines):
             if self._should_break_block_processing():
@@ -1025,6 +1178,28 @@ class GridLangControlFlow:
             if not line_clean:
                 i += 1
                 continue
+            if line_number in guard_line_numbers:
+                # The guard was already evaluated for the whole body above.
+                # A guard is a bare 'If <cond>' line: it has no 'then' and no
+                # 'End' of its own, so only the guard line is skipped here and
+                # the 'End' that follows still closes the enclosing block.
+                i += 1
+                continue
+            if self._token_end.match(line_clean):
+                # A bare 'End' closes an enclosing block whose handler already
+                # ran its body; it is a terminator, not a statement.
+                i += 1
+                continue
+
+            # Producers, consumers and guards of a run share the block's row
+            # stream, exactly as they do at the top level.
+            row_stream = getattr(
+                self.compiler, '_try_execute_row_stream_group', None)
+            if row_stream is not None:
+                next_i = row_stream(block_lines, i)
+                if next_i is not None:
+                    i = next_i
+                    continue
 
             handled, next_i = self._handle_block_when_statement(
                 block_lines, i, line, line_number, line_clean)
@@ -2006,6 +2181,12 @@ class GridLangControlFlow:
 
         stack = []  # Stack of dicts: {type, start_i, start_line, clauses?}
 
+        # Validation-only nesting stack used to reject an 'End' that closes
+        # nothing.  It is deliberately separate from the structural stack
+        # above: 'let ... then' blocks are executed by a different code path
+        # and are not part of block_map, but they still consume an 'End'.
+        open_stack = []
+
         for i, (line, line_number) in enumerate(lines):
             raw = line
             line = self._strip_inline_comment(line)
@@ -2023,6 +2204,7 @@ class GridLangControlFlow:
                     'clauses': [{'kind': 'if', 'header_i': i, 'header_line': line_number}]
                 }
                 stack.append(block)
+                open_stack.append('if')
                 continue
 
             # ELSEIF
@@ -2044,17 +2226,30 @@ class GridLangControlFlow:
             # FOR
             if self._header_for.match(line_clean):
                 stack.append({'type': 'for', 'start_i': i,
-                             'start_line': line_number})
+                              'start_line': line_number})
+                open_stack.append('for')
                 continue
 
             # WHEN
             if self._header_when.match(line_clean):
                 stack.append({'type': 'when', 'start_i': i,
-                             'start_line': line_number})
+                              'start_line': line_number})
+                open_stack.append('when')
                 continue
+
+            # LET ... then
+            if self._header_let.match(line_clean):
+                open_stack.append('let')
+                continue
+
 
             # END
             if self._token_end.match(line_clean):
+                if not open_stack:
+                    raise SyntaxError(
+                        f"'End' without a matching block header at line "
+                        f"{line_number}")
+                open_stack.pop()
                 if not stack:
                     continue
                 block = stack.pop()
@@ -2099,13 +2294,46 @@ class GridLangControlFlow:
         # Any unclosed blocks?
         return self.block_map
 
-    def _process_if_elseif_else_block(self, block_lines, if_condition_result, if_line_number, if_block):
+    def _process_if_elseif_else_block(self, block_lines, if_condition_result, if_line_number, if_block, if_condition=None):
         """Process IFâ€“ELSEIFâ€“ELSE blocks, with correct clause selection and nested IF support."""
 
         active_clause_lines = []
         clause_found = False
         in_active_clause = False
         depth = 0  # nested IF depth
+        # Condition of the clause that ends up running, so reactive
+        # recomputation of its bindings honors it too.
+        active_clause_condition = None
+        active_clause_header = None
+        if if_condition:
+            active_clause_condition = if_condition.strip()
+            active_clause_header = if_line_number
+            # The IF clause body ends at the first depth-0 ELSEIF/ELSE. Its
+            # condition guards that body on every iteration, including the
+            # iterations where another clause runs, so record it for those
+            # lines: the reactive recomputation of a binding happens outside
+            # this walk and must honor the same condition.
+            if_clause_lines = []
+            clause_depth = 0
+            scan_lines = block_lines[1:] if (
+                block_lines and re.match(
+                    r'^\s*if\s+(.+?)\s+then\s*$', block_lines[0][0], re.I)
+            ) else block_lines
+            for body_line, body_line_number in scan_lines:
+                body_clean = self._strip_inline_comment(body_line).strip()
+                if clause_depth == 0 and (
+                        re.match(r'^\s*elseif\b.+?\bthen\s*$', body_clean, re.I)
+                        or re.match(r'^\s*else\s*$', body_clean, re.I)):
+                    break
+                if self._block_header(body_clean):
+                    clause_depth += 1
+                elif self._token_end.match(body_clean) and clause_depth > 0:
+                    clause_depth -= 1
+                if_clause_lines.append((body_line, body_line_number))
+            if if_clause_lines:
+                self._add_block_guard_entries(
+                    if_clause_lines,
+                    [(active_clause_condition, active_clause_header)])
 
         # Check if the main IF clause should be active
         if if_condition_result:
@@ -2134,6 +2362,8 @@ class GridLangControlFlow:
                         in_active_clause = True
                         clause_found = True
                         active_clause_lines = []
+                        active_clause_condition = cond
+                        active_clause_header = line_number
                     else:
                         in_active_clause = False
                 else:
@@ -2144,6 +2374,8 @@ class GridLangControlFlow:
                     in_active_clause = True
                     clause_found = True
                     active_clause_lines = []
+                    active_clause_condition = None
+                    active_clause_header = line_number
                 else:
                     in_active_clause = False
 
@@ -2164,6 +2396,10 @@ class GridLangControlFlow:
 
         # Execute the chosen clause
         if active_clause_lines:
+            if active_clause_condition is not None:
+                self._add_block_guard_entries(
+                    active_clause_lines,
+                    [(active_clause_condition, active_clause_header)])
             self._process_block(active_clause_lines,
                                 self.compiler.current_scope())
 
@@ -2240,7 +2476,8 @@ class GridLangControlFlow:
         else:
             # Complex IF-ELSEIF-ELSE block
             self._process_if_elseif_else_block(
-                block_lines, condition_result, line_number, if_block)
+                block_lines, condition_result, line_number, if_block,
+                if_condition=condition)
 
         # Return the number of lines consumed (from start to end of the IF block)
         return if_block['end_i'] - current_index
@@ -2310,7 +2547,8 @@ class GridLangControlFlow:
                 if has_elseif_else:
                     # Process the if-elseif-else structure
                     self._process_if_elseif_else_block(
-                        block_lines, condition_result, line_number)
+                        block_lines, condition_result, line_number,
+                        if_block=None, if_condition=condition)
                 else:
                     # Process as a simple IF statement
                     if condition_result:
