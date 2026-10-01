@@ -2653,6 +2653,11 @@ class GridLangCompiler(GridLangExecutor):
             unresolved_before = set(self.pending_assignments.keys())
             for var, assignment in sorted(self.pending_assignments.items(), key=lambda x: (x[0].startswith('__line_'), int(x[0].replace('__line_', '') if x[0].startswith('__line_') else '0'))):
                 expr, line_number, deps = assignment[:3]
+                if var.startswith("__if_line_"):
+                    # A deferred IF line is not a variable assignment. It is
+                    # retried by _process_deferred_assignments, once the names
+                    # it reads have been bound, so it is left untouched here.
+                    continue
                 self._validate_pending_assignment_not_self_referential(
                     var, expr, deps, line_number)
                 if var.startswith("__line_"):

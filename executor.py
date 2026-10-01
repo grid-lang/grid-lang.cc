@@ -3659,6 +3659,7 @@ class GridLangExecutor(GridLangBase):
             line_number,
             var_list):
         self.push_scope(is_private=True, is_loop_scope=True)
+        evaluated_values = []
         for var, type_name, constraints, value in var_list:
             if value is not None:
                 try:
@@ -3672,6 +3673,7 @@ class GridLangExecutor(GridLangBase):
                         var, evaluated_value, inferred_type, constraints)
                     self.current_scope().update(
                         var, evaluated_value, line_number)
+                    evaluated_values.append(evaluated_value)
                 except NameError as e:
                     self.get_global_scope().define(
                         var, None, type_name, constraints, is_uninitialized=True)
@@ -3699,6 +3701,12 @@ class GridLangExecutor(GridLangBase):
         if depth > 0:
             raise SyntaxError(
                 f"Unclosed FOR block starting at line {line_number}")
+        if any(is_error_value(v) for v in evaluated_values):
+            # The loop value is itself in error, so there is no iteration to
+            # run - the same rule that skips an error element inside a For
+            # list. The bindings above stay in place for later references.
+            self.pop_scope()
+            return i
         init_entry = next(
             ((v, t, c) for v, t, c, _ in var_list if c and 'init' in c), None)
         import sys as _sys
