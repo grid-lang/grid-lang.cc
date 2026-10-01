@@ -315,11 +315,15 @@ class GridLangTypeProcessor:
         prev_hidden_member_calls = getattr(
             self.compiler, '_allow_hidden_member_calls', False)
         prev_outer_ro = getattr(self.compiler, '_outer_scope_read_only', False)
+        prev_allow_overwrite = getattr(self.compiler, '_allow_scope_overwrite', False)
         prev_parent_scope = getattr(self.compiler, '_parent_scope', None)
         prev_member_keys = getattr(self.compiler, '_type_member_keys', None)
         self.compiler._allow_hidden_field_access = True
         self.compiler._allow_hidden_member_calls = True
         self.compiler._outer_scope_read_only = True
+        # Instance fields are pre-seeded into this scope below, so a `Let` in
+        # the body that names a field rebinds it rather than colliding.
+        self.compiler._allow_scope_overwrite = True
         self.compiler._parent_scope = outer_scope
 
         # Add the type instance to the scope so code can reference it
@@ -363,6 +367,7 @@ class GridLangTypeProcessor:
                     str(inferred_type).lower(), {}) or {}
             init_fields = set(type_def.get('_init_fields', set()))
             default_fields = set(type_def.get('_default_fields', set()))
+            self._push_type_fields_to_scope(value_dict)
             self._execute_type_block(
                 code_lines, value_dict, input_values, line_number, init_fields,
                 default_fields=default_fields)
@@ -374,6 +379,7 @@ class GridLangTypeProcessor:
             self.compiler._allow_hidden_field_access = prev_hidden_access
             self.compiler._allow_hidden_member_calls = prev_hidden_member_calls
             self.compiler._outer_scope_read_only = prev_outer_ro
+            self.compiler._allow_scope_overwrite = prev_allow_overwrite
             self.compiler._parent_scope = prev_parent_scope
             self.compiler._type_member_keys = prev_member_keys
             self.compiler.pop_scope()
@@ -381,10 +387,85 @@ class GridLangTypeProcessor:
                 # The WITH marker only matters while the constructor body runs.
                 value_dict.pop('_with_applied_fields', None)
 
+    def _type_field_names(self, value_dict):
+        """Declared field names of an instance, excluding private markers."""
+        if not isinstance(value_dict, dict):
+            return []
+        return [k for k in value_dict.keys()
+                if not str(k).startswith('_') and str(k) != 'grid']
+
+    def _scope_has_var(self, scope, name):
+        lowered = str(name).lower()
+        return any(str(k).lower() == lowered for k in scope.variables)
+
+    def _push_type_fields_to_scope(self, value_dict, only=None):
+        """Mirror instance field values into scope variables.
+
+        Field writes performed by :meth:`_process_type_assignment` land in
+        ``value_dict``, but the shared block engine reads bare identifiers
+        from the scope, so the two views must be kept in step. Pass *only* to
+        refresh a single field after a write.
+        """
+        scope = self.compiler.current_scope()
+        names = [only] if only is not None else self._type_field_names(value_dict)
+        for name in names:
+            if name is None:
+                continue
+            value = value_dict.get(name) if isinstance(value_dict, dict) else None
+            if self._scope_has_var(scope, name):
+                actual = scope._get_case_insensitive_key(name, scope.variables)
+                if actual:
+                    scope.variables[actual] = value
+            else:
+                scope.define(name, value, None, {}, is_uninitialized=False)
+
+    def _sync_type_fields_from_scope(self, value_dict):
+        """Copy field values written by the shared engine into the instance."""
+        if not isinstance(value_dict, dict):
+            return
+        scope = self.compiler.current_scope()
+        for name in self._type_field_names(value_dict):
+            if self._scope_has_var(scope, name):
+                value_dict[name] = scope.get(name)
+
+    def _run_type_block_body(self, block_lines, value_dict, line_number):
+        """Execute nested constructor block lines with the shared block engine.
+
+        Routing through ``_process_block`` gives constructor bodies the same
+        guard collection, guard registration, bindings-before-effects ordering
+        and ``When`` support as every other block in the language.
+        """
+        if not block_lines:
+            return
+        self._push_type_fields_to_scope(value_dict)
+        # The shared engine addresses statements as (text, line_number) pairs.
+        numbered = [(l, line_number) for l in block_lines]
+        self.compiler.control_flow._process_block(
+            numbered, self.compiler.current_scope())
+        self._sync_type_fields_from_scope(value_dict)
+
+    def _type_guard_lines(self, code_lines, line_number):
+        """Bare ``If <cond>`` guards declared directly in a constructor body.
+
+        Mirrors the shared engine: a guard gates the whole body it appears in,
+        is position-independent, and is skipped during the statement walk.
+        """
+        numbered = [(l, line_number) for l in code_lines]
+        return self.compiler.control_flow._collect_block_guards(numbered)
+
     def _execute_type_block(self, code_lines, value_dict, input_values, line_number, init_fields=None, default_fields=None):
         """Execute a list of type code lines within the current scope."""
         init_fields = init_fields or set()
         default_fields = default_fields or set()
+        # Guards gate the entire constructor body, exactly as in the shared
+        # block engine: collect and evaluate them before the walk.
+        guards = self._type_guard_lines(code_lines, line_number)
+        if guards:
+            self.compiler.control_flow._register_block_guards(
+                [(l, line_number) for l in code_lines], guards)
+            if not self.compiler.control_flow._evaluate_block_guards(guards):
+                return
+        guard_texts = {g[0].strip().lower() for g in guards}
         i = 0
         while i < len(code_lines):
             code_line = code_lines[i]
@@ -400,6 +481,25 @@ class GridLangTypeProcessor:
                     and not re.search(r'\binit\b', stripped_line, re.I)):
                 # Skip field declarations that slipped into executable code.
                 i += 1
+                continue
+
+            # A bare ``If <cond>`` guard has no body of its own; it was
+            # already collected and evaluated above, so just skip it here.
+            if re.match(r'^\s*if\s+\S', stripped_line, re.I) and \
+                    not re.search(r'\bthen\b', stripped_line, re.I):
+                i += 1
+                continue
+
+            # ``When <cond> do ... End`` registers with the shared reactive
+            # machinery, so constructor bodies get When semantics for free.
+            if re.match(r'^when\s+.+\s+do$', stripped_line, re.I):
+                when_match = re.match(r'^\s*when\s+(.+?)\s+do\s*$',
+                                       stripped_line, re.I)
+                when_body, end_index = self._collect_type_block_lines(
+                    code_lines, i)
+                self.compiler.control_flow.executor._register_when_block(
+                    when_match.group(1).strip(), when_body, line_number)
+                i = end_index + 1
                 continue
 
             if stripped_line.lower().startswith('push '):
@@ -934,16 +1034,10 @@ class GridLangTypeProcessor:
                 if_block = block_lines[:idx]
                 else_block = block_lines[idx + 1:]
                 break
-        condition_passed = True
-        try:
-            condition_passed = self.compiler.control_flow._evaluate_if_condition(
-                header, line_number)
-        except Exception:
-            condition_passed = False
+        condition_passed = self.compiler.control_flow._evaluate_if_condition(
+            header, line_number)
         chosen = if_block if condition_passed else else_block
-        if chosen:
-            self._execute_type_block(
-                chosen, value_dict, input_values, line_number)
+        self._run_type_block_body(chosen, value_dict, line_number)
         return scan_i + 1
 
     def _with_value_matches(self, a, b):
@@ -965,7 +1059,23 @@ class GridLangTypeProcessor:
         return a == b
 
     def _process_type_assignment(self, line, value_dict, input_values, line_number, init_fields=None, default_fields=None, is_push=False):
-        """Handle assignments inside type definitions (e.g., x = in_x)."""
+        """Handle assignments inside type definitions (e.g., x = in_x).
+
+        The written value lands in ``value_dict``; it is mirrored into the
+        scope so the shared block engine reads the updated field.
+        """
+        before = dict(value_dict) if isinstance(value_dict, dict) else None
+        self._process_type_assignment_impl(
+            line, value_dict, input_values, line_number, init_fields,
+            default_fields=default_fields, is_push=is_push)
+        if isinstance(value_dict, dict):
+            for _key, _val in value_dict.items():
+                if str(_key).startswith('_') or str(_key) == 'grid':
+                    continue
+                if before is None or before.get(_key) != _val:
+                    self._push_type_fields_to_scope(value_dict, only=_key)
+
+    def _process_type_assignment_impl(self, line, value_dict, input_values, line_number, init_fields=None, default_fields=None, is_push=False):
         init_fields = init_fields or set()
         default_fields = default_fields or set()
 

@@ -170,18 +170,18 @@ Notable methods:
 Also defines `SubprocessResult` (37): result container exposing `grid`,
 `variables`, `outputs`, and `_UnitSourceNamespace` (52) the UnitSource lookups.
 
-### `executor.py` (6198 lines) — the runtime loop
+### `executor.py` (6204 lines) — the runtime loop
 `class GridLangExecutor` is the **base class that owns the interpreter's
 dispatch loop and its per-run runtime state**. It is not instantiated directly
 as a facade (the old compiler→executor copy handoff was removed); `run` is the
 live entry. Key methods (the `compiler.py`/`grid_lang_common.py` layers call
 `super()`/override these):
-- `run` (2600): top-level sequence (acts on `self`; see Architecture).
-- `_run_setup` (5309), `_run_prepare_execution` (5348), `_print_outputs`
-  (4716), `_materialize_inits` (5934), `_process_deferred_assignments` (6073).
+- `run` (2606): top-level sequence (acts on `self`; see Architecture).
+- `_run_setup` (5315), `_run_prepare_execution` (5354), `_print_outputs`
+  (4716), `_materialize_inits` (5940), `_process_deferred_assignments` (6079).
   `_run_prepare_execution` now calls `_materialize_unit_source_constants` + `_register_top_level_converts`.
-- Main loop: `_run_main_loop` (2641) → `_run_main_loop_impl` (3190) →
-  `_run_main_loop_impl_body` (3238). `_handle_main_loop_*` methods dispatch
+- Main loop: `_run_main_loop` (2647) → `_run_main_loop_impl` (3196) →
+  `_run_main_loop_impl_body` (3244). `_handle_main_loop_*` methods dispatch
   statement kinds: `Let` (1128), `For` (1752 fallback), grid assignment (3903),
   `When` blocks (3956), `Push` (4152), `Return` (4108), misc (3724).
 - Dependency/guard machinery: `_build_dependency_network` (1137),
@@ -192,7 +192,7 @@ live entry. Key methods (the `compiler.py`/`grid_lang_common.py` layers call
   `_bind_declared_var` (1255, now `expected_unit`), standard assignment,
   second pass, generator values, `_materialize_inits`.
 - `For`: `_execute_simple_for_assignment` (749, now `expected_unit`), `Push` via `target_unit`.
-- `Push` semantics: `_handle_push_assignment` (5644), `_evaluate_push_expression`
+- `Push` semantics: `_handle_push_assignment` (5650), `_evaluate_push_expression`
   (4345, now `expected_unit`), `_handle_push_assignment_line`.
 - `When` blocks: `_register_when_block` (289), `_process_when_triggers` (765),
   `_run_when_block` (781), `_handle_when_block`.
@@ -287,22 +287,22 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   (1339, 1390).
 - `_handle_block_*` methods (343–960): per-statement handling inside blocks.
 
-### `scope.py` (1361 lines) — scope + variable semantics
+### `scope.py` (1366 lines) — scope + variable semantics
 - `class Scope` (85): variable storage with constraints.
-  - `define` (515), `update` (608), `get` (777), `is_uninitialized` (798),
-    `get_defining_scope` (813).
-  - Inputs/outputs: `define_input` (826), `define_output` (590, now preserves `unit` from `Input` when `Output` shares name), `is_input`/`is_output` (518/527), `connect_pipe` (873), `push_value`
-    (555), `_propagate_wave` (915) — the publish/listen ripple.
+  - `define` (515), `update` (613), `get` (782), `is_uninitialized` (803),
+    `get_defining_scope` (818).
+  - Inputs/outputs: `define_input` (831), `define_output` (590, now preserves `unit` from `Input` when `Output` shares name), `is_input`/`is_output` (518/527), `connect_pipe` (878), `push_value`
+    (555), `_propagate_wave` (920) — the publish/listen ripple.
   - Unit handling: `_unit_convert` (104, now tries `apply_conversion` before `#UNIT`), `_has_pending_assignment` (158).
-  - Constraints: `_re_evaluate_constraints` (968), `_check_constraints` (830, now unit-aware for `Let y of m = 5 of in`), `_validate_base_type` (1039) — validates scalars AND, since the pyarrow
+  - Constraints: `_re_evaluate_constraints` (973), `_check_constraints` (830, now unit-aware for `Let y of m = 5 of in`), `_validate_base_type` (1044) — validates scalars AND, since the pyarrow
     removal, element-by-element base types of `dim` arrays (via
     `array_handler.validate_array_element_types`), `_expression_depends_on`
     (651). `_array_unset_value` (array_handler.py:1507) resolves `None`
     sentinels for unset template array cells: checks the variable's
     `constraints['default']` (from `or = <expr>`) and evaluates it; falls back
     to `error_value(NA_ERROR)` (`#N/A`).
-  - Scoping: `is_shadowed` (929), `get_evaluation_scope` (937),
-    `get_full_scope` (1351), `_coerce_custom_type_value` (252).
+  - Scoping: `is_shadowed` (934), `get_evaluation_scope` (942),
+    `get_full_scope` (1356), `_coerce_custom_type_value` (252).
 - `class _GridStore` (37): dict backing `compiler.grid`; every cell write
   calls `compiler._notify_cell_changed` (compiler.py:3447). (The old
   `_ListenerGrid`/`GridLiveView` classes were removed — `_GridStore` is the
@@ -311,17 +311,44 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   `_outer_scope_read_only` flag to reject writes from read-only function
   sub-compilers to outer scopes.
 
-### `type_processor.py` (1386 lines) — `Define X as Type` handling
+### `type_processor.py` (1496 lines) — `Define X as Type` handling
 `class GridLangTypeProcessor`:
 - Type-def parsing: `_parse_type_def` (82), `_parse_type_def_line` (90),
   `_extract_type_field_line` (9696, `_parse_type_field_constraints` (194),
   `_record_type_field_definition` (15157, `_collect_type_computed_fields`
   (178), `_finalize_type_def_state` (281).
 - Executing type body code against an instance: `_execute_type_code` (304),
-  `_execute_type_block` (25252, `_process_grid_assignment` (539),
-  `_process_type_for_loop` (38389, `_process_type_let_statement` (794),
-  `_process_type_assignment` (58581.
-- `_build_type_eval_scope` (70708, `_execute_builder` (1198).
+  `_execute_type_block` (456), `_process_grid_assignment` (639),
+  `_process_type_for_loop` (716), `_process_type_let_statement` (894),
+  `_process_type_assignment` (1061).
+- `_build_type_eval_scope` (1287), `_execute_builder` (1308).
+- **Constructor/builder bodies now share the main block engine.** Nested
+  `If ... then` blocks are delegated to `control_flow._process_block` via
+  `_run_type_block_body`, and bare `If <cond>` guards are collected and
+  evaluated with `control_flow._collect_block_guards` /
+  `_evaluate_block_guards`, so guard collection, guard registration and
+  bindings-before-effects ordering match every other block in the language.
+  Three consequences, all previously broken:
+  - Instance **fields are readable inside the body**. `_push_type_fields_to_scope`
+    mirrors `value_dict` into the scope, and `_sync_type_fields_from_scope`
+    copies engine writes back, so `Print x` no longer raises `NameError` and
+    `If x > 0 then` is no longer silently false. A field name now shadows a
+    same-named outer/global variable inside the body — previously the body
+    silently read the *global* even when the field was declared with a value.
+  - A `Let` naming an instance field **rebinds that field** rather than
+    colliding. `scope.define` honours `compiler._allow_scope_overwrite`,
+    which is set only for the duration of `_execute_type_code`.
+  - Bare `If <cond>` guards gate a constructor body, as elsewhere.
+- `When <cond> do` inside a constructor body registers with
+  `executor._register_when_block` instead of raising "Unrecognized statement
+  in type constructor", but does not fire on later field writes: a bare
+  field name is not a reactive scope variable, and `When` only fires through
+  the dotted path (`When p.x > 0`). Bare-variable `When` does not fire
+  anywhere else either (top level or inside a `For` block), so this is a
+  pre-existing limitation rather than a constructor-specific gap.
+- Forward references inside a constructor body (`[A1] := y` before
+  `Let y = 3`) fail exactly as they do in the main loop; see the pending
+  all-bindings-first-pass work.
 
 ### `parser.py` (661 lines) — variable-definition parsing
 `class GridLangParser`:
@@ -368,6 +395,15 @@ rebuilding dotted members for imported types.
 ### `net.py` (569 lines) — Net resource transport
 Client/server socket transport behind the `Net` resource (LISTEN server
 grants, request/response, `ReadAll`/`Reply`).
+
+> **Known separation smell**: networking logic is split across *both*
+> `net.py` and `builtin_functions.py`. `net.py` owns the transport, URI
+> matching (`parse_address`, `_query_globe`, `_segments_match`) and the
+> low-level routing, while `builtin_functions.py` owns the grant
+> declaration and the `Net` builtin surface (`builtin_net_connect`,
+> `builtin_net_server`, `_connection_handle`). The two overlap on
+> connection/server concerns; consolidating them would make the resource
+> layer a single, auditable unit.
 
 ### `test_runner.py` (3014 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — runs 525 tests (Tests 282–293 unit tests, Tests 331–349 push/cell-mirror/subprocess semantics, Tests 350–357d resource/`Require`/grant semantics, Tests 385–405b module/`use`/instance-state/dotted-Require/ModuleVersion/runnable-module-run/unknown-call/init-never-fires-on-import semantics, Tests 452–465 live pipes + user-function vectorization/element-access, Tests 479–488 Net LISTEN/server routing + `ReadAll`/`Reply` semantics via the fake listener transport). At the bottom of the file it runs itself when executed directly:
@@ -557,7 +593,7 @@ grants, request/response, `ReadAll`/`Reply`).
     by a program**. `Define ticker.counter as Handle` is rejected at parse
     (compiler.py:3595-3620) *before* any truncation to the bare resource
     prefix, so `ticker` itself is never clobbered.
-- **Net resource** (builtin_functions.py): a grant whose `methods` are exactly
+- **Net resource**: grant/handle semantics live in `builtin_functions.py` (declaration + connection/server helpers); `net.py` provides URI matching and transport utilities for a grant whose `methods` are exactly
   `{"LISTEN"}` is a **server** grant — mixing LISTEN with client verbs is
   refused at grant-merge time (permissions.py). The granted address is the
   bind target; no path template is needed for serving (`/**` is meaningless),

@@ -1790,18 +1790,24 @@ class GridLangExecutor(GridLangBase):
         return inferred_type
 
     def _is_call_expression(self, expr):
-        """Whether expr is a subprocess/function call like 'Name(args)'.
+        """Whether expr is a subprocess/function/constructor call.
 
-        Also recognizes dotted capability member calls -- 'Cap.Member(args)'
-        or 'handle.member(args)' -- so handle-producing Let bindings such as
-        ``Let time = tick.counter()`` are never misclassified as constant
-        equality bindings. ``tick` here is a granted capability variable
-        (not a subprocess/function name), so both bare and dotted forms are
-        checked.
+        Covers ``Name(args)``, dotted capability member calls like
+        ``Cap.Member(args)`` / ``handle.member(args)``, and ``new Type``
+        constructor forms (with or without an argument list).
+
+        These are all computed values with side effects, so a Let binding
+        holding one must never be pinned as a constant equality binding --
+        otherwise ``_check_constraints`` re-evaluates the expression and the
+        side effects run twice. ``tick`` in ``Let time = tick.counter()`` is
+        a granted capability variable rather than a callable name, so bare
+        and dotted forms are both checked against known callables.
         """
         if not isinstance(expr, str):
             return False
         stripped = expr.strip()
+        if re.match(r'^new\s+[A-Za-z][A-Za-z0-9_.]*', stripped, re.I):
+            return True
         m = re.match(
             r'^([A-Za-z][A-Za-z0-9_.]*)\s*\(.*\)\s*$', stripped, re.S)
         if not m:

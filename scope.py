@@ -517,7 +517,12 @@ class Scope:
         self._validate_variable_name(name, line_number, internal=internal)
         # Check for case-insensitive conflicts
         existing_key = self._get_case_insensitive_key(name, self.variables)
-        if existing_key and not is_uninitialized:
+        # Constructor/builder bodies may rebind their own instance fields, so
+        # the shared engine is allowed to overwrite a pre-seeded field there.
+        allow_overwrite = bool(
+            getattr(self, 'compiler', None) is not None and
+            getattr(self.compiler, '_allow_scope_overwrite', False))
+        if existing_key and not is_uninitialized and not allow_overwrite:
             raise ValueError(
                 f"Variable '{name}' conflicts with existing variable '{existing_key}' in this scope")
         # Handle Keytype freshness and implicit as IdKey
