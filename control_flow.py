@@ -2187,6 +2187,11 @@ class GridLangControlFlow:
         # and are not part of block_map, but they still consume an 'End'.
         open_stack = []
 
+        # Lines that sit inside a structural block body. Their cell-spill
+        # listeners are installed when the block actually executes, so a block
+        # whose guard fails never registers one.
+        block_body_lines = set()
+
         for i, (line, line_number) in enumerate(lines):
             raw = line
             line = self._strip_inline_comment(line)
@@ -2194,6 +2199,9 @@ class GridLangControlFlow:
 
             if not line_clean:
                 continue
+
+            if open_stack and not self._token_end.match(line_clean):
+                block_body_lines.add(line_number)
 
             # IF
             if self._header_if.match(line_clean):
@@ -2292,6 +2300,7 @@ class GridLangControlFlow:
             # otherwise just a normal line; nothing to do in pre-scan
 
         # Any unclosed blocks?
+        self.block_body_lines = block_body_lines
         return self.block_map
 
     def _process_if_elseif_else_block(self, block_lines, if_condition_result, if_line_number, if_block, if_condition=None):

@@ -3190,25 +3190,50 @@ class GridLangExecutor(GridLangBase):
     def _run_main_loop_impl(self, lines, guard_conditions):
         return self._run_main_loop_impl_body(lines, guard_conditions)
 
+    def _cell_spill_dependencies(self, rhs):
+        """Variables a ``[cell] := rhs`` mirror depends on.
+
+        Every free variable in the expression is a dependency, so a mirror
+        like ``[C6] := a * b`` is recomputed when either ``a`` or ``b`` is
+        published to. The spill root (the base of a dotted, called or indexed
+        reference) is included as well, so ``[C1] := grid{a}`` still reacts
+        to ``grid``. Function, subprocess and type names are not variables.
+        """
+        deps = set(self._extract_dependencies_from_expression(rhs) or ())
+        root = _extract_spill_root_var(rhs)
+        if root:
+            deps.add(root)
+        functions = self.functions or {}
+        subprocesses = self.subprocesses or {}
+        types = getattr(self, 'types_defined', None) or {}
+        return {dep for dep in deps
+                if dep and dep.lower() not in functions
+                and dep.lower() not in subprocesses
+                and dep.lower() not in types}
+
     def _pre_register_cell_spill_constraints(self, lines):
         """Register ``[cell] := expr`` spill constraints before the main loop
         runs, so that Push statements notify them regardless of statement
         order. Re-evaluation of a pre-registered line only takes effect once
-        the target cell has been materialized (its write has executed)."""
+        the target cell has been materialized (its write has executed).
+
+        Lines inside a block body are skipped: they register when the block
+        executes, so a body whose guard fails installs no listener at all."""
+        block_body_lines = getattr(
+            self.control_flow, 'block_body_lines', None) or set()
         for line, line_number in lines:
             if ':=' not in line:
+                continue
+            if line_number in block_body_lines:
                 continue
             target, rhs = map(str.strip, line.split(':=', 1))
             if not re.match(r'^\[\^?[A-Za-z{]', target) or not target.endswith(']'):
                 continue
-            root = _extract_spill_root_var(rhs)
-            if not root:
-                continue
-            if root.lower() in (self.functions or {}) or root.lower() in (
-                    self.subprocesses or {}):
+            deps = self._cell_spill_dependencies(rhs)
+            if not deps:
                 continue
             self._register_cell_spill_listener(
-                line, root, line_number, None)
+                line, deps, line_number, None)
 
     def _run_main_loop_impl_body(self, lines, guard_conditions):
         self._pre_register_cell_spill_constraints(lines)
@@ -4784,13 +4809,11 @@ class GridLangExecutor(GridLangBase):
                         else:
                             self.array_handler.evaluate_line_with_assignment(
                                 line, line_number, scope.get_evaluation_scope())
-                            rhs_root = _extract_spill_root_var(
-                                rhs) if rhs_vars else None
-                            if rhs_root and rhs_root.lower() not in (
-                                    self.functions or {}) and rhs_root.lower() not in (
-                                    self.subprocesses or {}):
+                            rhs_deps = self._cell_spill_dependencies(
+                                rhs) if rhs_vars else set()
+                            if rhs_deps:
                                 self._register_cell_spill_listener(
-                                    line, rhs_root, line_number, scope)
+                                    line, rhs_deps, line_number, scope)
                     except Exception as e:
                         missing = self.extract_missing_dependencies(e)
                         if missing:
@@ -4920,11 +4943,11 @@ class GridLangExecutor(GridLangBase):
         except Exception as e:
             raise RuntimeError(
                 f"Error evaluating '{value}': {e} at line {line_number}")
-        rhs_root = _extract_spill_root_var(value)
-        if rhs_root and rhs_root.lower() not in (self.functions or {}) and rhs_root.lower() not in (self.subprocesses or {}):
+        rhs_deps = self._cell_spill_dependencies(value)
+        if rhs_deps:
             scope = self.current_scope()
             self._register_cell_spill_listener(
-                line, rhs_root, line_number, scope)
+                line, rhs_deps, line_number, scope)
         return True, i + 1
 
     def _handle_when_block(self, lines, i, line, line_number):

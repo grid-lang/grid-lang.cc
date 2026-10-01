@@ -952,6 +952,14 @@ class GridLangCompiler(GridLangExecutor):
         sources = getattr(self, 'live_input_sources', None) or {}
         if not sources:
             return
+        was_suppressed = getattr(self, '_suppress_live_notify', False)
+        self._suppress_live_notify = True
+        try:
+            self._refresh_live_inputs_now(sources)
+        finally:
+            self._suppress_live_notify = was_suppressed
+
+    def _refresh_live_inputs_now(self, sources):
         try:
             scope = self.current_scope()
         except Exception:
@@ -990,12 +998,50 @@ class GridLangCompiler(GridLangExecutor):
         if not caller or not binding:
             return
         saved = getattr(self, '_live_write_through', None)
+        was_suppressed = getattr(self, '_suppress_live_notify', False)
         self._live_write_through = {'scope': scope, 'binding': binding.lower()}
+        self._suppress_live_notify = True
         try:
             caller._apply_single_binding(binding, value, scope,
                                          line_number=line_number)
         finally:
             self._live_write_through = saved
+            self._suppress_live_notify = was_suppressed
+
+    def _reject_output_reads(self, outputs, body_lines, callable_name):
+        """An Output is a destination, never an input.
+
+        ``Push o = ...`` (or assigning the result of another call into it)
+        targets an output, which is its purpose. Any other mention of the
+        name reads it, and reading an output is a compile error: its value
+        belongs to whoever published it, not to this callable.
+        """
+        outs = {str(name).lower() for name in outputs or ()}
+        if not outs:
+            return
+        for text, ln in body_lines or ():
+            line = str(text)
+            # An Output declaration names its own output, which is not a
+            # read; an initializer after '=' still would be.
+            if re.match(r'^\s*output\s+', line, re.I):
+                _, sep, tail = line.partition('=')
+                if not sep:
+                    continue
+                line = tail
+            # String literals first (a name inside one is not a reference),
+            # then the apostrophe comment.
+            cleaned = re.sub(r'"[^"]*"', '""', line)
+            cleaned = re.sub(r"'[^']*.*$", '', cleaned)
+            destination = re.match(
+                r'^\s*push\s+([A-Za-z_]\w*)\b', cleaned, re.I)
+            if destination and destination.group(1).lower() in outs:
+                continue
+            for name in re.findall(r'(?<![\w.!])[A-Za-z_]\w*', cleaned):
+                if name.lower() in outs:
+                    raise SyntaxError(
+                        f"Output '{name}' of {callable_name} cannot be read "
+                        f"as input at line {ln}; an output is a push "
+                        f"destination, not an input")
 
     def _extract_functions(self, lines, label_lines, dim_lines):
         if not hasattr(self, '_program_defined_names'):
@@ -1037,6 +1083,7 @@ class GridLangCompiler(GridLangExecutor):
                 func_name = None
             if def_kind:
                 body_lines = []
+                body_line_numbers = []
                 block_depth = 0
                 i += 1
                 while i < len(lines):
@@ -1054,9 +1101,11 @@ class GridLangCompiler(GridLangExecutor):
                             break
                         block_depth = max(0, block_depth - 1)
                         body_lines.append(body_line)
+                        body_line_numbers.append(body_ln)
                         i += 1
                         continue
                     body_lines.append(body_line)
+                    body_line_numbers.append(body_ln)
                     i += 1
                 # Strip a trailing `live` marker on Input/Output declarations
                 # and record which signature slots are live pipes.
@@ -1065,14 +1114,16 @@ class GridLangCompiler(GridLangExecutor):
                 signature = []
                 live_outputs = []
                 live_inputs = []
-                for b in body_lines:
+                for b_index, b in enumerate(body_lines):
+                    decl_ln = (body_line_numbers[b_index]
+                               if b_index < len(body_line_numbers) else None)
                     decl_text, b_live = self._carve_live_suffix(b.strip())
                     sanitized_body_lines.append(decl_text if b_live else b)
                     m_in = re.match(r'^\s*input\s+(.+)$', decl_text, re.I)
                     if m_in:
                         try:
                             parsed_var, parsed_type, parsed_constraints, _ = self.parser._parse_variable_def(
-                                decl_text, body_ln)
+                                decl_text, decl_ln)
                         except SyntaxError:
                             # A malformed declaration is a parse failure and
                             # must reject the program, not be skipped silently.
@@ -1098,7 +1149,7 @@ class GridLangCompiler(GridLangExecutor):
                     if m_out:
                         try:
                             parsed_var, parsed_type, parsed_constraints, _ = self.parser._parse_variable_def(
-                                decl_text, body_ln)
+                                decl_text, decl_ln)
                         except SyntaxError:
                             raise
                         except Exception:
@@ -1112,6 +1163,9 @@ class GridLangCompiler(GridLangExecutor):
                                     {'name': name, 'kind': 'output', 'live': b_live})
                                 if b_live:
                                     live_outputs.append(name)
+                self._reject_output_reads(
+                    outputs, list(zip(body_lines, body_line_numbers)),
+                    func_name)
                 func_code = "\n".join(sanitized_body_lines)
                 code_lines = [ln for ln in sanitized_body_lines
                               if not ln.strip().lower().startswith(('input ', 'output '))]
@@ -3355,27 +3409,39 @@ class GridLangCompiler(GridLangExecutor):
         if var_name:
             self._set_by[('var', var_name.lower())] = 'client'
 
-    def _register_cell_spill_listener(self, line, rhs_var, line_number, scope=None):
-        """Register a cell-spill := line as a listener on rhs_var.
+    def _register_cell_spill_listener(self, line, rhs_vars, line_number, scope=None):
+        """Register a cell-spill := line as a listener on every rhs var.
 
-        When rhs_var changes (e.g. via push from a subprocess), the
+        When one of them changes (e.g. via push from a subprocess), the
         entire ``:=`` line is re-evaluated so the cell write sees the
-        updated value. A ``scope`` of None means the line is a
-        pre-registered constraint whose scope is resolved at recompute
-        time (used so that Push notifies the constraint regardless of
-        statement order).
+        updated value. A mirror may read several variables (``[C6] := a *
+        b``), so it is registered under each dependency. A ``scope`` of None
+        means the line is a pre-registered constraint whose scope is resolved
+        at recompute time (used so that Push notifies the constraint
+        regardless of statement order).
         """
-        if not rhs_var:
+        if isinstance(rhs_vars, str):
+            rhs_vars = [rhs_vars] if rhs_vars else []
+        deps = {str(var) for var in rhs_vars if var}
+        if not deps:
             return
         cell_refs = self._extract_cell_refs(str(line))
-        record = {'var': None, 'expr': rhs_var, 'scope': scope,
+        record = {'var': None, 'expr': sorted(deps)[0], 'scope': scope,
                   'line': line, 'line_number': line_number,
-                  'deps': {rhs_var}, 'cell_refs': cell_refs}
-        key = ('var', rhs_var.lower())
-        holder = self._listeners.setdefault(key[0], {}).setdefault(key[1], {})
-        holder[('__cell_spill_' + line, id(scope))] = record
+                  'deps': deps, 'cell_refs': cell_refs}
+        token = ('__cell_spill_' + str(line), id(scope))
+        for dep in sorted(deps):
+            holder = self._listeners.setdefault(
+                'var', {}).setdefault(dep.lower(), {})
+            holder[token] = record
 
     def _notify_var_changed(self, name, value):
+        # Live I/O (a live input refreshing, or a live output writing
+        # through) republishes a value the callee already observed; it must
+        # not cascade into re-running dependents. Only a normal assignment or
+        # Push notifies.
+        if getattr(self, '_suppress_live_notify', False):
+            return
         self._propagate(('var', name.lower()), value)
 
     def _notify_cell_changed(self, cell_ref, value):
@@ -4885,6 +4951,9 @@ class GridLangCompiler(GridLangExecutor):
                         {'name': name, 'kind': 'output', 'live': b_live})
                     if b_live:
                         live_outputs.append(name)
+        self._reject_output_reads(
+            outputs, [(text, line_number)
+                      for text in (body or '').splitlines()], module_name)
         entry = {
             'name': module_name,
             'code': body,
