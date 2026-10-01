@@ -387,6 +387,24 @@ class GridLangControlFlow:
                 depth -= 1
         return for_entries
 
+    def _normalize_block_lines(self, block_lines, line_number):
+        """Coerce a block body into the ``(text, line_number)`` pairs the engine uses.
+
+        The engine identifies statements -- guards especially -- by line
+        number, so every body must be numbered. Most callers already hold
+        numbered lines from ``prepare()``; a constructor or builder body holds
+        bare strings and a single ``line_number`` for the whole body, so each
+        line is given a distinct offset number. A shared number would make the
+        engine treat every statement as the guard line and skip the body.
+        """
+        normalized = []
+        for offset, entry in enumerate(block_lines, start=1):
+            if isinstance(entry, tuple):
+                normalized.append(entry)
+            else:
+                normalized.append((entry, line_number + offset))
+        return normalized
+
     def _extract_block_body(self, block_lines, start_index):
         """Return the body lines and matching END index for a block starting at start_index."""
         depth = 0

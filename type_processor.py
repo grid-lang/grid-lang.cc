@@ -438,35 +438,64 @@ class GridLangTypeProcessor:
         if not block_lines:
             return
         self._push_type_fields_to_scope(value_dict)
-        # The shared engine addresses statements as (text, line_number) pairs.
-        numbered = [(l, line_number) for l in block_lines]
+        numbered = self.compiler.control_flow._normalize_block_lines(
+            block_lines, line_number)
         self.compiler.control_flow._process_block(
             numbered, self.compiler.current_scope())
         self._sync_type_fields_from_scope(value_dict)
 
-    def _type_guard_lines(self, code_lines, line_number):
-        """Bare ``If <cond>`` guards declared directly in a constructor body.
-
-        Mirrors the shared engine: a guard gates the whole body it appears in,
-        is position-independent, and is skipped during the statement walk.
-        """
-        numbered = [(l, line_number) for l in code_lines]
-        return self.compiler.control_flow._collect_block_guards(numbered)
-
     def _execute_type_block(self, code_lines, value_dict, input_values, line_number, init_fields=None, default_fields=None):
-        """Execute a list of type code lines within the current scope."""
+        """Entry point for a constructor/builder body."""
         init_fields = init_fields or set()
         default_fields = default_fields or set()
-        # Guards gate the entire constructor body, exactly as in the shared
-        # block engine: collect and evaluate them before the walk.
-        guards = self._type_guard_lines(code_lines, line_number)
+        # Guards gate the whole body, exactly as in the shared block engine:
+        # collect and evaluate them before the walk, and skip them below.
+        numbered = self.compiler.control_flow._normalize_block_lines(
+            code_lines, line_number)
+        guards = self.compiler.control_flow._collect_block_guards(numbered)
         if guards:
-            self.compiler.control_flow._register_block_guards(
-                [(l, line_number) for l in code_lines], guards)
+            self.compiler.control_flow._register_block_guards(numbered, guards)
             if not self.compiler.control_flow._evaluate_block_guards(guards):
                 return
-        guard_texts = {g[0].strip().lower() for g in guards}
         i = 0
+        while i < len(code_lines):
+            stripped_line = code_lines[i].strip()
+            # A bare ``If <cond>`` guard carries no body of its own and was
+            # already evaluated for the whole body above.
+            if re.match(r'^\s*if\s+\S', stripped_line, re.I) and \
+                    not re.search(r'\bthen\b', stripped_line, re.I):
+                i += 1
+                continue
+            if re.match(r'^when\s+.+\s+do', stripped_line, re.I):
+                # ``When <cond> do <stmt>`` takes a single statement and has no
+                # End of its own, so hand the condition and that one statement
+                # to the engine's registration entry point.
+                when = re.match(r'^\s*when\s+(.+?)\s+do\s+(.+)$',
+                                stripped_line, re.I)
+                if when:
+                    self.compiler.control_flow.executor._register_when_block(
+                        when.group(1).strip(),
+                        [(when.group(2).strip(), line_number)], line_number)
+                    i += 1
+                    continue
+            i = self._execute_type_statement(
+                code_lines, i, value_dict, input_values, line_number,
+                init_fields, default_fields)
+            if i is None:
+                return
+        return
+
+    def _execute_type_statement(self, code_lines, i, value_dict, input_values, line_number,
+                                init_fields=None, default_fields=None):
+        """Execute one constructor-body statement, returning the next index.
+
+        Field declarations and field writes go to the type interpreter. Every
+        other construct -- ``If``/``For``/``Let`` blocks, cell writes, calls --
+        is delegated to the shared block engine by
+        :meth:`_run_type_block_body`, so it has exactly one implementation.
+        """
+        init_fields = init_fields or set()
+        default_fields = default_fields or set()
         while i < len(code_lines):
             code_line = code_lines[i]
             stripped_line = code_line.strip()
@@ -483,23 +512,13 @@ class GridLangTypeProcessor:
                 i += 1
                 continue
 
-            # A bare ``If <cond>`` guard has no body of its own; it was
-            # already collected and evaluated above, so just skip it here.
+            # Guard lines and nested blocks are handled by the shared block
+            # engine; see _execute_type_block's delegation below. A bare
+            # ``If <cond>`` guard carries no body of its own and was already
+            # collected and evaluated, so it is skipped here.
             if re.match(r'^\s*if\s+\S', stripped_line, re.I) and \
                     not re.search(r'\bthen\b', stripped_line, re.I):
                 i += 1
-                continue
-
-            # ``When <cond> do ... End`` registers with the shared reactive
-            # machinery, so constructor bodies get When semantics for free.
-            if re.match(r'^when\s+.+\s+do$', stripped_line, re.I):
-                when_match = re.match(r'^\s*when\s+(.+?)\s+do\s*$',
-                                       stripped_line, re.I)
-                when_body, end_index = self._collect_type_block_lines(
-                    code_lines, i)
-                self.compiler.control_flow.executor._register_when_block(
-                    when_match.group(1).strip(), when_body, line_number)
-                i = end_index + 1
                 continue
 
             if stripped_line.lower().startswith('push '):
