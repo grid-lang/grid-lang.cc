@@ -4531,10 +4531,6 @@ class GridLangCompiler(GridLangExecutor):
         """Delegate to type processor."""
         return self.type_processor._process_grid_assignment(line, var_name, value_dict, line_number)
 
-    def _process_type_for_loop(self, loop_line, all_lines, var_name, value_dict, line_number):
-        """Delegate to type processor."""
-        return self.type_processor._process_type_for_loop(loop_line, all_lines, var_name, value_dict, line_number)
-
     def _process_type_let_statement(self, line, var_name, value_dict, line_number):
         """Delegate to type processor."""
         return self.type_processor._process_type_let_statement(line, var_name, value_dict, line_number)

@@ -1948,6 +1948,13 @@ class GridLangExecutor(GridLangBase):
                 line_number=line_number)
             if mark_implicit:
                 define_scope.mark_implicit_let(var)
+            if (getattr(self.current_scope(), 'is_loop_scope', False)
+                    and define_scope is self.current_scope()):
+                # A declaration inside a loop body is scoped to that body and
+                # must not be copied back to the parent scope when the
+                # iteration ends. ``implicit_let`` is not consulted by the
+                # loop copy-back, so record it where that copy-back looks.
+                define_scope.local_let_declarations.add(var.lower())
             defining_scope = define_scope
 
         # A declaration like `Let d not null dim {*,*} or = none` has no value
@@ -4674,9 +4681,10 @@ class GridLangExecutor(GridLangBase):
                     expr, line_number, deps, constraints)
             return i + 1
 
-        return self._handle_main_loop_misc_statement(line, line_number, i)
+        return self._handle_main_loop_misc_statement(
+            line, line_number, i, lines=lines)
 
-    def _handle_main_loop_misc_statement(self, line, line_number, i):
+    def _handle_main_loop_misc_statement(self, line, line_number, i, lines=None):
         handled_grid, next_i = self._handle_main_loop_grid_assignment(
             line, line_number, i)
         if handled_grid:
@@ -4692,11 +4700,21 @@ class GridLangExecutor(GridLangBase):
             return i + 1
 
         if (
-            '=' in line
-            and ':=' not in line
-            and _first_keyword(line) not in _STATEMENT_KEYWORDS
+            ':=' not in line
             and not re.match(r'^\[\s*\^?[A-Za-z]+\d+\s*\]\s*:\s*', line)
+            and self.control_flow._is_optional_let_line(line.strip())
         ):
+            # A declaration with the LET keyword left out binds exactly as an
+            # explicit LET does, including constraint-only forms that carry no
+            # '=' at all ('x > 1', 'v as number').
+            if lines is not None:
+                return self._handle_main_loop_let_statement(
+                    lines, i, 'Let ' + line, line_number,
+                    'Let ' + line.strip())
+            if '=' not in line:
+                # No line context to defer against; the predicate already
+                # confirmed this is a declaration.
+                return i + 1
             target, rhs = line.split('=', 1)
             target, rhs = target.strip(), rhs.strip()
             rhs_vars = None
@@ -4851,8 +4869,28 @@ class GridLangExecutor(GridLangBase):
         if self._maybe_handle_subprocess_call(line, line_number):
             return i + 1
 
+        self._reject_stray_pseudo_constraint(line, line_number)
         self._reject_unknown_call(line, line_number)
         return i + 1
+
+    # 'live' and 'init' are declaration modifiers, not statements: they belong
+    # on the Input/Output/For line that declares the slot.
+    _PSEUDO_CONSTRAINT_RE = re.compile(
+        r'^\s*([A-Za-z_][\w.]*)\s+(live|init)\b', re.I)
+
+    def _reject_stray_pseudo_constraint(self, line, line_number):
+        """Raise when ``live``/``init`` is used as a standalone statement."""
+        m = self._PSEUDO_CONSTRAINT_RE.match(line.strip())
+        if not m:
+            return
+        name, keyword = m.group(1), m.group(2).lower()
+        rest = line.strip()[m.end():]
+        # 'a init 5' is still a stray modifier on a bare line.
+        raise SyntaxError(
+            f"'{keyword}' is only valid on an Input/Output/For declaration "
+            f"line, not on a standalone statement: '{name} {keyword}' at line "
+            f"{line_number}"
+            + (f" (unexpected trailing {rest.strip()!r})" if rest.strip() else ''))
 
     def _reject_unknown_call(self, line, line_number):
         """Turn a bare call to a non-existent subprocess/function into an error.

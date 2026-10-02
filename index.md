@@ -123,7 +123,7 @@ no duplication to keep in sync across two live objects anymore.
   `1` is special: `UnitValue._is_one`, `__mul__` treats `1` as unitless, `_divide` `m/1→m` `m/m→1`, `__pow__` allows exponent `1`.
 - `UnitValue` overloads: `+`/`-` same unit or one side unitless; `*` with `1`; `/`/`\`/`mod` with `1`; `^` with `1`.
 
-### `compiler.py` (6331 lines) — state + orchestration, public API
+### `compiler.py` (6327 lines) — state + orchestration, public API
 `class GridLangCompiler` is the engine's **state holder and public surface**. It
 is the only class `main.py` constructs. It inherits the runtime loop from
 `GridLangExecutor` and holds nearly all persistent state created in `__init__`:
@@ -160,28 +160,28 @@ Notable methods:
 - `_instantiate_type` (1594), `_evaluate_with_value` (2002), `_apply_with_clause`
   (1246): type/`with` object construction; now handles `:` field unit conversion.
 - `call_subprocess` (2448): runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (4530), `_process_declarations_and_labels` (5058),
-  `_collect_global_declarations` (5222): top-level statement handling; now handles `of 1` and `"ox" of animal`.
-- `export_to_csv` (6118): `--debug` CSV export (grid as matrix, or outputs as
+- `_process_grid_assignment` (4530), `_process_declarations_and_labels` (5054),
+  `_collect_global_declarations` (5218): top-level statement handling; now handles `of 1` and `"ox" of animal`.
+- `export_to_csv` (6114): `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
-- `set_input_values` (6141): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
+- `set_input_values` (6137): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
 - `_seed_globals` (1670): for sub-compilers; **skips redefining `grid`**.
 
 Also defines `SubprocessResult` (37): result container exposing `grid`,
 `variables`, `outputs`, and `_UnitSourceNamespace` (52) the UnitSource lookups.
 
-### `executor.py` (6204 lines) — the runtime loop
+### `executor.py` (6242 lines) — the runtime loop
 `class GridLangExecutor` is the **base class that owns the interpreter's
 dispatch loop and its per-run runtime state**. It is not instantiated directly
 as a facade (the old compiler→executor copy handoff was removed); `run` is the
 live entry. Key methods (the `compiler.py`/`grid_lang_common.py` layers call
 `super()`/override these):
-- `run` (2606): top-level sequence (acts on `self`; see Architecture).
-- `_run_setup` (5315), `_run_prepare_execution` (5354), `_print_outputs`
-  (4716), `_materialize_inits` (5940), `_process_deferred_assignments` (6079).
+- `run` (2613): top-level sequence (acts on `self`; see Architecture).
+- `_run_setup` (5353), `_run_prepare_execution` (5392), `_print_outputs`
+  (4716), `_materialize_inits` (5978), `_process_deferred_assignments` (6117).
   `_run_prepare_execution` now calls `_materialize_unit_source_constants` + `_register_top_level_converts`.
-- Main loop: `_run_main_loop` (2647) → `_run_main_loop_impl` (3196) →
-  `_run_main_loop_impl_body` (3244). `_handle_main_loop_*` methods dispatch
+- Main loop: `_run_main_loop` (2654) → `_run_main_loop_impl` (3203) →
+  `_run_main_loop_impl_body` (3251). `_handle_main_loop_*` methods dispatch
   statement kinds: `Let` (1128), `For` (1752 fallback), grid assignment (3903),
   `When` blocks (3956), `Push` (4152), `Return` (4108), misc (3724).
 - Dependency/guard machinery: `_build_dependency_network` (1137),
@@ -192,7 +192,7 @@ live entry. Key methods (the `compiler.py`/`grid_lang_common.py` layers call
   `_bind_declared_var` (1255, now `expected_unit`), standard assignment,
   second pass, generator values, `_materialize_inits`.
 - `For`: `_execute_simple_for_assignment` (749, now `expected_unit`), `Push` via `target_unit`.
-- `Push` semantics: `_handle_push_assignment` (5650), `_evaluate_push_expression`
+- `Push` semantics: `_handle_push_assignment` (5688), `_evaluate_push_expression`
   (4345, now `expected_unit`), `_handle_push_assignment_line`.
 - `When` blocks: `_register_when_block` (289), `_process_when_triggers` (765),
   `_run_when_block` (781), `_handle_when_block`.
@@ -205,11 +205,11 @@ live entry. Key methods (the `compiler.py`/`grid_lang_common.py` layers call
   back-compat; compiler.py imports the same `_DEPENDENCY_IGNORED_TOKENS`). They are
   now a single source of truth in `grid_lang_common.py`, shared by both layers.
 
-### `grid_lang_common.py` (217 lines) — shared base + helpers
-`class GridLangBase` (177) is the common ancestor of `GridLangExecutor` and thus
+### `grid_lang_common.py` (219 lines) — shared base + helpers
+`class GridLangBase` (179) is the common ancestor of `GridLangExecutor` and thus
 `GridLangCompiler`. It holds shared helpers used across layers: `_STATEMENT_KEYWORDS`,
 `_first_keyword`, `_IDENTIFIER_TOKEN_PATTERN`, `_STRING_LITERAL_PATTERN`,
-`_DEPENDENCY_IGNORED_TOKENS`, `_strip_constraint_operands` (41),
+`_DEPENDENCY_IGNORED_TOKENS`, `_strip_constraint_operands` (43),
 `_strip_builder_arrows`, `_strip_cell_address_tokens`, `_has_star_dim`,
 `_apply_dim_base_offsets`, `_infer_declared_type`. Put methods/data needed by
 both the compiler and executor layers here. (Note: `error_value`/`UNIVERSAL_ZERO`
@@ -272,20 +272,73 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
 - Grid-as-array: `get_grid_row` (2639), `get_grid_column` (2668); generic
   `get_array_element`/`set_array_element` handle `_GridStore` like any sparse array.
 
-### `control_flow.py` (2581 lines) — blocks: For / If / Let / When
+### `control_flow.py` (2796 lines) — blocks: For / If / Let / When
 `class GridLangControlFlow` executes block constructs. Module-level regexes
 (9–16) define `if...then`, `elseif...then`, `else`, `for...do`,
 `when...do`, `end`.
 - `process_for_statement` (179): For-loop handling (ranges, init, arrays).
-- Block engine: `_process_block` (1160), `_extract_block_body` (390),
-  `pre_scan_blocks` (2171), `_prepare_block_line` (419).
-- If: `_process_if_statement` (1250) and the "new"/"rich" variants (2011,
-  2113), `_parse_if_header` (1284), `_collect_if_blocks` (1354),
-  `_execute_if_block_choice` (1454), `_process_if_elseif_else_block` (2306);
-  condition evaluation helpers `_evaluate_if_*` (1703–2099).
-- Let: `_process_let_statement_inline` (1541), field/index assignment helpers
-  (1339, 1390).
+- Block engine: `_process_block` (1323), `_extract_block_body` (408),
+  `pre_scan_blocks` (2332), `_prepare_block_line` (437).
+- If: `_process_if_statement` (1427) and the "new"/"rich" variants (2011,
+  2113), `_parse_if_header` (1461), `_collect_if_blocks` (1531),
+  `_execute_if_block_choice` (1631), `_process_if_elseif_else_block` (2467);
+  condition evaluation helpers `_evaluate_if_*` (1864–2260).
+- Let: `_process_let_statement_inline` (1718), field/index assignment helpers
+  (1339, 1390). **One binder everywhere:** `_bind_let_var_in_block` delegates
+  to `executor._bind_declared_var`, so a `Let` in a block body is the same
+  instruction as a top-level `Let`. Equality bindings pin a `constant`
+  constraint, so a conflicting rebind is `#VALUE`:
+  ```
+  Let x = 5 / Let x = 6   ->  #VALUE
+  x = 5 / x = 6           ->  #VALUE
+  ```
+  A loop body still re-binds on every iteration, because
+  `_bind_declared_var` records a loop-body declaration in
+  `local_let_declarations` and the loop's copy-back to the parent scope skips
+  exactly that set — the variable is dropped when the iteration ends, so
+  `let a = (i + 3) * i \ 2 + 1` binds afresh each pass (Tests 119 and 141).
+  This is scope, not a separate semantic: previously `_bind_declared_var`
+  recorded loop-locality only in `implicit_let`, which the copy-back does not
+  consult, so the variable leaked to the parent scope and its `constant` pin
+  collided on the following iteration.
+- `live` and `init` are declaration modifiers, not statements. They are valid
+  only as suffixes on an `Input`/`Output`/`For` declaration line
+  (`Input a live`, `Output o init 5 live`, `For rev as Text init ""`).
+  `_reject_stray_pseudo_constraint` (executor.py) raises a `SyntaxError` on a
+  standalone `a live` / `a init 5` line rather than letting it become an
+  unevaluated expression or a silent no-op.
+- **The `Let` keyword is optional** whenever a line is unambiguously a
+  declaration: `_is_optional_let_line` rejects a leading instruction keyword,
+  an `AND` connective, a `THEN` header, and the I/O-only modifiers `live` and
+  `init`, then asks `_parse_variable_def` whether the line declares something
+  (a value, a constraint, or a type). So every constraint kind works with the
+  keyword dropped, not just assignment:
+  ```
+  Let x > 1                      x > 1
+  Let v as number                v as number
+  Let u of peso = 5              u of peso = 5
+  Let arr dim 3 as logical = ..  arr dim 3 as logical = ..
+  Let grid not null or = 0       grid not null or = 0
+  ```
+  A bare `a` declares nothing, so `Let a` stays mandatory. A comparison stays
+  mandatory because its `=` belongs to `>=`/`<=`/`<>`/`!=`, not an assignment.
+  A recognised declaration then dispatches to the ordinary `Let` binder
+  (`_handle_block_optional_let_statement` in a block, and
+  `_handle_main_loop_misc_statement` at top level), so bare and explicit `Let`
+  are the same instruction with the same rebinding semantics.
+- **Known gap: unrecognized operators.** `_replace_operators` translates `mod`,
+  `\`, `^`, and the boolean literals for `eval()`, so a Python-only operator
+  reaches `eval()` and may evaluate silently instead of erroring — `//` and
+  `**` return `3.0` and `8.0` rather than failing. A denylist scan was tried and
+  reverted: it hunts for bad tokens instead of failing to parse the line, so it
+  could only ever approximate the real rule. The right shape is for the
+  expression parser to attempt the line and raise when it cannot recognize a
+  construct; that is still to be designed.
 - `_handle_block_*` methods (343–960): per-statement handling inside blocks.
+- `_scan_local_if_block` (2576): derives `If`/`Elseif`/`Else` clause structure
+  from the lines at hand, for bodies that are not in the top-level pre-scan
+  (constructor bodies, nested slices), so the shared clause-selection code
+  runs unchanged.
 
 ### `scope.py` (1366 lines) — scope + variable semantics
 - `class Scope` (85): variable storage with constraints.
@@ -311,24 +364,24 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   `_outer_scope_read_only` flag to reject writes from read-only function
   sub-compilers to outer scopes.
 
-### `type_processor.py` (1496 lines) — `Define X as Type` handling
+### `type_processor.py` (1302 lines) — `Define X as Type` handling
 `class GridLangTypeProcessor`:
 - Type-def parsing: `_parse_type_def` (82), `_parse_type_def_line` (90),
   `_extract_type_field_line` (9696, `_parse_type_field_constraints` (194),
   `_record_type_field_definition` (15157, `_collect_type_computed_fields`
   (178), `_finalize_type_def_state` (281).
 - Executing type body code against an instance: `_execute_type_code` (304),
-  `_execute_type_block` (456), `_process_grid_assignment` (639),
-  `_process_type_for_loop` (716), `_process_type_let_statement` (894),
-  `_process_type_assignment` (1061).
-- `_build_type_eval_scope` (1287), `_execute_builder` (1308).
-- **Constructor/builder bodies now share the main block engine.** Nested
-  `If ... then` blocks are delegated to `control_flow._process_block` via
-  `_run_type_block_body`, and bare `If <cond>` guards are collected and
-  evaluated with `control_flow._collect_block_guards` /
-  `_evaluate_block_guards`, so guard collection, guard registration and
-  bindings-before-effects ordering match every other block in the language.
-  Three consequences, all previously broken:
+  `_execute_type_block` (452), `_process_grid_assignment` (668),
+  `_process_type_let_statement` (743),
+  `_process_type_assignment` (867).
+- `_build_type_eval_scope` (1093), `_execute_builder` (1114).
+- **Constructor/builder bodies now share the main block engine.** `For`,
+  `Let ... then`, and `If ... then/else` bodies are delegated to
+  `control_flow._process_block` through `_process_type_for_block_via_engine`,
+  `_process_type_let_then_via_engine`, and `_process_type_if_block_via_engine`.
+  There is no type-specific For/Let/If interpreter: parsing, loop walking,
+  clause selection and guard handling are all the engine's. Three
+  consequences, all previously broken:
   - Instance **fields are readable inside the body**. `_push_type_fields_to_scope`
     mirrors `value_dict` into the scope, and `_sync_type_fields_from_scope`
     copies engine writes back, so `Print x` no longer raises `NameError` and
@@ -341,11 +394,11 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   - Bare `If <cond>` guards gate a constructor body, as elsewhere.
 - `When <cond> do` inside a constructor body registers with
   `executor._register_when_block` instead of raising "Unrecognized statement
-  in type constructor", but does not fire on later field writes: a bare
-  field name is not a reactive scope variable, and `When` only fires through
-  the dotted path (`When p.x > 0`). Bare-variable `When` does not fire
-  anywhere else either (top level or inside a `For` block), so this is a
-  pre-existing limitation rather than a constructor-specific gap.
+  in type constructor`. Whether it fires on later field writes is still
+  unverified: a bare field name is not a reactive scope variable, and `When`
+  is known to fire through the dotted path (`When p.x > 0`). Note that
+  `When e > 0 do print $"..."` on one line is headerless, single-statement
+  syntax with no `End` — see `test_when.grid`.
 - Forward references inside a constructor body (`[A1] := y` before
   `Let y = 3`) fail exactly as they do in the main loop; see the pending
   all-bindings-first-pass work.

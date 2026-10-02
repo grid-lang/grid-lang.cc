@@ -388,11 +388,16 @@ class GridLangTypeProcessor:
                 value_dict.pop('_with_applied_fields', None)
 
     def _type_field_names(self, value_dict):
-        """Declared field names of an instance, excluding private markers."""
+        """Declared field names of an instance, excluding private markers.
+
+        The implicit ``grid`` is included: the block engine resolves ``grid``
+        by name, so a body such as ``Let grid{a, 1} = 0`` must write the
+        instance's own grid rather than resolve the name to an outer grid.
+        """
         if not isinstance(value_dict, dict):
             return []
         return [k for k in value_dict.keys()
-                if not str(k).startswith('_') and str(k) != 'grid']
+                if not str(k).startswith('_')]
 
     def _scope_has_var(self, scope, name):
         lowered = str(name).lower()
@@ -603,23 +608,28 @@ class GridLangTypeProcessor:
                 i += 1
                 continue
             if re.match(r'^for\b', stripped_line, re.I) and re.search(r'\bdo\b', stripped_line, re.I):
-                # For var = expr do — define var and run body once
-                if '=' in stripped_line and not re.search(r'\bin\b', stripped_line, re.I):
-                    i = self._process_type_for_assignment_block(
-                        code_lines, i, value_dict, input_values, line_number)
-                    continue
-                i = self._process_type_for_loop(
-                    code_lines, i, value_dict, input_values, line_number)
+                # Delegate to the engine's FOR handling (ranges, AND-clauses,
+                # For x = expr). The engine walks the body via _process_block.
+                numbered = self.compiler.control_flow._normalize_block_lines(
+                    code_lines, line_number)
+                i = self.compiler.control_flow._process_type_for_block_via_engine(
+                    numbered, i, value_dict, line_number)
                 continue
             if re.match(r'^if\b', stripped_line, re.I) and re.search(r'\bthen\b', stripped_line, re.I):
-                i = self._process_type_if_block(
-                    code_lines, i, value_dict, input_values, line_number)
+                # Delegate to the engine's IF handling; the body is executed
+                # by _process_block, so guards and ordering stay in one place.
+                numbered = self.compiler.control_flow._normalize_block_lines(
+                    code_lines, line_number)
+                i = self.compiler.control_flow._process_type_if_block_via_engine(
+                    numbered, i, value_dict, line_number)
                 continue
             if re.match(r'^let\b', stripped_line, re.I):
                 # Let ... then block inside type constructor
                 if re.search(r'\bthen\b', stripped_line, re.I):
-                    i = self._process_type_let_then_block(
-                        code_lines, i, value_dict, input_values, line_number)
+                    numbered = self.compiler.control_flow._normalize_block_lines(
+                        code_lines, line_number)
+                    i = self.compiler.control_flow._process_type_let_then_via_engine(
+                        numbered, i, value_dict, line_number)
                     continue
                 # Let statement: Let grid{a, b} = grid{a-1, b-1} + grid{a-1, b}
                 self._process_type_let_statement(
@@ -730,186 +740,6 @@ class GridLangTypeProcessor:
             if 'grid' not in value_dict:
                 value_dict['grid'] = {}
             value_dict['grid'][(row - 1, col_num - 1)] = value
-
-
-    def _process_type_for_loop(self, all_lines, start_index, value_dict, input_values, line_number):
-        """Process for loop inside type definition."""
-        loop_line = all_lines[start_index].strip()
-        lower_line = loop_line.lower()
-        if not re.search(r'\bdo\b', lower_line):
-            # This is a field declaration, not a loop.
-            return start_index + 1
-
-        match = re.match(r'^\s*for\s+(.+?)\s+do\s*$', loop_line, re.I)
-        if not match:
-            raise SyntaxError(f"Unsupported loop syntax: {loop_line}")
-
-        var_defs = match.group(1).strip()
-        var_parts = split_var_defs(var_defs)
-        loop_defs = []
-        for var_part in var_parts:
-            part = var_part.strip()
-            part_match = re.match(
-                r'^([\w_]+)\s+in\s+(.+?)(?:\s+step\s+(-?\d+))?(?:\s+index\s+([\w_]+))?$',
-                part, re.I)
-            if not part_match:
-                raise SyntaxError(f"Unsupported loop syntax: {loop_line}")
-            var_name, range_expr, step_str, index_var = part_match.groups()
-            step = int(step_str) if step_str else None
-            loop_defs.append({
-                'var_name': var_name,
-                'range_expr': range_expr.strip(),
-                'step': step,
-                'index_var': index_var
-            })
-
-        # Extract loop body
-        depth = 1
-        end_index = None
-        i = start_index + 1
-        while i < len(all_lines):
-            line = all_lines[i].strip()
-            if re.match(r'^\s*for\b', line, re.I) and re.search(r'\bdo\b', line, re.I):
-                depth += 1
-            elif re.match(r'^\s*end\b', line, re.I):
-                depth -= 1
-                if depth == 0:
-                    end_index = i
-                    break
-            i += 1
-        if end_index is None:
-            raise SyntaxError(
-                f"Unclosed FOR block starting at line {line_number}")
-
-        loop_body = all_lines[start_index + 1:end_index]
-
-        def _evaluate_loop_values(range_expr, step_value):
-            eval_scope = self._build_type_eval_scope(value_dict, input_values)
-            if ' to ' in range_expr:
-                start_expr, end_expr = range_expr.split(' to ', 1)
-                step_expr = None
-                if ' step ' in end_expr:
-                    end_expr, step_expr = [
-                        part.strip() for part in end_expr.split(' step ', 1)]
-                start_val = self.compiler.expr_evaluator.eval_expr(
-                    start_expr.strip(), eval_scope, line_number)
-                end_val = self.compiler.expr_evaluator.eval_expr(
-                    end_expr.strip(), eval_scope, line_number)
-                start_val = int(start_val)
-                end_val = int(end_val)
-                step_final = step_value
-                if step_expr and step_final is None:
-                    step_final = int(self.compiler.expr_evaluator.eval_expr(
-                        step_expr, eval_scope, line_number))
-                if step_final is None:
-                    step_final = 1
-                if step_final < 0:
-                    return list(range(start_val, end_val - 1, step_final))
-                return list(range(start_val, end_val + 1, step_final))
-            if range_expr.startswith('{') and range_expr.endswith('}'):
-                values = []
-                inner = range_expr[1:-1].strip()
-                if not inner:
-                    return []
-                parts = [p.strip() for p in inner.split(',') if p.strip()]
-                for part in parts:
-                    if (part.startswith('"') and part.endswith('"')) or (
-                            part.startswith("'") and part.endswith("'")):
-                        values.append(part[1:-1])
-                        continue
-                    try:
-                        values.append(self.compiler.expr_evaluator.eval_expr(
-                            part, eval_scope, line_number))
-                    except Exception:
-                        try:
-                            values.append(float(part))
-                        except ValueError:
-                            values.append(part)
-                return values
-
-            result = self.compiler.expr_evaluator.eval_or_eval_array(
-                range_expr, eval_scope, line_number)
-            if isinstance(result, dict):
-                return self.compiler.array_handler.flatten_array(
-                    result, line_number)
-            if isinstance(result, (list, tuple)):
-                return list(result)
-            if isinstance(result, numbers.Real):
-                return [result]
-            if result is None:
-                return []
-            return [result]
-
-        def _execute_loop(level=0):
-            if level >= len(loop_defs):
-                self._execute_type_block(
-                    loop_body, value_dict, input_values, line_number)
-                return
-            loop_def = loop_defs[level]
-            values = _evaluate_loop_values(
-                loop_def['range_expr'], loop_def['step'])
-            for idx, val in enumerate(values, start=1):
-                self.compiler.push_scope(is_private=False)
-                self.compiler.current_scope().define(
-                    loop_def['var_name'], val, 'number')
-                if loop_def['index_var']:
-                    self.compiler.current_scope().define(
-                        loop_def['index_var'], idx, 'number')
-                _execute_loop(level + 1)
-                self.compiler.pop_scope()
-
-        _execute_loop()
-        return end_index + 1
-
-    def _process_type_for_assignment_block(self, code_lines, i, value_dict, input_values, line_number):
-        """Handle ``For var = expr do ... End`` inside type constructors.
-
-        Defines *var* = *expr*, then executes the body lines once.
-        """
-        header = code_lines[i].strip()
-        header = re.sub(r'\s+do\s*$', '', header, flags=re.I).strip()
-        header = re.sub(r'^For\s+', '', header, count=1, flags=re.I)
-        eval_scope = self._build_type_eval_scope(value_dict, input_values)
-        var, type_name, constraints, expr = self.compiler._parse_variable_def(
-            header, line_number)
-        init_expr = (constraints or {}).get('init')
-        if expr is None and init_expr is not None:
-            expr = init_expr
-        if expr is not None:
-            value = self.compiler.expr_evaluator.eval_or_eval_array(
-                str(expr), eval_scope, line_number)
-            scope = self.compiler.current_scope()
-            defining_scope = scope.get_defining_scope(var)
-            inferred = type_name or self.compiler.array_handler.infer_type(
-                value, line_number)
-            if inferred == 'int':
-                inferred = 'number'
-            if defining_scope:
-                defining_scope.update(var, value, line_number)
-            else:
-                scope.define(var, value, inferred,
-                             constraints or {}, is_uninitialized=False)
-        # Collect and execute body
-        depth = 1
-        scan_i = i + 1
-        body = []
-        while scan_i < len(code_lines) and depth > 0:
-            line = code_lines[scan_i].strip()
-            if re.match(r'^for\b', line, re.I) and re.search(r'\bdo\b', line, re.I):
-                depth += 1
-            elif re.match(r'^let\b', line, re.I) and re.search(r'\bthen\b', line, re.I):
-                depth += 1
-            elif re.match(r'^end\b', line, re.I):
-                depth -= 1
-                if depth == 0:
-                    break
-            body.append(code_lines[scan_i])
-            scan_i += 1
-        self.compiler.push_scope(is_loop_scope=True)
-        self._execute_type_block(body, value_dict, input_values, line_number)
-        self.compiler.pop_scope()
-        return scan_i + 1
-
     def _process_type_let_statement(self, line, var_name, value_dict, line_number, input_values=None):
         """Process let statement inside type definition.
 
@@ -1015,49 +845,6 @@ class GridLangTypeProcessor:
             block_lines.append(next_line)
             scan_i += 1
         return block_lines, scan_i
-
-    def _process_type_let_then_block(self, code_lines, i, value_dict, input_values, line_number):
-        """Handle ``Let cond then ... End`` blocks inside type constructors."""
-        header = code_lines[i].strip()
-        header = re.sub(r'\s+then\s*$', '', header, flags=re.I).strip()
-        header = re.sub(r'^Let\s+', '', header, count=1, flags=re.I)
-        eval_scope = self._build_type_eval_scope(value_dict, {})
-        var, type_name, constraints, expr = self.compiler._parse_variable_def(
-            header, line_number)
-        block_lines, scan_i = self._collect_type_block_lines(code_lines, i)
-        condition_passed = True
-        if expr is not None:
-            try:
-                val = self.compiler.expr_evaluator.eval_or_eval_array(
-                    str(expr), eval_scope, line_number)
-                condition_passed = bool(val)
-            except Exception:
-                condition_passed = False
-        if condition_passed:
-            self._execute_type_block(
-                block_lines, value_dict, input_values, line_number)
-        return scan_i + 1
-
-    def _process_type_if_block(self, code_lines, i, value_dict, input_values, line_number):
-        """Handle ``If cond then ... [else ...] End`` blocks inside type constructors."""
-        header = code_lines[i].strip()
-        header = re.sub(r'\s+then\s*$', '', header, flags=re.I).strip()
-        header = re.sub(r'^if\s+', '', header, count=1, flags=re.I)
-        block_lines, scan_i = self._collect_type_block_lines(
-            code_lines, i, track_if_depth=True)
-        # Split at else
-        if_block = block_lines
-        else_block = []
-        for idx, line in enumerate(block_lines):
-            if line.strip().lower() == 'else':
-                if_block = block_lines[:idx]
-                else_block = block_lines[idx + 1:]
-                break
-        condition_passed = self.compiler.control_flow._evaluate_if_condition(
-            header, line_number)
-        chosen = if_block if condition_passed else else_block
-        self._run_type_block_body(chosen, value_dict, line_number)
-        return scan_i + 1
 
     def _with_value_matches(self, a, b):
         """True when a WITH-applied value and a constructor-computed value agree."""

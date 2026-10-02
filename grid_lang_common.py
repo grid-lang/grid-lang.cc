@@ -16,7 +16,9 @@ import re
 # ---------------------------------------------------------------------------
 # Statement dispatch — replaces re.match(r'^\s*(input|define|…)\b')
 # ---------------------------------------------------------------------------
-_STATEMENT_KEYWORDS = frozenset(['input','define','output','let','if','for','when','return','push','require','print'])
+_STATEMENT_KEYWORDS = frozenset(['input', 'define', 'output', 'let', 'if', 'for',
+                                'when', 'return', 'push', 'require', 'print',
+                                'else', 'elseif'])
 
 def _first_keyword(line):
     s = line.lstrip()

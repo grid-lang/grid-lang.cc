@@ -455,6 +455,142 @@ class GridLangControlFlow:
             condition, block_body, line_number)
         return True, end_index + 1
 
+    def _run_constructor_block(self, block_lines, value_dict, line_number):
+        """Execute constructor/builder block lines with the engine's walkers.
+
+        A constructor body is ordinary language code that additionally reads and
+        writes its instance's fields, so it is executed by this engine rather
+        than by a second interpreter. Fields are mirrored into the scope for
+        the duration and written back afterwards.
+        """
+        if not block_lines:
+            return
+        self._push_type_fields_to_scope(value_dict)
+        try:
+            self._process_block(block_lines, self.compiler.current_scope())
+        finally:
+            self._sync_type_fields_from_scope(value_dict)
+
+    def _process_type_if_block_via_engine(self, block_lines, i, value_dict, line_number):
+        """Run an ``If ... then [elseif/else] ... End`` from a constructor body.
+
+        Parsing, condition evaluation and branch selection are the engine's;
+        the selected branch runs through ``_process_block``.
+        """
+        line, ln, line_clean = self._prepare_block_line(block_lines, i)
+        consumed = self._process_if_statement_rich(line, ln, block_lines, i)
+        end = min(i + consumed + 1, len(block_lines))
+        self._sync_type_fields_from_scope(value_dict)
+        return end
+
+    def _process_type_for_block_via_engine(self, block_lines, i, value_dict, line_number):
+        """Run a ``For ... do ... End`` from a constructor body via the engine."""
+        line, ln, line_clean = self._prepare_block_line(block_lines, i)
+        # Multi-variable ``AND`` ranges need the cartesian/dynamic-bound walk
+        # the main loop owns; it drives the body through _process_block too.
+        m_vars = re.match(r'^\s*for\s+(.+?)\s+do\s*$', line, re.I)
+        if m_vars and ' and ' in m_vars.group(1).lower() \
+                and ' in ' in m_vars.group(1).lower():
+            handled, next_i = self.compiler._handle_for_and_syntax(
+                block_lines, i, m_vars.group(1).strip(), True, ln)
+            self._sync_type_fields_from_scope(value_dict)
+            return next_i if handled else i + 1
+        handled, next_i = self._handle_block_for_statement(block_lines, i, line, ln)
+        if not handled:
+            body, end_index = self._extract_block_body(block_lines, i)
+            self.process_for_statement(line, ln, self.compiler.current_scope())
+            self._run_constructor_block(body, value_dict, line_number)
+            next_i = end_index + 1
+        self._sync_type_fields_from_scope(value_dict)
+        return next_i
+
+    def _process_type_let_then_via_engine(self, block_lines, i, value_dict, line_number):
+        """Run a ``Let <cond> then ... End`` from a constructor body."""
+        return self._handle_let_cond_block(
+            block_lines, i, line_number,
+            on_done=lambda: self._sync_type_fields_from_scope(value_dict))
+
+    def _handle_let_cond_block(self, block_lines, i, line_number,
+                               value_dict=None, on_done=None):
+        """Run a conditional ``Let <cond> then ... End`` block.
+
+        The condition decides whether the body runs; the body itself is
+        ordinary code and is executed by :meth:`_process_block`.
+        """
+        line, ln, line_clean = self._prepare_block_line(block_lines, i)
+        header = re.sub(r'^Let\s+', '', line_clean, count=1, flags=re.I)
+        header = re.sub(r'\s+then\s*$', '', header, flags=re.I).strip()
+        body, end_index = self._extract_block_body(block_lines, i)
+        _, _, constraints, expr = self.compiler._parse_variable_def(
+            header, ln)
+        condition_passed = True
+        if expr is not None:
+            try:
+                value = self.compiler.expr_evaluator.eval_or_eval_array(
+                    str(expr),
+                    self.compiler.current_scope().get_evaluation_scope(), ln)
+                condition_passed = bool(value)
+            except Exception:
+                condition_passed = False
+        if condition_passed and body:
+            self._process_block(body, self.compiler.current_scope())
+        if callable(on_done):
+            on_done()
+        return end_index + 1
+
+    def _push_type_fields_to_scope(self, value_dict, only=None):
+        """Constructor-side helper: mirror instance fields into the scope."""
+        return self.compiler.type_processor._push_type_fields_to_scope(
+            value_dict, only=only)
+
+    def _sync_type_fields_from_scope(self, value_dict):
+        """Constructor-side helper: copy engine field writes into the instance."""
+        return self.compiler.type_processor._sync_type_fields_from_scope(value_dict)
+
+    def _is_optional_let_line(self, line_clean):
+        """True when a line may be read as a ``Let`` with the keyword left out.
+
+        The keyword is optional only when the line is unambiguously a
+        declaration. Every constraint kind is accepted -- a type
+        (``a as number``), a unit (``a of peso``), a dim
+        (``arr dim 3 as logical = {...}``), a choice or default
+        (``grid not null or = 0``), and an inequality (``x > 1``) -- because
+        the parser, not this predicate, decides what a declaration looks like.
+        A bare ``a`` with neither a value nor a constraint stays mandatory.
+
+        Two shapes stay mandatory here: a leading instruction keyword, and a
+        comparison, whose ``=`` is part of ``>=``/``<=``/``==``/``<>``/``!=``
+        rather than an assignment.
+        """
+        if not line_clean:
+            return False
+        if re.search(r'\s+and\s+|\bthen\b', line_clean, re.I):
+            return False
+        first = re.match(r'^\s*(\$?[A-Za-z_][\w.]*)', line_clean)
+        if not first:
+            return False
+        if _first_keyword(first.group(1).lstrip('$').split('.')[0]) in _STATEMENT_KEYWORDS:
+            return False
+        try:
+            _var, type_name, constraints, expr = \
+                self.compiler._parse_variable_def(line_clean, 0)
+        except Exception:
+            return False
+        # A bare name declares nothing on its own, so `Let a` is required.
+        return bool(expr or constraints or type_name)
+
+    def _handle_block_optional_let_statement(self, block_lines, i, line,
+                                            line_number, line_clean):
+        """Run ``name = expr`` as ``Let name = expr`` in block context.
+
+        This reuses the in-block ``Let`` binder, so bare assignment and an
+        explicit ``Let`` in the same context are the same instruction.
+        """
+        if not self._is_optional_let_line(line_clean):
+            return False, i
+        self._process_let_statement_inline('Let ' + line, line_number)
+        return True, i + 1
+
     def _handle_block_push_or_output_statement(self, i, line, line_number, line_clean):
         """Handle PUSH and OUTPUT statements in block context."""
         if line_clean.lower().startswith('push '):
@@ -1244,6 +1380,11 @@ class GridLangControlFlow:
             if handled:
                 i = next_i
                 continue
+            # Conditional block: 'Let <cond> then' is a guarded body, unlike
+            # the declaration form 'Let <var> = ...' handled by the tail.
+            if self._header_let.match(line_clean):
+                i = self._handle_let_cond_block(block_lines, i, line_number)
+                continue
             handled, next_i = self._handle_block_cell_binding_or_assignment(
                 block_pending, i, line, line_number, line_clean)
             if handled:
@@ -1253,6 +1394,15 @@ class GridLangControlFlow:
                 block_lines, i, line, line_number, line_clean)
             if should_return:
                 return
+            if handled:
+                i = next_i
+                continue
+
+            # 'name = expr' is a Let with the keyword left out. It is matched
+            # only once every explicit statement has declined the line, so no
+            # keyword form and no other assignment form can be shadowed by it.
+            handled, next_i = self._handle_block_optional_let_statement(
+                block_lines, i, line, line_number, line_clean)
             if handled:
                 i = next_i
                 continue
@@ -1557,17 +1707,18 @@ class GridLangControlFlow:
             line_number)
 
     def _process_let_statement_inline(self, line, line_number):
-        """
-        Process a LET statement inline (for use in IF-ELSE blocks).
-        """
+        """Bind a LET declaration appearing inside a block body.
 
-        # Parse the LET statement
+        A block body re-executes on every iteration of its enclosing loop, so
+        a declaration there re-binds rather than pins: it is a mutable
+        assignment with the LET declaration syntax, not the immutable
+        equality binding the top-level ``_bind_declared_var`` performs.
+        """
         m = re.match(r'^\s*LET\s+(.+?)(?:\s+then\s*$|\s*$)', line, re.I)
         if not m:
             raise SyntaxError(f"Invalid LET syntax at line {line_number}")
 
         var_def = m.group(1).strip()
-
         var_list = []
         if ' and ' in var_def.lower():
             var_parts = split_var_defs(var_def)
@@ -1580,8 +1731,6 @@ class GridLangControlFlow:
                 var_def, line_number)
             var_list.append((var, type_name, constraints, expr))
 
-
-        # Process each variable
         scope_dict = self.compiler.current_scope().get_evaluation_scope()
         for var, type_name, constraints, expr in var_list:
             if self._try_process_let_field_index_assignment(
@@ -1590,45 +1739,30 @@ class GridLangControlFlow:
             if self._try_process_let_indexed_assignment(
                     var, expr, scope_dict, line_number):
                 continue
-            defining_scope = self.compiler.current_scope().get_defining_scope(var)
-            if defining_scope and self.compiler._is_outer_scope(defining_scope):
-                # Subprocesses/functions shadow caller variables locally.
-                defining_scope = None
-            if defining_scope:
-                if constraints:
-                    if var in defining_scope.constraints:
-                        merged = dict(defining_scope.constraints[var])
-                        merged.update(constraints)
-                        constraints = merged
-                    defining_scope.constraints[var] = constraints
-                if expr is None and var in defining_scope.variables and defining_scope.variables[var] is not None:
-                    continue
-            else:
-                if self.compiler.current_scope().is_shadowed(var):
-                    print(
-                        f"Warning: LET defines '{var}' which shadows a variable in an outer scope at line {line_number}")
-                self.compiler.current_scope().define(
-                    var, None, type_name, constraints, is_uninitialized=True)
-                if self.compiler.current_scope() is not self.compiler.get_global_scope():
-                    self.compiler.current_scope().local_let_declarations.add(
-                        var.lower())
+            self._bind_let_var_in_block(
+                var, type_name, constraints, expr, scope_dict, line_number)
+            # A loop body re-executes every iteration, so a `Let` there binds
+            # fresh each time instead of pinning one immutable value. The
+            # loop copy-back drops the variable, so re-binding a name across
+            # iterations is a new binding rather than a conflicting one.
 
-            if expr is not None:
-                try:
-                    evaluated_value = self.compiler.expr_evaluator.eval_or_eval_array(
-                        expr, scope_dict, line_number)
-                    self.compiler.current_scope().update(var, evaluated_value, line_number)
-                    scope_dict[var] = evaluated_value
-                    pending_vars = [
-                        pending_var for pending_var in list(self.compiler.pending_assignments.keys())
-                        if not pending_var.startswith('__line_')
-                    ]
-                    for pending_var in pending_vars:
-                        self.compiler._attempt_resolve_pending_var(
-                            pending_var, line_number)
-                except NameError as e:
-                    raise NameError(
-                        f"Undefined variables in LET statement: {var} at line {line_number}")
+    def _bind_let_var_in_block(self, var, type_name, constraints, expr,
+                               scope_dict, line_number):
+        """Bind a LET that appears inside a block body.
+
+        Uses the same binder as a top-level LET, so the two are one
+        instruction. The difference is scope, not semantics: a block body
+        re-executes on every iteration of its enclosing loop, so
+        ``let a = f(i)`` binds a new value each pass. That works because
+        ``_bind_declared_var`` marks a loop-body declaration in
+        ``local_let_declarations``, and the loop's copy-back to the parent
+        scope skips exactly that set -- the variable is dropped when the
+        iteration ends, so each iteration binds afresh rather than colliding
+        with its own previous value.
+        """
+        self.compiler._bind_declared_var(
+            var, type_name, constraints, expr, line_number,
+            scope_dict=scope_dict, shadow_keyword='LET', mark_implicit=True)
 
     def _try_process_let_field_index_assignment(self, var, expr, scope_dict, line_number):
         field_index_match = re.match(
@@ -2430,6 +2564,54 @@ class GridLangControlFlow:
             self._process_block(active_clause_lines,
                                 self.compiler.current_scope())
 
+    def _scan_local_if_block(self, line, line_number, lines, current_index):
+        """Derive IF/ELSEIF/ELSE clause structure from *lines*.
+
+        Bodies that are executed through :meth:`_process_block` without being
+        part of the top-level pre-scan (constructor bodies, nested slices) have
+        no entry in ``if_blocks``. This builds the same shape so the shared
+        clause-selection code can run unchanged.
+        """
+        clauses = []
+        header_re = re.compile(r'^\s*(if|elseif)\s+(.+?)\s+then\s*$', re.I)
+        m = header_re.match(line)
+        if not m:
+            return None
+        clauses.append({
+            'kind': m.group(1).lower(),
+            'condition': m.group(2).strip(),
+            'start': current_index + 1,
+        })
+        end_i = None
+        depth = 0
+        for i in range(current_index + 1, len(lines)):
+            body = lines[i][0].strip() if isinstance(lines[i], tuple) \
+                else str(lines[i]).strip()
+            if header_re.match(body) or re.match(r'^\s*for\b.+?\bdo\s*$',
+                                                body, re.I) \
+                    or re.match(r'^\s*let\b.+?\bthen\s*$', body, re.I) \
+                    or re.match(r'^\s*when\b.+?\bdo\s*$', body, re.I):
+                depth += 1
+            elif self._token_end.match(body):
+                if depth == 0:
+                    end_i = i
+                    break
+                depth -= 1
+            if depth == 0 and re.match(r'^\s*else\s*$', body, re.I):
+                clauses.append({'kind': 'else', 'condition': None,
+                                'start': i + 1})
+        if end_i is None:
+            raise SyntaxError(f"Unclosed IF block at line {line_number}")
+        clauses[-1]['end'] = end_i
+        return {
+            'start_line': line_number,
+            'end_line': lines[end_i][1] if isinstance(lines[end_i], tuple)
+            else line_number,
+            'start_i': current_index,
+            'end_i': end_i,
+            'clauses': clauses,
+        }
+
     def _process_if_statement_rich(self, line, line_number, lines, current_index):
         """Process IF statement using the rich block structure with clause information"""
 
@@ -2440,6 +2622,12 @@ class GridLangControlFlow:
                 if_block = block
                 break
 
+        if not if_block:
+            # Blocks running through a nested body (e.g. a constructor body)
+            # are not part of the top-level pre-scan, so derive the clause
+            # structure from the lines at hand.
+            if_block = self._scan_local_if_block(line, line_number,
+                                                 lines, current_index)
         if not if_block:
             return 1
 
