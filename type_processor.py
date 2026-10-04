@@ -76,6 +76,8 @@ class GridLangTypeProcessor:
             'computed_fields': {},
             'init_fields': set(),
             'default_fields': set(),
+            'declared_fields': set(),
+            'field_defaults': {},
             'constant_fields': set(),
         }
 
@@ -106,8 +108,45 @@ class GridLangTypeProcessor:
             )
             return
 
-        # Executable code inside type definition (strip leading colon if present)
-        state['executable_code'].append(line.lstrip(':').strip())
+# Executable code inside type definition (strip leading colon if present)
+        code_line = line.lstrip(':').strip()
+        self._record_type_body_default(state, code_line)
+        state['executable_code'].append(code_line)
+
+    def _record_type_body_default(self, state, code_line):
+        """Capture ``name ... or = <value>`` written as a bare body line.
+
+        A colon field declaration records its default through
+        :meth:`_record_type_field_definition`, but the keyword-less body form
+        (``grid not null or = 0``) is plain executable code. Record the default
+        here too so ``or =`` behaves identically whichever spelling is used, and
+        so the value does not have to be recovered from source later.
+
+        The compiler parser reads the declaration, so any other constraint may
+        accompany ``not null or = <value>`` (``rate as number >= 1 not null or =
+        3.5``) without this needing to understand them.
+        """
+        if not re.search(r'\bor\s*=', code_line, re.I):
+            return
+        parser = getattr(self.compiler, 'parser', None) if self.compiler else None
+        if parser is None or not hasattr(parser, '_parse_variable_def'):
+            return
+        # The parser rejects a line that starts with an instruction keyword, so
+        # drop the optional declaration keyword first: ``Let grid not null or =
+        # 0`` and ``grid not null or = 0`` must record the same default.
+        decl_line = re.sub(
+            r'^\s*(?:let|for|input|output|declare)\s+', '', code_line,
+            count=1, flags=re.I)
+        try:
+            name, _, constraints, _ = parser._parse_variable_def(
+                decl_line, 0)
+        except Exception:
+            return
+        default = (constraints or {}).get('default')
+        name = re.sub(r'^\$', '', str(name or '').strip()).lower()
+        if not name or not default or not name.isidentifier():
+            return
+        state['field_defaults'][name] = default
 
     def _parse_type_input_definition(self, line, stripped, line_number):
         """Parse a type constructor input declaration."""
@@ -200,6 +239,8 @@ class GridLangTypeProcessor:
                 _, parsed_type, parsed_constraints, _ = self.compiler._parse_variable_def(
                     field_line, line_number)
                 parsed_constraints = parsed_constraints or {}
+            except SyntaxError:
+                raise
             except Exception:
                 parsed_constraints = {}
         if parsed_type and 'type' not in parsed_constraints and 'type_union' not in parsed_constraints:
@@ -245,6 +286,11 @@ class GridLangTypeProcessor:
             if name.startswith('$'):
                 state['hidden_fields'].add(clean_name.lower())
             state['fields'][clean_name] = parsed_field['effective_type']
+            # Every ``:`` field is a field, whether or not it carries a default,
+            # an init value, or nothing at all (``: x``). The body arrives
+            # normalized to ``x = ...``, so this declaration record is the only
+            # thing that separates a field write from a bare LET.
+            state['declared_fields'].add(clean_name.lower())
             if parsed_field['parsed_constraints']:
                 state['field_constraints'][clean_name] = dict(
                     parsed_field['parsed_constraints'])
@@ -254,6 +300,8 @@ class GridLangTypeProcessor:
                 state['init_fields'].add(clean_name.lower())
                 if parsed_field['init_kind'] == 'or_default':
                     state['default_fields'].add(clean_name.lower())
+                    state['field_defaults'][clean_name.lower()] = (
+                        parsed_field['init_expr'])
         # Allow constructor-style assignments (e.g., ": x = in_x") to execute.
         if (re.search(r'^\$?[A-Za-z][\w_.]*\s*=', parsed_field['field_line']) and
                 'or =' not in lowered):
@@ -295,6 +343,10 @@ class GridLangTypeProcessor:
             fields['_init_fields'] = state['init_fields']
         if state['default_fields']:
             fields['_default_fields'] = state['default_fields']
+        if state['declared_fields']:
+            fields['_declared_fields'] = state['declared_fields']
+        if state['field_defaults']:
+            fields['_field_defaults'] = dict(state['field_defaults'])
         if state['constant_fields']:
             fields['_constant_fields'] = state['constant_fields']
         fields['_member_keys'] = {k.lower() for k in state['fields'].keys()
@@ -367,10 +419,12 @@ class GridLangTypeProcessor:
                     str(inferred_type).lower(), {}) or {}
             init_fields = set(type_def.get('_init_fields', set()))
             default_fields = set(type_def.get('_default_fields', set()))
+            declared_fields = set(type_def.get('_declared_fields', set()))
             self._push_type_fields_to_scope(value_dict)
             self._execute_type_block(
                 code_lines, value_dict, input_values, line_number, init_fields,
-                default_fields=default_fields)
+                default_fields=default_fields,
+                declared_fields=declared_fields)
         except Exception as e:
             raise
         finally:
@@ -449,10 +503,12 @@ class GridLangTypeProcessor:
             numbered, self.compiler.current_scope())
         self._sync_type_fields_from_scope(value_dict)
 
-    def _execute_type_block(self, code_lines, value_dict, input_values, line_number, init_fields=None, default_fields=None):
+    def _execute_type_block(self, code_lines, value_dict, input_values, line_number, init_fields=None, default_fields=None,
+                           declared_fields=None):
         """Entry point for a constructor/builder body."""
         init_fields = init_fields or set()
         default_fields = default_fields or set()
+        declared_fields = declared_fields or set()
         # Guards gate the whole body, exactly as in the shared block engine:
         # collect and evaluate them before the walk, and skip them below.
         numbered = self.compiler.control_flow._normalize_block_lines(
@@ -485,13 +541,13 @@ class GridLangTypeProcessor:
                     continue
             i = self._execute_type_statement(
                 code_lines, i, value_dict, input_values, line_number,
-                init_fields, default_fields)
+                init_fields, default_fields, declared_fields)
             if i is None:
                 return
         return
 
     def _execute_type_statement(self, code_lines, i, value_dict, input_values, line_number,
-                                init_fields=None, default_fields=None):
+                                init_fields=None, default_fields=None, declared_fields=None):
         """Execute one constructor-body statement, returning the next index.
 
         Field declarations and field writes go to the type interpreter. Every
@@ -649,7 +705,27 @@ class GridLangTypeProcessor:
                 i += 1
                 continue
             if '=' in stripped_line:
-                # Simple assignment inside constructor (e.g., x = in_x)
+                # A bare ``=`` in a body is a LET with the keyword left out, so
+                # it takes exactly the LET path: an already-declared target
+                # (instance field, or a name declared by For/Input/Output/an
+                # earlier LET) gets an equality constraint bound to it, and an
+                # undeclared one becomes a body-local.
+                #
+                # The one exception is a ``:`` field declaration. It reaches
+                # here already rewritten to ``x = 0`` -- the body arrives
+                # normalized -- so text alone cannot tell the two apart. The
+                # marker is the declaration itself (``_declared_fields``).
+                target_match = re.match(r'^\s*(\$?[\w_]+)', stripped_line)
+                target_name = (
+                    target_match.group(1).lstrip('$').lower()
+                    if target_match else '')
+                declared = declared_fields
+                if target_name not in declared:
+                    self._process_type_let_statement(
+                        f"let {stripped_line}", 'this', value_dict,
+                        line_number, input_values)
+                    i += 1
+                    continue
                 self._process_type_assignment(
                     stripped_line, value_dict, input_values, line_number, init_fields,
                     default_fields=default_fields)

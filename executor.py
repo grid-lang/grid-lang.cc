@@ -1303,6 +1303,9 @@ class GridLangExecutor(GridLangBase):
         except Exception:
             return False
         if expr is None:
+            if (constraints or {}).get('default') is not None:
+                return bool(self._bind_declared_var(
+                    var, type_name, constraints, expr, line_number))
             return False
         status = self._bind_declared_var(
             var, type_name, constraints, expr, line_number)
@@ -1572,6 +1575,28 @@ class GridLangExecutor(GridLangBase):
                 break
             passes += 1
 
+    def _is_state_affecting_statement(self, stripped):
+        """Whether a line can bind or mutate program state.
+
+        The dead-code filter in ``_prepare_main_loop_line`` may only drop a
+        line that reaches no requested output when dropping it cannot change
+        observable state. That holds for bare value-producing expressions and
+        nothing else, so every declaration, assignment and control statement
+        is treated as state-affecting regardless of which keyword carries it.
+        """
+        if not stripped:
+            return False
+        if stripped.startswith('['):
+            # A cell assignment or a cell declaration (``[A1]: value``).
+            return True
+        if '=' in stripped:
+            return True
+        if _first_keyword(stripped) in _STATEMENT_KEYWORDS:
+            return True
+        if self.control_flow._is_optional_let_line(stripped):
+            return True
+        return False
+
     def _prepare_main_loop_line(self, lines, i):
         """Prepare and pre-filter the current main-loop line."""
         # Resolve ready global declarations before INIT materialization so
@@ -1607,9 +1632,10 @@ class GridLangExecutor(GridLangBase):
             return {'action': 'continue', 'next_i': i + 1}
 
         node = self.dependency_graph['by_line'].get(line_number)
-        if node and self.needed_line_numbers and line_number not in self.needed_line_numbers:
-            if not stripped_lower.startswith(('let ', 'for ', 'if ', 'elseif', 'else', 'when ')):
-                return {'action': 'continue', 'next_i': i + 1}
+        if (node and self.needed_line_numbers
+                and line_number not in self.needed_line_numbers
+                and not self._is_state_affecting_statement(stripped)):
+            return {'action': 'continue', 'next_i': i + 1}
 
         return {
             'action': 'process',

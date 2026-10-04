@@ -1962,20 +1962,20 @@ class GridLangCompiler(GridLangExecutor):
                 if fill_value is not None:
                     grid_store['_default'] = fill_value
                 else:
-                    exec_code = type_def.get('_executable_code', [])
-                    for code_line in exec_code:
-                        or_match = re.match(
-                            r'^Let\s+grid\b.*\bor\s*=\s*(.+)$', code_line, re.I)
-                        if or_match:
-                            or_val = or_match.group(1).strip()
-                            if or_val.lower() == 'none':
-                                grid_store['_default'] = UNIVERSAL_ZERO
-                            else:
-                                try:
-                                    grid_store['_default'] = float(or_val)
-                                except (ValueError, TypeError):
-                                    pass
-                            break
+                    # ``or = <value>`` on the grid declares a null-default: the
+                    # cell is either not null, or reads as <value>. Read the
+                    # recorded per-name default instead of re-scanning the
+                    # constructor source
+                    or_val = (type_def.get('_field_defaults') or {}).get('grid')
+                    if or_val is not None:
+                        or_val = str(or_val).strip()
+                        if or_val.lower() == 'none':
+                            grid_store['_default'] = UNIVERSAL_ZERO
+                        else:
+                            try:
+                                grid_store['_default'] = float(or_val)
+                            except (ValueError, TypeError):
+                                pass
                 value_dict['grid'] = grid_store
             else:
                 shape = [end - start + 1 for start, end in raw_dims]
@@ -3681,16 +3681,26 @@ class GridLangCompiler(GridLangExecutor):
                 # block dependent lines.
                 return False
         scope = scope or self.current_scope()
+        # A dotted name is a member access on its base object, not a variable
+        # literally called "r.request": ``rq = r.request`` depends on ``r``.
+        # Without this every capability line (routes, replies, server methods)
+        # looks like it reads an undefined variable, so it is deferred to
+        # pending and never resolves once the request arrives.
+        lookup_name = name
+        if '.' in lookup_name and not scope.get_defining_scope(lookup_name):
+            base = lookup_name.split('.', 1)[0]
+            if scope.get_defining_scope(base):
+                lookup_name = base
         # Treat entirely undefined names as unresolved so dependent lines are deferred
-        if not scope.get_defining_scope(name):
+        if not scope.get_defining_scope(lookup_name):
             return True
         if normalized in self.undefined_dependencies:
             return True
-        if scope.is_uninitialized(name):
+        if scope.is_uninitialized(lookup_name):
             return True
-        if include_global_pending and name in self.pending_assignments:
+        if include_global_pending and lookup_name in self.pending_assignments:
             return True
-        if scope_pending and name in scope_pending:
+        if scope_pending and lookup_name in scope_pending:
             return True
         return False
 

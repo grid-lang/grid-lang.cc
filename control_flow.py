@@ -564,7 +564,7 @@ class GridLangControlFlow:
         """
         if not line_clean:
             return False
-        if re.search(r'\s+and\s+|\bthen\b', line_clean, re.I):
+        if re.search(r'\bthen\b', line_clean, re.I):
             return False
         first = re.match(r'^\s*(\$?[A-Za-z_][\w.]*)', line_clean)
         if not first:
@@ -1028,7 +1028,7 @@ class GridLangControlFlow:
 
     def _extract_rhs_vars(self, rhs):
         rhs_vars = set(re.findall(
-            r'\b[\w_]+\b(?=\s*(?:[\[\{]|!\w+\s*\(|(?:\.\w+)?\s*$))', rhs))
+            r'(?<![\w.])\b[\w_]+\b(?=\s*(?:[\[\{]|!\w+\s*\(|(?:\.\w+)?\s*$))', rhs))
         if '$"' in rhs:
             placeholders = re.findall(r'\{\s*([^}]*?)\s*\}', rhs)
             for ph in placeholders:
@@ -1055,6 +1055,32 @@ class GridLangControlFlow:
         }
         return rhs_vars
 
+    def _is_index_element_write(self, line, line_number):
+        """Whether a plain ``=`` line writes an element of an indexed array.
+
+        ``grid{2, 2} = 7``, ``grid![A1] = 1`` and ``grid(1) = 9`` are element
+        writes, not declarations, so they belong to the shared indexed-write
+        path (``_try_process_let_indexed_assignment``) whichever keyword
+        introduces them. Claiming them here instead left
+        ``_parse_assignment_target_details`` to reject them with "Invalid
+        assignment target" once the LET keyword was left out.
+
+        Returns False for cell targets (``[A1] := ...``) and for plain
+        identifiers, which stay this handler's business.
+        """
+        if ':=' in line or '=' not in line:
+            return False
+        target = line.split('=', 1)[0].strip()
+        if not target or target.startswith('['):
+            return False
+        scope_dict = self.compiler.current_scope().get_evaluation_scope()
+        try:
+            var_name, _ = self.compiler.expr_evaluator._parse_index_target(
+                target, scope_dict, line_number)
+        except Exception:
+            return False
+        return var_name is not None
+
     def _handle_block_cell_binding_or_assignment(self, block_pending, i, line, line_number, line_clean):
         if re.match(r'^\[\s*\^?[A-Za-z]+\d+\s*\]\s*:\s*', line) and '=' in line and ':=' not in line:
             try:
@@ -1071,6 +1097,7 @@ class GridLangControlFlow:
                 'if ', 'for ', 'when ', 'let ', 'output ', 'input ', 'define ', 'return ', 'push ', 'print '))
             and not line.strip().startswith(': ')
             and not re.match(r'^\[\s*\^?[A-Za-z]+\d+\s*\]\s*:\s*', line)
+            and not self._is_index_element_write(line, line_number)
         )):
             return False, i
         if ':=' in line:

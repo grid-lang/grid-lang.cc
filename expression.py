@@ -1459,6 +1459,18 @@ class ExpressionEvaluator:
             candidates = []
             if obj_type:
                 candidates.append(f"{obj_type}.{method_name}".lower())
+            # Engine handles (``net!request``, ``net!route``, ...) register
+            # their builtins under the handle type, so ``rq.Reply(...)`` has
+            # to be looked up as ``net!request.reply``. Without this the
+            # candidate list held only the bare method name, no builtin
+            # matched, and the call fell through to the Python fallback.
+            handle_type = (
+                obj_value.get('_handle_type')
+                if isinstance(obj_value, dict) else None)
+            if handle_type:
+                qualified = f"{handle_type}.{method_name}".lower()
+                if qualified not in candidates:
+                    candidates.append(qualified)
             candidates.append(method_name.lower())
             if isinstance(obj_value, str) and f"text.{method_name}".lower() not in candidates:
                 candidates.append(f"text.{method_name}".lower())
