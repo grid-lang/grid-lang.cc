@@ -108,8 +108,11 @@ class GridLangTypeProcessor:
             )
             return
 
-# Executable code inside type definition (strip leading colon if present)
-        code_line = line.lstrip(':').strip()
+        # Executable code inside a type definition. Only one leading colon is
+        # dropped here: ``::`` and field markers are resolved by the statement
+        # splitter before the body is collected, so anything left is the
+        # separator ahead of a code statement, not a field declaration.
+        code_line = line[1:].strip() if line.startswith(':') else line.strip()
         self._record_type_body_default(state, code_line)
         state['executable_code'].append(code_line)
 

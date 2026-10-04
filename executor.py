@@ -1894,6 +1894,30 @@ class GridLangExecutor(GridLangBase):
             return value
         return self.array_handler.materialize_list_array(value)
 
+    def _existing_member_field(self, var):
+        """Return ``(root, field)`` when ``var`` already names a live field.
+
+        ``a.top = 3`` is a LET, so it binds a name rather than writing a
+        field. When ``a`` is an object that already exposes ``top``, ``a.top``
+        is resolvable and so is not a new variable name: the LET would declare
+        a second, unrelated variable literally called ``a.top`` and the field
+        write would be silently dropped. Push is the instruction that mutates
+        an existing field.
+        """
+        if '.' not in (var or ''):
+            return None, None
+        path = [part.strip() for part in var.split('.') if part.strip()]
+        if len(path) < 2:
+            return None, None
+        value = self.current_scope().get(path[0])
+        for part in path[1:-1]:
+            if not isinstance(value, dict) or part not in value:
+                return None, None
+            value = value[part]
+        if not isinstance(value, dict) or path[-1] not in value:
+            return None, None
+        return path[0], path[-1]
+
     def _bind_declared_var(
             self,
             var,
@@ -1969,6 +1993,10 @@ class GridLangExecutor(GridLangBase):
             if shadow_keyword and self.current_scope().is_shadowed(var):
                 print(
                     f"Warning: {shadow_keyword} defines '{var}' which shadows a variable in an outer scope at line {line_number}")
+            member_root, member_field = self._existing_member_field(var)
+            if shadow_keyword and member_root:
+                print(
+                    f"Warning: {shadow_keyword} defines '{var}' which shadows a member field of '{member_root}' at line {line_number}")
             define_scope.define(
                 var, None, type_name, constraints, is_uninitialized=True,
                 line_number=line_number)

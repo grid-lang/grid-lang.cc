@@ -34,6 +34,18 @@ def _strip_meta(value):
     return value
 
 
+def _is_unset_marker(value):
+    """True for ``#N/A``, the language's "not available" marker.
+
+    An unset variable holds ``#N/A``. It is a sticky error like any other, but
+    it is the one error that means "absent" rather than "failed", so ``null``
+    and ``not_null`` still have to judge it.
+    """
+    if value == NA_ERROR:
+        return True
+    return isinstance(value, UnitValue) and value.error_code == NA_ERROR
+
+
 class _GridStore(dict):
     """The single grid backing store, held as the predefined ``grid`` variable.
 
@@ -719,7 +731,7 @@ class Scope:
                     except ConstraintError as exc:
                         value = exc.code
                         runtime_unit = None
-                if not is_error_value(value):
+                if not is_error_value(value) or _is_unset_marker(value):
                     try:
                         defining_scope._check_constraints(actual_key, value, line_number)
                     except ConstraintError as exc:
@@ -749,7 +761,7 @@ class Scope:
                     name, value, defining_scope.constraints.get(name, {}), line_number)
                 value = self._coerce_universal_zero(
                     value, defining_scope.types.get(name))
-                if not is_error_value(value):
+                if not is_error_value(value) or _is_unset_marker(value):
                     try:
                         defining_scope._check_constraints(name, value, line_number)
                     except ConstraintError as exc:
@@ -1060,9 +1072,10 @@ class Scope:
         if hasattr(self, 'compiler') and hasattr(self.compiler, 'types_defined') and var_type in self.compiler.types_defined:
             return
         constraints = self.constraints.get(type_key, {}) or {}
-        if constraints.get('input') or constraints.get('output'):
-            # Inputs/outputs are validated by their own 'type' constraint or
-            # left loosely typed (untyped OUTPUT defaults to 'text').
+        if constraints.get('input'):
+            # Inputs arrive from the command line or the user as text and are
+            # converted to the declared type at intake, so anything still raw
+            # here has not been through that path yet.
             return
         if isinstance(value, (list, tuple, dict)):
             if constraints.get('dim'):
@@ -1090,10 +1103,36 @@ class Scope:
                 TYPE_ERROR,
                 f"'{name}' must be logical, got {actual_type} at line {line_number}")
 
+    def _check_null_constraints(self, name, constraints, value,
+                                line_number=None):
+        """Judge ``null``/``not_null`` for a value that skipped validation.
+
+        ``#N/A`` is the language's "not available" marker -- what an unset
+        variable holds -- rather than a sticky failure, so ``null`` matches it
+        and ``not_null`` forbids it. Every other error code keeps bypassing
+        validation so the original cause survives instead of being masked.
+        """
+        if constraints.get('not_null') and is_error_value(value):
+            raise ConstraintError(
+                VALUE_ERROR,
+                f"'{name}' must not be null at line {line_number}")
+        if constraints.get('null') and not is_error_value(value):
+            raise ConstraintError(
+                VALUE_ERROR,
+                f"'{name}' must be null at line {line_number}")
+
     def _check_constraints(self, name, value, line_number=None):
         # Case-insensitive constraint lookup
         if is_error_value(value):
-            # A sticky error bypasses all constraint/type validation.
+            # A sticky error bypasses all constraint/type validation, except
+            # that #N/A still has to answer null/not_null.
+            actual_key = self._get_case_insensitive_key(name, self.constraints)
+            key_for_constraints = actual_key if actual_key is not None else name
+            if _is_unset_marker(value):
+                self._check_null_constraints(
+                    key_for_constraints,
+                    self.constraints.get(key_for_constraints, {}),
+                    value, line_number)
             return
         actual_key = self._get_case_insensitive_key(name, self.constraints)
         key_for_constraints = actual_key if actual_key is not None else name

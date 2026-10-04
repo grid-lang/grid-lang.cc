@@ -997,6 +997,14 @@ class GridLangCompiler(GridLangExecutor):
         scope = info.get('scope')
         if not caller or not binding:
             return
+        # An error Push to a live output with an ``or =`` default falls back to
+        # that default, same as a non-live output. Nothing is published unless
+        # something is actually pushed: an output that is never pushed leaves
+        # the caller's binding alone rather than seeding it with the default.
+        fallback = self._output_default_fallback(
+            out_name, value, self.current_scope())
+        if fallback is not None:
+            value = fallback
         saved = getattr(self, '_live_write_through', None)
         was_suppressed = getattr(self, '_suppress_live_notify', False)
         self._live_write_through = {'scope': scope, 'binding': binding.lower()}
@@ -1160,7 +1168,9 @@ class GridLangCompiler(GridLangExecutor):
                             outputs.extend(names)
                             for name in names:
                                 signature.append(
-                                    {'name': name, 'kind': 'output', 'live': b_live})
+                                    {'name': name, 'kind': 'output', 'live': b_live,
+                                     'constraints': dict(parsed_constraints or {}),
+                                     'type': parsed_type})
                                 if b_live:
                                     live_outputs.append(name)
                 self._reject_output_reads(
@@ -2427,6 +2437,18 @@ class GridLangCompiler(GridLangExecutor):
         except NameError:
             scope.define(target, simple_value)
 
+    def _signature_default(self, sp_def, out_name):
+        """Return the ``or =`` default declared for an output slot, if any."""
+        for entry in (sp_def.get('signature') or []):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get('kind') != 'output':
+                continue
+            if str(entry.get('name', '')).lower() != str(out_name).lower():
+                continue
+            return (entry.get('constraints') or {}).get('default')
+        return None
+
     def _apply_subprocess_outputs(self, sp_def, output_values, output_bindings, caller_scope=None, line_number=None):
         """Map subprocess output variables to caller-provided bindings."""
         if not output_bindings or not sp_def.get('outputs'):
@@ -2441,6 +2463,21 @@ class GridLangCompiler(GridLangExecutor):
                 continue
             out_key = out_name.lower()
             if out_key not in outputs:
+                # Nothing was pushed for this output. An ``or =`` default still
+                # describes the value: the output is either not null or bound to
+                # the default, so the caller gets the default rather than an
+                # unbound slot. Without one it stays untouched (#N/A).
+                default_expr = self._signature_default(
+                    sp_def, out_name)
+                if default_expr is not None:
+                    try:
+                        fallback = self.expr_evaluator.eval_expr(
+                            str(default_expr), scope.get_evaluation_scope())
+                    except Exception:
+                        fallback = None
+                    if fallback is not None:
+                        self._apply_single_binding(
+                            binding, fallback, scope, line_number=line_number)
                 continue
             self._apply_single_binding(
                 binding, outputs.get(out_key), scope, line_number=line_number)
@@ -4014,6 +4051,147 @@ class GridLangCompiler(GridLangExecutor):
         else:
             self._module_export_bindings = {}
 
+    def _split_statement_separators(self, code):
+        """Split source into statements on ``:`` / ``::`` separators.
+
+        A colon separates two statements exactly where a newline would, so it
+        never leads a line -- a leading ``:`` is the field-declaration marker
+        instead. ``::`` between two statements marks the statement that follows
+        it as a field declaration, which is how fields are declared on a single
+        line::
+
+            Define Point as Type :: x as number :: y as number : End Point
+
+        Separators are recognised only at bracket/brace depth 0, outside strings
+        and before any comment. ``:=`` stays an assignment, a colon inside
+        ``[...]`` stays a range (``[A1:B2] := 1``), a colon inside ``{...}``
+        stays a named-dimension label (``dim {Dept: *, Quarter: 4}``), and a
+        colon directly after ``]`` stays the labelled-cell form
+        (``[A1] : a = 51``).
+
+        Consecutive separators collapse: once a line has been split, a colon
+        starting the next statement is leftover punctuation and is dropped, so
+        ``:`` only ever separates and ``::`` only ever declares. A ``::`` that
+        has no statement in front of it is not a separator either and is left
+        for the type parser to reject.
+
+        Returns ``(text, line_number)`` pairs; statements split from one source
+        line all report that line's number so diagnostics stay accurate.
+        """
+        statements = []
+        for line_number, raw in enumerate(code.strip().splitlines(), start=1):
+            statements.extend(self._split_statement_line(raw, line_number))
+        return statements
+
+    def _split_statement_line(self, raw, line_number):
+        """Split one source line into ``(text, line_number)`` statements."""
+        parts = []
+        buf = []
+        field_next = False
+        depth = 0
+        brace = 0
+        in_string = False
+        # Scoped to the statement being built, not the line: a separator needs a
+        # statement in front of it, so a leading ':' or '::' is left alone.
+        buf_code = False
+        after_bracket = False
+        i = 0
+        n = len(raw)
+        while i < n:
+            ch = raw[i]
+            nxt = raw[i + 1] if i + 1 < n else ''
+            if in_string:
+                buf.append(ch)
+                if ch == '\\' and nxt:
+                    buf.append(nxt)
+                    i += 2
+                    continue
+                if ch == '"':
+                    in_string = False
+                i += 1
+                continue
+            if ch == '"':
+                in_string = True
+                after_bracket = False
+                buf.append(ch)
+                buf_code = True
+                i += 1
+                continue
+            if ch == "'":
+                break
+            if ch == '[':
+                depth += 1
+                after_bracket = False
+                buf.append(ch)
+                buf_code = True
+                i += 1
+                continue
+            if ch == '{':
+                brace += 1
+                after_bracket = False
+                buf.append(ch)
+                buf_code = True
+                i += 1
+                continue
+            if ch == '}':
+                brace = max(0, brace - 1)
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == ']':
+                depth = max(0, depth - 1)
+                after_bracket = True
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == ':' and not depth and not brace:
+                if nxt == '=':
+                    buf.append(ch)
+                    buf.append(nxt)
+                    i += 2
+                    continue
+                if nxt == ':':
+                    if buf_code:
+                        parts.append((''.join(buf), field_next))
+                        buf = []
+                        buf_code = False
+                        field_next = True
+                    else:
+                        # '::' leads the line, so it sits between no two
+                        # statements; leave it for the type parser to reject.
+                        buf.append(ch)
+                        buf.append(nxt)
+                    i += 2
+                    continue
+                if buf_code and not after_bracket:
+                    parts.append((''.join(buf), field_next))
+                    buf = []
+                    buf_code = False
+                    field_next = False
+                    i += 1
+                    continue
+            if not ch.isspace():
+                buf_code = True
+                after_bracket = False
+            buf.append(ch)
+            i += 1
+        parts.append((''.join(buf), field_next))
+
+        statements = []
+        for index, (text, is_field) in enumerate(parts):
+            text = text.strip()
+            if index:
+                # Past the first statement on a line, a leading colon is
+                # separator punctuation left over from splitting, not a field
+                # marker: ':' only ever separates and '::' only ever declares.
+                # The first statement keeps its colon, which is the
+                # line-leading field marker (': x as number').
+                text = text.lstrip(':').strip()
+            if not text:
+                continue
+            statements.append((':' + text if is_field else text, line_number))
+        return statements
+
     def _preprocess_code(self, code):
 
         if not hasattr(self, '_program_defined_names'):
@@ -4037,8 +4215,7 @@ class GridLangCompiler(GridLangExecutor):
         continuation_line = ""
         in_continuation = False
 
-        for line in code.strip().splitlines():
-            line_number += 1
+        for line, line_number in self._split_statement_separators(code):
             s = line.rstrip()
 
 
@@ -5142,6 +5319,16 @@ class GridLangCompiler(GridLangExecutor):
             elif is_end and depth > 0:
                 depth -= 1
 
+        # A top-level Output is a destination, never an input: reading one is a
+        # compile error. The caller's own variable that receives a subprocess's
+        # output is an ordinary variable and stays readable -- what is rejected
+        # is reading a name this scope declared as an Output.
+        top_level_outputs = sorted(
+            getattr(self.current_scope(), 'output_variables', None) or ())
+        if top_level_outputs:
+            self._reject_output_reads(
+                top_level_outputs, list(lines), 'this program')
+
         for line, line_number in label_lines:
             self._process_label_assignment(line, line_number)
         for line, line_number in lines:
@@ -5235,12 +5422,12 @@ class GridLangCompiler(GridLangExecutor):
             self._collect_require_declaration(line, line_number)
             return
 
-        # Handle INPUT and OUTPUT declarations that don't start with ':'
         line_stripped = line.lstrip()
-        if line_stripped.lower().startswith(("input ", "output ")):
-            a = line_stripped.strip()
-        else:
+        colon_prefixed = line_stripped.startswith(':')
+        if colon_prefixed:
             a = line_stripped[1:].strip()
+        else:
+            a = line_stripped.strip()
 
         parsed = None
 
@@ -5251,7 +5438,7 @@ class GridLangCompiler(GridLangExecutor):
                 f"Self-referential assignment '{m_self.group(1)} = {m_self.group(1)}' at line {line_number}")
 
         # Handle INPUT declarations
-        if a.lower().startswith('input '):
+        if not colon_prefixed and a.lower().startswith('input '):
             var, type_name, constraints, expr = self.parser._parse_variable_def(
                 a, line_number)
             constraints = constraints or {}
@@ -5266,7 +5453,7 @@ class GridLangCompiler(GridLangExecutor):
             return
 
         # Handle OUTPUT declarations
-        m_output = re.match(
+        m_output = None if colon_prefixed else re.match(
             r'^OUTPUT\s+(.+)$', a, re.I | re.S)
         if m_output:
             def_str = m_output.group(1).strip()
@@ -5277,7 +5464,7 @@ class GridLangCompiler(GridLangExecutor):
             if expr is not None and 'init' not in constraints:
                 constraints['init'] = expr
                 expr = None
-            parsed = (var, type_name or 'text', constraints, expr)
+            parsed = (var, type_name, constraints, expr)
 
         if parsed:
             var, type_name, constraints, expr = parsed
@@ -6021,6 +6208,84 @@ class GridLangCompiler(GridLangExecutor):
             if mapped_var.lower() == var_lower:
                 self._spill_value_to_cells(cell, value, None)
 
+    def _find_output_declaration(self, var_name, global_scope):
+        """Locate the scope and key that declare ``var_name``."""
+        scope = global_scope
+        while scope is not None:
+            key = scope._get_case_insensitive_key(var_name, scope.constraints)
+            if key:
+                return scope, key
+            scope = getattr(scope, 'parent', None)
+        return None, None
+
+    def _value_satisfies_declaration(self, defining_scope, key, value):
+        """True when ``value`` is acceptable for a declaration, else False.
+
+        The question is put to the same validators a normal assignment uses,
+        so ``or =`` can never drift from what an assignment actually accepts:
+        ``range``, ``in``, ``<=``, ``type``, ``not_null`` and the rest are
+        covered because they are the ones that raise.
+
+        ``Scope._check_constraints`` deliberately skips the base-type check
+        for outputs -- an Output carries its type in ``types`` rather than a
+        ``type`` constraint -- so the declared base type is compared here
+        using the same ``infer_type`` that skipped check relies on.
+        """
+        if is_error_value(value):
+            return False
+        constraints = defining_scope.constraints.get(key) or {}
+        try:
+            if constraints.get('dim'):
+                self.array_handler.check_dimension_constraints(key, value, None)
+            defining_scope._check_constraints(key, value, None)
+        except ConstraintError:
+            return False
+        except Exception:
+            # A validator that could not run has not disproved the value, so
+            # keep it rather than discarding a good push.
+            return True
+        if constraints.get('dim'):
+            return True
+        type_key = defining_scope._get_case_insensitive_key(
+            key, defining_scope.types)
+        declared = defining_scope.types.get(type_key) if type_key else None
+        if declared not in ('number', 'text', 'logical'):
+            return True
+        actual = self.array_handler.infer_type(value, None)
+        if declared == 'number':
+            return actual in ('number', 'float64', 'int', 'int64')
+        if declared == 'text':
+            return actual in ('string', 'text')
+        # infer_type classifies bool as 'int', so test the Python type.
+        return isinstance(value, bool)
+
+    def _output_default_fallback(self, var_name, value, global_scope):
+        """Return an output's ``or =`` default when a pushed value can't stand.
+
+        ``or =`` means the value is either valid or bound to the default, so a
+        Push that is an error (``#N/A`` from an unset cell) or that the
+        declaration rejects falls back to the default instead of propagating:
+
+            Output res as number or = 7
+            Push res = "wrong"     ->  res: 7
+
+        Returns None when there is no default, leaving the pushed value alone.
+        """
+        defining_scope, key = self._find_output_declaration(
+            var_name, global_scope)
+        if defining_scope is None:
+            return None
+        default_expr = (defining_scope.constraints.get(key) or {}).get('default')
+        if default_expr is None:
+            return None
+        if self._value_satisfies_declaration(defining_scope, key, value):
+            return None
+        try:
+            return self.expr_evaluator.eval_expr(
+                str(default_expr), global_scope.get_evaluation_scope())
+        except Exception:
+            return None
+
     def _record_output_value(self, var_name, value):
         """Record values for declared output variables."""
         if value is None:
@@ -6033,6 +6298,11 @@ class GridLangCompiler(GridLangExecutor):
             value = list(value['array'])
         elif is_sparse_array(value):
             value = [value[k] for k in sorted(value.keys())]
+        else:
+            fallback = self._output_default_fallback(
+                var_key, value, global_scope)
+            if fallback is not None:
+                value = fallback
         # Keep the unit attached so function/subprocess outputs retain it when
         # they are returned to a caller (grid writes strip it instead).
         if is_error_value(value):
