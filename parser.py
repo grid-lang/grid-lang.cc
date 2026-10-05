@@ -14,6 +14,23 @@ class GridLangParser:
     def __init__(self, compiler=None):
         self.compiler = compiler
 
+    @staticmethod
+    def _literal_token_value(token):
+        """Type an unquoted set-literal token the way the evaluator would.
+
+        A set constraint is written as source text, so `{1,2}` arrives as the
+        strings '1' and '2'. Comparing those against a number never matches,
+        so numeric and boolean tokens are converted here and everything else
+        is left as text.
+        """
+        if re.match(r'^[+-]?\d+$', token):
+            return int(token)
+        if re.match(r'^[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?$', token):
+            return float(token)
+        if token.lower() in ('true', 'false'):
+            return token.lower() == 'true'
+        return token
+
     def _parse_variable_def(self, def_str, line_number):
         # Allow leading ':' in global declarations
         def_str = def_str.lstrip(':').strip()
@@ -142,8 +159,10 @@ class GridLangParser:
                             continue
                         if (v_clean.startswith('"') and v_clean.endswith('"')) or (
                                 v_clean.startswith("'") and v_clean.endswith("'")):
-                            v_clean = v_clean[1:-1]
-                        values.append(v_clean)
+                            # Quoted: text by definition.
+                            values.append(v_clean[1:-1])
+                            continue
+                        values.append(self._literal_token_value(v_clean))
                     constraints['in'] = values
                 elif ' to ' in next_part:
                     range_parts = next_part.split(' to ', 1)

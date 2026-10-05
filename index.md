@@ -458,7 +458,7 @@ grants, request/response, `ReadAll`/`Reply`).
 > connection/server concerns; consolidating them would make the resource
 > layer a single, auditable unit.
 
-### `test_runner.py` (3327 lines) — inline test suite
+### `test_runner.py` (3368 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — runs 525 tests (Tests 282–293 unit tests, Tests 331–349 push/cell-mirror/subprocess semantics, Tests 350–357d resource/`Require`/grant semantics, Tests 385–405b module/`use`/instance-state/dotted-Require/ModuleVersion/runnable-module-run/unknown-call/init-never-fires-on-import semantics, Tests 452–465 live pipes + user-function vectorization/element-access, Tests 479–488 Net LISTEN/server routing + `ReadAll`/`Reply` semantics via the fake listener transport). At the bottom of the file it runs itself when executed directly:
 `python test_runner.py [names...]`. Failing names are printed.
 
