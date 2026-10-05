@@ -250,6 +250,50 @@ whose signature contains at least one live slot.
   not-yet-initialized source is skipped until it resolves.
 - Live output targets must be variables holding a target (a cell reference or
   a valid assignment target), because the callee writes straight into them.
+- A live `Output` requires a live `Input` in the same signature. The live input
+  is the only thing that reads the caller's variable back, so a live output with
+  no live input has no reader: the callee cannot observe the effect of its own
+  output, and the caller gets nothing a plain `Output` bound to the same
+  variable would not give — while giving up the per-push history a plain output
+  keeps. Declaring one without the other is a compile error.
+
+The idiomatic use is a live output that does **not** depend on a live input: the
+callee streams values out, and a live input re-reads the caller's state
+independently.
+
+```
+Define Spill as Subprocess
+  Input y as number live
+  Output x as number live
+  Output res as number
+  Push x = 7          'x does not read y
+  Push res = y + 5    'res is computed from the caller's state
+End Spill
+: t as number
+: r as number
+Spill(t + 5, t, r)   'y = t + 5, a plain function of caller state
+```
+
+**Advanced: a live output that depends on a live input forms a feedback loop**,
+and the loop has to be seeded or it never starts. When the live input is written
+as a function of the live output's target, every value in the chain starts as
+`#N/A`, so each push publishes an error and nothing propagates:
+
+```
+Define Feed as Subprocess
+  Input y as number live
+  Output out init 3 live   'seed: from inside the sub
+  Push out = y + 1         'y = target + 1, a function of out's target
+End Feed
+: target as number
+Feed(target + 1, target)   'target is #N/A until the first push lands
+```
+
+Seed it from **inside** the sub with `init` on the live output (as above), or
+from **outside** by seeding the live input's source variable before the call. Once
+seeded, each push updates the target and every live input is re-evaluated
+against the new value before the next statement, so the sequence advances one
+step per push.
 
 Used together, live pipes give callbacks: a function can emit candidate values
 through live outputs while a live input re-runs a predicate the caller supplied

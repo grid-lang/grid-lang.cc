@@ -123,7 +123,7 @@ no duplication to keep in sync across two live objects anymore.
   `1` is special: `UnitValue._is_one`, `__mul__` treats `1` as unitless, `_divide` `m/1→m` `m/m→1`, `__pow__` allows exponent `1`.
 - `UnitValue` overloads: `+`/`-` same unit or one side unitless; `*` with `1`; `/`/`\`/`mod` with `1`; `^` with `1`.
 
-### `compiler.py` (6607 lines) — state + orchestration, public API
+### `compiler.py` (6636 lines) — state + orchestration, public API
 `class GridLangCompiler` is the engine's **state holder and public surface**. It
 is the only class `main.py` constructs. It inherits the runtime loop from
 `GridLangExecutor` and holds nearly all persistent state created in `__init__`:
@@ -150,21 +150,21 @@ Notable methods:
 - `run` (823): engine entry — `_reset_state()` then delegates to the inherited
   runtime pipeline (no executor handoff).
 - `current_scope`/`push_scope`/`pop_scope` (310/325/331).
-- `_seed_grid_variable` (3744): predefines `grid` in the global scope as a
+- `_seed_grid_variable` (3770): predefines `grid` in the global scope as a
   `_GridStore` (sparse array keyed by 0-based `(row,col)` tuples; aliased as
   `self.grid`), so `grid{row, col}` works at top level. Skipped inside
   read-only function sub-compilers.
 - UnitSource: `_parse_unit_source_header` (295) / `_finalize_unit_source` (309) / `_register_convert_line` (344) / `_infer_convert_target_unit` (262, evaluates RHS with stripped var, falls back to declared units) / `_materialize_unit_source_constants` (451) / `_register_top_level_converts` (445).
-- `_extract_functions` (1054): pulls `Function`/`Subprocess` defs out of the
+- `_extract_functions` (1077): pulls `Function`/`Subprocess` defs out of the
   main code and registers them.
-- `_instantiate_type` (1604), `_evaluate_with_value` (2012), `_apply_with_clause`
+- `_instantiate_type` (1630), `_evaluate_with_value` (2038), `_apply_with_clause`
   (1246): type/`with` object construction; now handles `:` field unit conversion.
-- `call_subprocess` (2485): runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (4717), `_process_declarations_and_labels` (5241),
-  `_collect_global_declarations` (5415): top-level statement handling; now handles `of 1` and `"ox" of animal`.
-- `export_to_csv` (6394): `--debug` CSV export (grid as matrix, or outputs as
+- `call_subprocess` (2511): runs a sub-`GridLangCompiler` in isolation.
+- `_process_grid_assignment` (4743), `_process_declarations_and_labels` (5270),
+  `_collect_global_declarations` (5444): top-level statement handling; now handles `of 1` and `"ox" of animal`.
+- `export_to_csv` (6423): `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
-- `set_input_values` (6417): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
+- `set_input_values` (6446): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
 - `_seed_globals` (1670): for sub-compilers; **skips redefining `grid`**.
 
 Also defines `SubprocessResult` (37): result container exposing `grid`,
@@ -357,7 +357,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   - Scoping: `is_shadowed` (946), `get_evaluation_scope` (954),
     `get_full_scope` (1395), `_coerce_custom_type_value` (264).
 - `class _GridStore` (49): dict backing `compiler.grid`; every cell write
-  calls `compiler._notify_cell_changed` (compiler.py:3484). (The old
+  calls `compiler._notify_cell_changed` (compiler.py:3510). (The old
   `_ListenerGrid`/`GridLiveView` classes were removed — `_GridStore` is the
   single grid store, keyed by 0-based index tuples.)
 - `_ACTIVE_RUNNERS` (22): stack of executing compilers; used with the
@@ -458,7 +458,7 @@ grants, request/response, `ReadAll`/`Reply`).
 > connection/server concerns; consolidating them would make the resource
 > layer a single, auditable unit.
 
-### `test_runner.py` (3319 lines) — inline test suite
+### `test_runner.py` (3327 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — runs 525 tests (Tests 282–293 unit tests, Tests 331–349 push/cell-mirror/subprocess semantics, Tests 350–357d resource/`Require`/grant semantics, Tests 385–405b module/`use`/instance-state/dotted-Require/ModuleVersion/runnable-module-run/unknown-call/init-never-fires-on-import semantics, Tests 452–465 live pipes + user-function vectorization/element-access, Tests 479–488 Net LISTEN/server routing + `ReadAll`/`Reply` semantics via the fake listener transport). At the bottom of the file it runs itself when executed directly:
 `python test_runner.py [names...]`. Failing names are printed.
 
@@ -631,7 +631,7 @@ grants, request/response, `ReadAll`/`Reply`).
   grant is resolved by `permissions.RequirementResolver` (executor.py:4811)
   and binds `grant_map`/`bindings` in scope. Resources are **declarations
   only**: `register_resource` (builtin_functions.py:116) seeds the returned
-  metadata into `RESOURCES`; `_seed_predefined_resources` (compiler.py:3763)
+  metadata into `RESOURCES`; `_seed_predefined_resources` (compiler.py:3789)
   copies it into `self.types_defined` once per engine, **surviving per-run
   resets** (`_reset_state`) like type definitions. Handle types (`Timer`,
   `Counter`) are declared with `register_handle` (builtin_functions.py:178),

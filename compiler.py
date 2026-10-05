@@ -1016,6 +1016,24 @@ class GridLangCompiler(GridLangExecutor):
             self._live_write_through = saved
             self._suppress_live_notify = was_suppressed
 
+    def _check_live_signature(self, live_inputs, live_outputs,
+                              callable_name, line_number):
+        """Reject a live Output that has no live Input to pair with.
+
+        A live Output writes straight into the caller's variable, and a live
+        Input is the only thing that reads it back: the caller's variable is
+        re-evaluated in the caller's scope before each callee statement. With
+        no live Input the write has no reader, so the callee cannot observe the
+        effect of its own output and the caller gains nothing that a plain
+        Output bound to the same variable would not give -- while giving up the
+        index-keyed history a plain Output keeps. Pair the two, or drop 'live'.
+        """
+        if live_outputs and not live_inputs:
+            raise SyntaxError(
+                f"Output '{live_outputs[0]}' of {callable_name} is live but "
+                f"{callable_name} has no live Input to read it back; add "
+                f"'Input ... live' or drop 'live' at line {line_number}")
+
     def _reject_output_reads(self, outputs, body_lines, callable_name):
         """An Output is a destination, never an input.
 
@@ -1043,7 +1061,12 @@ class GridLangCompiler(GridLangExecutor):
             destination = re.match(
                 r'^\s*push\s+([A-Za-z_]\w*)\b', cleaned, re.I)
             if destination and destination.group(1).lower() in outs:
-                continue
+                # Writing to an Output is its purpose, so the destination is
+                # not a read. Blank out just that name and keep scanning the
+                # line: the expression may read a different Output.
+                start, end = destination.span(1)
+                cleaned = (cleaned[:start] + ' ' * (end - start)
+                           + cleaned[end:])
             for name in re.findall(r'(?<![\w.!])[A-Za-z_]\w*', cleaned):
                 if name.lower() in outs:
                     raise SyntaxError(
@@ -1176,6 +1199,9 @@ class GridLangCompiler(GridLangExecutor):
                 self._reject_output_reads(
                     outputs, list(zip(body_lines, body_line_numbers)),
                     func_name)
+                self._check_live_signature(
+                    live_inputs, live_outputs,
+                    f"{def_kind.capitalize()} '{func_name}'", line_number)
                 func_code = "\n".join(sanitized_body_lines)
                 code_lines = [ln for ln in sanitized_body_lines
                               if not ln.strip().lower().startswith(('input ', 'output '))]
@@ -5137,6 +5163,9 @@ class GridLangCompiler(GridLangExecutor):
         self._reject_output_reads(
             outputs, [(text, line_number)
                       for text in (body or '').splitlines()], module_name)
+        self._check_live_signature(
+            live_inputs, live_outputs, f"Subprocess '{module_name}'",
+            line_number)
         entry = {
             'name': module_name,
             'code': body,
