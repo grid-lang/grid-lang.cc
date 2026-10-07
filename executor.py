@@ -10,7 +10,7 @@ from control_flow import GridLangControlFlow
 from parser import GridLangParser
 from units import VALUE_ERROR, TYPE_ERROR, ConstraintError, error_value, is_error_value
 from utils import col_to_num, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array, strip_array_cell_indices, is_wildcard_address
-from grid_lang_common import GridLangBase, _STATEMENT_KEYWORDS, _first_keyword, _DEPENDENCY_IGNORED_TOKENS, _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens, resolve_text_constant_token, mask_text_constant_tokens, match_push_assignment, unpack_push_assignment, match_return_statement
+from grid_lang_common import GridLangBase, _STATEMENT_KEYWORDS, _first_keyword, _DEPENDENCY_IGNORED_TOKENS, _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens, resolve_text_constant_token, mask_text_constant_tokens, match_push_assignment, unpack_push_assignment, match_return_statement, is_definition_body_error
 DEPENDENCY_IGNORED_TOKENS = _DEPENDENCY_IGNORED_TOKENS
 
 IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z][A-Za-z0-9_.]*')
@@ -1489,6 +1489,10 @@ class GridLangExecutor(GridLangBase):
 
     def _attempt_resolve_pending_var(self, var_name, trigger_line):
         """Try to resolve a global pending assignment for a specific variable."""
+        if var_name.startswith('__line_') or var_name.startswith('__if_line_'):
+            # A deferred statement, not a variable assignment: its "expr" is a
+            # whole line, and it is retried by the deferred-statement passes.
+            return False
         if var_name not in self.pending_assignments:
             return False
         assignment = self.pending_assignments[var_name]
@@ -1522,7 +1526,18 @@ class GridLangExecutor(GridLangBase):
             defining_scope.update(var_name, value, assign_line)
             del self.pending_assignments[var_name]
             return True
-        except Exception as e:
+        except ValueError as e:
+            if is_definition_body_error(e):
+                raise RuntimeError(
+                    f"Error resolving pending '{var_name}' from '{expr}': {e} "
+                    f"at line {assign_line}")
+            # Not satisfiable right now; leave it pending for a later pass.
+            return False
+        except NameError as e:
+            if is_definition_body_error(e):
+                raise RuntimeError(
+                    f"Error resolving pending '{var_name}' from '{expr}': {e} "
+                    f"at line {assign_line}")
             missing = self.extract_missing_dependencies(e)
             if missing:
                 for dep in missing:
@@ -1530,8 +1545,11 @@ class GridLangExecutor(GridLangBase):
                 updated_deps = set(deps) | set(missing)
                 self.pending_assignments[var_name] = (
                     expr, assign_line, updated_deps, constraints)
-                return False
             return False
+        except Exception as e:
+            raise RuntimeError(
+                f"Error resolving pending '{var_name}' from '{expr}': {e} "
+                f"at line {assign_line}")
 
     def _resolve_ready_pending_vars(self, trigger_line):
         """Resolve any global pending variable assignments that are ready."""
@@ -1550,14 +1568,17 @@ class GridLangExecutor(GridLangBase):
             for pending_var in pending_vars:
                 resolved = False
                 if hasattr(resolver, '_resolve_global_dependency'):
-                    try:
-                        resolved = bool(resolver._resolve_global_dependency(
-                            pending_var,
-                            trigger_line,
-                            target_scope=self.current_scope(),
-                        ))
-                    except Exception:
-                        resolved = False
+                    # _resolve_global_dependency already classifies failures:
+                    # NameError/ValueError mean "not ready yet" and it returns
+                    # False, anything else it re-raises. Swallowing that raise
+                    # here hid every error raised inside a constructor body,
+                    # leaving the variable unresolved and the program running
+                    # on with a None it never mentions.
+                    resolved = bool(resolver._resolve_global_dependency(
+                        pending_var,
+                        trigger_line,
+                        target_scope=self.current_scope(),
+                    ))
                 else:
                     resolved = self._attempt_resolve_pending_var(
                         pending_var, trigger_line)

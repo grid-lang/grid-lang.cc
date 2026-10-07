@@ -66,6 +66,38 @@ def match_return_statement(text):
     return _RETURN_STATEMENT_RE.match(text)
 
 # ---------------------------------------------------------------------------
+# Definition-body error tagging
+#
+# A constructor / builder / handle body runs while the pending-assignment
+# resolver is evaluating some expression.  The resolver must tell "a name that
+# is not bound *yet*" (retry later) apart from "the body failed" (surface it
+# now).  Body failures are tagged on the way out, so a resolver that catches
+# NameError/ValueError can still recognise them by walking the cause chain.
+# ---------------------------------------------------------------------------
+def mark_definition_body_error(error):
+    """Tag *error* as having escaped a definition body and return it."""
+    try:
+        error._from_definition_body = True
+    except Exception:
+        pass
+    return error
+
+def is_definition_body_error(error):
+    """True when *error*, or anything it wraps, escaped a definition body."""
+    stack = [error]
+    seen = set()
+    while stack:
+        err = stack.pop()
+        if err is None or id(err) in seen:
+            continue
+        seen.add(id(err))
+        if getattr(err, '_from_definition_body', False):
+            return True
+        stack.append(getattr(err, '__cause__', None))
+        stack.append(getattr(err, '__context__', None))
+    return False
+
+# ---------------------------------------------------------------------------
 # Lexing / dependency extraction
 # ---------------------------------------------------------------------------
 _IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z][A-Za-z0-9_.]*')

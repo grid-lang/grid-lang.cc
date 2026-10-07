@@ -2413,13 +2413,14 @@ class ExpressionEvaluator:
                     elif hasattr(self.compiler, 'current_scope'):
                         target_scope = self.compiler.current_scope()
                     if target_scope is not None:
-                        try:
-                            self.compiler._resolve_global_dependency(
-                                expr, line_number, target_scope=target_scope)
-                            if hasattr(target_scope, 'get_full_scope'):
-                                value = target_scope.get_full_scope().get(expr, value)
-                        except Exception:
-                            pass
+                        # Let the resolution error through: a failure inside a
+                        # constructor body is a real error, not a name that is
+                        # simply not bound yet (_resolve_global_dependency
+                        # returns False for that instead of raising).
+                        self.compiler._resolve_global_dependency(
+                            expr, line_number, target_scope=target_scope)
+                        if hasattr(target_scope, 'get_full_scope'):
+                            value = target_scope.get_full_scope().get(expr, value)
             return True, value
         if isinstance(scope, dict):
             expr_lower = expr.lower()

@@ -24,7 +24,7 @@ from grid_lang_common import (
     _STATEMENT_KEYWORDS, _first_keyword,
     _IDENTIFIER_TOKEN_PATTERN, _STRING_LITERAL_PATTERN, _DEPENDENCY_IGNORED_TOKENS,
     _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens,
-    _is_numeric_token, mask_text_constant_tokens,
+    _is_numeric_token, mask_text_constant_tokens, is_definition_body_error,
 )
 from builtin_functions import BUILTINS, KEYWORDS, RESOURCES
 from modules import (
@@ -3008,10 +3008,16 @@ class GridLangCompiler(GridLangExecutor):
             del self.pending_assignments[var]
             return True
         except ValueError as e:
+            if is_definition_body_error(e):
+                raise RuntimeError(
+                    f"Error resolving global dependency '{var}': {e} at line {assign_line}")
             del self.pending_assignments[var]
             self.grid.clear()
             return False
         except NameError as e:
+            if is_definition_body_error(e):
+                raise RuntimeError(
+                    f"Error resolving global dependency '{var}': {e} at line {assign_line}")
             return False
         except Exception as e:
             raise RuntimeError(
@@ -3122,6 +3128,9 @@ class GridLangCompiler(GridLangExecutor):
                             self.grid.clear()
                             del self.pending_assignments[var]
                     except NameError as e:
+                        if is_definition_body_error(e):
+                            raise RuntimeError(
+                                f"Error resolving '{var}' from '{expr}': {e} at line {line_number}")
                         missing = self.extract_missing_dependencies(e)
                         if missing:
                             for dep in missing:
@@ -3177,9 +3186,15 @@ class GridLangCompiler(GridLangExecutor):
                                 self.grid.clear()
                         del self.pending_assignments[var]
                     except ValueError as e:
+                        if is_definition_body_error(e):
+                            raise RuntimeError(
+                                f"Error resolving '{var}' from '{expr}': {e} at line {line_number}")
                         del self.pending_assignments[var]
                         self.grid.clear()
                     except NameError as e:
+                        if is_definition_body_error(e):
+                            raise RuntimeError(
+                                f"Error resolving '{var}' from '{expr}': {e} at line {line_number}")
                         missing = self.extract_missing_dependencies(e)
                         if missing:
                             for dep in missing:
@@ -6374,6 +6389,9 @@ class GridLangCompiler(GridLangExecutor):
                     expr, scope.get_full_scope(), line_number,
                     expected_unit=(constraints or {}).get('unit'))
             except NameError as e:
+                if is_definition_body_error(e):
+                    raise RuntimeError(
+                        f"Error resolving '{var}' from '{expr}': {e} at line {line_number}")
                 missing = self.extract_missing_dependencies(e)
                 if not missing or not any(
                         dep.lower() in expr.lower() for dep in missing):

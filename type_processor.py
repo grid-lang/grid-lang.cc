@@ -11,7 +11,11 @@ from utils import (
     is_wildcard_address,
     split_var_defs,
 )
-from grid_lang_common import match_push_assignment, unpack_push_assignment
+from grid_lang_common import (
+    match_push_assignment,
+    mark_definition_body_error,
+    unpack_push_assignment,
+)
 
 
 def split_builder_chain(expr):
@@ -430,7 +434,9 @@ class GridLangTypeProcessor:
                 default_fields=default_fields,
                 declared_fields=declared_fields)
         except Exception as e:
-            raise
+            # Tag the failure so the pending-assignment resolver reports it
+            # instead of reading it as "a dependency that is not bound yet".
+            raise mark_definition_body_error(e)
         finally:
             if isinstance(instance_grid, dict) and hasattr(self.compiler, '_context_grid_stack') and self.compiler._context_grid_stack:
                 self.compiler._context_grid_stack.pop()

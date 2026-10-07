@@ -6,7 +6,7 @@ Handles FOR loops, IF statements, LET statements, and block processing.
 import re
 from units import UNIVERSAL_ZERO, ERROR_CODES, is_error_value
 from utils import num_to_col, split_var_defs, is_sparse_array
-from grid_lang_common import _STATEMENT_KEYWORDS, _first_keyword, match_push_assignment, unpack_push_assignment, match_return_statement
+from grid_lang_common import _STATEMENT_KEYWORDS, _first_keyword, match_push_assignment, unpack_push_assignment, match_return_statement, is_definition_body_error
 
 # Regex patterns for block parsing
 HEADER_IF = re.compile(r'^\s*if\b(.+?)\bthen\s*$', re.I)
@@ -2344,10 +2344,16 @@ class GridLangControlFlow:
             del self.compiler.pending_assignments[var]
             return True
         except ValueError as e:
+            if is_definition_body_error(e):
+                raise RuntimeError(
+                    f"Error resolving global dependency '{var}': {e} at line {assign_line}")
             del self.compiler.pending_assignments[var]
             self.compiler.grid.clear()
             return False
         except NameError as e:
+            if is_definition_body_error(e):
+                raise RuntimeError(
+                    f"Error resolving global dependency '{var}': {e} at line {assign_line}")
             return False
         except Exception as e:
             raise RuntimeError(
