@@ -191,6 +191,9 @@ class GridLangParser:
                     constraints[keyword] = next_part
             elif keyword == 'init':
                 constraints['init'] = next_part
+                # Source line of the declaration: lazy INIT materialization
+                # (Scope.get) needs it to report accurate errors.
+                constraints['init_line'] = line_number
             elif keyword == 'index':
                 constraints['index'] = next_part
             elif keyword == 'or':
@@ -354,12 +357,151 @@ class GridLangParser:
 
         return None
 
+    @staticmethod
+    def _split_with_assignment(part):
+        """Split ``name = expr`` at the first top-level ``=`` that assigns.
+
+        Comparison operators are skipped, so ``y >= 1.5`` is not read as an
+        assignment to the field ``y >``.
+        """
+        in_quotes = None
+        paren = bracket = brace = 0
+        idx = 0
+        while idx < len(part):
+            char = part[idx]
+            if in_quotes is not None:
+                if char == '\\':
+                    idx += 2
+                    continue
+                if char == in_quotes:
+                    in_quotes = None
+            elif char in '"\'':
+                in_quotes = char
+            elif char in '([{':
+                if char == '(':
+                    paren += 1
+                elif char == '[':
+                    bracket += 1
+                else:
+                    brace += 1
+            elif char in ')]}':
+                if char == ')':
+                    paren -= 1
+                elif char == ']':
+                    bracket -= 1
+                else:
+                    brace -= 1
+            elif char == '=' and paren == bracket == brace == 0:
+                prev = part[idx - 1] if idx else ''
+                nxt = part[idx + 1] if idx + 1 < len(part) else ''
+                if prev in '<>!' or nxt == '=':
+                    idx += 1
+                    continue
+                return part[:idx].strip(), part[idx + 1:].strip()
+            idx += 1
+        return None
+
+    def _parse_with_grid_spec(self, part, line_number):
+        """Parse a ``with (grid ...)`` entry into the grid dimension constraint.
+
+        The entry is read with the shared declaration parser, so ``as``,
+        ``not null``, ``dim``, ``or =`` and the data expression all follow the
+        same grammar as a ``Let`` declaration.  The result keeps the shape the
+        array layer already consumes: ``dims`` plus the optional ``grid_type``,
+        ``not_null``, ``matrix_data``, ``value``, ``data_var`` and ``default``.
+        """
+        parsed = self._parse_with_field_spec(part, line_number)
+        if parsed is None:
+            raise SyntaxError(
+                f"Expected 'dim' after grid definition in 'with ({part})' "
+                f"at line {line_number}")
+        _, grid_expr, cons = parsed
+        grid_type = cons.pop('type', None)
+        not_null = bool(cons.pop('not_null', False))
+        init_source = cons.pop('init', None)
+        raw_dims = cons.pop('dim', None)
+        if not raw_dims:
+            raise SyntaxError(
+                f"Expected 'dim' after grid definition in 'with ({part})' "
+                f"at line {line_number}")
+        dims = []
+        for _name, size in raw_dims:
+            if isinstance(size, str):
+                size = None if size.strip() == '*' else size.strip()
+            dims.append((1, size))
+        dim_constraint = {'dims': dims}
+        if grid_type:
+            dim_constraint['grid_type'] = grid_type
+        if not_null:
+            dim_constraint['not_null'] = True
+        if init_source is not None:
+            dim_constraint['data_var'] = init_source
+        if grid_expr is not None:
+            if re.match(r'^{.+?}(?:\s*\|\s*{.+?})*$', grid_expr):
+                matrices = [m.strip()[1:-1] for m in grid_expr.split('|')]
+                matrix_data = []
+                for matrix in matrices:
+                    rows = [r.strip().split(',') for r in matrix.split(';')]
+                    matrix_data.append(
+                        [[float(v.strip()) for v in row] for row in rows])
+                dim_constraint['matrix_data'] = (
+                    matrix_data if len(matrix_data) > 1 else matrix_data)
+            elif re.match(r'^[\d.]+$', grid_expr):
+                dim_constraint['value'] = float(grid_expr)
+            elif re.match(r'^\w+$', grid_expr):
+                dim_constraint['data_var'] = grid_expr
+            else:
+                raise SyntaxError(
+                    f"Invalid grid data: '{grid_expr}' at line {line_number}")
+        default = cons.pop('default', None)
+        if default is not None:
+            dim_constraint['default'] = default
+        return dim_constraint
+
+    def _parse_with_field_spec(self, part, line_number):
+        """Parse one ``with (...)`` entry into (field, value, constraint spec).
+
+        The entry is a variable declaration without its leading keyword, so the
+        regular declaration parser is reused verbatim: ``y = 2``, ``y < 2``,
+        ``y as number``, ``y in {1, 2}``, ``y of m`` and ``y not null`` all
+        produce the same constraint dict a ``Let``/type-field declaration
+        would.  ``value`` is the unevaluated ``=`` expression when present, so
+        consumers keep evaluating it themselves exactly as before.
+        """
+        try:
+            field, field_type, field_cons, field_expr = self._parse_variable_def(
+                part, line_number)
+        except SyntaxError:
+            raise
+        except Exception:
+            return None
+        field = (field or '').strip()
+        if not field:
+            return None
+        spec = dict(field_cons)
+        if field_type:
+            spec['type'] = field_type
+        value = None
+        if field_expr is not None:
+            if isinstance(field_expr, str):
+                value = field_expr.strip()
+            else:
+                # A set literal is handed back already parsed; consumers expect
+                # the source text, so recover it from the entry itself.
+                split = self._split_with_assignment(part)
+                if split is not None:
+                    value = split[1]
+        if value is None and not spec:
+            return None
+        return field, value, spec
+
     def _apply_with_clause(self, with_content_str, constraints, line_number):
         if not with_content_str:
             return
 
         with_inner_content = with_content_str[1:-1].strip()
         with_constraints = {}
+        with_specs = {}
         dim_constraint = None
         wc_parts = []
         current = ""
@@ -390,82 +532,34 @@ class GridLangParser:
                 if dim_constraint is not None:
                     raise SyntaxError(
                         f"Multiple grid DIM statements not allowed in with clause at line {line_number}")
-                rest = wc[len('grid'):].strip()
-                not_null = False
-                grid_type = None
-                if rest.lower().startswith('as '):
-                    rest = rest[3:].strip()
-                    m_type = re.match(r'(\w+)', rest)
-                    if m_type:
-                        grid_type = m_type.group(1)
-                        rest = rest[m_type.end():].strip()
-                if rest.lower().startswith('not null'):
-                    not_null = True
-                    rest = rest[len('not null'):].strip()
-                if not rest.lower().startswith('dim'):
-                    raise SyntaxError(
-                        f"Expected 'dim' after grid definition at line {line_number}")
-                rest = rest[3:].strip()
-                if not rest.startswith('{'):
-                    raise SyntaxError(
-                        f"Expected '{{' to start dimension sizes at line {line_number}")
-                end = rest.index('}')
-                dim_str = rest[1:end]
-                rest = rest[end + 1:].strip()
-                dim_parts = [p.strip() for p in dim_str.split(',')]
-                dim_constraint = {
-                    'dims': [(1, None if p.strip() == '*' else int(p.strip())) for p in dim_parts]}
-                if grid_type:
-                    dim_constraint['grid_type'] = grid_type
-                if not_null:
-                    dim_constraint['not_null'] = True
-                if rest.startswith('='):
-                    grid_data = rest[1:].strip()
-                    if re.match(r'^{.+?}(?:\s*\|\s*{.+?})*$', grid_data):
-                        matrices = [m.strip()[1:-1] for m in grid_data.split('|')]
-                        matrix_data = []
-                        for matrix in matrices:
-                            rows = [r.strip().split(',') for r in matrix.split(';')]
-                            matrix_data.append(
-                                [[float(v.strip()) for v in row] for row in rows])
-                        dim_constraint['matrix_data'] = matrix_data if len(
-                            matrix_data) > 1 else matrix_data
-                    elif re.match(r'^[\d.]+$', grid_data):
-                        dim_constraint['value'] = float(grid_data)
-                    elif re.match(r'^\w+$', grid_data):
-                        dim_constraint['data_var'] = grid_data
-                    else:
-                        raise SyntaxError(
-                            f"Invalid grid data: '{grid_data}' at line {line_number}")
-                    rest = ''
-                elif rest.lower().startswith('init'):
-                    rest = rest[4:].strip()
-                    if re.match(r'^\w+$', rest):
-                        dim_constraint['data_var'] = rest
-                        rest = ''
-                or_match = re.match(r'\s*or\s*=\s*(.+)$', rest, re.I)
-                if or_match:
-                    dim_constraint['default'] = or_match.group(1).strip()
-            elif '=' in wc:
-                key, value = [s.strip() for s in wc.split('=', 1)]
-                if value.startswith('"') and value.endswith('"'):
-                    # Keep the quoted form: a quoted value is a string
-                    # literal, distinct from a bare identifier reference.
-                    # Consumers finalize it (strip quotes) when applied.
-                    with_constraints[key] = value
-                else:
-                    try:
-                        with_constraints[key] = self.compiler.expr_evaluator.eval_expr(
-                            value, self.compiler.current_scope().get_full_scope(), line_number)
-                    except Exception:
-                        with_constraints[key] = value.strip('"')
+                dim_constraint = self._parse_with_grid_spec(wc, line_number)
             else:
-                name = wc.strip()
-                if name:
-                    with_constraints[name] = name
+                spec = self._parse_with_field_spec(wc, line_number)
+                if spec is None:
+                    raise SyntaxError(
+                        f"Ambiguous 'with ({wc})' at line {line_number}: expected "
+                        "'<field> <constraint>', e.g. 'y = 2.0' or 'y < 2'")
+                field, value, field_spec = spec
+                if value is not None:
+                    if value.startswith('"') and value.endswith('"'):
+                        # Keep the quoted form: a quoted value is a string
+                        # literal, distinct from a bare identifier reference.
+                        # Consumers finalize it (strip quotes) when applied.
+                        with_constraints[field] = value
+                    else:
+                        try:
+                            with_constraints[field] = self.compiler.expr_evaluator.eval_expr(
+                                value, self.compiler.current_scope().get_full_scope(),
+                                line_number)
+                        except Exception:
+                            with_constraints[field] = value.strip('"')
+                    field_spec['constant'] = with_constraints[field]
+                with_specs[field] = field_spec
 
         if with_constraints:
             constraints['with'] = with_constraints
+        if with_specs:
+            constraints['with_specs'] = with_specs
         if dim_constraint:
             constraints['dim'] = dim_constraint
 

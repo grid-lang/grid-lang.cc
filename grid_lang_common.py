@@ -28,6 +28,44 @@ def _first_keyword(line):
     return m.group(1).lower() if m else ""
 
 # ---------------------------------------------------------------------------
+# Push / Return line parsing — shared by GridLangExecutor (top-level
+# dispatch) and GridLangControlFlow (dispatch inside block bodies).  The two
+# are separate objects - control flow holds the executor rather than
+# inheriting from it - so the patterns live here instead of being copied into
+# both, where they can drift apart and split Push parsing by context.
+# ---------------------------------------------------------------------------
+_PUSH_ASSIGNMENT_RE = re.compile(r"^\s*push\s+([^=]+)(=\s.+)?", re.I)
+_RETURN_STATEMENT_RE = re.compile(r'^\s*return\s+(.+)$', re.I)
+
+def match_push_assignment(text):
+    """Match a Push line.  Returns the regex match, or None."""
+    return _PUSH_ASSIGNMENT_RE.match(text)
+
+def unpack_push_assignment(push_match):
+    """Split a Push match into ``(target, value_expr)``.
+
+    Three shapes:
+
+    * ``(target, expr)`` — a normal ``Push <target> = <expr>``.
+    * ``(target, None)`` — a void Push: ``Push <target>`` with no '=' at all.
+      Nothing is stored; listeners are notified with the current value.
+    * ``(None, None)`` — the line carries an '=' with no right-hand side (a
+      right-hand side that strips away as a comment leaves exactly this
+      shape).  The '=' is extra, so this is invalid syntax rather than a void
+      Push.
+    """
+    target, value_expr = push_match.groups()
+    if value_expr is None:
+        if '=' in push_match.string:
+            return None, None
+        return target.strip(), None
+    return target.strip(), value_expr[1:]
+
+def match_return_statement(text):
+    """Match a Return line.  Returns the regex match, or None."""
+    return _RETURN_STATEMENT_RE.match(text)
+
+# ---------------------------------------------------------------------------
 # Lexing / dependency extraction
 # ---------------------------------------------------------------------------
 _IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z][A-Za-z0-9_.]*')

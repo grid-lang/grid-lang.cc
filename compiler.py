@@ -34,6 +34,20 @@ from modules import (
 )
 
 
+class NamedWithPayload(dict):
+    """``{field: value}`` mapping for a named WITH clause that also carries
+    the constraints parsed alongside each assignment.
+
+    It stays a plain dict for every existing consumer (``items()``, ``values()``,
+    ``get()``); ``specs`` is the extra channel used to attach field constraints
+    to the constructed object.
+    """
+
+    def __init__(self, *args, specs=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.specs = specs if isinstance(specs, dict) else {}
+
+
 class SubprocessResult:
     """Container for subprocess execution results."""
 
@@ -2098,9 +2112,11 @@ class GridLangCompiler(GridLangExecutor):
                 return coerced
         return field_value
 
-    def _apply_with_constraints(self, value, with_constraints, scope, line_number=None, type_name=None):
+    def _apply_with_constraints(self, value, with_constraints, scope, line_number=None, type_name=None, with_specs=None, derive_constraints=True):
         """Apply WITH clause values to a newly created object."""
-        if not with_constraints or not isinstance(value, dict):
+        if not isinstance(value, dict):
+            return value
+        if not with_constraints and not with_specs:
             return value
         field_map = {}
         public_fields = {}
@@ -2144,10 +2160,242 @@ class GridLangCompiler(GridLangExecutor):
         # removed once the constructor body has executed.
         marker = value.setdefault('_with_applied_fields', set())
         marker.update(assigned_fields)
+        self._attach_with_field_constraints(
+            value, with_constraints, with_specs, field_map, assigned_fields,
+            scope, line_number, derive_constraints)
         if type_name and type_name.lower() in self.types_defined:
             self._recompute_type_fields_after_with(
                 type_name, value, scope, line_number)
         return value
+
+    def _attach_with_field_constraints(
+            self, value, with_constraints, with_specs, field_map, assigned_fields,
+            scope=None, line_number=None, derive_constraints=True):
+        """Record the WITH clause as per-instance field constraints.
+
+        ``with (y = 2)`` means the constructed object is pinned to that value,
+        exactly as if the constructor body contained ``y = 2``: pushing the same
+        value succeeds, pushing anything else yields the constraint's error
+        value.  Constraints written in full form (``y < 2``, ``y in {1, 2}``,
+        ``y as number``) constrain the field without assigning it, and are
+        stored so member pushes validate against them too.
+        """
+        specs = value.get('_with_constraints')
+        if not isinstance(specs, dict):
+            specs = {}
+        with_specs = with_specs if isinstance(with_specs, dict) else {}
+        lowered_specs = {
+            str(k).lower(): v for k, v in with_specs.items() if isinstance(v, dict)}
+
+        def _resolve(key):
+            lowered = str(key).lower()
+            return str(field_map.get(lowered, key))
+
+        # Constraints that do not assign a value still have to reach the object.
+        for lowered, spec in lowered_specs.items():
+            if not spec:
+                continue
+            specs.setdefault(_resolve(lowered), {}).update(spec)
+        # An assigned value is itself a constant constraint on that field.
+        for raw_key, raw_value in (with_constraints or {}).items():
+            key_name = _resolve(raw_key)
+            spec = dict(specs.get(key_name, {}))
+            if (derive_constraints and 'constant' not in spec
+                    and not is_error_value(raw_value)):
+                spec['constant'] = raw_value
+            if spec:
+                specs[key_name] = spec
+        if specs:
+            value['_with_constraints'] = specs
+            self._check_with_field_constraints(value, specs, scope, line_number)
+
+    def _check_with_field_constraints(self, value, specs, scope, line_number=None):
+        """Reject a construction whose existing field values break a WITH constraint.
+
+        Mirrors the constructor-push conflict path: the object is flagged so the
+        assignment yields the constraint's error value.
+        """
+        for field, _cons in specs.items():
+            if field not in value:
+                continue
+            current = value.get(field)
+            if current is None or is_error_value(current):
+                continue
+            violation = self._validate_object_field_value(
+                value, field, current, line_number)
+            if violation is not None:
+                value['_with_conflict'] = True
+                return
+
+    def _object_field_constraints(self, obj, field_name):
+        """Merged constraints for one field of a constructed object.
+
+        Combines the constraints declared on the type with the ones the WITH
+        clause attached to this instance; the instance wins where both apply.
+        """
+        if not isinstance(obj, dict):
+            return {}
+        merged = {}
+        type_name = obj.get('_type_name')
+        if type_name:
+            type_def = self.types_defined.get(str(type_name).lower())
+            if isinstance(type_def, dict):
+                declared = type_def.get('_field_constraints') or {}
+                for key, cons in declared.items():
+                    if (str(key).lower() == str(field_name).lower()
+                            and isinstance(cons, dict)):
+                        merged.update(cons)
+        instance = obj.get('_with_constraints')
+        if isinstance(instance, dict):
+            for key, cons in instance.items():
+                if (str(key).lower() == str(field_name).lower()
+                        and isinstance(cons, dict)):
+                    merged.update(cons)
+        return merged
+
+    def _raw_evaluation_scope(self, extra=None):
+        """A Scope holding raw (unwrapped) values for constraint evaluation.
+
+        get_full_scope() would wrap every value for reading, and that wrapper
+        runs (and consumes) the lazy constant-conflict checks owned by the
+        surrounding read path.  Seeding raw stored values avoids perturbing
+        them while still letting a constraint reference sibling fields.
+        """
+        tmp_scope = Scope(self)
+        chain = []
+        current = self.current_scope()
+        while current is not None and not current.is_private:
+            chain.append(current)
+            current = current.parent
+        for scope in reversed(chain):
+            for name, item in scope.variables.items():
+                tmp_scope.variables.setdefault(name, item)
+        for key, item in (extra or {}).items():
+            if not str(key).startswith('_'):
+                tmp_scope.variables[key] = item
+        return tmp_scope
+
+    def _member_push_conflicts_with_constant(self, root_name, root_value,
+                                             member_parts, new_value,
+                                             line_number=None):
+        """True when a member Push would break an equality-bound variable.
+
+        An equality binding freezes the whole object: the bound value -- and
+        everything reachable from it -- may not be rewritten by a Push.  The
+        root check therefore runs unconditionally, ahead of any per-field
+        constraint, so a frozen root never reaches the durable per-field path.
+        The stored value is retained and a transient #VALUE goes to the
+        variable's listeners.  Returns False when the root is not
+        equality-bound, which is where the durable per-field constraint path
+        stays in charge.
+        """
+        if not isinstance(root_value, dict) or not member_parts:
+            return False
+        defining = self.current_scope().get_defining_scope(root_name)
+        if defining is None:
+            return False
+        actual_key = defining._get_case_insensitive_key(
+            root_name, defining.variables)
+        if not actual_key:
+            return False
+        constraints = defining.constraints.get(actual_key) or {}
+        constant_expr = constraints.get('constant')
+        if constant_expr is None:
+            return False
+        try:
+            import copy
+            from array_handler import constant_value_matches
+            eval_scope = self._raw_evaluation_scope()
+            if isinstance(constant_expr, str):
+                expected = self.expr_evaluator.eval_or_eval_array(
+                    constant_expr, eval_scope.get_full_scope(), line_number)
+            else:
+                expected = constant_expr
+            if constraints.get('with'):
+                type_name = defining.types.get(actual_key)
+                expected = self._apply_with_constraints(
+                    expected, constraints.get('with', {}),
+                    eval_scope.get_full_scope(), None, type_name=type_name)
+            if not isinstance(expected, dict):
+                return False
+            prospective = copy.deepcopy(root_value)
+            target = prospective
+            for part in member_parts[:-1]:
+                if not isinstance(target, dict):
+                    return False
+                target = target.get(part)
+            leaf = member_parts[-1]
+            if not isinstance(target, dict):
+                return False
+            existing = None
+            for key, item in target.items():
+                if str(key).lower() == str(leaf).lower():
+                    existing = key
+                    break
+            # A field the bound value does not carry is still a rewrite of the
+            # frozen object, so it takes part in the comparison as well.
+            target[existing if existing is not None else leaf] = new_value
+
+            def _public(value):
+                return {k: v for k, v in value.items()
+                        if not str(k).startswith('_')}
+            return not constant_value_matches(
+                _public(expected), _public(prospective),
+                self.array_handler.to_display_value)
+        except Exception:
+            return False
+
+    def _validate_object_field_value(self, obj, field_name, value, line_number=None):
+        """Return an error code when ``value`` violates the field's constraints.
+
+        ``None`` means the value is acceptable.  Constraints are evaluated in a
+        temporary scope seeded with the object's own fields, so a constraint may
+        reference sibling fields just as a type declaration may.
+        """
+        constraints = self._object_field_constraints(obj, field_name)
+        if not constraints or is_error_value(value):
+            return None
+        tmp_scope = self._raw_evaluation_scope(extra=obj)
+        tmp_scope.constraints[field_name] = constraints
+        declared_type = constraints.get('type')
+        if isinstance(declared_type, str):
+            tmp_scope.types[field_name] = declared_type
+        try:
+            tmp_scope._check_constraints(field_name, value, line_number)
+        except ConstraintError as exc:
+            return exc.code
+        except Exception:
+            return None
+        return None
+
+    def _field_matches_constant(self, obj, field_name, value, line_number=None):
+        """True when ``value`` satisfies the field's equality constant.
+
+        An equality constant (``y = 2.0`` on the field or in the WITH clause)
+        pins the field: a Push that would change it is rejected and the pinned
+        value retained, matching the plain-Push rule for an equality-bound
+        variable in ``_set_var_value``.  ``True`` when the field is not pinned.
+        """
+        constraints = self._object_field_constraints(obj, field_name)
+        constant_expr = constraints.get('constant')
+        if constant_expr is None or is_error_value(value):
+            return True
+        try:
+            from array_handler import constant_value_matches
+            tmp_scope = self._raw_evaluation_scope(extra=obj)
+            tmp_scope.constraints[field_name] = constraints
+            declared_type = constraints.get('type')
+            if isinstance(declared_type, str):
+                tmp_scope.types[field_name] = declared_type
+            if isinstance(constant_expr, str):
+                expected = self.expr_evaluator.eval_or_eval_array(
+                    constant_expr, tmp_scope.get_full_scope(), line_number)
+            else:
+                expected = constant_expr
+            return constant_value_matches(
+                expected, value, self.array_handler.to_display_value)
+        except Exception:
+            return True
 
     def _check_type_field_constraints(self, type_name, field_name, value, value_dict, scope, line_number=None):
         type_def = self.types_defined.get(type_name.lower())
@@ -2196,7 +2444,8 @@ class GridLangCompiler(GridLangExecutor):
         """
         if with_kind == 'named':
             return self._apply_with_constraints(
-                value, with_payload, scope, line_number, type_name)
+                value, with_payload, scope, line_number, type_name,
+                with_specs=getattr(with_payload, 'specs', None))
         if with_kind == 'positional':
             fields = self._get_public_type_fields(type_name) if type_name and type_name.lower(
             ) in self.types_defined else {}
@@ -2210,8 +2459,11 @@ class GridLangCompiler(GridLangExecutor):
             for i, raw in enumerate(with_payload):
                 if i < len(names):
                     named[names[i]] = raw
+            # A positional WITH fills the fields in declaration order; it is an
+            # Init, so the values it lays down stay mutable.
             return self._apply_with_constraints(
-                value, named, scope, line_number, type_name)
+                value, named, scope, line_number, type_name,
+                derive_constraints=False)
         if with_kind == 'clone':
             source = self.expr_evaluator.eval_or_eval_array(
                 with_payload, scope, line_number)
@@ -2249,8 +2501,11 @@ class GridLangCompiler(GridLangExecutor):
                 continue
             named[name] = raw
         target = copy.deepcopy(template)
+        # A clone copies values, not constraints: it behaves like Init, so the
+        # copied fields stay mutable on the new instance.
         return self._apply_with_constraints(
-            target, named, scope, line_number, type_name)
+            target, named, scope, line_number, type_name,
+            derive_constraints=False)
 
     def _with_deps(self, with_text, line_number=None):
         """Dependency identifiers referenced by the value side of a WITH clause."""
@@ -2346,20 +2601,31 @@ class GridLangCompiler(GridLangExecutor):
         return parts
 
     def _split_named_with_parts(self, text, line_number=None):
-        """Split named 'key = value' WITH entries into a {field: expr} dict."""
+        """Split named WITH entries into a {field: value} mapping.
+
+        Every entry is a field declaration without its leading keyword, so the
+        regular declaration parser handles the whole constraint language:
+        ``y = 1``, ``y < 2``, ``y >= 1.5``, ``y as number``, ``y in {1, 2}``,
+        ``y of m``, ``y not null``.  Entries that constrain a field without
+        assigning it contribute no value but are recorded in ``specs``.
+        """
         assignments = {}
+        specs = {}
         for part in text:
-            if '=' in part:
-                key, value = part.split('=', 1)
-                assignments[key.strip()] = value.strip()
-            else:
-                name = part.strip()
-                if name:
-                    raise SyntaxError(
-                        f"Ambiguous 'with ({name})' at line {line_number}: use "
-                        "'<field> = <value>' for named constraints or 'with {…}' "
-                        "for positional — by-name shorthand is not implied")
-        return assignments
+            if not part.strip():
+                continue
+            parsed = self.parser._parse_with_field_spec(part, line_number)
+            if parsed is None:
+                raise SyntaxError(
+                    f"Ambiguous 'with ({part.strip()})' at line {line_number}: "
+                    "expected '<field> <constraint>', e.g. 'y = 2' or 'y < 2'")
+            field, value, spec = parsed
+            if value is not None:
+                assignments[field] = value
+                spec['constant'] = value
+            if spec:
+                specs[field] = spec
+        return NamedWithPayload(assignments, specs=specs)
 
     def _parse_with_clause(self, with_text, line_number=None):
         """Parse a WITH clause body.
@@ -3285,12 +3551,13 @@ class GridLangCompiler(GridLangExecutor):
         evaluated_value = self.expr_evaluator.eval_or_eval_array(
             expr, scope_dict or search_scope.get_evaluation_scope(),
             line_number)
-        if constraints.get('with'):
+        if constraints.get('with') or constraints.get('with_specs'):
             evaluated_value = self._apply_with_constraints(
                 evaluated_value,
                 constraints.get('with', {}),
                 search_scope.get_full_scope(),
                 line_number,
+                with_specs=constraints.get('with_specs'),
                 type_name=type_name)
         if type_name:
             evaluated_value, constraints = defining_scope._coerce_custom_type_value(
@@ -3549,12 +3816,10 @@ class GridLangCompiler(GridLangExecutor):
         original = defining_scope.variables.get(actual_key)
         from units import error_value
         defining_scope.variables[actual_key] = error_value(error_code)
-        self._transient_active = True
         try:
             self._propagate(dep_key, error_value(error_code))
         finally:
             defining_scope.variables[actual_key] = original
-            self._transient_active = False
 
     def _block_guards_hold(self, guard_entries):
         """True when every recorded block guard currently holds."""
@@ -3590,13 +3855,6 @@ class GridLangCompiler(GridLangExecutor):
                 self, '_block_guards_by_line', {}).get(record.get('line_number'))
             if guard_entries and not self._block_guards_hold(guard_entries):
                 return
-            # Cell mirrors are equality constraints on their expression: while
-            # the source holds a transient error (a rejected push), the mirror
-            # keeps its last consistent value instead of storing the error.
-            prev_cells = {}
-            if getattr(self, '_transient_active', False):
-                for ref in record.get('cell_refs', ()):
-                    prev_cells[ref] = self.grid.get(ref)
             was_recomputing = getattr(self, '_in_cell_spill_recompute', False)
             self._in_cell_spill_recompute = True
             try:
@@ -3606,12 +3864,6 @@ class GridLangCompiler(GridLangExecutor):
                 pass
             finally:
                 self._in_cell_spill_recompute = was_recomputing
-            if prev_cells:
-                from units import is_error_value
-                for ref, old in prev_cells.items():
-                    new = self.grid.get(ref)
-                    if is_error_value(new) and not is_error_value(old):
-                        self._set_grid_cell(ref, old)
             return
         var_name = record.get('var')
         expr = record.get('expr')
@@ -5457,6 +5709,14 @@ class GridLangCompiler(GridLangExecutor):
             a = line_stripped[1:].strip()
         else:
             a = line_stripped.strip()
+
+            m_init_new = re.match(
+                r'^([\w_]+)\s+init\s+(new\s+\w+.*)$', a, re.I | re.S)
+            if m_init_new:
+                self._process_let_binding(
+                    m_init_new.group(1), None, {},
+                    m_init_new.group(2), line_number)
+                return
 
         parsed = None
 

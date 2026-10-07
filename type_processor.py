@@ -11,6 +11,7 @@ from utils import (
     is_wildcard_address,
     split_var_defs,
 )
+from grid_lang_common import match_push_assignment, unpack_push_assignment
 
 
 def split_builder_chain(expr):
@@ -586,17 +587,21 @@ class GridLangTypeProcessor:
                 continue
 
             if stripped_line.lower().startswith('push '):
-                push_match = re.match(
-                    r'^\s*push\s+(\$?[\w_]+(?:\([^)]+\)|\{[^}]+\})?)(?:\s*=\s*(.+))?\s*$',
-                    stripped_line,
-                    re.I,
-                )
+                push_match = match_push_assignment(stripped_line)
                 if not push_match:
                     raise SyntaxError(
                         f"Invalid PUSH syntax at line {line_number}")
-                target, value_expr = push_match.groups()
+                target, value_expr = unpack_push_assignment(push_match)
+                if target is None:
+                    raise SyntaxError(
+                        f"Invalid PUSH syntax at line {line_number}: '=' has "
+                        f"no value. Use 'Push <target> = <expression>', or "
+                        f"write 'Push <target>' with no '=' to re-notify "
+                        f"listeners")
                 if value_expr is None:
-                    value_expr = target
+                    self._notify_type_push(target, value_dict, line_number)
+                    i += 1
+                    continue
                 assign_line = f"{target} = {value_expr}"
                 self._process_type_assignment(
                     assign_line, value_dict, input_values, line_number, init_fields,
@@ -942,6 +947,62 @@ class GridLangTypeProcessor:
         if a is None or b is None:
             return a is None and b is None
         return a == b
+
+    def _notify_type_push(self, target, value_dict, line_number):
+        """A void ``Push <target>`` inside a constructor body.
+
+        Nothing is stored: the target keeps the value it already holds, and
+        every listener of it is re-notified with that value - the same
+        notification a value Push would send, minus the write.  The target is
+        validated the way a value Push validates it: an instance field, a
+        member of the type being built, or a name the body itself declared.
+        """
+        owner = self.compiler
+        if target.startswith('['):
+            try:
+                cell_value = owner.array_handler.lookup_cell(
+                    target.strip('[]'), line_number)
+            except Exception:
+                return
+            if hasattr(owner, '_notify_cell_changed'):
+                owner._notify_cell_changed(target, cell_value)
+            return
+        root = target.split('.')[0].strip()
+        if root.startswith('$'):
+            root = root[1:]
+        name_match = re.match(r'^[\w_]+', root)
+        if not name_match:
+            raise SyntaxError(
+                f"Invalid Push target '{target}' at line {line_number}")
+        root = name_match.group(0)
+
+        scope = owner.current_scope()
+        actual_field = get_case_insensitive_key(value_dict, root)
+        is_public_field = (actual_field is not None
+                           and not str(actual_field).startswith('_'))
+        def_scope = scope.get_defining_scope(root)
+        if not is_public_field:
+            member_keys = getattr(owner, '_type_member_keys', None) or set()
+            if (root.lower() not in member_keys
+                    and (def_scope is None or owner._is_outer_scope(def_scope))):
+                raise NameError(
+                    f"Cannot Push to '{root}': variable is not defined at line {line_number}")
+
+        if is_public_field:
+            value = value_dict.get(actual_field)
+            self._push_type_fields_to_scope(value_dict, only=actual_field)
+        elif def_scope is not None:
+            value = scope.get(root)
+        else:
+            value = value_dict.get(
+                actual_field) if actual_field is not None else None
+
+        if hasattr(owner, '_notify_var_changed'):
+            owner._notify_var_changed(root, value)
+        if hasattr(owner, '_enqueue_push'):
+            owner._enqueue_push(root, value)
+        if hasattr(owner, '_process_when_triggers'):
+            owner._process_when_triggers()
 
     def _process_type_assignment(self, line, value_dict, input_values, line_number, init_fields=None, default_fields=None, is_push=False):
         """Handle assignments inside type definitions (e.g., x = in_x).
@@ -1344,16 +1405,40 @@ class GridLangTypeProcessor:
             current += ch
         return args
 
+    def _instance_is_scope_bound(self, instance):
+        """True when ``instance`` is already the stored value of a variable.
+
+        Builders must never mutate a live, bound variable: they are a
+        construction-time operation on an in-progress object that is not yet
+        visible to any name.
+        """
+        if not hasattr(self.compiler, 'current_scope'):
+            return False
+        scope = self.compiler.current_scope()
+        seen = set()
+        while scope is not None and id(scope) not in seen:
+            seen.add(id(scope))
+            for value in scope.variables.values():
+                if value is instance:
+                    return True
+            scope = getattr(scope, 'parent', None)
+        return False
+
     def _apply_builder_chain(self, instance, chain_text, scope, line_number):
         """Apply a '-> builder(args) ...' chain to a freshly-constructed instance.
 
         Builders only run during construction: either inside a type's own
         constructor, or in a chain that follows 'new' directly. They mutate
         the in-progress object and the final chain result is what gets bound.
+        The instance must therefore still be unbound - it may not be the
+        stored value of any variable yet.
         """
         if not isinstance(instance, dict):
             raise TypeError(
                 f"Builder chains can only apply to object instances at line {line_number}")
+        if self._instance_is_scope_bound(instance):
+            raise PermissionError(
+                f"Builder chains can only run on an unbound object at line {line_number}")
         type_name = instance.get('_type_name')
         if not type_name:
             raise TypeError(

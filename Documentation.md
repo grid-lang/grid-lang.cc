@@ -289,26 +289,35 @@ The grid is not the only place that can hold values.
 Create a new file called _variables.grid_ with the contents:
 
 ```vb
-: result = $"The result is {n - value}"
-For n init 5
+Let result = $"The result is {n - value}"
+Let n init 5
 Let value = 2
 Print result
 ```
 
-That defines three named variables, _result_, _n_ and _value_ using three different ways.
+That defines three named variables, _result_, _n_ and _value_ in three different ways.
 
-There is not one way better than the others. All have their own merits.
+There is not one way better than the others. All have their own use.
 
 For example, _n_ is assigned a value using **init** which means it can receive a new value later.
+
+Keyword **Let** is optional so you can also write:
+
+```vb
+result = $"The result is {n - value}"
+n init 5
+value = 2
+Print result
+```
 
 ## Updating a Variable With Push
 
 Edit _variables.grid_ to update _n_ with a new value:
 
 ```vb
-: result = $"The result is {n - value}"
-For n init 5
-Let value = 2
+result = $"The result is {n - value}"
+n init 5
+value = 2
 Push n = n * 2.2
 Print result
 ```
@@ -323,9 +332,9 @@ The result is 9
 Try to output the result before **push**:
 
 ```vb
-: result = $"The result is {n - value}"
-For n init 5
-Let value = 2
+result = $"The result is {n - value}"
+n init 5
+value = 2
 Print result
 Push n = n * 2.2
 Print result
@@ -340,5 +349,13 @@ The result is 9
 ```
 
 Note how _result_ which depends on _n_ is being updated by `Push n`. A **Grid** program can contain **push** instructions that affect previously defined variables.
+
+A **push** can also name only the target, with no `=` at all:
+
+```vb
+Push n
+```
+
+That form stores nothing — _n_ keeps the value it already has — but it re-sends the notification, so everything that depends on _n_ recomputes. Writing the `=` without a value after it (`Push n =`) is not valid syntax: the `=` needs an expression, and it is not a shorter way to write the form above.
 
 That property is essential to keep named variables and the grid consistent over time.

@@ -10,7 +10,7 @@ from control_flow import GridLangControlFlow
 from parser import GridLangParser
 from units import VALUE_ERROR, TYPE_ERROR, ConstraintError, error_value, is_error_value
 from utils import col_to_num, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array, strip_array_cell_indices, is_wildcard_address
-from grid_lang_common import GridLangBase, _STATEMENT_KEYWORDS, _first_keyword, _DEPENDENCY_IGNORED_TOKENS, _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens, resolve_text_constant_token, mask_text_constant_tokens
+from grid_lang_common import GridLangBase, _STATEMENT_KEYWORDS, _first_keyword, _DEPENDENCY_IGNORED_TOKENS, _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens, resolve_text_constant_token, mask_text_constant_tokens, match_push_assignment, unpack_push_assignment, match_return_statement
 DEPENDENCY_IGNORED_TOKENS = _DEPENDENCY_IGNORED_TOKENS
 
 IDENTIFIER_TOKEN_PATTERN = re.compile(r'[A-Za-z][A-Za-z0-9_.]*')
@@ -243,16 +243,13 @@ class GridLangExecutor(GridLangBase):
         return dedup
 
     def _match_push_assignment(self, text):
-        return re.match(r"^\s*push\s+([^=]+)(=\s.+)?", text, re.I)
+        return match_push_assignment(text)
 
     def _unpack_push_assignment(self, push_match):
-        target, value_expr = push_match.groups()
-        if value_expr is None:
-            return None, target.strip()
-        return target.strip(), value_expr[1:]
+        return unpack_push_assignment(push_match)
 
     def _match_return_statement(self, text):
-        return re.match(r'^\s*return\s+(.+)$', text, re.I)
+        return match_return_statement(text)
 
     def _has_push_action(self, text):
         if not text:
@@ -746,10 +743,6 @@ class GridLangExecutor(GridLangBase):
             return
         defining_scope = self.current_scope().get_defining_scope(var_name)
         if defining_scope:
-            actual_key = defining_scope._get_case_insensitive_key(
-                var_name, defining_scope.variables)
-            if actual_key and defining_scope.constraints.get(actual_key, {}).get('constant') is not None:
-                defining_scope._conflict_flags.add(actual_key)
             defining_scope.update(var_name, value, line_number)
         else:
             self.current_scope().define(
@@ -1623,7 +1616,13 @@ class GridLangExecutor(GridLangBase):
             return {'action': 'continue', 'next_i': i + 1}
         # Skip global declarations as they're already processed in _process_declarations_and_labels
         if stripped.startswith(':'):
-            return {'action': 'continue', 'next_i': i + 1}
+            # Allow global ': var init ...' to run at executor time so
+            # 'new Type' INIT expressions are materialised (compiler-only
+            # handling doesn't bind values for executor's scope).
+            if re.match(r'^:\s*[A-Za-z_][\w_\.]*\s+init\b', stripped, re.I):
+                pass  # don't skip; let it be handled as a declaration
+            else:
+                return {'action': 'continue', 'next_i': i + 1}
         # Require lines resolve during preparation; nothing executes at runtime.
         if stripped_lower.startswith('require '):
             return {'action': 'continue', 'next_i': i + 1}
@@ -1939,6 +1938,19 @@ class GridLangExecutor(GridLangBase):
         yet defined. Returns 'bound', 'deferred', or None when expr is None.
         """
         constraints = dict(constraints or {})
+        # `= new Type(...)` is an equality binding to a freshly constructed
+        # object, exactly like the ':' constructor declaration. It is excluded
+        # from the string-expression pin below (a call expression is not a
+        # constant) and is pinned instead to the evaluated object afterwards,
+        # so every declaration form freezes the bound object the same way.
+        is_new_binding = (
+            isinstance(expr, str)
+            and re.match(r'^\s*new\s+[A-Za-z_]', expr, re.I) is not None
+        )
+        # A WITH clause still has to reach the object even when an earlier
+        # eager INIT pass already produced a value, otherwise the per-instance
+        # field constraints are silently dropped.
+        has_with = bool(constraints.get('with') or constraints.get('with_specs'))
         # Declarations with '=' behave like an equality binding, not a mutable
         # assignment. Keep this limited to string expressions to avoid changing
         # literal-list behavior parsed into Python lists by the parser.
@@ -1950,6 +1962,7 @@ class GridLangExecutor(GridLangBase):
             and expr.strip()
             and 'constant' not in constraints
             and 'init' not in constraints
+            and not is_new_binding
             and not self._is_call_expression(expr)
         ):
             constraints['constant'] = expr.strip()
@@ -1987,7 +2000,10 @@ class GridLangExecutor(GridLangBase):
                 constraints = merged
             if constraints:
                 defining_scope.constraints[var] = constraints
-            if expr is None and var in defining_scope.variables and defining_scope.variables[var] is not None:
+            if (expr is None
+                    and not has_with
+                    and var in defining_scope.variables
+                    and defining_scope.variables[var] is not None):
                 return None
         else:
             if shadow_keyword and self.current_scope().is_shadowed(var):
@@ -2046,6 +2062,38 @@ class GridLangExecutor(GridLangBase):
             except Exception:
                 return None
 
+        if expr is None and constraints.get('init') is not None:
+            # 'Let a init new Box' has no '=' expression: materialize the INIT
+            # value now, the way the For path does.  INIT is a Push, so the
+            # binding stays mutable -- unlike '=' it pins no equality.
+            try:
+                init_value = self.expr_evaluator.eval_or_eval_array(
+                    str(constraints['init']),
+                    search_scope.get_evaluation_scope(),
+                    line_number, expected_unit=constraints.get('unit'))
+                init_value = self.array_handler.check_dimension_constraints(
+                    var, init_value, line_number)
+                if constraints.get('with') or constraints.get('with_specs'):
+                    init_value = self._apply_with_constraints(
+                        init_value, constraints.get('with', {}),
+                        search_scope.get_full_scope(), line_number,
+                        with_specs=constraints.get('with_specs'),
+                        type_name=type_name)
+                if type_name:
+                    init_value, constraints = defining_scope._coerce_custom_type_value(
+                        type_name, init_value, constraints, line_number)
+                actual_constraint_key = defining_scope._get_case_insensitive_key(
+                    var, defining_scope.constraints) or var
+                defining_scope.constraints[actual_constraint_key] = constraints
+                search_scope.update(var, init_value, line_number)
+                if scope_dict is not None:
+                    scope_dict[var] = init_value
+                return 'bound'
+            except NameError:
+                return None
+            except Exception:
+                return None
+
         if expr is None:
             return None
 
@@ -2069,12 +2117,13 @@ class GridLangExecutor(GridLangBase):
                 line_number, expected_unit=expected_unit)
             evaluated_value = self.array_handler.check_dimension_constraints(
                 var, evaluated_value, line_number)
-            if constraints.get('with'):
+            if constraints.get('with') or constraints.get('with_specs'):
                 evaluated_value = self._apply_with_constraints(
                     evaluated_value,
                     constraints.get('with', {}),
                     search_scope.get_full_scope(),
                     line_number,
+                    with_specs=constraints.get('with_specs'),
                     type_name=type_name)
             if type_name:
                 evaluated_value, constraints = defining_scope._coerce_custom_type_value(
@@ -2114,6 +2163,17 @@ class GridLangExecutor(GridLangBase):
                 # (text items arrive quoted) with the evaluated value so
                 # constraint checks compare real values.
                 constraints['constant'] = value
+                actual_constraint_key = defining_scope._get_case_insensitive_key(
+                    var, defining_scope.constraints) or var
+                defining_scope.constraints[actual_constraint_key] = constraints
+            if is_new_binding and isinstance(value, dict) and isinstance(value.get('_type_name'), str):
+                # Pin a public-field snapshot of the constructed object, the
+                # same snapshot the ':' constructor declaration stores, so
+                # bare/Let/For and ':' bindings freeze identically.
+                constraints = dict(constraints)
+                constraints['constant'] = {
+                    k: copy.deepcopy(v) for k, v in value.items()
+                    if not str(k).startswith('_')}
                 actual_constraint_key = defining_scope._get_case_insensitive_key(
                     var, defining_scope.constraints) or var
                 defining_scope.constraints[actual_constraint_key] = constraints
@@ -2432,6 +2492,22 @@ class GridLangExecutor(GridLangBase):
                 value = raw_value
             value = self._strip_init_copy_immutability(value)
             value = self._to_sparse_undimmed(value, constraints)
+            if isinstance(value, dict) and (
+                    constraints.get('with') or constraints.get('with_specs')):
+                # WITH carries per-instance field constraints.  Applying it
+                # here keeps every INIT path (eager pass, FOR, LET, ':') on the
+                # same footing: without it the object is stored bare and member
+                # pushes never validate against the clause.
+                try:
+                    value = self._apply_with_constraints(
+                        value,
+                        constraints.get('with', {}),
+                        target_scope.get_full_scope(),
+                        line_number,
+                        with_specs=constraints.get('with_specs'),
+                        type_name=type_name)
+                except Exception:
+                    pass
             owner = getattr(self, 'compiler', None) or self
             if actual_key in defining_scope.variables:
                 if owner._set_by.get(('var', actual_key.lower())) == 'client':
@@ -3730,6 +3806,24 @@ class GridLangExecutor(GridLangBase):
                     values = self._evaluate_generator_values(
                         init_expr, line_number)
                 if not values:
+                    # Not a generator/list: evaluate the init expression as a
+                    # single value so object construction binds too
+                    # (e.g. ': a init new Box').  Mirrors the block-scope
+                    # fallback in _execute_for_declaration_block_scope.
+                    try:
+                        values = self._evaluate_push_expression(
+                            str(init_expr), line_number)
+                    except Exception:
+                        values = []
+                    if not values:
+                        try:
+                            values = [self.expr_evaluator.eval_or_eval_array(
+                                str(init_expr),
+                                target_scope.get_evaluation_scope(),
+                                line_number)]
+                        except Exception:
+                            values = []
+                if not values:
                     continue
 
                 effective_type = target_scope.types.get(actual_key, type_name)
@@ -4314,6 +4408,12 @@ class GridLangExecutor(GridLangBase):
         skip_lines = 0
         for j in range(i + 1, len(lines)):
             candidate_line, candidate_line_number = lines[j]
+            stripped_candidate = candidate_line.strip()
+            if re.match(r'^end\b', stripped_candidate, re.I):
+                # An inline body belongs to this loop only when it appears
+                # before 'end': reading past it would swallow the first
+                # statement after the loop and run it in the loop scope.
+                break
             if ':=' in candidate_line or self._has_push_action(candidate_line):
                 next_executable_line = candidate_line
                 next_executable_line_number = candidate_line_number
@@ -5739,7 +5839,68 @@ class GridLangExecutor(GridLangBase):
                 template_expr, iter_scope, line_number))
         return results
 
+    def _notify_push_listeners(self, target, line_number):
+        """Handle a void Push (``Push <target>`` with no expression).
+
+        The stored value is never touched. Whatever the target already holds
+        is re-published to its listeners - derived cells recompute, When
+        blocks whose dependencies include it re-run - which is the same
+        notification a value Push sends, minus the write.
+        """
+        owner = getattr(self, 'compiler', None) or self
+        if target.startswith('['):
+            cell_map = getattr(owner, '_cell_var_map', None) or {}
+            bound_var = cell_map.get(target)
+            if bound_var is None:
+                to_index = getattr(owner, '_to_index', None)
+                if to_index is not None:
+                    try:
+                        bound_var = cell_map.get(
+                            to_index(target.strip('[]')))
+                    except Exception:
+                        bound_var = None
+            if not bound_var:
+                try:
+                    cell_value = self.array_handler.lookup_cell(
+                        target.strip('[]'), line_number)
+                except Exception:
+                    return
+                if hasattr(owner, '_notify_cell_changed'):
+                    owner._notify_cell_changed(target, cell_value)
+                return
+            target = bound_var
+        elif re.search(r'[\(\{!]', target):
+            indexed = re.match(r'^[\w_]+', target)
+            if not indexed:
+                raise SyntaxError(
+                    f"Invalid Push target '{target}' at line {line_number}")
+            target = indexed.group(0)
+        else:
+            target = target.split('.')[0].strip()
+        if self.current_scope().get_defining_scope(target) is None:
+            raise NameError(
+                f"Cannot Push to '{target}': variable is not defined at line {line_number}")
+        value = self.current_scope().get(target)
+        if hasattr(owner, '_notify_var_changed'):
+            owner._notify_var_changed(target, value)
+        self._enqueue_push(target, value)
+        self._process_when_triggers()
+
     def _handle_push_assignment(self, target, value_expr, line_number):
+        if not target:
+            # Only reachable from an '=' with no right-hand side: the '=' is
+            # extra, and there is nothing here to Push.
+            raise SyntaxError(
+                f"Invalid PUSH syntax at line {line_number}: '=' has no value. "
+                f"Use 'Push <target> = <expression>', or write "
+                f"'Push <target>' with no '=' to re-notify listeners")
+        if value_expr is None:
+            # A void Push: the line names a target with no '=' expression at
+            # all ('Push x').  Nothing is stored - the target keeps the value
+            # it already holds - but every listener of it is re-notified with
+            # that value, so dependent cells and When blocks recompute.
+            self._notify_push_listeners(target, line_number)
+            return
         import sys as _sys
         # Key type variables are immutable: Push to a stored keytype var is forbidden
         try:
@@ -5869,17 +6030,6 @@ class GridLangExecutor(GridLangBase):
         if not isinstance(root_value, dict):
             raise ValueError(f"'{root_name}' is not an object at line {line_number}")
 
-        # Flag the root variable for lazy conflict validation if it has a
-        # constant constraint.  The mutation below changes the dict in-place,
-        # so the value will no longer match the constant expression on read.
-        defining_scope = self.current_scope().get_defining_scope(root_name)
-        if defining_scope:
-            actual_key = defining_scope._get_case_insensitive_key(
-                root_name, defining_scope.variables)
-            if (actual_key
-                    and defining_scope.constraints.get(actual_key, {}).get('constant') is not None):
-                defining_scope._conflict_flags.add(actual_key)
-
         current_obj = root_value
         owner_path = root_name
         member_parts = path_parts[1:]
@@ -5911,6 +6061,36 @@ class GridLangExecutor(GridLangBase):
                 if isinstance(existing, list):
                     existing.append(value)
                 else:
+                    # The root is equality-bound ('a = new Box'): a Push into
+                    # any field must not rewrite the constant.  Reject the
+                    # write, keep the stored value, and emit a transient
+                    # #VALUE to the root's listeners -- the member-Push
+                    # counterpart of the check in _set_var_value (Test 331/337).
+                    if self._member_push_conflicts_with_constant(
+                            root_name, root_value, member_parts, value,
+                            line_number):
+                        owner = getattr(self, 'compiler', None) or self
+                        owner._propagate_transient(root_name, VALUE_ERROR)
+                        ctx = getattr(
+                            self, '_context_grid_stack', None) or getattr(
+                            owner, '_context_grid_stack', None)
+                        if ctx:
+                            raise ValueError(
+                                f"Cannot modify constant field at line {line_number}")
+                        return True
+                    # Otherwise the field's own constraints (inequality, set,
+                    # range, type) apply, exactly as a constrained variable
+                    # does: the error value is stored in the field, so reads of
+                    # the whole object propagate it.
+                    violation = self._validate_object_field_value(
+                        current_obj, actual_field, value, line_number)
+                    if violation is not None:
+                        current_obj[actual_field] = violation
+                        self.current_scope().update(
+                            root_name, root_value, line_number)
+                        self._enqueue_push(root_name, root_value)
+                        self._process_when_triggers()
+                        return True
                     current_obj[actual_field] = value
                 break
 
@@ -6048,13 +6228,14 @@ class GridLangExecutor(GridLangBase):
                 if var_name.lower() in deferred:
                     continue
                 init_expr = constraints.get('init')
+                init_line = constraints.get('init_line')
                 deps = self._extract_dependencies_from_expression(
                     str(init_expr))
                 if any(self.has_unresolved_dependency(dep, scope=scope) for dep in deps):
                     continue
                 try:
                     val = self.expr_evaluator.eval_or_eval_array(
-                        str(init_expr), scope.get_full_scope(), None)
+                        str(init_expr), scope.get_full_scope(), init_line)
                     type_key = scope._get_case_insensitive_key(
                         var_name, scope.types) or var_name
                     var_type = scope.types.get(type_key)
@@ -6063,7 +6244,7 @@ class GridLangExecutor(GridLangBase):
                         var_type,
                         constraints,
                         [val],
-                        None,
+                        init_line,
                         scope=scope)
                 except Exception as exc:
                     pass

@@ -6,7 +6,7 @@ Handles FOR loops, IF statements, LET statements, and block processing.
 import re
 from units import UNIVERSAL_ZERO, ERROR_CODES, is_error_value
 from utils import num_to_col, split_var_defs, is_sparse_array
-from grid_lang_common import _STATEMENT_KEYWORDS, _first_keyword
+from grid_lang_common import _STATEMENT_KEYWORDS, _first_keyword, match_push_assignment, unpack_push_assignment, match_return_statement
 
 # Regex patterns for block parsing
 HEADER_IF = re.compile(r'^\s*if\b(.+?)\bthen\s*$', re.I)
@@ -16,6 +16,14 @@ HEADER_FOR = re.compile(r'^\s*for\b(.+?)\bdo\s*$', re.I)
 HEADER_WHEN = re.compile(r'^\s*when\b(.+?)\bdo\s*$', re.I)
 HEADER_LET = re.compile(r'^\s*let\b(.+?)\bthen\s*$', re.I)
 TOKEN_END = re.compile(r'^\s*end\s*$', re.I)
+# 'End For', 'End If' and friends: a keyword after 'end' is never a block
+# terminator (the terminator is the bare 'end' token), and it is never a
+# definition close either, because definitions close with the name they
+# declared - 'End Point', 'End Sub'.  These are rejected outright rather
+# than falling through, which would silently leave the block open.
+TOKEN_END_KEYWORD = re.compile(
+    r'^\s*end\s+(?:for|if|else|elseif|while|when|select|case|each|next|do|let|with)\b',
+    re.I)
 
 
 class GridLangControlFlow:
@@ -38,6 +46,7 @@ class GridLangControlFlow:
         self._header_when = HEADER_WHEN
         self._header_let = HEADER_LET
         self._token_end = TOKEN_END
+        self._token_end_keyword = TOKEN_END_KEYWORD
 
     def _strip_inline_comment(self, s: str) -> str:
         """Strip an inline comment.
@@ -109,16 +118,13 @@ class GridLangControlFlow:
                 live_pub(var, value, line_number)
 
     def _match_push_assignment(self, text):
-        return re.match(r"^\s*push\s+([^=]+)(=\s.+)?", text, re.I)
+        return match_push_assignment(text)
 
     def _unpack_push_assignment(self, push_match):
-        target, value_expr = push_match.groups()
-        if value_expr is None:
-            return None, target.strip()
-        return target.strip(), value_expr[1:]
+        return unpack_push_assignment(push_match)
 
     def _match_return_statement(self, text):
-        return re.match(r'^\s*return\s+(.+)$', text, re.I)
+        return match_return_statement(text)
 
     def _match_print_statement(self, text):
         return re.match(r'^\s*print\s+(.+)$', text, re.I)
@@ -2378,6 +2384,15 @@ class GridLangControlFlow:
 
             if not line_clean:
                 continue
+
+            # A block ends with exactly 'end'.  A keyword after 'End' matches
+            # neither a block header nor the 'end' token, so it would be
+            # skipped silently and the block it appears to close would stay
+            # open (or, with nothing open, simply vanish).
+            if self._token_end_keyword.match(line_clean):
+                raise SyntaxError(
+                    f"'{line_clean}' is not a terminator at line "
+                    f"{line_number}: a block ends with 'end'")
 
             if open_stack and not self._token_end.match(line_clean):
                 block_body_lines.add(line_number)
