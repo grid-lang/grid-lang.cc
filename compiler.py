@@ -143,6 +143,7 @@ class GridLangCompiler(GridLangExecutor):
         self._listeners = {'cell': {}, 'var': {}}
         self._set_by = {}
         self._propagating = set()
+        self._transient_poisons = {}
         self._singletons = {}
         self.dimensions = {}
         self.dim_names = {}
@@ -3810,16 +3811,20 @@ class GridLangCompiler(GridLangExecutor):
             self._propagating.discard(dep_key)
 
     def _propagate_transient(self, var_name, error_code):
-        """Emit a transient error to all listeners of var_name.
+        """Latch an error onto a variable and every listener of it.
 
-        The variable's stored value is temporarily replaced with the error,
-        listeners recompute and store the error, then the original value
-        is restored. The constraint enforces the read value on future access.
+        The stored value is replaced with the error and *stays* replaced, so a
+        listener bound before a rejected Push and one bound after it both read
+        the error: binding order never changes what a target reads.  The
+        previous value is remembered, and comes back either when the rejected
+        target itself is Pushed again or when one of the listener's own
+        dependencies changes and recomputes it -- a restore never
+        re-notifies, so a listener nothing recomputes keeps the error.
         """
         dep_key = ('var', var_name.lower())
-        entries = self._listeners.get('var', {}).get(var_name.lower(), {})
-        if not entries:
-            return
+        poisons = getattr(self, '_transient_poisons', None)
+        if poisons is None:
+            poisons = self._transient_poisons = {}
         scope = self.current_scope()
         defining_scope = scope.get_defining_scope(var_name)
         if defining_scope is None:
@@ -3828,13 +3833,69 @@ class GridLangCompiler(GridLangExecutor):
             var_name, defining_scope.variables)
         if actual_key is None:
             actual_key = var_name
-        original = defining_scope.variables.get(actual_key)
-        from units import error_value
+        poison_key = (id(defining_scope), str(actual_key).lower())
+        if poison_key not in poisons:
+            # The first poison owns the real value; a second rejected Push on
+            # the same target must not save the error as the thing to restore.
+            poisons[poison_key] = (
+                defining_scope, actual_key,
+                defining_scope.variables.get(actual_key))
         defining_scope.variables[actual_key] = error_value(error_code)
+        if not self._listeners.get('var', {}).get(var_name.lower()):
+            return
+        was = getattr(self, '_in_transient_push', False)
+        self._in_transient_push = True
         try:
             self._propagate(dep_key, error_value(error_code))
         finally:
-            defining_scope.variables[actual_key] = original
+            self._in_transient_push = was
+
+    def _clear_transient_poisons(self, target=None):
+        """Put back the value a rejected Push left reading the error.
+
+        Only the poisons that belong to `target` are restored, so a Push to
+        something else -- 'Push other = 1' after a rejected 'Push a.top = 9'
+        -- is a no-op that leaves every reader of `a.top` where it is,
+        whatever order the listeners were bound in.  Recovery therefore
+        needs a push to the rejected target itself.
+        """
+        poisons = getattr(self, '_transient_poisons', None)
+        if not poisons:
+            return
+        if target is None:
+            names = None
+        else:
+            names = {str(target).lower(), str(target).split('.')[0].lower()}
+        for poison_key in list(poisons):
+            defining_scope, actual_key, original = poisons[poison_key]
+            if names is not None and str(actual_key).lower() not in names:
+                continue
+            if is_error_value(defining_scope.variables.get(actual_key)):
+                defining_scope.variables[actual_key] = original
+            del poisons[poison_key]
+
+    def _restore_poisons_named(self, names):
+        """Put back the real value of every poisoned variable in `names`.
+
+        A listener that recomputes because one of *its* dependencies changed
+        reads the stored value, not the error a rejected Push latched onto
+        it: the error lives until that listener recalculates (Test 738).
+        Never runs while a rejected Push is still propagating, so the
+        listeners that Push notifies still latch the error.
+        """
+        if not names:
+            return
+        poisons = getattr(self, '_transient_poisons', None)
+        if not poisons:
+            return
+        wanted = {str(n).lower() for n in names if n}
+        for poison_key in list(poisons):
+            defining_scope, actual_key, original = poisons[poison_key]
+            if str(actual_key).lower() not in wanted:
+                continue
+            if is_error_value(defining_scope.variables.get(actual_key)):
+                defining_scope.variables[actual_key] = original
+            del poisons[poison_key]
 
     def _block_guards_hold(self, guard_entries):
         """True when every recorded block guard currently holds."""
@@ -3851,6 +3912,8 @@ class GridLangCompiler(GridLangExecutor):
 
     def _recompute_client(self, record):
         """Recompute a client variable from its stored expression."""
+        if not getattr(self, '_in_transient_push', False):
+            self._restore_poisons_named(record.get('deps'))
         line = record.get('line')
         if line:
             scope = record.get('scope')

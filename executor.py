@@ -6091,6 +6091,15 @@ class GridLangExecutor(GridLangBase):
                 f"Invalid PUSH syntax at line {line_number}: '=' has no value. "
                 f"Use 'Push <target> = <expression>', or write "
                 f"'Push <target>' with no '=' to re-notify listeners")
+        # A Push to the rejected target is what recovers a value a rejected
+        # Push left reading the error: clear only that target's outstanding
+        # poison before this Push reads or notifies anything
+        # (compiler._clear_transient_poisons).  A Push to anything else is a
+        # no-op on the poisoned readers.
+        owner = getattr(self, 'compiler', None) or self
+        clear = getattr(owner, '_clear_transient_poisons', None)
+        if clear is not None:
+            clear(target)
         if value_expr is None:
             # A void Push: the line names a target with no '=' expression at
             # all ('Push x').  Nothing is stored - the target keeps the value
