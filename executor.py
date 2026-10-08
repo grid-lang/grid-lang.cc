@@ -1696,6 +1696,30 @@ class GridLangExecutor(GridLangBase):
             return True, i + 1
         return False, i
 
+    def _handle_bare_let_line(self, line, line_number):
+        """Run an assignment-shaped line through the Let pipeline.
+
+        Block bodies hand ``P.x = i`` to the cell-assignment path, which only
+        understands addresses; giving the line the same treatment as an
+        explicit ``Let P.x = i`` keeps construction identical wherever the
+        statement appears.  Lines this cannot read as a member write are
+        left to the caller.
+        """
+        if ':=' in line or '=' not in line:
+            return False
+        var, type_name, constraints, expr = self._parse_variable_def(
+            line, line_number)
+        if expr is None or '.' not in var:
+            return False
+        var_list = [(var, type_name, constraints, expr)]
+        scope_dict = self.current_scope().get_evaluation_scope()
+        member_writes = self._process_let_first_pass(
+            var_list, scope_dict, line_number)
+        self._run_let_second_pass(var_list, line_number)
+        self._execute_let_inline(
+            [], 0, line_number, var_list, member_writes)
+        return True
+
     def _handle_main_loop_let_statement(self, lines, i, line, line_number, stripped):
         m = re.match(
             r'^\s*let\s+(.+?)(?:\s+then\s*$|\s*$)', stripped, re.I)
@@ -1718,15 +1742,25 @@ class GridLangExecutor(GridLangBase):
 
 
         scope_dict = self.current_scope().get_evaluation_scope()
-        self._process_let_first_pass(var_list, scope_dict, line_number)
+        member_writes = self._process_let_first_pass(
+            var_list, scope_dict, line_number)
 
         self._run_let_second_pass(var_list, line_number)
 
         if has_block:
-            return self._execute_let_block(lines, i, line_number, var_list)
-        return self._execute_let_inline(lines, i, line_number, var_list)
+            return self._execute_let_block(
+                lines, i, line_number, var_list, member_writes)
+        return self._execute_let_inline(
+            lines, i, line_number, var_list, member_writes)
 
     def _process_let_first_pass(self, var_list, scope_dict, line_number):
+        """Bind every target of one Let line.
+
+        Returns the lowercase names that were *not* declared as variables --
+        index writes, field writes and object-member writes -- so the
+        post-passes that constrain declared variables can skip them.
+        """
+        member_writes = set()
         let_var_order = [var.lower() for var, _, _, _ in var_list]
         for idx, (var, type_name, constraints, expr) in enumerate(var_list):
             var_lower = var.lower()
@@ -1740,10 +1774,17 @@ class GridLangExecutor(GridLangBase):
 
             if self._try_handle_let_field_assignment(
                     var, expr, scope_dict, line_number):
+                member_writes.add(var_lower)
                 continue
 
             if self._try_handle_let_index_assignment(
                     var, expr, scope_dict, line_number):
+                member_writes.add(var_lower)
+                continue
+
+            if self._try_handle_dotted_member_let(
+                    var, expr, scope_dict, line_number):
+                member_writes.add(var_lower)
                 continue
 
             self._process_let_standard_assignment(
@@ -1756,6 +1797,7 @@ class GridLangExecutor(GridLangBase):
                 remaining_let_vars,
             )
             remaining_let_vars.discard(var_lower)
+        return member_writes
 
     def _try_handle_let_field_assignment(
             self, var, expr, scope_dict, line_number):
@@ -1819,6 +1861,127 @@ class GridLangExecutor(GridLangBase):
     def _try_handle_let_index_assignment(
             self, var, expr, scope_dict, line_number):
         return self._try_let_index_assignment(var, expr, scope_dict, line_number)
+
+    def _repin_member_write_constant(self, scope, root_name, root_value,
+                                     line_number):
+        """Re-freeze an equality-bound root after a field was constructed on it.
+
+        ``: p = new Point`` pins ``p`` to the object the constructor built, so
+        the read path keeps comparing ``p`` against that pin.  ``p.x = 3``
+        builds a field on the very same object, which would leave the pin and
+        the value disagreeing -- the read would store ``#VALUE`` for the whole
+        root.  Re-pinning to the object as it now stands keeps the freeze and
+        lets the field bind.  A root with no ``constant`` binding has nothing
+        to keep in step.
+        """
+        key = scope._get_case_insensitive_key(root_name, scope.variables)
+        if key is None:
+            return
+        constraints = scope.constraints.get(key)
+        if not constraints or 'constant' not in constraints:
+            return
+        constraint_key = scope._get_case_insensitive_key(
+            root_name, scope.constraints) or key
+        constraints = dict(constraints)
+        constraints['constant'] = {
+            k: copy.deepcopy(v) for k, v in root_value.items()
+            if not str(k).startswith('_')}
+        scope.constraints[constraint_key] = constraints
+
+    def _try_handle_dotted_member_let(
+            self, var, expr, scope_dict, line_number):
+        """Write a dotted Let target into its object instead of naming a variable.
+
+        ``p.x = 3`` constructs the field, the way ``D(2) = "hi"`` writes an
+        array element: the object already carries the field, so the assignment
+        goes into it.  Returns False when the target is not a member write so
+        the caller falls back to the ordinary declaration path.
+
+        Four shapes stay off this path:
+
+        * no expression (``p.x as number``, ``p.x > 1``) -- those declare
+          constraints, they do not write a field;
+        * an unknown root -- with nothing to construct on, ``x.y = 100``
+          declares a local named ``x.y``, which is what it has always done
+          (Test 558b);
+        * a root declared in an outer scope -- a subprocess or function
+          declaring ``P.x`` binds a local that shadows the caller's member,
+          which is what the shadow warning in ``_bind_declared_var`` reports;
+        * a root holding no value, or one whose value came from ``init`` --
+          only a root a ``=`` binding produced accepts a field Let, so those
+          raise and point at ``Push``.
+        """
+        if expr is None or re.search(r'[\(\{!]', var):
+            return False
+        path_parts = [part.strip() for part in var.split('.') if part.strip()]
+        if len(path_parts) < 2:
+            return False
+        if not all(re.match(r'^[\w_]+$', part) for part in path_parts):
+            return False
+
+        root_name = path_parts[0]
+        defining_scope = self.current_scope().get_defining_scope(root_name)
+        if defining_scope is None:
+            return False
+        if self._is_outer_defining_scope(defining_scope):
+            return False
+
+        root_key = defining_scope._get_case_insensitive_key(
+            root_name, defining_scope.variables)
+        if root_key is None:
+            return False
+        root_value = defining_scope.variables.get(root_key)
+        root_constraints = defining_scope.constraints.get(root_key) or {}
+        if root_value is None or 'init' in root_constraints:
+            raise NameError(
+                f"Cannot bind '{var}': '{root_name}' is not bound to a value; "
+                f"use Push to update '{var}' at line {line_number}")
+
+        value = self.expr_evaluator.eval_or_eval_array(
+            expr, scope_dict, line_number)
+        root_value, leaf_parent, owner_path, leaf_key, leaf_name = \
+            self._walk_member_path(root_name, path_parts, line_number)
+
+        type_def = None
+        type_name = leaf_parent.get('_type_name')
+        if isinstance(type_name, str):
+            type_def = self.types_defined.get(type_name.lower())
+            if not isinstance(type_def, dict):
+                type_def = None
+        member_keys = type_def.get('_member_keys') if type_def else None
+        declared = any(
+            not str(key).startswith('_')
+            and str(key).lower() == leaf_name.lower()
+            for key in leaf_parent)
+        if not declared and member_keys:
+            declared = leaf_name.lower() in member_keys
+        if not declared:
+            raise ValueError(
+                f"Field '{leaf_name}' is not defined on '{owner_path}' "
+                f"at line {line_number}")
+
+        leaf_lower = leaf_name.lower()
+        init_fields = type_def.get('_init_fields') if type_def else None
+        default_fields = (type_def.get('_default_fields') or set()
+                          if type_def else set())
+        if init_fields and leaf_lower in init_fields and leaf_lower not in default_fields:
+            # The constructor put a value in the field (``: z as number = 1``,
+            # ``init``): that is a binding, and a Let may not rebind it, so the
+            # field reads back the error value.  ``or =`` only supplies a
+            # default, so those fields stay bindable (Test 556 vs 559).
+            leaf_parent[leaf_key] = VALUE_ERROR
+        else:
+            violation = self._validate_object_field_value(
+                leaf_parent, leaf_name, value, line_number)
+            leaf_parent[leaf_key] = (
+                violation if violation is not None else value)
+
+        self._repin_member_write_constant(
+            defining_scope, root_name, root_value, line_number)
+        self.current_scope().update(root_name, root_value, line_number)
+        self._enqueue_push(root_name, root_value)
+        self._process_when_triggers()
+        return True
 
     def _infer_declared_type(self, expr, evaluated_value, line_number):
         """Infer a declared variable's type from a constructor or its value."""
@@ -1929,7 +2092,13 @@ class GridLangExecutor(GridLangBase):
         path = [part.strip() for part in var.split('.') if part.strip()]
         if len(path) < 2:
             return None, None
-        value = self.current_scope().get(path[0])
+        try:
+            value = self.current_scope().get(path[0])
+        except NameError:
+            # The root is not a variable at all, so there is no member to
+            # shadow and the dotted name is free to become a local
+            # (Test 558b).
+            return None, None
         for part in path[1:-1]:
             if not isinstance(value, dict) or part not in value:
                 return None, None
@@ -2285,7 +2454,8 @@ class GridLangExecutor(GridLangBase):
                     pass
         return defining_scope.get(var)
 
-    def _execute_let_block(self, lines, i, line_number, var_list):
+    def _execute_let_block(self, lines, i, line_number, var_list,
+                           member_writes=None):
         self.push_scope(is_private=True)
         block_lines = []
         depth = 1
@@ -2307,8 +2477,9 @@ class GridLangExecutor(GridLangBase):
             raise SyntaxError(
                 f"Unclosed LET block starting at line {line_number}")
         block_end_i = scan_i
+        member_writes = member_writes or set()
         for var, _, constraints, _ in var_list:
-            if constraints:
+            if constraints and var.lower() not in member_writes:
                 defining_scope = self.current_scope().get_defining_scope(var) or self.current_scope()
                 var_value = self._resolve_pending_let_var(var, defining_scope)
                 if var_value is None:
@@ -2336,6 +2507,9 @@ class GridLangExecutor(GridLangBase):
         # Skip the block when any declared variable holds an error value
         # (``Let x = <error> then ... End`` must not execute its body).
         for var, _, _, _ in var_list:
+            if var.lower() in member_writes:
+                # Written into an object rather than declared here.
+                continue
             defining_scope = self.current_scope(
             ).get_defining_scope(var) or self.current_scope()
             var_value = self._resolve_pending_let_var(
@@ -2392,9 +2566,11 @@ class GridLangExecutor(GridLangBase):
         self.pop_scope()
         return block_end_i + 1
 
-    def _execute_let_inline(self, lines, i, line_number, var_list):
+    def _execute_let_inline(self, lines, i, line_number, var_list,
+                            member_writes=None):
+        member_writes = member_writes or set()
         for var, _, constraints, _ in var_list:
-            if constraints:
+            if constraints and var.lower() not in member_writes:
                 defining_scope = self.current_scope().get_defining_scope(var) or self.current_scope()
                 var_value = self._resolve_pending_let_var(var, defining_scope)
                 if var_value is None:
@@ -6047,14 +6223,72 @@ class GridLangExecutor(GridLangBase):
             return False
 
         root_name = path_parts[0]
+        member_parts = path_parts[1:]
+        root_value, current_obj, _owner_path, actual_field, field_name = \
+            self._walk_member_path(root_name, path_parts, line_number)
+
+        existing = current_obj.get(actual_field)
+        if isinstance(existing, list):
+            existing.append(value)
+        else:
+            # The root is equality-bound ('a = new Box'): a Push into
+            # any field must not rewrite the constant.  Reject the
+            # write, keep the stored value, and emit a transient
+            # #VALUE to the root's listeners -- the member-Push
+            # counterpart of the check in _set_var_value (Test 331/337).
+            if self._member_push_conflicts_with_constant(
+                    root_name, root_value, member_parts, value,
+                    line_number):
+                owner = getattr(self, 'compiler', None) or self
+                owner._propagate_transient(root_name, VALUE_ERROR)
+                ctx = getattr(
+                    self, '_context_grid_stack', None) or getattr(
+                        owner, '_context_grid_stack', None)
+                if ctx:
+                    raise ValueError(
+                        f"Cannot modify constant field at line {line_number}")
+                return True
+            # Otherwise the field's own constraints (inequality, set,
+            # range, type) apply, exactly as a constrained variable
+            # does: the error value is stored in the field, so reads of
+            # the whole object propagate it.
+            violation = self._validate_object_field_value(
+                current_obj, actual_field, value, line_number)
+            if violation is not None:
+                current_obj[actual_field] = violation
+                self.current_scope().update(
+                    root_name, root_value, line_number)
+                self._enqueue_push(root_name, root_value)
+                self._process_when_triggers()
+                return True
+            current_obj[actual_field] = value
+
+        self.current_scope().update(root_name, root_value, line_number)
+        self._enqueue_push(root_name, root_value)
+        self._process_when_triggers()
+        return True
+
+    def _walk_member_path(self, root_name, path_parts, line_number):
+        """Resolve a dotted member path down to the object that holds its leaf.
+
+        Returns ``(root_value, leaf_parent, owner_path, leaf_key, leaf_name)``.
+        Every part before the leaf must already exist and hold an object, and
+        hidden or immutable fields are rejected at every level including the
+        leaf.  Callers own the write policy for the leaf itself: a Push creates
+        a field the instance does not carry yet, a Let does not.
+        """
+        if len(path_parts) < 2:
+            raise ValueError(
+                f"Member path needs at least one field at line {line_number}")
         root_value = self.current_scope().get(root_name)
         if not isinstance(root_value, dict):
-            raise ValueError(f"'{root_name}' is not an object at line {line_number}")
+            raise ValueError(
+                f"'{root_name}' is not an object at line {line_number}")
 
         current_obj = root_value
         owner_path = root_name
         member_parts = path_parts[1:]
-
+        last_index = len(member_parts) - 1
         for idx, field_name in enumerate(member_parts):
             public_keys = {
                 k.lower(): k for k in current_obj.keys()
@@ -6076,44 +6310,8 @@ class GridLangExecutor(GridLangBase):
                     raise ValueError(
                         f"Field '{field_name}' of '{owner_path}' is immutable at line {line_number}")
 
-            is_last = idx == len(member_parts) - 1
-            if is_last:
-                existing = current_obj.get(actual_field)
-                if isinstance(existing, list):
-                    existing.append(value)
-                else:
-                    # The root is equality-bound ('a = new Box'): a Push into
-                    # any field must not rewrite the constant.  Reject the
-                    # write, keep the stored value, and emit a transient
-                    # #VALUE to the root's listeners -- the member-Push
-                    # counterpart of the check in _set_var_value (Test 331/337).
-                    if self._member_push_conflicts_with_constant(
-                            root_name, root_value, member_parts, value,
-                            line_number):
-                        owner = getattr(self, 'compiler', None) or self
-                        owner._propagate_transient(root_name, VALUE_ERROR)
-                        ctx = getattr(
-                            self, '_context_grid_stack', None) or getattr(
-                            owner, '_context_grid_stack', None)
-                        if ctx:
-                            raise ValueError(
-                                f"Cannot modify constant field at line {line_number}")
-                        return True
-                    # Otherwise the field's own constraints (inequality, set,
-                    # range, type) apply, exactly as a constrained variable
-                    # does: the error value is stored in the field, so reads of
-                    # the whole object propagate it.
-                    violation = self._validate_object_field_value(
-                        current_obj, actual_field, value, line_number)
-                    if violation is not None:
-                        current_obj[actual_field] = violation
-                        self.current_scope().update(
-                            root_name, root_value, line_number)
-                        self._enqueue_push(root_name, root_value)
-                        self._process_when_triggers()
-                        return True
-                    current_obj[actual_field] = value
-                break
+            if idx == last_index:
+                return root_value, current_obj, owner_path, actual_field, field_name
 
             if actual_field not in current_obj:
                 raise ValueError(
@@ -6124,11 +6322,8 @@ class GridLangExecutor(GridLangBase):
                     f"'{owner_path}.{actual_field}' is not an object at line {line_number}")
             current_obj = next_obj
             owner_path = f"{owner_path}.{actual_field}"
-
-        self.current_scope().update(root_name, root_value, line_number)
-        self._enqueue_push(root_name, root_value)
-        self._process_when_triggers()
-        return True
+        raise ValueError(
+            f"Member path needs at least one field at line {line_number}")
 
     def _assign_indexed_target(self, target, value_expr, line_number):
         paren_match = re.match(r'^([\w_]+)\s*\(([^)]+)\)$', target)

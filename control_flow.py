@@ -1159,6 +1159,13 @@ class GridLangControlFlow:
                         evaluated_value, line_number)
                     self.compiler.current_scope().define(
                         target, evaluated_value, inferred_type, {}, is_uninitialized=False)
+            elif (':=' not in line and re.match(
+                    r'^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$',
+                    target)):
+                # ``P.x = i`` builds a field inside a block the same way it
+                # does at the top level; the address path below only
+                # understands cells.
+                self.compiler._handle_bare_let_line(line, line_number)
             else:
                 self.compiler.array_handler.evaluate_line_with_assignment(
                     line, line_number, self.compiler.current_scope().get_evaluation_scope())
@@ -1274,7 +1281,8 @@ class GridLangControlFlow:
         pending defers the whole body through the deferred-assignment machinery
         (the If line is retried once the binding resolves); a guard that is
         false - including one naming something that never resolves - skips the
-        body.
+        body. A guard naming a variable that nothing will ever define is an
+        error: skipping the body would silently hide the typo.
         """
         pending_assignments = getattr(self.compiler, 'pending_assignments', {})
         for guard_line, line_number, condition in guards:
@@ -1290,11 +1298,28 @@ class GridLangControlFlow:
                 pending_assignments[f"__if_line_{line_number}"] = (
                     guard_line, line_number, deps)
                 return False
+            for dep in sorted(deps):
+                if current_scope.get_defining_scope(dep) is not None:
+                    continue
+                if dep in pending_assignments:
+                    continue
+                if dep.lower() in (getattr(self.compiler, 'functions', None) or {}):
+                    continue
+                if dep.lower() in (getattr(self.compiler, 'subprocesses', None) or {}):
+                    continue
+                if dep.lower() in (getattr(self.compiler, 'types_defined', None) or {}):
+                    continue
+                raise NameError(
+                    f"Name '{dep}' is not defined at line {line_number}")
             try:
                 result = self._evaluate_if_condition(
                     condition, line_number, warn_boolean=True)
             except NameError:
-                result = False
+                # The condition names something that does not exist at all.
+                # A guard is a condition on state the block depends on, so
+                # running (or skipping) the body on an undefined name would
+                # hide the typo: report it instead.
+                raise
             if not result or self._guard_dependencies_are_errors(condition):
                 return False
         return True
