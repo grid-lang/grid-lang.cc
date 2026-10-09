@@ -1584,6 +1584,10 @@ class ArrayHandler:
                 key = tuple(i - 1 for i in parse_address(cell_ref))
             except ValueError:
                 key = None
+        if key is not None:
+            pull = getattr(self.compiler, '_pull_cell_ref', None)
+            if pull is not None:
+                pull(key)
         if key is not None and key in store:
             return store[key]
         if key is not None and len(key) > 2:
@@ -2538,12 +2542,16 @@ class ArrayHandler:
         if isinstance(array, dict) and 'array' not in array:
             if not indices:
                 raise ValueError(
-                    f"Expected at least one index at line {line_number}")
+                    f"Expected at least one index for sparse array at line {line_number}")
             if any(idx < 0 for idx in indices):
                 raise ConstraintError(
                     REF_ERROR,
                     f"Negative index {indices} for sparse array at line {line_number}")
-            array[tuple(indices)] = value
+            key = tuple(indices)
+            if array is getattr(self.compiler, 'grid', None):
+                self.compiler._write_grid_store_cell(array, key, value)
+            else:
+                array[key] = value
             return array
 
         if not isinstance(array, list):

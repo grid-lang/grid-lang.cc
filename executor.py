@@ -2370,6 +2370,13 @@ class GridLangExecutor(GridLangBase):
             search_scope.update(var, value, line_number)
             if scope_dict is not None:
                 scope_dict[var] = value
+            # The binding just evaluated its own expression; dep changes it
+            # caused (live outputs streaming into its inputs) are not pending
+            # work for this record.
+            owner = getattr(self, 'compiler', None) or self
+            clear = getattr(owner, '_clear_stale_for', None)
+            if clear is not None:
+                clear(var)
             return 'bound'
         except NameError as e:
             missing = self.extract_missing_dependencies(e)
@@ -2962,6 +2969,13 @@ class GridLangExecutor(GridLangBase):
 
         # Process any remaining deferred assignments
         self._process_deferred_assignments()
+
+        # End-of-program wave: output collection reads variables and grid
+        # cells directly, so flush every pending recompute first.
+        owner = getattr(self, 'compiler', None) or self
+        settle = getattr(owner, '_settle_stale', None)
+        if settle is not None:
+            settle()
 
         # A deferred IF whose dependencies never resolved is still a failure.
         # It is only reported here, after the retry pass had its chance.
@@ -6097,6 +6111,9 @@ class GridLangExecutor(GridLangBase):
         # (compiler._clear_transient_poisons).  A Push to anything else is a
         # no-op on the poisoned readers.
         owner = getattr(self, 'compiler', None) or self
+        boundary = getattr(owner, '_wave_push_boundary', None)
+        if boundary is not None:
+            boundary(target)
         clear = getattr(owner, '_clear_transient_poisons', None)
         if clear is not None:
             clear(target)

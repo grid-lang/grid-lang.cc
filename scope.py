@@ -9,7 +9,7 @@ import re
 from units import (
     DIM_ERROR, NA_ERROR, NUM_ERROR, TYPE_ERROR, UNIT_ERROR, UNIVERSAL_ZERO,
     VALUE_ERROR, ConstraintError, UnitValue, apply_conversion, error_value,
-    is_error_value, strip_units,
+    is_error_value,
 )
 from utils import (
     iter_interpolation_placeholders, is_sparse_array,
@@ -44,54 +44,6 @@ def _is_unset_marker(value):
     if value == NA_ERROR:
         return True
     return isinstance(value, UnitValue) and value.error_code == NA_ERROR
-
-
-class _GridStore(dict):
-    """The single grid backing store, held as the predefined ``grid`` variable.
-
-    Storage is a sparse dict keyed strictly by 0-based numeric index tuples
-    (``(row, col)`` or extended N-D tuples), matching how the grid array is
-    read and written with ``grid{row, col}``. Address-string keys (``'A1'``)
-    are NOT accepted here; the compiler's ``_to_index``/``_set_grid_cell``
-    helpers perform that conversion at the call sites.
-
-    Every write strips units and notifies the owning compiler so that client
-    variables listening on a grid cell are recomputed when a publisher
-    (push/init) updates one of their dependency cells.
-    """
-
-    def __init__(self, owner=None):
-        super().__init__()
-        self._grid_owner = owner
-
-    @staticmethod
-    def _normalize_key(key):
-        if isinstance(key, tuple):
-            return key
-        raise TypeError(
-            f"Grid store keys must be numeric index tuples, got {key!r}")
-
-    def __setitem__(self, key, value):
-        key = self._normalize_key(key)
-        super().__setitem__(key, strip_units(value))
-        owner = self._grid_owner
-        if owner is not None and hasattr(owner, '_notify_cell_changed'):
-            owner._notify_cell_changed(key, value)
-
-    def __getitem__(self, key):
-        return super().__getitem__(self._normalize_key(key))
-
-    def __contains__(self, key):
-        try:
-            return super().__contains__(self._normalize_key(key))
-        except TypeError:
-            return False
-
-    def get(self, key, default=None):
-        try:
-            return super().get(self._normalize_key(key), default)
-        except TypeError:
-            return default
 
 
 class Scope:
@@ -743,6 +695,9 @@ class Scope:
         # Case-insensitive lookup
         actual_key = self._get_case_insensitive_key(name, self.variables)
         if actual_key:
+            pull = getattr(self.compiler, '_pull_named', None)
+            if pull is not None:
+                pull(name)
             value = self.variables[actual_key]
             # Lazily apply INIT defaults when the variable is first read
             if value is None:

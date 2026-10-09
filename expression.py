@@ -131,6 +131,9 @@ class ExpressionEvaluator:
         """
         if isinstance(expr, list):
             return self._eval_array_literal_elements(expr, scope, line_number)
+        pull = getattr(self.compiler, '_pull_for_expr', None)
+        if pull is not None:
+            pull(expr, scope if isinstance(scope, dict) else None)
         if expected_unit is not None:
             prev = self._expected_unit
             self._expected_unit = expected_unit
@@ -2556,6 +2559,9 @@ class ExpressionEvaluator:
                 f"Expression evaluation depth limit exceeded for '{expr}' at line {line_number}")
 
         expr = expr.strip()
+        pull = getattr(self.compiler, '_pull_for_expr', None)
+        if pull is not None:
+            pull(expr, scope if isinstance(scope, dict) else None)
         # Primitive grid dim none rank 0: any n.grid{...} is #REF
         m_grid_idx = re.match(r'^([\w_]+)\.grid\{[^}]+\}$', expr, re.I)
         if m_grid_idx:

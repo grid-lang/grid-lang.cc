@@ -266,6 +266,15 @@ class GridLangBase:
 
     def pop_scope(self):
         if len(self.scopes) > 1:
+            # Scope exit ends the wave: settle stale listeners before the
+            # scope (and any record bound to it) goes away.
+            owner = getattr(self, 'compiler', None) or self
+            settle = getattr(owner, '_settle_stale', None)
+            if settle is not None:
+                settle()
+                wave = getattr(owner, '_wave_pushed', None)
+                if wave is not None:
+                    wave.clear()
             self.scopes.pop()
         else:
             raise RuntimeError("Cannot pop global scope")

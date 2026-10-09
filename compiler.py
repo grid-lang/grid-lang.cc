@@ -7,7 +7,7 @@ import copy
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
 from utils import col_to_num, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT, is_sparse_array, strip_array_cell_indices
-from scope import Scope, _GridStore
+from scope import Scope
 from units import (
     UNIT_ERROR, UNIVERSAL_ZERO, TYPE_ERROR, VALUE_ERROR, UnitValue, ConstraintError, error_value,
     is_error_value, strip_units, register_conversion, has_conversion,
@@ -139,11 +139,18 @@ class GridLangCompiler(GridLangExecutor):
         self.types = self.scopes[0].types
         # Client/publisher listener registry. Cells and variables written by a
         # client binding (: v = expr) register listeners; publisher updates
-        # (init/push) propagate to those listeners immediately.
+        # (init/push) mark those listeners stale, and a read (or wave-end
+        # settle) recomputes them.
         self._listeners = {'cell': {}, 'var': {}}
         self._set_by = {}
         self._propagating = set()
         self._transient_poisons = {}
+        self._client_index = {}
+        self._cell_writers = {}
+        self._stale_records = {}
+        self._pulling = set()
+        self._pull_stack = []
+        self._wave_pushed = set()
         self._singletons = {}
         self.dimensions = {}
         self.dim_names = {}
@@ -3714,7 +3721,7 @@ class GridLangCompiler(GridLangExecutor):
         """Register var_name as a client listener on every cell/var its expr reads.
 
         Called during a client binding; the registry lives on this compiler so
-        notifications (reached via compiler references from scope/_GridStore)
+        notifications (reached via compiler references from the grid store)
         always touch the same objects.
         """
         if not expr or scope is None:
@@ -3748,12 +3755,65 @@ class GridLangCompiler(GridLangExecutor):
                 continue
             keys.append(('var', dep.lower()))
         record = {'var': var_name, 'expr': str(expr), 'scope': scope,
-                  'deps': deps, 'cell_refs': cell_refs}
+                  'deps': deps, 'cell_refs': cell_refs, 'stale': False}
         for kind, key in keys:
             holder = self._listeners.setdefault(kind, {}).setdefault(key, {})
-            holder[(var_name.lower(), id(scope))] = record
+            self._install_record(holder, (var_name.lower(), id(scope)), record)
         if var_name:
             self._set_by[('var', var_name.lower())] = 'client'
+            bucket = self._client_index.setdefault(var_name.lower(), {})
+            self._install_record(
+                bucket, (var_name.lower(), id(scope)), record)
+
+    def _clear_stale_for(self, name):
+        """Drop pending recomputes for the binding of ``name`` itself."""
+        bucket = self._client_index.get(str(name).lower())
+        if not bucket:
+            return
+        for record in list(bucket.values()):
+            record['stale'] = False
+            self._stale_records.pop(id(record), None)
+
+    def _install_record(self, holder, token, record):
+        """Put ``record`` into a listener bucket, retiring any record it replaces.
+
+        Re-registering the same target (pre-pass, then the runtime binding)
+        swaps in a fresh record; the old one may still sit in the stale set
+        and would be recomputed at the next settle as an orphan.
+        """
+        old = holder.get(token)
+        if old is not None and old is not record:
+            self._stale_records.pop(id(old), None)
+        holder[token] = record
+
+    def _index_cell_writers(self, record, line):
+        """Index a cell-spill record under the cells its line writes.
+
+        The pull side of a cell read (``[A1]`` in an expression) needs the
+        writers of that cell; ``_listeners['cell']`` only holds readers.
+        """
+        sep = ':=' if ':=' in line else '='
+        lhs = line.split(sep, 1)[0]
+        for ref in self._extract_cell_refs(lhs):
+            bucket = self._cell_writers.setdefault(tuple(ref), {})
+            self._install_record(
+                bucket, (record.get('line'), id(record.get('scope'))), record)
+
+    def _retire_spill_records(self, line):
+        """Drop earlier registrations of the same spill line.
+
+        The pre-pass registers a ``:=`` constraint with scope=None; the
+        runtime pass registers it again with a real scope. Two live records
+        for one line recompute each other forever through dep notifications.
+        """
+        for holder in self._listeners.get('var', {}).values():
+            for token in [t for t, rec in holder.items()
+                          if rec.get('line') == line]:
+                self._stale_records.pop(id(holder.pop(token)), None)
+        for bucket in self._cell_writers.values():
+            for token in [t for t, rec in bucket.items()
+                          if rec.get('line') == line]:
+                self._stale_records.pop(id(bucket.pop(token)), None)
 
     def _register_cell_spill_listener(self, line, rhs_vars, line_number, scope=None):
         """Register a cell-spill := line as a listener on every rhs var.
@@ -3771,15 +3831,17 @@ class GridLangCompiler(GridLangExecutor):
         deps = {str(var) for var in rhs_vars if var}
         if not deps:
             return
+        self._retire_spill_records(str(line))
         cell_refs = self._extract_cell_refs(str(line))
         record = {'var': None, 'expr': sorted(deps)[0], 'scope': scope,
                   'line': line, 'line_number': line_number,
-                  'deps': deps, 'cell_refs': cell_refs}
+                  'deps': deps, 'cell_refs': cell_refs, 'stale': False}
         token = ('__cell_spill_' + str(line), id(scope))
         for dep in sorted(deps):
             holder = self._listeners.setdefault(
                 'var', {}).setdefault(dep.lower(), {})
-            holder[token] = record
+            self._install_record(holder, token, record)
+        self._index_cell_writers(record, str(line))
 
     def _notify_var_changed(self, name, value):
         # Live I/O (a live input refreshing, or a live output writing
@@ -3788,13 +3850,169 @@ class GridLangCompiler(GridLangExecutor):
         # Push notifies.
         if getattr(self, '_suppress_live_notify', False):
             return
-        self._propagate(('var', name.lower()), value)
+        self._mark_listeners_stale('var', str(name).lower())
 
     def _notify_cell_changed(self, cell_ref, value):
-        self._propagate(('cell', cell_ref), value)
+        key = cell_ref
+        if not isinstance(key, tuple):
+            try:
+                key = tuple(
+                    i - 1 for i in parse_address(str(key).strip().strip('[]')))
+            except ValueError:
+                return
+        self._mark_listeners_stale('cell', key)
+
+    def _mark_listeners_stale(self, kind, key):
+        bucket = self._listeners.get(kind, {}).get(key)
+        if not bucket:
+            return
+        for record in list(bucket.values()):
+            self._mark_stale(record)
+
+    def _mark_stale(self, record):
+        # A record being recomputed right now re-notifies itself when its
+        # evaluation has side effects (live feedback pushes, cell writes).
+        # Recomputing it again would loop; the value it just produced already
+        # observed those side effects.
+        if id(record) in self._pulling:
+            return
+        if not record.get('stale'):
+            record['stale'] = True
+            self._stale_records[id(record)] = record
+
+    def _pull_record(self, record):
+        """Recompute one stale listener (pull side of a read)."""
+        token = id(record)
+        if not record.get('stale'):
+            self._stale_records.pop(token, None)
+            return
+        if token in self._pulling:
+            return
+        self._stale_records.pop(token, None)
+        self._pulling.add(token)
+        self._pull_stack.append(record)
+        try:
+            record['stale'] = False
+            self._recompute_client(record)
+        except Exception:
+            pass
+        finally:
+            self._pulling.discard(token)
+            self._pull_stack.pop()
+
+    def _pull_named(self, name, scope_dict=None):
+        """Recompute every stale client binding named ``name``.
+
+        When the caller already snapshotted an evaluation-scope dict, patch
+        the dict so the evaluation reads the value just recomputed.
+        """
+        bucket = self._client_index.get(str(name).lower())
+        if not bucket:
+            return
+        pulled = False
+        for record in list(bucket.values()):
+            if record.get('stale'):
+                self._pull_record(record)
+                pulled = True
+        if pulled and scope_dict is not None:
+            self._patch_eval_scope(name, scope_dict)
+
+    def _pull_cell_ref(self, ref):
+        """Recompute every stale writer of one grid cell."""
+        if not self._stale_records:
+            return
+        bucket = self._cell_writers.get(tuple(ref))
+        if not bucket:
+            return
+        for record in list(bucket.values()):
+            self._pull_record(record)
+
+    def _patch_eval_scope(self, name, scope_dict):
+        try:
+            base = None
+            if self._pull_stack:
+                base = self._pull_stack[-1].get('scope')
+            base = base or self.current_scope()
+            defining = base.get_defining_scope(name)
+            if defining is None:
+                return
+            key = defining._get_case_insensitive_key(name, defining.variables)
+            if key is None:
+                return
+            wrapped = defining._wrap_for_eval(key, defining.variables[key])
+        except Exception:
+            return
+        for variant in (name, name.lower(), name.upper()):
+            if variant in scope_dict:
+                scope_dict[variant] = wrapped
+
+    def _pull_for_expr(self, expr, scope_dict=None):
+        """Make every client target and cell writer named in ``expr`` fresh.
+
+        Expression evaluation reads a snapshot dict built before the pull, so
+        fresh targets must be patched back into it.
+        """
+        if not self._stale_records or expr is None:
+            return
+        text = str(expr)
+        for token in _IDENTIFIER_TOKEN_PATTERN.findall(text):
+            if token:
+                self._pull_named(token.split('.')[0], scope_dict)
+        for ref in self._extract_cell_refs(text):
+            self._pull_cell_ref(ref)
+
+    def _settle_stale(self):
+        """Recompute stale listeners until none are left (wave end).
+
+        A record re-marked after it was settled this pass (two registrations
+        of one line, side-effect cycles) is deferred to the next wave instead
+        of being recomputed again here.
+        """
+        seen = set()
+        deferred = []
+        guard = 0
+        while self._stale_records:
+            token = next(iter(self._stale_records))
+            if token in seen:
+                deferred.append(self._stale_records.pop(token))
+                continue
+            record = self._stale_records.pop(token)
+            seen.add(token)
+            self._pull_record(record)
+            guard += 1
+            if guard > 100000:
+                break
+        for record in deferred:
+            if record.get('stale'):
+                self._stale_records[id(record)] = record
+
+    def _wave_target_key(self, target):
+        text = str(target).strip()
+        if text.startswith('['):
+            try:
+                return ('cell', tuple(
+                    i - 1 for i in parse_address(text.strip('[]'))))
+            except ValueError:
+                return ('cell', text)
+        match = re.match(r'^[\w_]+', text)
+        if match:
+            return ('var', match.group(0).lower())
+        return ('var', text.lower())
+
+    def _wave_push_boundary(self, target):
+        """A Push to a target this wave already updated ends the wave."""
+        key = self._wave_target_key(target)
+        if key in self._wave_pushed:
+            self._settle_stale()
+            self._wave_pushed.clear()
+        self._wave_pushed.add(key)
 
     def _propagate(self, dep_key, value):
-        """Recompute every client listener that depends on dep_key."""
+        """Eagerly recompute every client listener that depends on dep_key.
+
+        Reserved for the error path: a rejected Push must latch the error on
+        listeners immediately. Value updates only mark records stale.
+        """
         if dep_key in self._propagating:
             return
         entries = self._listeners.get(dep_key[0], {}).get(dep_key[1], {})
@@ -3804,6 +4022,8 @@ class GridLangCompiler(GridLangExecutor):
         try:
             for record in list(entries.values()):
                 try:
+                    record['stale'] = False
+                    self._stale_records.pop(id(record), None)
                     self._recompute_client(record)
                 except Exception:
                     pass
@@ -3942,6 +4162,15 @@ class GridLangCompiler(GridLangExecutor):
                 pass
             finally:
                 self._in_cell_spill_recompute = was_recomputing
+            # Errors cascade eagerly: readers of an errored cell must latch
+            # #VALUE now, not at the next wave end.
+            for ref in record.get('cell_refs', ()):
+                try:
+                    written = self.grid.get(tuple(ref))
+                except Exception:
+                    written = None
+                if is_error_value(written):
+                    self._propagate(('cell', tuple(ref)), written)
             return
         var_name = record.get('var')
         expr = record.get('expr')
@@ -3979,6 +4208,10 @@ class GridLangCompiler(GridLangExecutor):
                 var_type, val, constraints, None)
             defining_scope.constraints[actual_key] = constraints
         defining_scope.update(var_name, val, None)
+        # Errors cascade eagerly so every reader of the errored variable
+        # latches #VALUE immediately (binding order never matters).
+        if is_error_value(val):
+            self._propagate(('var', str(var_name).lower()), val)
 
     def _split_assignment_expr(self, text):
         """Split on the first standalone '=' not part of comparison operators."""
@@ -4109,8 +4342,8 @@ class GridLangCompiler(GridLangExecutor):
         if getattr(self, '_outer_scope_read_only', False):
             return
         store = getattr(self, 'grid', None)
-        if not isinstance(store, _GridStore):
-            store = _GridStore(self)
+        if not isinstance(store, dict):
+            store = {}
             self.grid = store
         self.scopes[0].variables['grid'] = store
         self.scopes[0].constraints['grid'] = {
@@ -4160,7 +4393,7 @@ class GridLangCompiler(GridLangExecutor):
             cur = parent
             while cur is not None:
                 g = cur.variables.get('grid')
-                if isinstance(g, _GridStore):
+                if isinstance(g, dict):
                     return g
                 cur = getattr(cur, 'parent', None)
             # Fallback to parent compiler's store if parent scope is from caller
@@ -4173,16 +4406,49 @@ class GridLangCompiler(GridLangExecutor):
         if scopes and scopes[0].variables.get('grid') is not None:
             return scopes[0].variables['grid']
         store = getattr(self, 'grid', None)
-        if isinstance(store, _GridStore):
+        if isinstance(store, dict):
             return store
-        store = _GridStore(self)
+        store = {}
         self.grid = store
         return store
+
+    def _grid_store_owner(self, store):
+        """The compiler that created ``store`` (its listeners must be
+        notified when a cell changes)."""
+        if getattr(self, 'grid', None) is store:
+            return self
+        seen = set()
+        cur = getattr(self, '_parent_scope', None)
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            comp = getattr(cur, 'compiler', None)
+            if comp is not None and getattr(comp, 'grid', None) is store:
+                return comp
+            cur = getattr(cur, 'parent', None)
+        return self
+
+    def _write_grid_store_cell(self, store, key, value):
+        """Write one cell of a grid store.
+
+        The global grid strips units and notifies cell listeners so clients
+        recompute; an instance grid (the type-context store on the stack) is
+        a plain dict and keeps its raw values.
+        """
+        ctx = getattr(self, '_context_grid_stack', None)
+        if ctx and ctx[-1] is store:
+            store[key] = value
+            return
+        store[key] = strip_units(value)
+        owner = self._grid_store_owner(store)
+        notify = getattr(owner, '_notify_cell_changed', None)
+        if notify is not None:
+            notify(key, value)
 
     def _set_grid_cell(self, cell_ref, value):
         """Write a single cell (address string or index tuple) into the grid
         store."""
-        self._get_grid_store()[self._to_index(cell_ref)] = value
+        store = self._get_grid_store()
+        self._write_grid_store_cell(store, self._to_index(cell_ref), value)
 
     def _spill_value_to_cells(self, cell_ref, value, line_number=None):
         """Auto-spill an array value into the grid starting at cell_ref.
@@ -4268,6 +4534,12 @@ class GridLangCompiler(GridLangExecutor):
         owner._listeners = {'cell': {}, 'var': {}}
         owner._set_by = {}
         owner._propagating = set()
+        owner._client_index = {}
+        owner._cell_writers = {}
+        owner._stale_records = {}
+        owner._pulling = set()
+        owner._pull_stack = []
+        owner._wave_pushed = set()
         parent_scope = getattr(self, '_parent_scope', None)
         if parent_scope is not None:
             # Subprocesses and functions reference the caller's scope chain live
