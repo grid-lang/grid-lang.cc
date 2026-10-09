@@ -272,7 +272,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
 - Grid-as-array: `get_grid_row` (2647), `get_grid_column` (2676); generic
   `get_array_element`/`set_array_element` handle `_GridStore` like any sparse array.
 
-### `control_flow.py` (2860 lines) — blocks: For / If / Let / When
+### `control_flow.py` (2864 lines) — blocks: For / If / Let / When
 `class GridLangControlFlow` executes block constructs. Module-level regexes
 (9–16) define `if...then`, `elseif...then`, `else`, `for...do`,
 `when...do`, `end`.

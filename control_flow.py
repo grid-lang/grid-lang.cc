@@ -2683,6 +2683,9 @@ class GridLangControlFlow:
             'start_i': current_index,
             'end_i': end_i,
             'clauses': clauses,
+            # Indices are relative to *lines* (a constructor body or nested
+            # slice), not to the program-wide preprocessed list.
+            'local': True,
         }
 
     def _process_if_statement_rich(self, line, line_number, lines, current_index):
@@ -2739,8 +2742,9 @@ class GridLangControlFlow:
 
         # Extract the block lines from the IF block. Prefer the cached full list of
         # preprocessed lines so nested IF statements still have access to their
-        # ELSEIF/ELSE headers even when we're processing a sliced block.
-        if self._preprocessed_lines:
+        # ELSEIF/ELSE headers even when we're processing a sliced block. A
+        # locally scanned block carries indices into *lines*, so slice there.
+        if self._preprocessed_lines and not if_block.get('local'):
             block_lines = self._preprocessed_lines[
                 if_block['start_i'] + 1: if_block['end_i'] + 1]
         else:
