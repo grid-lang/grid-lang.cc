@@ -4430,15 +4430,16 @@ class GridLangCompiler(GridLangExecutor):
     def _write_grid_store_cell(self, store, key, value):
         """Write one cell of a grid store.
 
-        The global grid strips units and notifies cell listeners so clients
-        recompute; an instance grid (the type-context store on the stack) is
-        a plain dict and keeps its raw values.
+        Cells keep values raw during execution (unit wrappers and error
+        values survive the round-trip through the grid); units strip and
+        error codes become text only at export (_build_output_dict,
+        _debug_export_value). An instance grid (the type-context store on
+        the stack) is a plain dict written as-is.
         """
         ctx = getattr(self, '_context_grid_stack', None)
+        store[key] = value
         if ctx and ctx[-1] is store:
-            store[key] = value
             return
-        store[key] = strip_units(value)
         owner = self._grid_store_owner(store)
         notify = getattr(owner, '_notify_cell_changed', None)
         if notify is not None:
@@ -4512,12 +4513,13 @@ class GridLangCompiler(GridLangExecutor):
         Tuple keys are converted back to ``'A1'``-style references (extended
         addresses stay dotted, e.g. ``'A1.B1'``) and each value is converted
         to its display form, matching the shape of the previous sheet store
-        returned by ``run()``.
+        returned by ``run()``. Units strip and error codes become text here:
+        the export boundary, not the grid write.
         """
         result = {}
         for key, value in self._get_grid_store().items():
             result[indices_to_address([i + 1 for i in key])] = (
-                self.array_handler.to_display_value(value))
+                self.array_handler.to_display_value(strip_units(value)))
         return result
 
     def _reset_state(self):
@@ -6972,7 +6974,11 @@ class GridLangCompiler(GridLangExecutor):
         return output_str[:max_length-3] + "..."
 
     def _debug_export_value(self, value):
-        """Format runtime values for debug CSV output."""
+        """Format runtime values for debug CSV output.
+
+        Strips units and turns error values into their ``#...`` text: the
+        CSV boundary, not the grid write."""
+        value = strip_units(value)
         if isinstance(value, dict) and 'array' in value:
             value = list(value['array'])
         elif is_sparse_array(value):

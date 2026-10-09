@@ -123,7 +123,7 @@ no duplication to keep in sync across two live objects anymore.
   `1` is special: `UnitValue._is_one`, `__mul__` treats `1` as unitless, `_divide` `m/1→m` `m/m→1`, `__pow__` allows exponent `1`.
 - `UnitValue` overloads: `+`/`-` same unit or one side unitless; `*` with `1`; `/`/`\`/`mod` with `1`; `^` with `1`.
 
-### `compiler.py` (7249 lines) — state + orchestration, public API
+### `compiler.py` (7255 lines) — state + orchestration, public API
 `class GridLangCompiler` is the engine's **state holder and public surface**. It
 is the only class `main.py` constructs. It inherits the runtime loop from
 `GridLangExecutor` and holds nearly all persistent state created in `__init__`:
@@ -160,11 +160,11 @@ Notable methods:
 - `_instantiate_type` (1652), `_evaluate_with_value` (2060), `_apply_with_clause`
   (1246): type/`with` object construction; now handles `:` field unit conversion.
 - `call_subprocess` (2785): runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (5345), `_process_declarations_and_labels` (5872),
-  `_collect_global_declarations` (6046): top-level statement handling; now handles `of 1` and `"ox" of animal`.
-- `export_to_csv` (7036): `--debug` CSV export (grid as matrix, or outputs as
+- `_process_grid_assignment` (5347), `_process_declarations_and_labels` (5874),
+  `_collect_global_declarations` (6048): top-level statement handling; now handles `of 1` and `"ox" of animal`.
+- `export_to_csv` (7042): `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
-- `set_input_values` (7059): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
+- `set_input_values` (7065): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
 - `_seed_globals` (1670): for sub-compilers; **skips redefining `grid`**.
 
 Also defines `SubprocessResult` (51): result container exposing `grid`,

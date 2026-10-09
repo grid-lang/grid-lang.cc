@@ -11,14 +11,14 @@ Unit rules:
   mismatched units count as a difference (never an error).
 - ``<``/``<=``/``>``/``>=`` allow a unitless operand on either side; mismatched
   units on both sides produce a ``#UNIT`` error value.
-- Arithmetic rules are implemented as operator overloads on UnitValue. Grid
-  writes strip the unit wrapper (the grid stores plain numbers).
+- Arithmetic rules are implemented as operator overloads on UnitValue. The
+  grid keeps values raw during execution; export strips the unit wrapper.
 
 Error values:
 - Errors are sticky: every operation on an error value yields another error
   value, comparisons on it are treated as an error (an If condition then takes
-  the else branch), and it strips to its literal ``#...`` string at storage and
-  grid boundaries.
+  the else branch), and it strips to its literal ``#...`` string at variable
+  storage and export boundaries.
 - The error codes follow spreadsheet conventions:
     #UNIT   unit mismatch
     #DIV/0  divide (or mod/floor-div) by zero
@@ -247,7 +247,7 @@ class UnitValue:
     ``error_code`` marks a sticky error: every operation on an error value
     yields another error value, comparisons on it are treated as an error (an
     If condition then takes the else branch), and it strips to the literal
-    ``#...`` string at the grid boundary.
+    ``#...`` string at the export boundary.
     """
 
     __slots__ = ('value', 'unit', 'error_code', 'key_type', 'fresh_key')
@@ -520,7 +520,7 @@ def apply_conversion(value, value_unit, target_unit, eval_fn=None):
 
 
 def strip_units(value):
-    """Recursively remove unit wrappers for storage/grid boundaries.
+    """Recursively remove unit wrappers at export boundaries.
 
     An error value strips to its literal ``#...`` code.
     """
