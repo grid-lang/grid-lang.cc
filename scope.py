@@ -285,6 +285,20 @@ class Scope:
             materialized, constraints = self._coerce_custom_type_value(
                 var_type, materialized, constraints, line_number)
             self.constraints[constraints_key] = constraints
+        # WITH field values belong to the init (same as the eager INIT path);
+        # without this a lazy read sees the bare constructor's null fields.
+        if (materialized is not None and not is_error_value(materialized)
+                and isinstance(materialized, dict)
+                and (constraints.get('with') or constraints.get('with_specs'))
+                and hasattr(self, 'compiler')):
+            try:
+                materialized = self.compiler._apply_with_constraints(
+                    materialized, constraints.get('with', {}),
+                    self.get_full_scope(), line_number,
+                    type_name=var_type,
+                    with_specs=constraints.get('with_specs'))
+            except Exception:
+                pass
         if materialized is not None and not is_error_value(materialized) and constraints and constraints.get('dim') and hasattr(self, 'compiler'):
             try:
                 materialized = self.compiler.array_handler.check_dimension_constraints(

@@ -1080,15 +1080,23 @@ class GridLangCompiler(GridLangExecutor):
             # then the apostrophe comment.
             cleaned = re.sub(r'"[^"]*"', '""', line)
             cleaned = re.sub(r"'[^']*.*$", '', cleaned)
+            # Push and Let both name their destination before any '=': the
+            # LHS names are written (a Let LHS also declares constraints),
+            # never read. Blank them out and keep scanning the rest of the
+            # line, which may still read a different Output.
             destination = re.match(
-                r'^\s*push\s+([A-Za-z_]\w*)\b', cleaned, re.I)
-            if destination and destination.group(1).lower() in outs:
-                # Writing to an Output is its purpose, so the destination is
-                # not a read. Blank out just that name and keep scanning the
-                # line: the expression may read a different Output.
-                start, end = destination.span(1)
-                cleaned = (cleaned[:start] + ' ' * (end - start)
-                           + cleaned[end:])
+                r'^\s*(?:push|let)\s+'
+                r'([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)',
+                cleaned, re.I)
+            if destination and any(
+                    name.strip().lower() in outs
+                    for name in destination.group(1).split(',')):
+                for name in destination.group(1).split(','):
+                    nm = name.strip()
+                    start = cleaned.find(nm, destination.start(1))
+                    if start >= 0:
+                        cleaned = (cleaned[:start] + ' ' * len(nm)
+                                   + cleaned[start + len(nm):])
             for name in re.findall(r'(?<![\w.!])[A-Za-z_]\w*', cleaned):
                 if name.lower() in outs:
                     raise SyntaxError(
@@ -2907,11 +2915,26 @@ class GridLangCompiler(GridLangExecutor):
                             merged_val = value
                             break
                 if merged_val is None and out_key in deferred_inits:
-                    init_expr, init_constraints = deferred_inits[out_key]
+                    entry = deferred_inits[out_key]
+                    init_expr, init_constraints = entry[0], entry[1]
+                    init_type = entry[2] if len(entry) > 2 else None
                     try:
                         scope_dict = dict(last_scope_vars)
                         merged_val = self.expr_evaluator.eval_or_eval_array(
                             str(init_expr), scope_dict, line_number)
+                        # Same footing as the eager INIT path: eval the base
+                        # constructor, then apply the WITH clause field values.
+                        merged_val = copy.deepcopy(merged_val)
+                        if isinstance(merged_val, dict) and (
+                                init_constraints.get('with') or
+                                init_constraints.get('with_specs')):
+                            merged_val = self._apply_with_constraints(
+                                merged_val,
+                                init_constraints.get('with', {}),
+                                scope_dict, line_number,
+                                type_name=init_type,
+                                with_specs=init_constraints.get(
+                                    'with_specs'))
                     except Exception:
                         merged_val = None
                 if merged_val is not None:
@@ -6138,9 +6161,20 @@ class GridLangCompiler(GridLangExecutor):
                             # Live outputs seed immediately so the write-through
                             # binding observes the init value during the run.
                             try:
+                                import copy
                                 eval_scope = self.current_scope().get_full_scope()
                                 init_val = self.expr_evaluator.eval_expr(
                                     init_expr, eval_scope, line_number)
+                                init_val = copy.deepcopy(init_val)
+                                if isinstance(init_val, dict) and (
+                                        constraints.get('with') or
+                                        constraints.get('with_specs')):
+                                    init_val = self._apply_with_constraints(
+                                        init_val, constraints.get('with', {}),
+                                        eval_scope, line_number,
+                                        type_name=type_name,
+                                        with_specs=constraints.get(
+                                            'with_specs'))
                                 self.current_scope().update(
                                     var_name, init_val, line_number)
                                 live_pub = getattr(
@@ -6156,7 +6190,7 @@ class GridLangCompiler(GridLangExecutor):
                         if not hasattr(self, '_deferred_output_inits'):
                             self._deferred_output_inits = {}
                         self._deferred_output_inits[var_name.lower()] = (
-                            init_expr, constraints)
+                            init_expr, constraints, type_name)
                     else:
                         eval_scope = self.current_scope().get_full_scope()
                         import copy
