@@ -170,29 +170,29 @@ Notable methods:
 Also defines `SubprocessResult` (51): result container exposing `grid`,
 `variables`, `outputs`, and `_UnitSourceNamespace` (66) the UnitSource lookups.
 
-### `executor.py` (6719 lines) — the runtime loop
+### `executor.py` (6833 lines) — the runtime loop
 `class GridLangExecutor` is the **base class that owns the interpreter's
 dispatch loop and its per-run runtime state**. It is not instantiated directly
 as a facade (the old compiler→executor copy handoff was removed); `run` is the
 live entry. Key methods (the `compiler.py`/`grid_lang_common.py` layers call
 `super()`/override these):
-- `run` (2947): top-level sequence (acts on `self`; see Architecture).
-- `_run_setup` (5718), `_run_prepare_execution` (5757), `_print_outputs`
-  (4716), `_materialize_inits` (6454), `_process_deferred_assignments` (6594).
+- `run` (3037): top-level sequence (acts on `self`; see Architecture).
+- `_run_setup` (5808), `_run_prepare_execution` (5847), `_print_outputs`
+  (4716), `_materialize_inits` (6565), `_process_deferred_assignments` (6705).
   `_run_prepare_execution` now calls `_materialize_unit_source_constants` + `_register_top_level_converts`.
-- Main loop: `_run_main_loop` (2995) → `_run_main_loop_impl` (3544) →
-  `_run_main_loop_impl_body` (3592). `_handle_main_loop_*` methods dispatch
+- Main loop: `_run_main_loop` (3085) → `_run_main_loop_impl` (3634) →
+  `_run_main_loop_impl_body` (3682). `_handle_main_loop_*` methods dispatch
   statement kinds: `Let` (1128), `For` (1752 fallback), grid assignment (3903),
   `When` blocks (3956), `Push` (4152), `Return` (4108), misc (3724).
 - Dependency/guard machinery: `_build_dependency_network` (1130),
   `_determine_needed_lines`, `_evaluate_guard_conditions`,
   `_evaluate_global_guards_pre_execution`, `_execute_global_for_loops`,
   `_attempt_resolve_pending_var`, `_resolve_ready_pending_vars`.
-- `Let` semantics: first pass `_process_let_first_pass` (1756), binding
+- `Let` semantics: first pass `_process_let_first_pass` (1759), binding
   `_bind_declared_var` (1255, now `expected_unit`), standard assignment,
   second pass, generator values, `_materialize_inits`.
 - `For`: `_execute_simple_for_assignment` (749, now `expected_unit`), `Push` via `target_unit`.
-- `Push` semantics: `_handle_push_assignment` (6100), `_evaluate_push_expression`
+- `Push` semantics: `_handle_push_assignment` (6190), `_evaluate_push_expression`
   (4345, now `expected_unit`), `_handle_push_assignment_line`.
 - `When` blocks: `_register_when_block` (286), `_process_when_triggers` (758),
   `_run_when_block` (774), `_handle_when_block`.
@@ -245,45 +245,45 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
 - Builtins (143): `ROWS` (143) / `SUM` (155) / `LEN` (166, `Text.Len`) / `ABS` (174, `Number.Abs`) / `POWER` (179) / `INT` (184) / `MID` (189, `Text.Mid`) / `TEXTSPLIT` (199, `Text.Split`) / `COUNTA` (207) / `RANDARRAY` (223) / `SORTBY` (229) / `TRANSPOSE` (240) / `MIN` (291, `Number.Min`) / `MAX` (299, `Number.Max`) plus math shims (`sqrt`/`sin`/… → `Number.<name>`, 306) and `str`/`int`/`float`/`abs` (313). `MIN`/`MAX` flatten via `_to_list` before `min`/`max`.
 - Public API (323): `_is_array_arg` (1039) / `_broadcast_builtin` (326, only for `VECTORIZED`; detects `list`/`{'array':…}`/sparse, checks equal lengths, applies scalar broadcast, otherwise returns `None` to fall back to normal call) / `get_builtin_functions` (373, builds `name→wrapped` dict; wrapper does `_check_arity`, then `_broadcast_builtin`, then `fn(*args)` with `TypeError→#TYPE/I`; injects `math`).
 
-### `array_handler.py` (3065 lines) — grid/array/tensor operations
+### `array_handler.py` (3101 lines) — grid/array/tensor operations
 `class ArrayHandler` centralizes all array knowledge:
 - Cell addressing & lookup: `resolve_cell_index` (65), `cell_ref_to_indices`
-  (129), `lookup_cell` (1563), `get_range_values` (1253/1286),
-  `_lookup_extended_address` (131367, `_write_extended_tensor` (1652).
+  (129), `lookup_cell` (1599), `get_range_values` (1253/1286),
+  `_lookup_extended_address` (131367, `_write_extended_tensor` (1688).
 - Assignment: `evaluate_line_with_assignment` (296),
   `_parse_assignment_target_details` (26257, `_perform_assignment_write` (598),
-  `_assign_horizontal_array` (98984, `assign_range` (1339),
-  `_assign_extended_range` (121221, `_assign_index_selector` (944),
-  `_assign_dim_selector` (85837, `_update_bound_array_cell` (1139),
+  `_assign_horizontal_array` (98984, `assign_range` (1375),
+  `_assign_extended_range` (121221, `_assign_index_selector` (980),
+  `_assign_dim_selector` (85837, `_update_bound_array_cell` (1175),
   `assign_implicit_intersection_range` (60597, implicit-intersection rewrite
   (`_rewrite_implicit_intersection` 597).
-- Spilling helpers: `_resolve_spill_unset` (1545) replaces `None` sentinels
+- Spilling helpers: `_resolve_spill_unset` (1581) replaces `None` sentinels
   in flat arrays before writing to grid (uses variable default or `#N/A`);
-  `flatten_array` (1922) column-major flattens any array to 1D;
-  `flatten_object_fields` (1863) flattens object fields for grid spills.
+  `flatten_array` (1958) column-major flattens any array to 1D;
+  `flatten_object_fields` (1899) flattens object fields for grid spills.
 - Array construction/shape: `create_array` (1773, accepts `template=True` to
-  fill with `None` sentinels), `create_object_array` (2192),
-  `get_array_shape` (2090), `reshape_array` (2591), `infer_type` (1966, now handles `UnitValue("beef")→text`), 
-  `fill_array` (2994), `flatten_object_fields` (1863), `flatten_array`
-  (1443), `_nested_from_flat` (2010), `to_display_value` (1967).
-- Constraints/dims: `set_labels` (2207), `check_dimension_constraints` (2301),
+  fill with `None` sentinels), `create_object_array` (2228),
+  `get_array_shape` (2126), `reshape_array` (2627), `infer_type` (1966, now handles `UnitValue("beef")→text`), 
+  `fill_array` (3030), `flatten_object_fields` (1899), `flatten_array`
+  (1443), `_nested_from_flat` (2046), `to_display_value` (2003).
+- Constraints/dims: `set_labels` (2243), `check_dimension_constraints` (2337),
   `validate_array_element_types` (161694 — element-level base-type checking
-  (`as number`/`as text` arrays reject mismatched scalars), `_dim_size` (2234).
-- Grid-as-array: `get_grid_row` (2647), `get_grid_column` (2676); generic
+  (`as number`/`as text` arrays reject mismatched scalars), `_dim_size` (2270).
+- Grid-as-array: `get_grid_row` (2683), `get_grid_column` (2712); generic
   `get_array_element`/`set_array_element` handle `_GridStore` like any sparse array.
 
-### `control_flow.py` (2864 lines) — blocks: For / If / Let / When
+### `control_flow.py` (2954 lines) — blocks: For / If / Let / When
 `class GridLangControlFlow` executes block constructs. Module-level regexes
 (9–16) define `if...then`, `elseif...then`, `else`, `for...do`,
 `when...do`, `end`.
 - `process_for_statement` (185): For-loop handling (ranges, init, arrays).
-- Block engine: `_process_block` (1372), `_extract_block_body` (414),
-  `pre_scan_blocks` (2387), `_prepare_block_line` (443).
-- If: `_process_if_statement` (1476) and the "new"/"rich" variants (2011,
-  2113), `_parse_if_header` (1510), `_collect_if_blocks` (1580),
-  `_execute_if_block_choice` (1680), `_process_if_elseif_else_block` (2531);
-  condition evaluation helpers `_evaluate_if_*` (1913–2309).
-- Let: `_process_let_statement_inline` (1767), field/index assignment helpers
+- Block engine: `_process_block` (1418), `_extract_block_body` (414),
+  `pre_scan_blocks` (2446), `_prepare_block_line` (443).
+- If: `_process_if_statement` (1522) and the "new"/"rich" variants (2011,
+  2113), `_parse_if_header` (1556), `_collect_if_blocks` (1633),
+  `_execute_if_block_choice` (1728), `_process_if_elseif_else_block` (2590);
+  condition evaluation helpers `_evaluate_if_*` (1972–2368).
+- Let: `_process_let_statement_inline` (1826), field/index assignment helpers
   (1339, 1390). **One binder everywhere:** `_bind_let_var_in_block` delegates
   to `executor._bind_declared_var`, so a `Let` in a block body is the same
   instruction as a top-level `Let`. Equality bindings pin a `constant`
@@ -335,7 +335,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   expression parser to attempt the line and raise when it cannot recognize a
   construct; that is still to be designed.
 - `_handle_block_*` methods (343–960): per-statement handling inside blocks.
-- `_scan_local_if_block` (2640): derives `If`/`Elseif`/`Else` clause structure
+- `_scan_local_if_block` (2728): derives `If`/`Elseif`/`Else` clause structure
   from the lines at hand, for bodies that are not in the top-level pre-scan
   (constructor bodies, nested slices), so the shared clause-selection code
   runs unchanged.
@@ -350,7 +350,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   - Constraints: `_re_evaluate_constraints` (904), `_check_constraints` (830, now unit-aware for `Let y of m = 5 of in`), `_validate_base_type` (975) — validates scalars AND, since the pyarrow
     removal, element-by-element base types of `dim` arrays (via
     `array_handler.validate_array_element_types`), `_expression_depends_on`
-    (651). `_array_unset_value` (array_handler.py:1507) resolves `None`
+    (651). `_array_unset_value` (array_handler.py:1543) resolves `None`
     sentinels for unset template array cells: checks the variable's
     `constraints['default']` (from `or = <expr>`) and evaluates it; falls back
     to `error_value(NA_ERROR)` (`#N/A`).
@@ -458,7 +458,7 @@ grants, request/response, `ReadAll`/`Reply`).
 > connection/server concerns; consolidating them would make the resource
 > layer a single, auditable unit.
 
-### `test_runner.py` (3593 lines) — inline test suite
+### `test_runner.py` (3728 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — runs 525 tests (Tests 282–293 unit tests, Tests 331–349 push/cell-mirror/subprocess semantics, Tests 350–357d resource/`Require`/grant semantics, Tests 385–405b module/`use`/instance-state/dotted-Require/ModuleVersion/runnable-module-run/unknown-call/init-never-fires-on-import semantics, Tests 452–465 live pipes + user-function vectorization/element-access, Tests 479–488 Net LISTEN/server routing + `ReadAll`/`Reply` semantics via the fake listener transport). At the bottom of the file it runs itself when executed directly:
 `python test_runner.py [names...]`. Failing names are printed.
 
@@ -495,8 +495,8 @@ grants, request/response, `ReadAll`/`Reply`).
   cell (horizontally). With `^`, object fields are expanded: one object per
   row, fields across columns. A single object WITHOUT `^` writes as a single
   cell value; with `^` it spills fields. The core spilling function is
-  `_assign_horizontal_array` (`array_handler.py:1217`);
-  `_assign_extended_address` (`array_handler.py:1315`) handles dotted targets
+  `_assign_horizontal_array` (`array_handler.py:1253`);
+  `_assign_extended_address` (`array_handler.py:1351`) handles dotted targets
   like `A1.B1.3`.
 - **Variables**: `: x = expr` (client binding — deferred until deps resolve),
   `Let x init val`/`= val`, `For x init val`. `Push x = expr` updates x and

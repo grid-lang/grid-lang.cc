@@ -11,7 +11,7 @@ from utils import col_to_num, num_to_col, split_cell, offset_cell, validate_cell
 from functools import reduce
 import operator
 import itertools
-from units import DIM_ERROR, NA_ERROR, REF_ERROR, TYPE_ERROR, UNIVERSAL_ZERO, ConstraintError, error_value, is_error_value
+from units import DIM_ERROR, NA_ERROR, REF_ERROR, TYPE_ERROR, UNIVERSAL_ZERO, VALUE_ERROR, ConstraintError, error_value, is_error_value
 
 
 def _public_eq(a, b):
@@ -708,6 +708,42 @@ class ArrayHandler:
         if self._update_bound_array_cell(target, value, line_number):
             self.compiler._set_grid_cell(target, value)
             return None
+        # A cell is a binding like any other: the ``:=`` constraint may bind
+        # it again only to the identical value -- binding a different value
+        # is a conflict and latches #VALUE.  A mirror recompute (its source
+        # moved through Push or another effect) keeps following its source,
+        # but may not overwrite a cell that already latched a conflict.
+        # A Push into the cell is mutation, not a binding, so it bypasses
+        # the registry entirely.
+        if not getattr(self.compiler, '_in_push_cell', False):
+            bind_values = getattr(self.compiler, '_cell_bind_values', None)
+            if bind_values is None:
+                bind_values = self.compiler._cell_bind_values = {}
+            bind_entry = bind_values.get(target)
+            is_recompute = getattr(
+                self.compiler, '_in_cell_spill_recompute', False)
+            value_is_binding = value is not None and not is_error_value(value)
+            if bind_entry is not None and bind_entry.get('conflict'):
+                if (not is_recompute and value_is_binding
+                        and constant_value_matches(
+                            value, bind_entry['value'], self.to_display_value)):
+                    # Re-binding the original value resolves the conflict.
+                    bind_entry['conflict'] = False
+                else:
+                    self.compiler._set_grid_cell(
+                        target, error_value(VALUE_ERROR))
+                    return None
+            elif value_is_binding:
+                if bind_entry is None:
+                    if not is_recompute:
+                        bind_values[target] = {'value': value, 'conflict': False}
+                elif not constant_value_matches(
+                        value, bind_entry['value'], self.to_display_value):
+                    if not is_recompute:
+                        bind_entry['conflict'] = True
+                        self.compiler._set_grid_cell(
+                            target, error_value(VALUE_ERROR))
+                        return None
         bound_var = self.compiler._cell_var_map.get(target)
         # A mirror recompute (executor drives any `:=` line that mirrors a
         # source variable) must refresh the grid cell only, never write the

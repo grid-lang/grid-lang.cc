@@ -1741,15 +1741,18 @@ class GridLangExecutor(GridLangBase):
             var_list.append((var, type_name, constraints, expr))
 
 
+        if has_block:
+            # The block form binds inside its own scope, so the header
+            # binding must be created after the scope push in
+            # ``_execute_let_block`` rather than here in the parent.
+            return self._execute_let_block(
+                lines, i, line_number, var_list)
         scope_dict = self.current_scope().get_evaluation_scope()
         member_writes = self._process_let_first_pass(
             var_list, scope_dict, line_number)
 
         self._run_let_second_pass(var_list, line_number)
 
-        if has_block:
-            return self._execute_let_block(
-                lines, i, line_number, var_list, member_writes)
         return self._execute_let_inline(
             lines, i, line_number, var_list, member_writes)
 
@@ -1971,10 +1974,28 @@ class GridLangExecutor(GridLangBase):
             # default, so those fields stay bindable (Test 556 vs 559).
             leaf_parent[leaf_key] = VALUE_ERROR
         else:
-            violation = self._validate_object_field_value(
-                leaf_parent, leaf_name, value, line_number)
-            leaf_parent[leaf_key] = (
-                violation if violation is not None else value)
+            # A field already bound by a Let must be bound again with the
+            # identical value -- a different value is a conflict and the
+            # field reads back as #VALUE, the same rule plain Let bindings
+            # follow (``a.top = 3`` then ``a.top = 4``).
+            let_bounds = leaf_parent.get('_let_bounds')
+            prior_bound = (let_bounds.get(leaf_lower)
+                           if isinstance(let_bounds, dict) else None)
+            if (prior_bound is not None
+                    and not constant_value_matches(
+                        value, prior_bound,
+                        self.array_handler.to_display_value)):
+                leaf_parent[leaf_key] = VALUE_ERROR
+            else:
+                violation = self._validate_object_field_value(
+                    leaf_parent, leaf_name, value, line_number)
+                leaf_parent[leaf_key] = (
+                    violation if violation is not None else value)
+                if violation is None:
+                    if not isinstance(let_bounds, dict):
+                        let_bounds = {}
+                        leaf_parent['_let_bounds'] = let_bounds
+                    let_bounds[leaf_lower] = value
 
         self._repin_member_write_constant(
             defining_scope, root_name, root_value, line_number)
@@ -2484,24 +2505,44 @@ class GridLangExecutor(GridLangBase):
             raise SyntaxError(
                 f"Unclosed LET block starting at line {line_number}")
         block_end_i = scan_i
-        member_writes = member_writes or set()
+        # Capture dotted header targets before the bind: the body may bind a
+        # field on the object, and a block-form binding must revert when the
+        # block ends (``Let a.top = 3 then ... End`` leaves the field as it
+        # was, exactly like the plain header variable is dropped).
+        captures = self._capture_member_writes(var_list, line_number)
+        scope_dict = self.current_scope().get_evaluation_scope()
+        member_writes = self._process_let_first_pass(
+            var_list, scope_dict, line_number)
+        self._run_let_second_pass(var_list, line_number)
+        # Only new variables are declared here; anything already bound in an
+        # enclosing scope was a rebind and stays where it was defined.
+        for var, _, _, _ in var_list:
+            if var.lower() in member_writes:
+                continue
+            if self.current_scope().get_defining_scope(var) is self.current_scope():
+                self.current_scope().local_let_declarations.add(var.lower())
+
+        def _skip_block():
+            # A skipped body still ran the header bind: revert the member
+            # bindings and drop the block-local variable with the scope.
+            self._restore_member_writes(captures)
+            self.pop_scope()
+            return block_end_i + 1
+
         for var, _, constraints, _ in var_list:
             if constraints and var.lower() not in member_writes:
                 defining_scope = self.current_scope().get_defining_scope(var) or self.current_scope()
                 var_value = self._resolve_pending_let_var(var, defining_scope)
                 if var_value is None:
-                    self.pop_scope()
-                    return block_end_i + 1
+                    return _skip_block()
                 for op, threshold in constraints.items() if constraints else []:
                     try:
                         threshold_value = float(threshold)
                         if isinstance(var_value, (int, float)):
                             if op == '<' and var_value >= threshold_value:
-                                self.pop_scope()
-                                return block_end_i + 1
+                                return _skip_block()
                             elif op == '>' and var_value <= threshold_value:
-                                self.pop_scope()
-                                return block_end_i + 1
+                                return _skip_block()
                     except ValueError:
                         pass
                 if defining_scope.constraints.get(var, {}):
@@ -2509,8 +2550,7 @@ class GridLangExecutor(GridLangBase):
                         defining_scope._check_constraints(
                             var, var_value, line_number)
                     except ValueError as e:
-                        self.pop_scope()
-                        return block_end_i + 1
+                        return _skip_block()
         # Skip the block when any declared variable holds an error value
         # (``Let x = <error> then ... End`` must not execute its body).
         for var, _, _, _ in var_list:
@@ -2524,8 +2564,7 @@ class GridLangExecutor(GridLangBase):
             if var_value is None:
                 var_value = defining_scope.variables.get(var)
             if is_error_value(var_value):
-                self.pop_scope()
-                return block_end_i + 1
+                return _skip_block()
 
         # Collect Let-defined variable names so we can exclude them from
         # promotion.  For and : define in the enclosing scope; only Let
@@ -2553,6 +2592,8 @@ class GridLangExecutor(GridLangBase):
                     continue
                 if key.lower() in let_var_names:
                     continue
+                if key.lower() in block_scope.local_let_declarations:
+                    continue
                 existing = parent_scope.get_defining_scope(key)
                 if existing:
                     try:
@@ -2570,8 +2611,57 @@ class GridLangExecutor(GridLangBase):
                     except Exception:
                         pass
 
+        # The header's member binding lives only inside the block: put the
+        # field back the way it was before the block ran.
+        self._restore_member_writes(captures)
         self.pop_scope()
         return block_end_i + 1
+
+    def _capture_member_writes(self, var_list, line_number):
+        """Snapshot the object fields a dotted Let header would bind.
+
+        Returns ``(leaf_parent, leaf_key, had_key, old_value, old_bounds)``
+        records taken before the bind runs, so the block form of ``Let`` can
+        revert the field (and the per-field binding registry) when the block
+        ends -- the binding exists only in the scope of the block.
+        """
+        captures = []
+        seen = set()
+        for var, _, _, expr in var_list:
+            if expr is None or '.' not in str(var):
+                continue
+            path_parts = [p.strip() for p in str(var).split('.') if p.strip()]
+            if len(path_parts) < 2 or not all(
+                    re.match(r'^[\w_]+$', p) for p in path_parts):
+                continue
+            try:
+                _, leaf_parent, _, leaf_key, _ = self._walk_member_path(
+                    path_parts[0], path_parts, line_number)
+            except Exception:
+                continue
+            marker = (id(leaf_parent), leaf_key)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            captures.append((
+                leaf_parent, leaf_key,
+                leaf_key in leaf_parent,
+                copy.deepcopy(leaf_parent.get(leaf_key)),
+                copy.deepcopy(leaf_parent.get('_let_bounds')),
+            ))
+        return captures
+
+    def _restore_member_writes(self, captures):
+        """Put captured fields (and their binding registry) back in place."""
+        for leaf_parent, leaf_key, had_key, old_value, old_bounds in captures:
+            if had_key:
+                leaf_parent[leaf_key] = old_value
+            else:
+                leaf_parent.pop(leaf_key, None)
+            if old_bounds is None:
+                leaf_parent.pop('_let_bounds', None)
+            else:
+                leaf_parent['_let_bounds'] = old_bounds
 
     def _execute_let_inline(self, lines, i, line_number, var_list,
                             member_writes=None):
@@ -6155,8 +6245,18 @@ class GridLangExecutor(GridLangBase):
                     f"Field 'grid' is read-only outside type at line {line_number}")
         if target.startswith('['):
             assignment_line = f"{target} := {value_expr}"
-            self.array_handler.evaluate_line_with_assignment(
-                assignment_line, line_number, self.current_scope().get_evaluation_scope())
+            # A Push into a cell is mutation (last value wins), not a new
+            # binding: flag it so the cell's equality-binding registry is
+            # left alone.
+            owner = getattr(self, 'compiler', None) or self
+            was_push = getattr(owner, '_in_push_cell', False)
+            owner._in_push_cell = True
+            try:
+                self.array_handler.evaluate_line_with_assignment(
+                    assignment_line, line_number,
+                    self.current_scope().get_evaluation_scope())
+            finally:
+                owner._in_push_cell = was_push
             return
         if re.search(r'[\(\{!]', target):
             self._assign_indexed_target(target, value_expr, line_number)
@@ -6306,7 +6406,18 @@ class GridLangExecutor(GridLangBase):
         if len(path_parts) < 2:
             raise ValueError(
                 f"Member path needs at least one field at line {line_number}")
-        root_value = self.current_scope().get(root_name)
+        # Resolve the root through its defining scope: a private block scope
+        # (a Let block) does not chain reads to its parent, but the binding
+        # still has to be reachable from inside the block.
+        defining = self.current_scope().get_defining_scope(root_name)
+        root_key = None
+        if defining is not None:
+            root_key = defining._get_case_insensitive_key(
+                root_name, defining.variables)
+        if defining is None or root_key is None:
+            root_value = self.current_scope().get(root_name)
+        else:
+            root_value = defining.variables.get(root_key)
         if not isinstance(root_value, dict):
             raise ValueError(
                 f"'{root_name}' is not an object at line {line_number}")
@@ -6661,16 +6772,19 @@ class GridLangExecutor(GridLangBase):
                     for dep in deps)
                 if unresolved:
                     continue
-                # Locate the index of the IF line in the cached preprocessed lines
+                # Locate the index of the IF line in the cached preprocessed
+                # lines. Match content as well: a renumbered constructor IF
+                # can share a line number with an unrelated main IF.
                 line_index = next(
-                    (idx for idx, (_, ln) in enumerate(self.control_flow._preprocessed_lines)
-                     if ln == line_number),
+                    (idx for idx, (txt, ln) in enumerate(
+                        self.control_flow._preprocessed_lines)
+                     if ln == line_number and txt == line_content),
                     None)
                 if line_index is None:
                     continue
-                if_block = next(
-                    (block for block in self.control_flow.if_blocks if block['start_line'] == line_number),
-                    None)
+                if_block = self.control_flow._match_global_if_block(
+                    line_number, self.control_flow._preprocessed_lines,
+                    line_index)
                 if if_block and len(if_block.get('clauses', [])) > 1:
                     self.control_flow._process_if_statement_rich(
                         line_content, line_number, self.control_flow._preprocessed_lines, line_index)

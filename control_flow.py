@@ -520,23 +520,61 @@ class GridLangControlFlow:
                                value_dict=None, on_done=None):
         """Run a conditional ``Let <cond> then ... End`` block.
 
-        The condition decides whether the body runs; the body itself is
-        ordinary code and is executed by :meth:`_process_block`.
+        Declaration headers (``Let x = 2 then``) bind their variable first,
+        exactly like the main-loop LET, so the body can read it; guard
+        headers (``Let x > 10 then``) run the body only when the current
+        value satisfies the comparison. The body itself is ordinary code and
+        is executed by :meth:`_process_block`.
         """
         line, ln, line_clean = self._prepare_block_line(block_lines, i)
         header = re.sub(r'^Let\s+', '', line_clean, count=1, flags=re.I)
         header = re.sub(r'\s+then\s*$', '', header, flags=re.I).strip()
         body, end_index = self._extract_block_body(block_lines, i)
-        _, _, constraints, expr = self.compiler._parse_variable_def(
+        var, type_name, constraints, expr = self.compiler._parse_variable_def(
             header, ln)
         condition_passed = True
-        if expr is not None:
+        plain_var = bool(isinstance(var, str) and re.match(
+            r'^[A-Za-z_]\w*$', var or ''))
+        if expr is not None and plain_var:
+            fresh = self.compiler.current_scope().get_defining_scope(var) is None
+            status = self.executor._bind_declared_var(
+                var, type_name, constraints, expr, ln,
+                shadow_keyword='LET', mark_implicit=True)
+            if status == 'deferred':
+                condition_passed = False
+            else:
+                if fresh and status == 'bound':
+                    # A block-form Let declares a new variable that is only
+                    # visible inside its block: record it where the enclosing
+                    # scope copy-back looks so it is dropped at End.
+                    self.compiler.current_scope().local_let_declarations.add(
+                        var.lower())
+                try:
+                    bound_value = self.compiler.current_scope().get(var)
+                except NameError:
+                    bound_value = None
+                # An error-valued or unresolved declaration skips the body,
+                # matching the main-loop LET block.
+                if bound_value is None or is_error_value(bound_value):
+                    condition_passed = False
+        elif expr is not None:
+            # Index/field writes are not bound here; keep the legacy
+            # truthiness gate so the body only runs on a real value.
             try:
                 value = self.compiler.expr_evaluator.eval_or_eval_array(
                     str(expr),
                     self.compiler.current_scope().get_evaluation_scope(), ln)
                 condition_passed = bool(value)
             except Exception:
+                condition_passed = False
+        elif constraints:
+            # Guard headers (``x > 10``, ``name <> "bob"``, ``q of peso``)
+            # are ordinary conditions: evaluate them with the shared If/'?'
+            # evaluator instead of re-implementing the operator table.
+            try:
+                condition_passed = bool(self._evaluate_if_condition(
+                    header, ln, warn_boolean=True))
+            except NameError:
                 condition_passed = False
         if condition_passed and body:
             self._process_block(body, self.compiler.current_scope())
@@ -704,11 +742,18 @@ class GridLangControlFlow:
                 block_lines, i)
 
             # Blocks with ELSEIF / ELSE clauses keep the rich handler.
-            if_block = next(
-                (block for block in self.if_blocks
-                 if block.get('start_line') == line_number),
-                None)
-            if if_block and len(if_block.get('clauses', [])) > 1:
+            if_block = self._match_global_if_block(
+                line_number, block_lines, i)
+            clause_count = len(if_block.get('clauses', [])) if if_block else 0
+            if not if_block:
+                # Constructor bodies are renumbered and absent from the
+                # pre-scan; without this an ELSE would run as part of the
+                # taken clause's span instead of being mutually exclusive.
+                local_block = self._scan_local_if_block(
+                    line, line_number, block_lines, i)
+                clause_count = len(local_block.get(
+                    'clauses', [])) if local_block else 0
+            if clause_count > 1:
                 try:
                     consumed = self._process_if_statement_rich(
                         line, line_number, block_lines, i)
@@ -1186,17 +1231,18 @@ class GridLangControlFlow:
             except Exception as e:
                 return True, i + 1, False
         if line.strip().startswith(': '):
+            assignment_line = line.strip()[2:]
+            m = re.match(r'^([\w_]+)\s*=\s*(.+)$', assignment_line)
+            if m:
+                # A colon-let on a plain variable has the same shape as the
+                # keyword-less assignment ``name = expr``; reuse its in-block
+                # Let binder (the cell evaluator below rejects plain-variable
+                # targets, and its failure is swallowed here).
+                handled, next_i = self._handle_block_optional_let_statement(
+                    block_lines, i, assignment_line, line_number, assignment_line)
+                if handled:
+                    return handled, next_i, False
             try:
-                assignment_line = line.strip()[2:]
-                m = re.match(r'^([\w_]+)\s*=\s*(.+)$', assignment_line)
-                if m:
-                    target_var = m.group(1)
-                    defining_scope = self.compiler.current_scope().get_defining_scope(
-                        target_var)
-                    if not defining_scope:
-                        inferred_type = 'number'
-                        self.compiler.current_scope().define(
-                            target_var, None, inferred_type, {}, is_uninitialized=True)
                 self.compiler.array_handler.evaluate_line_with_assignment(
                     assignment_line, line_number, self.compiler.current_scope().get_evaluation_scope())
             except Exception as e:
@@ -1573,6 +1619,13 @@ class GridLangControlFlow:
     def _process_if_block_statement(self, condition_result, lines, current_index, line_number):
         if_block_lines, else_block_lines, elseif_blocks, block_i = self._collect_if_blocks(
             lines, current_index, line_number)
+        # Same contract as the rich handler: targets assigned inside the
+        # block exist (as the ``""`` placeholder) even when the block is
+        # skipped, so reads after the IF do not raise NameError.
+        self._predeclare_block_assignment_targets(
+            if_block_lines + else_block_lines
+            + [ln for _, elseif_lines in elseif_blocks
+               for ln in elseif_lines])
         self._execute_if_block_choice(
             condition_result, if_block_lines, elseif_blocks, else_block_lines, line_number)
         return block_i - current_index - 1
@@ -1594,11 +1647,13 @@ class GridLangControlFlow:
                 if depth == 0:
                     block_i += 1
                     break
-            elif next_line_clean.startswith("if "):
-                current_block.append((next_line, next_line_number))
-                block_i += 1
-                continue
             elif self.compiler._starts_with_keyword(next_line_clean, "if ") and self.compiler._ends_with_keyword(next_line_clean, "then"):
+                depth += 1
+            elif re.match(r'^\s*(?:let\b.+\bthen|for\b.+\bdo|when\b.+\bdo)\s*$',
+                          next_line, re.I):
+                # Inner blocks (``Let ... then``, ``For ... do``) own an ``End``
+                # too; without this depth bump the inner ``End`` closes the
+                # outer IF and the remaining clauses leak out of the block.
                 depth += 1
             elif self.compiler._starts_with_keyword(next_line_clean, "elseif ") and self.compiler._ends_with_keyword(next_line_clean, "then") and depth == 1:
                 elseif_condition = re.match(
@@ -1614,16 +1669,9 @@ class GridLangControlFlow:
                 current_block.append((next_line, next_line_number))
                 block_i += 1
                 continue
-            elif self.compiler._starts_with_keyword(next_line_clean, "elseif ") and self.compiler._ends_with_keyword(next_line_clean, "then"):
-                depth += 1
-            elif self.compiler._starts_with_keyword(next_line_clean, "else"):
-                if depth == 1:
-                    depth -= 1
-                    if depth == 0:
-                        block_i += 1
-                        break
-                else:
-                    depth += 1
+            # A nested clause header (ELSEIF/ELSE of an inner IF) is ordinary
+            # content here: the nested IF's own handler splits it when the
+            # body runs, and it must not change this walk's depth.
             elif next_line_clean.startswith("for "):
                 if self._handle_special_nested_for_element_line(next_line, next_line_number):
                     current_block.append((next_line, next_line_number))
@@ -1678,17 +1726,28 @@ class GridLangControlFlow:
                 f"Failed to process nested array element assignment: {e}")
 
     def _execute_if_block_choice(self, condition_result, if_block_lines, elseif_blocks, else_block_lines, line_number):
+        # _collect_if_blocks keeps the ELSE/ELSEIF header line inside the
+        # clause body; strip it so the body is pure statements.
+        def strip_header(block_lines):
+            if block_lines:
+                first = block_lines[0][0].strip().lower()
+                if first == 'else' or first.startswith('elseif '):
+                    return block_lines[1:]
+            return block_lines
+
         if condition_result:
             self._execute_block_with_scope_transfer(if_block_lines, "IF")
             return
 
         for elseif_result, elseif_lines in elseif_blocks:
             if elseif_result:
-                self._execute_block_with_scope_transfer(elseif_lines, "ELSEIF")
+                self._execute_block_with_scope_transfer(
+                    strip_header(elseif_lines), "ELSEIF")
                 return
 
         if else_block_lines:
-            self._execute_block_with_scope_transfer(else_block_lines, "ELSE")
+            self._execute_block_with_scope_transfer(
+                strip_header(else_block_lines), "ELSE")
 
     def _execute_block_with_scope_transfer(self, block_lines, label):
         self.compiler.push_scope(is_private=False)
@@ -2617,7 +2676,7 @@ class GridLangControlFlow:
                 break
 
             else:
-                # --- Nested IF handling ---
+                # --- Nested block handling ---
                 if lower == "end" and depth > 0:
                     if in_active_clause:
                         active_clause_lines.append((line, line_number))
@@ -2625,6 +2684,13 @@ class GridLangControlFlow:
                 else:
                     if in_active_clause:
                         active_clause_lines.append((line, line_number))
+                    # Inner block headers (nested IF at depth > 0, ``Let ...
+                    # then``, ``For ... do``, ``When ... do``) own an ``End``;
+                    # bump depth so their ``End`` does not terminate the
+                    # clause walk before the ELSE/ELSEIF is seen.
+                    if re.match(r'^\s*(?:if|let|for|when)\b.+\b(?:then|do)\s*$',
+                                line, re.I):
+                        depth += 1
 
             i += 1
 
@@ -2636,6 +2702,28 @@ class GridLangControlFlow:
                     [(active_clause_condition, active_clause_header)])
             self._process_block(active_clause_lines,
                                 self.compiler.current_scope())
+
+    def _match_global_if_block(self, line_number, lines=None,
+                               current_index=None):
+        """Find the pre-scanned IF block for *line_number*.
+
+        Constructor and builder bodies are renumbered as ``call_line +
+        offset``, so their line numbers can collide with an unrelated main
+        level IF. A block whose header in the preprocessed source differs
+        from the line at hand is rejected and the caller falls back to a
+        local scan.
+        """
+        for block in self.if_blocks:
+            if block.get('start_line') != line_number:
+                continue
+            pre = self._preprocessed_lines
+            if pre and lines is not None and current_index is not None:
+                start_i = block.get('start_i', -1)
+                if 0 <= current_index < len(lines) and 0 <= start_i < len(pre):
+                    if lines[current_index] != pre[start_i]:
+                        continue
+            return block
+        return None
 
     def _scan_local_if_block(self, line, line_number, lines, current_index):
         """Derive IF/ELSEIF/ELSE clause structure from *lines*.
@@ -2692,11 +2780,8 @@ class GridLangControlFlow:
         """Process IF statement using the rich block structure with clause information"""
 
         # Find the IF block that starts at this line
-        if_block = None
-        for block in self.if_blocks:
-            if block['start_line'] == line_number:
-                if_block = block
-                break
+        if_block = self._match_global_if_block(
+            line_number, lines, current_index)
 
         if not if_block:
             # Blocks running through a nested body (e.g. a constructor body)
@@ -2783,17 +2868,22 @@ class GridLangControlFlow:
         current_scope = self.compiler.current_scope()
         for line_content, _ in block_lines:
             stripped = line_content.strip()
+            # ``Let`` targets are NOT predeclared: the LET handler binds them
+            # when its block runs, and a placeholder here would carry a wrong
+            # type into that bind (e.g. ``"" as text`` vs ``Let z = 1``).
             match = re.match(r'^:\s*([\w_]+)\s*=', stripped)
-            if not match:
-                match = re.match(r'^let\s+([\w_]+)\s*=', stripped, re.I)
             if match:
                 var_name = match.group(1)
                 defining_scope = current_scope.get_defining_scope(var_name)
                 if not defining_scope:
+                    # The placeholder exists so a skipped block still reads
+                    # (as ``#N/A``, an unvalued declaration) instead of
+                    # raising NameError; it stays untyped so the real
+                    # assignment (number, text, ...) is not rejected.
                     current_scope.define(
-                        var_name, "", 'text', {}, is_uninitialized=False)
-                elif defining_scope.is_uninitialized(var_name):
-                    defining_scope.update(var_name, "", None)
+                        var_name, None, None, {}, is_uninitialized=True)
+                # A variable already declared but unvalued keeps reading as
+                # #N/A; do not force it to "".
 
     def _process_if_statement_new(self, line, line_number, lines, current_index):
         """New simple IF processing using pre-scanned block map"""
