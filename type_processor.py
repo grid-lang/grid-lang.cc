@@ -382,6 +382,8 @@ class GridLangTypeProcessor:
         prev_allow_overwrite = getattr(self.compiler, '_allow_scope_overwrite', False)
         prev_parent_scope = getattr(self.compiler, '_parent_scope', None)
         prev_member_keys = getattr(self.compiler, '_type_member_keys', None)
+        prev_constructing = getattr(
+            self.compiler, '_constructing_type', None)
         self.compiler._allow_hidden_field_access = True
         self.compiler._allow_hidden_member_calls = True
         self.compiler._outer_scope_read_only = True
@@ -393,6 +395,10 @@ class GridLangTypeProcessor:
         # Add the type instance to the scope so code can reference it
         inferred_type = value_dict.get('_type_name') if isinstance(
             value_dict, dict) else None
+        if inferred_type:
+            # Bare builder calls in this body (including nested blocks)
+            # resolve against the type currently under construction.
+            self.compiler._constructing_type = inferred_type
         type_def = {}
         if inferred_type:
             type_def = self.compiler.types_defined.get(
@@ -450,6 +456,7 @@ class GridLangTypeProcessor:
             self.compiler._allow_scope_overwrite = prev_allow_overwrite
             self.compiler._parent_scope = prev_parent_scope
             self.compiler._type_member_keys = prev_member_keys
+            self.compiler._constructing_type = prev_constructing
             self.compiler.pop_scope()
             if isinstance(value_dict, dict):
                 # The WITH marker only matters while the constructor body runs.
@@ -714,6 +721,16 @@ class GridLangTypeProcessor:
             if stripped_line.startswith(':'):
                 # Field declaration: : attr init "attr" or : attr = expr
                 colon_line = stripped_line[1:].strip()
+                colon_name_m = re.match(r'^(\$?[\w_]+)', colon_line)
+                if getattr(self.compiler, '_builder_run', False) and colon_name_m:
+                    # Inside a builder every colon declaration is a
+                    # builder-local variable. Field writes in builders
+                    # go through Push.
+                    self._process_type_let_statement(
+                        f"Let {colon_line}", colon_name_m.group(1),
+                        value_dict, line_number, input_values)
+                    i += 1
+                    continue
                 init_m = re.match(r'^(\$?[\w_]+)\s+init\s+(.+)$', colon_line, re.I)
                 if init_m:
                     colon_line = f"{init_m.group(1)} = {init_m.group(2)}"
@@ -1325,7 +1342,7 @@ class GridLangTypeProcessor:
                 f"Builder '{builder_name}' does not take arguments at line {line_number}")
 
         code_lines = helper_def.get('code_lines') or helper_def.get('code', '').splitlines()
-        member_keys = type_def.get('_member_keys', set())
+        member_keys = set(type_def.get('_member_keys', set()))
         saved_non_member = {}
         for key in list(value_dict.keys()):
             if (not str(key).startswith('_')
@@ -1334,10 +1351,13 @@ class GridLangTypeProcessor:
                 saved_non_member[key] = value_dict.pop(key)
         saved_scopes = self.compiler.scopes[:]
         self.compiler.scopes = [self.compiler.scopes[0]]
+        prev_builder_run = getattr(self.compiler, '_builder_run', False)
+        self.compiler._builder_run = True
         try:
             self._execute_type_code(
                 code_lines, 'this', value_dict, line_number, input_values)
         finally:
+            self.compiler._builder_run = prev_builder_run
             value_dict.update(saved_non_member)
             self.compiler.scopes = saved_scopes
 

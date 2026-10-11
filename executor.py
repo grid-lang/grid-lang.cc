@@ -904,6 +904,55 @@ class GridLangExecutor(GridLangBase):
         _flush()
         return args
 
+    def _constructing_type_builder_entry(self, name):
+        """Builder of that name owned by the type under construction, or None.
+
+        Bare builder calls (``prepare(24)``) resolve here while a type's own
+        constructor or builder body executes; the ``$`` prefix is optional
+        because the call sits in the type's own construction scope.
+        """
+        type_name = getattr(self, '_constructing_type', None)
+        if not type_name:
+            return None
+        type_def = self.types_defined.get(str(type_name).lower(), {})
+        if not isinstance(type_def, dict):
+            return None
+        builders = type_def.get('_builders') or {}
+        return builders.get(str(name).lower().lstrip('$'))
+
+    def _call_construction_builder(self, name, arg_values, line_number=None):
+        """Run a bare builder call against the in-progress instance.
+
+        The instance is the constructor's ``this``; the builder mutates it
+        in place and the instance is returned (the same result a ``new``
+        chain yields).  Raises NameError when the name is not a builder of
+        the constructing type or the call escapes construction scope.
+        """
+        if line_number is None:
+            line_number = getattr(self, '_current_call_line', None) or 0
+        type_name = getattr(self, '_constructing_type', None)
+        entry = self._constructing_type_builder_entry(name)
+        if entry is None:
+            raise NameError(
+                f"Builder '{name}' is not defined for type "
+                f"'{type_name}' at line {line_number}")
+        try:
+            instance = self.current_scope().get('this')
+        except Exception:
+            instance = None
+        if not isinstance(instance, dict):
+            raise NameError(
+                f"Builder '{name}' can only run during construction of type "
+                f"'{type_name}' at line {line_number}")
+        self.type_processor._execute_builder(
+            str(type_name), name, instance, line_number,
+            list(arg_values or []))
+        # The builder ran with its own scope chain; mirror the mutated
+        # fields back into the constructor's scope so a later field sync
+        # does not clobber the builder's writes with stale scope values.
+        self.type_processor._push_type_fields_to_scope(instance)
+        return instance
+
     def _maybe_handle_subprocess_call(self, line, line_number):
         """Detect and execute bare subprocess call lines."""
         m = re.match(r'^\s*([\w\.]+)\s*\((.*)\)\s*$', line)
@@ -914,6 +963,16 @@ class GridLangExecutor(GridLangBase):
         if (not subprocess_defs or name.lower() not in subprocess_defs) and hasattr(self, 'compiler'):
             subprocess_defs = getattr(self.compiler, 'subprocesses', {}) or {}
         if name.lower() not in subprocess_defs:
+            if self._constructing_type_builder_entry(name) is not None:
+                arg_parts = self._split_call_arguments(args_str)
+                arg_values = [
+                    self.expr_evaluator.eval_or_eval_array(
+                        a, self.current_scope().get_evaluation_scope(),
+                        line_number)
+                    for a in arg_parts]
+                self._call_construction_builder(
+                    name, arg_values, line_number)
+                return True
             if self._bare_handle_member_call(name, args_str, line, line_number):
                 return True
             return False

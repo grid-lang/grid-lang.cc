@@ -21,7 +21,7 @@ from utils import (
     format_display_value,
     is_sparse_array,
 )
-from units import DIV0_ERROR, NA_ERROR, NUM_ERROR, REF_ERROR, UNIVERSAL_ZERO, VALUE_ERROR, UnitValue, ConstraintError, error_value, is_error_value, apply_conversion
+from units import DIV0_ERROR, NA_ERROR, NAME_ERROR, NUM_ERROR, REF_ERROR, UNIVERSAL_ZERO, VALUE_ERROR, UnitValue, ConstraintError, error_value, is_error_value, apply_conversion
 from grid_lang_common import resolve_text_constant_token
 from type_processor import split_builder_chain
 
@@ -928,8 +928,7 @@ class ExpressionEvaluator:
         if dim_var_key:
             dim_idx = self.compiler.dim_names[dim_var_key].get(dim_name)
             if dim_idx is None:
-                raise SyntaxError(
-                    f"Dimension '{dim_name}' not found for '{var_name}' at line {line_number}")
+                return True, error_value(NAME_ERROR)
             labels = self.compiler.dim_labels.get(dim_var_key, {}).get(dim_name, {})
         else:
             label_candidates = []
@@ -948,8 +947,7 @@ class ExpressionEvaluator:
             if len(label_candidates) == 1:
                 labels, dim_idx = label_candidates[0]
             else:
-                raise SyntaxError(
-                    f"Variable '{var_name}' has no named dimensions at line {line_number}")
+                return True, error_value(NAME_ERROR)
 
         index_str_clean = index_str.strip('"')
         dim_index = None
@@ -975,8 +973,9 @@ class ExpressionEvaluator:
                     elif evaluated_index.isdigit():
                         dim_index = int(evaluated_index) - 1
                     else:
-                        raise ValueError(
-                            f"Invalid index '{evaluated_index}' for dimension '{dim_name}' at line {line_number}")
+                        # The label is not in the dimension's label map and
+                        # can never appear later: a #NAME error value.
+                        return True, error_value(NAME_ERROR)
                 elif isinstance(evaluated_index, (int, float)):
                     dim_index = int(evaluated_index) - 1
                 else:
@@ -1560,8 +1559,10 @@ class ExpressionEvaluator:
             if actual_field not in scope_var and scope_var.get('_type_name'):
                 if field.lower() == 'grid':
                     return True, {}
-                raise NameError(
-                    f"Field '{field}' does not exist on '{var}' at line {line_number}")
+                # A nonexistent member field can never appear later (only a
+                # constructor declares fields), so the read is a #NAME
+                # error value instead of aborting the program.
+                return True, error_value(NAME_ERROR)
             if actual_field not in scope_var and field.lower() == 'grid':
                 return True, {}
             value = scope_var.get(actual_field)
@@ -1582,8 +1583,7 @@ class ExpressionEvaluator:
                 if actual_field not in var_value and var_value.get('_type_name'):
                     if field.lower() == 'grid':
                         return True, {}
-                    raise NameError(
-                        f"Field '{field}' does not exist on '{var}' at line {line_number}")
+                    return True, error_value(NAME_ERROR)
                 if actual_field not in var_value and field.lower() == 'grid':
                     return True, {}
                 value = var_value.get(actual_field)
@@ -4144,6 +4144,25 @@ class ExpressionEvaluator:
                            self.compiler.call_subprocess(_sname, a))
                 globals_dict[sname] = wrapper
                 original = sdef.get('original')
+                if original:
+                    globals_dict.setdefault(original, wrapper)
+                    globals_dict.setdefault(original.lower(), wrapper)
+                    globals_dict.setdefault(original.upper(), wrapper)
+        # Bare builder calls inside a type's own construction body reach the
+        # block engine's expression tail; wrap the constructing type's
+        # builders so they resolve there (statement lines are also caught
+        # natively by _maybe_handle_subprocess_call).
+        constructing = getattr(self.compiler, '_constructing_type', None)
+        if constructing:
+            type_def = self.compiler.types_defined.get(
+                str(constructing).lower(), {})
+            builders = (type_def.get('_builders') or {}) if isinstance(
+                type_def, dict) else {}
+            for bname, bdef in builders.items():
+                wrapper = (lambda *a, _bname=bname:
+                           self.compiler._call_construction_builder(_bname, a))
+                globals_dict.setdefault(bname, wrapper)
+                original = bdef.get('original')
                 if original:
                     globals_dict.setdefault(original, wrapper)
                     globals_dict.setdefault(original.lower(), wrapper)

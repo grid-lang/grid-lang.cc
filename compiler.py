@@ -178,6 +178,9 @@ class GridLangCompiler(GridLangExecutor):
         self.output_values = {}
         self._allow_hidden_field_access = False
         self._allow_hidden_member_calls = False
+        # Type whose constructor/builder body is executing; bare builder
+        # calls resolve against it while set.
+        self._constructing_type = None
         self.undefined_dependencies = set()
         self.dependency_graph = {'nodes': [], 'by_variable': {}, 'by_line': {}}
         self.global_guard_entries = []

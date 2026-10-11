@@ -28,6 +28,8 @@ Error values:
     #DIM    value does not match the declared dimensions
     #N/A    value not available (e.g. reading an uninitialized variable)
     #REF    invalid address (index out of range, too many dimensions)
+    #NAME   name not found (a missing member field, array dimension
+            label, or dimension name)
     #PERM   permission not granted: a required capability was denied, or a
             resource access exceeded what the user granted
 """
@@ -42,11 +44,12 @@ TYPE_ERROR = '#TYPE/I'
 DIM_ERROR = '#DIM'
 NA_ERROR = '#N/A'
 REF_ERROR = '#REF'
+NAME_ERROR = '#NAME'
 PERM_ERROR = '#PERM'
 
 ERROR_CODES = frozenset({
     UNIT_ERROR, DIV0_ERROR, NUM_ERROR, VALUE_ERROR, TYPE_ERROR,
-    DIM_ERROR, NA_ERROR, REF_ERROR, PERM_ERROR,
+    DIM_ERROR, NA_ERROR, REF_ERROR, NAME_ERROR, PERM_ERROR,
 })
 
 

@@ -500,9 +500,15 @@ class GridLangControlFlow:
         """Run an ``If ... then [elseif/else] ... End`` from a constructor body.
 
         Parsing, condition evaluation and branch selection are the engine's;
-        the selected branch runs through ``_process_block``.
+        the selected branch runs through ``_process_block``. The single-line
+        form ``if cond then action`` takes the block dispatcher's inline path.
         """
         line, ln, line_clean = self._prepare_block_line(block_lines, i)
+        if re.match(r'^\s*if\s+.+?\s+then\s+\S', line, re.I):
+            handled, end = self._handle_block_if_dispatch(
+                block_lines, i, line, ln, line_clean)
+            self._sync_type_fields_from_scope(value_dict)
+            return end if handled else i + 1
         consumed = self._process_if_statement_rich(line, ln, block_lines, i)
         end = min(i + consumed + 1, len(block_lines))
         self._sync_type_fields_from_scope(value_dict)
@@ -552,6 +558,7 @@ class GridLangControlFlow:
         var, type_name, constraints, expr = self.compiler._parse_variable_def(
             header, ln)
         condition_passed = True
+        block_local = False
         plain_var = bool(isinstance(var, str) and re.match(
             r'^[A-Za-z_]\w*$', var or ''))
         if expr is not None and plain_var:
@@ -568,6 +575,7 @@ class GridLangControlFlow:
                     # scope copy-back looks so it is dropped at End.
                     self.compiler.current_scope().local_let_declarations.add(
                         var.lower())
+                    block_local = True
                 try:
                     bound_value = self.compiler.current_scope().get(var)
                 except NameError:
@@ -597,6 +605,20 @@ class GridLangControlFlow:
                 condition_passed = False
         if condition_passed and body:
             self._process_block(body, self.compiler.current_scope())
+        if block_local:
+            # The header variable lives only inside the block. The main-loop
+            # LET drops it by popping the block scope; this path binds into
+            # the current scope, so drop it here instead of waiting for the
+            # enclosing scope's copy-back.
+            scope = self.compiler.current_scope()
+            old_key = scope._get_case_insensitive_key(
+                var, scope.variables)
+            if old_key is not None:
+                scope.variables.pop(old_key, None)
+                scope.types.pop(old_key, None)
+                scope.constraints.pop(old_key, None)
+            scope.local_let_declarations.discard(var.lower())
+            scope.clear_implicit_let(var)
         if callable(on_done):
             on_done()
         return end_index + 1
