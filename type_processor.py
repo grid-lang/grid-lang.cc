@@ -84,11 +84,13 @@ class GridLangTypeProcessor:
             'declared_fields': set(),
             'field_defaults': {},
             'constant_fields': set(),
+            'declare_line': None,
         }
 
     def _parse_type_def(self, lines, line_number=None, type_name=None):
         """Parse type definition lines and extract fields and executable code."""
         state = self._new_type_def_state()
+        state['declare_line'] = line_number
         for line in lines:
             self._parse_type_def_line(line, line_number, state)
         self._collect_type_computed_fields(state)
@@ -337,6 +339,8 @@ class GridLangTypeProcessor:
     def _finalize_type_def_state(self, state):
         """Build the public type-definition structure from parse state."""
         fields = state['fields']
+        if state.get('declare_line') is not None:
+            fields['_declare_line'] = state['declare_line']
         if state['executable_code']:
             fields['_executable_code'] = state['executable_code']
         if state['inputs']:

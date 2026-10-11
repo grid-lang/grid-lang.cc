@@ -455,7 +455,8 @@ class ExpressionEvaluator:
                 element_type, method_name)
             if func_key and func_key in getattr(self.compiler, 'functions', {}):
                 results.append(self.compiler.call_function(
-                    func_key, [elem] + evaluated_args, instance_type=element_type))
+                    func_key, [elem] + evaluated_args,
+                    instance_type=element_type, line_number=line_number))
         if results:
             return True, results
         return False, None
@@ -591,7 +592,8 @@ class ExpressionEvaluator:
                         evaluated_args = [self.eval_or_eval_array(
                             a, scope, line_number) for a in args_list]
                         return [self.compiler.call_function(
-                            func_key, [elem] + evaluated_args, instance_type=element_type)
+                            func_key, [elem] + evaluated_args,
+                            instance_type=element_type, line_number=line_number)
                             for elem in obj_list if isinstance(elem, dict)]
         if '|' in expr:
             return self._evaluate_pipe_array(expr, full_scope, line_number)
@@ -1051,7 +1053,8 @@ class ExpressionEvaluator:
         for elem in obj_list:
             if isinstance(elem, dict):
                 results.append(self.compiler.call_function(
-                    func_key, [elem] + evaluated_args, instance_type=element_type))
+                    func_key, [elem] + evaluated_args,
+                    instance_type=element_type, line_number=line_number))
         return True, results
 
     def _try_eval_object_creation(self, expr, scope, line_number):
@@ -1130,7 +1133,7 @@ class ExpressionEvaluator:
                         if args_text:
                             for raw in self._split_new_args(args_text, base_expr):
                                 evaluated_args.append(
-                                    self.expr_evaluator.eval_or_eval_array(
+                                    self.eval_or_eval_array(
                                         raw, scope, line_number))
                         base_value = self.compiler._instantiate_type(
                             type_name, evaluated_args, line_number,
@@ -1319,10 +1322,12 @@ class ExpressionEvaluator:
                             func_name, input_vals,
                             live_input_sources=live_sources,
                             live_output_bindings=live_bindings,
-                            caller_scope=self.compiler.current_scope())
+                            caller_scope=self.compiler.current_scope(),
+                            line_number=line_number)
                 evaluated_args = [self.eval_or_eval_array(
                     a, scope, line_number) for a in args_list] if args_list else []
-                return True, self.compiler.call_function(func_name, evaluated_args)
+                return True, self.compiler.call_function(
+                    func_name, evaluated_args, line_number=line_number)
 
         m_dotted_func = re.match(r'^([A-Za-z_][A-Za-z0-9_.]*)\s*\((.*)\)$', expr)
         if m_dotted_func:
@@ -1358,7 +1363,7 @@ class ExpressionEvaluator:
                 evaluated_args = [self.eval_or_eval_array(
                     a, scope, line_number) for a in args_list]
                 return True, self.compiler.call_function(
-                    call_name, evaluated_args)
+                    call_name, evaluated_args, line_number=line_number)
 
         return False, None
 
@@ -1424,7 +1429,9 @@ class ExpressionEvaluator:
                              for a in re.split(r',(?![^{]*})', arg_text) if a.strip()]
             evaluated_args = [self.eval_or_eval_array(
                 a, scope, line_number) for a in args_list]
-            return True, self.compiler.call_function(func_key, [obj_value] + evaluated_args, instance_type=obj_type)
+            return True, self.compiler.call_function(
+                func_key, [obj_value] + evaluated_args,
+                instance_type=obj_type, line_number=line_number)
 
         if obj_type:
             type_def = getattr(self.compiler, 'types_defined', {}).get(obj_type.lower(), {})
@@ -1742,7 +1749,8 @@ class ExpressionEvaluator:
             evaluated_args = [self.eval_or_eval_array(
                 a, scope, line_number) for a in args_list]
             return True, self.compiler.call_function(
-                func_key, [element] + evaluated_args, instance_type=element_type)
+                func_key, [element] + evaluated_args,
+                instance_type=element_type, line_number=line_number)
         if (not args_part or not args_part.strip()) and isinstance(element, dict):
             actual_field = get_case_insensitive_key(
                 element, method_name) or method_name
@@ -3673,7 +3681,14 @@ class ExpressionEvaluator:
                         f"Unsupported ** expansion at line {line_number}")
                 kwargs[kw.arg] = self._walk_ast_node(
                     kw.value, full_scope, globals_dict, line_number)
-            return func(*args, **kwargs)
+            # Record the call-site line for wrappers that cannot receive it
+            # directly (python-fallback function shims); nested calls restore.
+            prev_call_line = getattr(self.compiler, '_current_call_line', None)
+            self.compiler._current_call_line = line_number
+            try:
+                return func(*args, **kwargs)
+            finally:
+                self.compiler._current_call_line = prev_call_line
         if node_type is ast.Attribute:
             # Support flat dotted keys like 'SILength.inch' stored as a single
             # scope entry: resolve 'Block.field' directly before walking.

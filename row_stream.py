@@ -166,18 +166,24 @@ def zip_rows(row_lists):
     return rows
 
 
-def parse_cell_rule(line):
+def parse_cell_rule(line, allow_static=False):
     """Parse a dynamic cell rule ``[{...}...] := expr``.
 
     Returns a ``(target, value)`` tuple, or None when the line is not a cell
-    rule with at least one ``{...}`` interpolation in the target.
+    rule with at least one ``{...}`` interpolation in the target.  With
+    ``allow_static=True`` a fixed-address rule like ``[B2] := expr`` (no
+    interpolation) also matches; the wave model claims those as per-wave
+    consumers while the legacy row-stream group leaves them to the main loop.
     """
     m = _RULE_RE.match(line)
     if not m:
         return None
     target = m.group(1).strip()
     if '{' not in target:
-        return None
-    if not re.match(r'^\^?[A-Za-z{]', target):
+        if not allow_static:
+            return None
+        if not re.match(r'^\^?[A-Za-z]', target):
+            return None
+    elif not re.match(r'^\^?[A-Za-z{]', target):
         return None
     return target, m.group(2).strip()

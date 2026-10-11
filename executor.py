@@ -4,9 +4,10 @@ import math
 import copy
 import time
 from collections import deque
+from contextlib import contextmanager
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler, constant_value_matches
-from control_flow import GridLangControlFlow
+from control_flow import GridLangControlFlow, block_nesting_delta
 from parser import GridLangParser
 from units import VALUE_ERROR, TYPE_ERROR, ConstraintError, error_value, is_error_value
 from utils import col_to_num, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array, strip_array_cell_indices, is_wildcard_address
@@ -1363,26 +1364,71 @@ class GridLangExecutor(GridLangBase):
                                     f"Cannot locate FOR block start at line {line_number}")
                             body_lines, end_idx = self.control_flow._extract_block_body(
                                 lines, idx)
-                            # Define the loop variable in current scope
-                            self.control_flow.process_for_statement(
-                                line, line_number, self.current_scope())
-                            # Do not execute the block when the loop
-                            # variable holds an error value
-                            # (``For x = <error> do ... End``).
-                            m_var = re.match(
-                                r'^\s*For\s+([\w_]+)\s*=', line, re.I)
-                            skip_block = False
-                            if m_var:
-                                var_name = m_var.group(1)
-                                def_scope = self.current_scope(
-                                ).get_defining_scope(var_name)
-                                if def_scope is not None:
-                                    var_value = def_scope.get(var_name)
-                                    if is_error_value(var_value):
-                                        skip_block = True
-                            # Execute the block body once
-                            if not skip_block:
-                                self.control_flow._process_block(body_lines)
+                            # A block For bound to a function that delivers a
+                            # stream wave-iterates: the body runs once per
+                            # delivered value (Init materializes the whole
+                            # stream into one value instead).  The header is
+                            # read with the shared declaration parser, same
+                            # as every other For-equality form.
+                            wave_iterated = False
+                            stream_var, stream_expr = None, None
+                            for_defs = re.sub(
+                                r'^\s*For\s+', '', line, flags=re.I)
+                            for_defs = re.sub(
+                                r'\s+do\s*$', '', for_defs, flags=re.I
+                            ).strip()
+                            try:
+                                stream_var, _st, _sc, parsed_expr = (
+                                    self._parse_variable_def(
+                                        for_defs, line_number))
+                                if isinstance(parsed_expr, str):
+                                    stream_expr = parsed_expr
+                            except Exception:
+                                pass
+                            if self._match_fp_call_name(
+                                    stream_expr) is not None:
+                                stream_values = self._evaluate_push_expression(
+                                    stream_expr, line_number)
+                                if len(stream_values) > 1:
+                                    wave_iterated = True
+                                    scope = self.current_scope()
+                                    for stream_value in stream_values:
+                                        if is_error_value(stream_value):
+                                            continue
+                                        inferred = self.array_handler.infer_type(
+                                            stream_value, line_number)
+                                        if inferred == 'int':
+                                            inferred = 'number'
+                                        def_scope = scope.get_defining_scope(
+                                            stream_var)
+                                        if def_scope is not None:
+                                            def_scope.update(
+                                                stream_var, stream_value,
+                                                line_number)
+                                        else:
+                                            scope.define(
+                                                stream_var, stream_value,
+                                                inferred, {}, False)
+                                        self.control_flow._process_block(
+                                            body_lines)
+                            if not wave_iterated:
+                                # Define the loop variable in current scope
+                                self.control_flow.process_for_statement(
+                                    line, line_number, self.current_scope())
+                                # Do not execute the block when the loop
+                                # variable holds an error value
+                                # (``For x = <error> do ... End``).
+                                skip_block = False
+                                if stream_var:
+                                    def_scope = self.current_scope(
+                                    ).get_defining_scope(stream_var)
+                                    if def_scope is not None:
+                                        var_value = def_scope.get(stream_var)
+                                        if is_error_value(var_value):
+                                            skip_block = True
+                                # Execute the block body once
+                                if not skip_block:
+                                    self.control_flow._process_block(body_lines)
                             # Mark body lines as executed so main loop skips them
                             for _, body_ln in body_lines:
                                 self.executed_global_for_lines.add(body_ln)
@@ -1667,6 +1713,22 @@ class GridLangExecutor(GridLangBase):
 
     def _handle_main_loop_quick_statements(self, lines, i, line, line_number, stripped, stripped_lower):
         """Handle single-line and light-weight statements before heavy branches."""
+        # Phase B of the wave model: a bare Push/Print/Return collected as a
+        # stream consumer runs one round - once per recorded wave, with that
+        # wave's values bound - instead of a single execution.  Deferred
+        # until every plain binding has run, so the effects observe the
+        # finished bindings.  Init lines are skipped here: the wave hook
+        # already queued their push effect into the deferred list.
+        wave_effects = getattr(self, '_wave_effects', None)
+        if wave_effects and getattr(self, '_wave_phase_a_done', False):
+            wave_effect = wave_effects.get(line_number)
+            if wave_effect is not None and line_number not in (
+                    getattr(self, '_wave_init_lines', None) or set()):
+                if getattr(self, '_wave_remaining_bindings', None):
+                    self._wave_deferred_effects.append(wave_effect)
+                else:
+                    self._execute_wave_effect_round(wave_effect)
+                return True, i + 1
         if stripped_lower.startswith("for ") and 'grid dim' in stripped_lower:
             handled = self._handle_for_grid_dim(
                 stripped, line_number)
@@ -2495,10 +2557,8 @@ class GridLangExecutor(GridLangBase):
                 depth -= 1
                 if depth == 0:
                     break
-            elif next_line_clean.startswith("for ") and next_line_clean.endswith("do"):
-                depth += 1
-            elif next_line_clean.startswith("let ") and " then " in next_line_clean:
-                depth += 1
+            else:
+                depth += block_nesting_delta(next_line_clean)
             block_lines.append((next_line, next_line_number))
             scan_i += 1
         if depth > 0:
@@ -2728,7 +2788,9 @@ class GridLangExecutor(GridLangBase):
                             call_name, arg_values, collect_all=False, line_number=line_number)]
                     elif hasattr(self, 'functions') and call_name.lower() in getattr(self, 'functions', {}):
                         values = [self.call_function(
-                            call_name, arg_values, instance_type=self.functions[call_name.lower()].get('member_of'))]
+                            call_name, arg_values,
+                            instance_type=self.functions[call_name.lower()].get('member_of'),
+                            line_number=line_number)]
                 except Exception:
                     values = []
         if not values:
@@ -2898,12 +2960,8 @@ class GridLangExecutor(GridLangBase):
                         depth -= 1
                         if depth == 0:
                             break
-                    elif clean.startswith('for ') and ' do' in clean:
-                        depth += 1
-                    elif clean.startswith('when ') and ' do' in clean:
-                        depth += 1
-                    elif clean.startswith('if ') and clean.endswith('then'):
-                        depth += 1
+                    else:
+                        depth += block_nesting_delta(clean)
                     block_lines.append((next_line, next_ln))
                     i += 1
                 # Execute block for each value produced by INIT expression of the first entry
@@ -3047,6 +3105,9 @@ class GridLangExecutor(GridLangBase):
         guard_conditions = {entry['line_number']: entry['condition']
                             for entry in guard_entries}
         self._run_main_loop(lines, guard_conditions)
+        # Safety flush: if a tracked binding line was never reached, its
+        # deferred effects would otherwise be stranded.
+        self._flush_deferred_wave_effects()
         if guard_entries and not self._global_guards_pre_evaluated:
             guard_passed = self._evaluate_guard_conditions(guard_entries)
             if not guard_passed:
@@ -3481,8 +3542,8 @@ class GridLangExecutor(GridLangBase):
                     depth -= 1
                     if depth == 0:
                         break
-                elif next_line_clean.endswith("do"):
-                    depth += 1
+                else:
+                    depth += block_nesting_delta(next_line_clean)
                 for_block_lines.append((next_line, next_line_number))
                 i += 1
 
@@ -3505,7 +3566,6 @@ class GridLangExecutor(GridLangBase):
                             self.current_scope().define(
                                 loop['index_var'], value_index, 'number')
                 self.control_flow._process_block(for_block_lines)
-
                 if self.exit_loop:
                     self.exit_loop = False
                     self.pop_scope()
@@ -3702,6 +3762,11 @@ class GridLangExecutor(GridLangBase):
             line_number = prep['line_number']
             stripped = prep['stripped']
             stripped_lower = prep['stripped_lower']
+
+            wave_next = self._try_execute_wave_machinery(lines, i)
+            if wave_next is not None:
+                i = wave_next
+                continue
 
             row_stream_next = self._try_execute_row_stream_group(lines, i)
             if row_stream_next is not None:
@@ -4179,10 +4244,8 @@ class GridLangExecutor(GridLangBase):
                 if depth == 0:
                     i += 1
                     break
-            elif next_line_clean.startswith("for ") and next_line_clean.endswith("do"):
-                depth += 1
-            elif next_line_clean.startswith("let ") and " then " in next_line_clean:
-                depth += 1
+            else:
+                depth += block_nesting_delta(next_line_clean)
             for_block_lines.append((next_line, next_line_number))
             i += 1
         if depth > 0:
@@ -4352,6 +4415,590 @@ class GridLangExecutor(GridLangBase):
         if evaluated is None:
             return []
         return [evaluated]
+
+    @staticmethod
+    def _wave_identifiers(text):
+        """Every identifier token in an address or expression fragment."""
+        return re.findall(r'[A-Za-z_]\w*', text or '')
+
+    def _match_fp_call_name(self, expr):
+        """Bare function/subprocess name called in *expr*, or None.
+
+        Shared by the wave collector and the global-For pre-pass: an
+        assignment whose RHS calls a defined function or subprocess may
+        deliver a stream of values.
+        """
+        if not isinstance(expr, str) or not expr:
+            return None
+        call_match = re.search(r'([A-Za-z_]\w*)\s*\(', expr)
+        if not call_match:
+            return None
+        name = call_match.group(1).lower()
+        functions = self.functions or {}
+        subprocesses = self.subprocesses or {}
+        if name in functions or name in subprocesses:
+            return name
+        return None
+
+    def _parse_wave_binding_candidate(self, stripped, line_number):
+        """Classify a depth-0 line as a binding, via the main-line parsers.
+
+        Returns ``(var, expr, init_expr, compile_time)``, or None when the
+        line is not a plain binding.  ``For``/``Let`` keywords are stripped
+        the same way the main loop strips them before handing the rest to
+        ``_parse_variable_def``; bare and colon lines are gated by the same
+        ``_is_optional_let_line`` predicate the main loop uses, so the wave
+        claims exactly the lines the legacy path executes as declarations.
+        """
+        lower = stripped.lower()
+        if lower.endswith('do') or lower.endswith('then'):
+            return None
+        compile_time = stripped.startswith(':')
+        body = stripped
+        if lower.startswith('for ') or lower.startswith('let '):
+            body = stripped[4:].strip()
+        elif not compile_time and not self.control_flow._is_optional_let_line(
+                stripped):
+            return None
+        if not body or ' and ' in body.lower():
+            # Multi-binding 'and' forms stay with the legacy path.
+            return None
+        # A WITH clause is stripped by the parser (its '=' may sit inside the
+        # parens); keep its raw text so init/fp expressions can be re-emitted
+        # as written, the way the legacy path re-reads the source line.
+        with_match = self.parser._find_with_clause_balanced(body)
+        raw_with = body[with_match[1]:with_match[2] + 1] if with_match else None
+        try:
+            var, _type_name, constraints, expr = self._parse_variable_def(
+                body, line_number)
+        except Exception:
+            return None
+        if 'var_list' in (constraints or {}):
+            # Comma-separated declaration: legacy path only.
+            return None
+        if var and var.startswith('$'):
+            var = var[1:]
+        if not var or not re.fullmatch(r'[A-Za-z_]\w*', var):
+            # Member/indexed targets are writes, not plain bindings.
+            return None
+        init_expr = (constraints or {}).get('init')
+        if init_expr is not None and raw_with is not None:
+            # Init never carries the parser's new-with fold (no '='), so the
+            # written WITH text is always re-appended here.
+            init_expr = f"{init_expr} with {raw_with}"
+        elif (isinstance(expr, str) and raw_with is not None
+                and not re.search(r'\bwith\s*\(', expr, re.I)):
+            # Non-new forms store WITH in constraints only; re-attach it so
+            # fp evaluation sees the expression as written.
+            expr = f"{expr} with {raw_with}"
+        return var, expr, init_expr, compile_time
+
+    def _compute_wave_tainted_vars(self, seed_vars):
+        """Close the wave-tied var set over the dependency graph.
+
+        Seeds are the wave-tied vars (bodyless For-in vars, their index vars,
+        function-producer binding vars); anything that transitively depends on
+        a wave-tied var inherits the taint.  Graph edges run var -> dependent
+        line numbers -> vars that line defines.
+        """
+        tainted = {name.lower() for name in seed_vars if name}
+        by_variable = (self.dependency_graph or {}).get('by_variable') or {}
+        by_line = (self.dependency_graph or {}).get('by_line') or {}
+        changed = True
+        while changed:
+            changed = False
+            for name in list(tainted):
+                info = by_variable.get(name)
+                if not info:
+                    continue
+                for line_number in info.get('dependents', ()) or ():
+                    node = by_line.get(line_number)
+                    if not node:
+                        continue
+                    for defined in node.get('defines', ()) or ():
+                        if not isinstance(defined, str):
+                            continue
+                        dep_key = defined.lower()
+                        if dep_key and dep_key not in tainted:
+                            tainted.add(dep_key)
+                            changed = True
+        return tainted
+
+    def _collect_global_wave_machinery(self, lines):
+        """Collect the global bodyless wave machinery, order-independent.
+
+        Depth-0 For-in producers, bare If stream guards, ``[...] :=`` rules,
+        bare Push/Print/Return effects, and function-producer candidate
+        bindings (``var = Func(...)`` whose var is referenced by the other
+        machinery).  Returns the collection dict, or None when the program
+        does not qualify - function/subprocess bodies, programs with global
+        When blocks, or programs without a bodyless producer - and the
+        legacy adjacency-based row-stream handling applies instead.
+        """
+        if getattr(self, '_is_operation_runner', False) or \
+                getattr(self, '_parent_scope', None) is not None:
+            return None
+        from row_stream import parse_cell_rule, parse_guard, parse_producer
+        producers = []
+        guards = []
+        rules = []
+        effects = []
+        candidates = []
+        init_lines = set()
+        has_global_when = False
+        depth = 0
+        control = self.control_flow
+        for raw_line, line_number in lines:
+            stripped = control._strip_inline_comment(raw_line).strip()
+            if not stripped:
+                continue
+            lower = stripped.lower()
+            is_block_if = bool(control._header_if.match(stripped))
+            is_block_for = bool(control._header_for.match(stripped))
+            is_block_when = bool(control._header_when.match(stripped))
+            is_block_let = bool(control._header_let.match(stripped))
+            is_define = _first_keyword(stripped) == 'define'
+            # Definitions close with the declared name ('End Point'), blocks
+            # with the bare 'end' token; both leave the enclosing depth.
+            is_end = bool(re.match(r'^\s*end\b', stripped, re.I))
+            if is_block_when and depth == 0:
+                has_global_when = True
+            at_depth_zero = depth == 0 and not (
+                is_block_if or is_block_for or is_block_when or is_block_let
+                or is_define or is_end)
+            if at_depth_zero:
+                producer = parse_producer(stripped)
+                if producer is not None:
+                    producers.append({'ln': line_number, 'data': producer})
+                else:
+                    guard = parse_guard(stripped)
+                    if guard is not None:
+                        guards.append({'ln': line_number, 'data': guard})
+                    else:
+                        # Static rules ([B2] := expr) are claimed here too:
+                        # the wave fires them per wave when their value is
+                        # wave-tainted, unlike the legacy row-stream group.
+                        rule = parse_cell_rule(stripped, allow_static=True)
+                        if rule is not None:
+                            rules.append({
+                                'ln': line_number, 'target': rule[0],
+                                'value_expr': rule[1]})
+                        elif lower == 'print' or lower.startswith('print '):
+                            effects.append({
+                                'ln': line_number, 'kind': 'print',
+                                'data': stripped})
+                        elif lower.startswith('return'):
+                            return_match = self._match_return_statement(
+                                stripped)
+                            if return_match is not None:
+                                effects.append({
+                                    'ln': line_number, 'kind': 'return',
+                                    'data': return_match.group(1).strip()})
+                        elif lower.startswith('push '):
+                            push_match = self._match_push_assignment(stripped)
+                            if push_match is not None:
+                                target, value_expr = (
+                                    self._unpack_push_assignment(push_match))
+                                effects.append({
+                                    'ln': line_number, 'kind': 'push',
+                                    'target': target,
+                                    'value_expr': value_expr})
+                        else:
+                            binding = self._parse_wave_binding_candidate(
+                                stripped, line_number)
+                            claimed = False
+                            if binding is not None:
+                                var, expr, init_expr, cand_compile_time = (
+                                    binding)
+                                if expr is not None and (
+                                        not str(expr).strip()):
+                                    # Empty assignment RHS: not a binding.
+                                    claimed = True
+                                elif self._match_fp_call_name(expr) is not None:
+                                    candidates.append({
+                                        'ln': line_number,
+                                        'var': var,
+                                        'expr': expr, 'kind': 'fp'})
+                                    claimed = True
+                                if not claimed:
+                                    if init_expr is not None:
+                                        # Init splits into a declaration
+                                        # (Phase-2 binding) and an assignment
+                                        # (Phase-3 push effect), like ``For
+                                        # x`` + ``Push x = expr``.
+                                        candidates.append({
+                                            'ln': line_number,
+                                            'var': var,
+                                            'expr': None,
+                                            'kind': 'line',
+                                            'init': True,
+                                            'compile_time': cand_compile_time})
+                                        effects.append({
+                                            'ln': line_number,
+                                            'kind': 'push',
+                                            'target': var,
+                                            'value_expr': init_expr})
+                                        init_lines.add(line_number)
+                                    else:
+                                        candidates.append({
+                                            'ln': line_number,
+                                            'var': var,
+                                            'expr': expr,
+                                            'kind': 'line',
+                                            # Colon declarations bind at
+                                            # compile time (prep skips them);
+                                            # they are already in place before
+                                            # the main loop and are not
+                                            # pending runtime bindings.
+                                            'compile_time': cand_compile_time})
+            if is_block_if or is_block_for or is_block_when or is_block_let \
+                    or is_define:
+                depth += 1
+            if is_end and depth > 0:
+                depth -= 1
+        if has_global_when or (not producers and not candidates):
+            return None
+        if not rules and not effects:
+            return None
+        # A function-producer candidate is only claimed when its var is
+        # referenced by the wave machinery; unrelated bindings stay with the
+        # main loop.
+        corpus_parts = []
+        for rule in rules:
+            corpus_parts.append(rule['target'])
+            corpus_parts.append(rule['value_expr'])
+        for guard in guards:
+            corpus_parts.append(guard['data'])
+        for effect in effects:
+            corpus_parts.append(effect.get('target') or '')
+            corpus_parts.append(effect.get('value_expr') or '')
+            corpus_parts.append(effect.get('data') or '')
+        for producer in producers:
+            for _var, range_expr, _index_var in producer['data']:
+                corpus_parts.append(range_expr)
+        corpus = '\n'.join(corpus_parts)
+        candidates = [
+            cand for cand in candidates
+            if re.search(r'\b' + re.escape(cand['var']) + r'\b',
+                         corpus, re.I)]
+        return {
+            'producers': producers,
+            'guards': guards,
+            'rules': rules,
+            'effects': effects,
+            'candidates': candidates,
+            'init_lines': init_lines,
+        }
+
+    def _try_execute_wave_machinery(self, lines, i):
+        """Engage the global two-phase wave engine at the first claimed line.
+
+        Phase A (once, here): expand every global bodyless producer, evaluate
+        function-producer candidates, then advance all producers in lockstep,
+        firing rules per wave (guards gate every fire) with zero side
+        effects.  Phase B: bare Push/Print/Return lines run one round per
+        recorded wave when the main loop reaches them; blocks and inits run
+        self-contained in source order, as today.  Returns the next index, or
+        None so the legacy dispatch handles the line.
+        """
+        if getattr(self, '_is_operation_runner', False) or \
+                getattr(self, '_parent_scope', None) is not None:
+            return None
+        from row_stream import row_sequences
+        line_number = lines[i][1]
+        if not self._wave_engaged and self._wave_collection is None:
+            collected = self._collect_global_wave_machinery(lines)
+            if collected is None:
+                # Settled: never engage; do not re-collect per line.
+                self._wave_collection = {'producers': []}
+                return None
+            # Classification is side-effect free and runs at the first line
+            # dispatch.  Plain bindings (Let/bare/For-equality/colon
+            # declarations) stay with the legacy main loop at their source
+            # position; only effects defer until every one of them has run,
+            # so Print/Push always observe the finished bindings.
+            line_candidates = [
+                cand for cand in collected['candidates']
+                if cand.get('kind') == 'line']
+            collected['candidates'] = [
+                cand for cand in collected['candidates']
+                if cand.get('kind') != 'line']
+            collected['line_candidates'] = line_candidates
+            # No stream or function producer means no waves: effects run
+            # once at their source position, and rules and guards stay with
+            # the legacy main loop.
+            streamless = (
+                not collected['producers'] and not collected['candidates'])
+            collected['streamless'] = streamless
+            # Wave taint decides rule classification: a wave-tainted address
+            # snapshots (establishes per wave, never listens); otherwise a
+            # wave-tainted value follows in place; unrelated rules are handed
+            # back to the main loop.
+            seed_vars = set()
+            for producer in collected['producers']:
+                for var, _range_expr, index_var in producer['data']:
+                    seed_vars.add(var)
+                    if index_var:
+                        seed_vars.add(index_var)
+            for cand in collected['candidates']:
+                seed_vars.add(cand['var'])
+            self._wave_tainted = self._compute_wave_tainted_vars(seed_vars)
+            kept_rules = []
+            for rule in collected['rules']:
+                target_ids = self._wave_identifiers(rule['target'])
+                if any(name.lower() in self._wave_tainted
+                       for name in target_ids):
+                    mode = 'snapshot'
+                else:
+                    value_ids = self._wave_identifiers(rule['value_expr'])
+                    if any(name.lower() in self._wave_tainted
+                           for name in value_ids):
+                        mode = 'listener'
+                    else:
+                        continue
+                self._wave_rule_modes[rule['ln']] = mode
+                kept_rules.append(rule)
+            collected['rules'] = kept_rules
+            self._wave_collection = collected
+            claim = (
+                {p['ln'] for p in collected['producers']}
+                | {r['ln'] for r in kept_rules}
+                | {c['ln'] for c in collected['candidates']}
+                | {e['ln'] for e in collected['effects']})
+            if not streamless:
+                claim |= {g['ln'] for g in collected['guards']}
+            self._wave_claim_set = claim
+            self._wave_effects = {
+                e['ln']: e for e in collected['effects']}
+            self._wave_remaining_bindings = {
+                c['ln'] for c in line_candidates
+                if not c.get('compile_time')}
+            self._wave_init_lines = collected.get('init_lines') or set()
+            self._wave_deferred_effects = []
+            self._wave_flush_pending = False
+        if self._wave_collection is None or (
+                not self._wave_engaged and not self._wave_claim_set and
+                not getattr(self, '_wave_remaining_bindings', None)):
+            return None
+        # Flush deferred effects on the line after the last binding ran, so
+        # the binding itself has executed before its consumers observe it.
+        if getattr(self, '_wave_flush_pending', False):
+            self._wave_flush_pending = False
+            self._flush_deferred_wave_effects()
+        if line_number in (getattr(self, '_wave_remaining_bindings', None)
+                           or set()):
+            self._wave_remaining_bindings.discard(line_number)
+            # An Init binding line also carries a Phase-3 push effect: queue
+            # it so the assignment runs after every binding is in place.
+            if line_number in self._wave_effects:
+                self._wave_deferred_effects.append(
+                    self._wave_effects[line_number])
+            if not self._wave_remaining_bindings:
+                self._wave_flush_pending = True
+            return None
+        if line_number not in self._wave_claim_set:
+            return None
+        if not self._wave_engaged:
+            # Expand streams first: an unresolvable range falls back to the
+            # legacy path before any state is mutated.
+            collected = self._wave_collection
+            env = self.current_scope().get_evaluation_scope()
+            streams = []
+            for producer in collected['producers']:
+                rows = row_sequences(
+                    producer['data'], env=env,
+                    resolve=self._resolve_stream_range)
+                if rows is None:
+                    self._wave_collection = {'producers': []}
+                    self._wave_claim_set = set()
+                    self._wave_effects = {}
+                    self._wave_remaining_bindings = set()
+                    self._wave_deferred_effects = []
+                    return None
+                streams.append(rows)
+            collected['streams'] = streams
+            # Function producers: candidates whose call delivers a stream
+            # self-identify here; each wave rebinds the var to the next
+            # delivered value, and it ends on the last one delivered.
+            fp_producers = []
+            scope = self.current_scope()
+            for cand in collected['candidates']:
+                values = self._evaluate_push_expression(
+                    cand['expr'], cand['ln'])
+                value = values[0] if values else None
+                inferred = self.array_handler.infer_type(value, cand['ln'])
+                if inferred == 'int':
+                    inferred = 'number'
+                def_scope = scope.get_defining_scope(cand['var'])
+                if def_scope is not None:
+                    def_scope.update(cand['var'], value, cand['ln'])
+                else:
+                    scope.define(cand['var'], value, inferred, {}, False)
+                if len(values) > 1:
+                    fp_producers.append({
+                        'var': cand['var'], 'values': values,
+                        'ln': cand['ln']})
+                else:
+                    self._register_listeners(
+                        cand['var'], cand['expr'], scope)
+            collected['fp_producers'] = fp_producers
+            self._wave_engaged = True
+            # A stream guard filters rows inside the wave loop; it is not a
+            # whole-program output guard, so drop it from the global guard
+            # bookkeeping (which re-evaluates guards after the loop and would
+            # clear the grid, because the row variables do not exist globally).
+            if not collected.get('streamless'):
+                stream_guard_lines = {g['ln'] for g in collected['guards']}
+                self.global_guard_line_numbers -= stream_guard_lines
+                entries = getattr(self, 'global_guard_entries', None)
+                if entries is not None:
+                    # In-place: run() captured the same list for its end-of-run
+                    # guard re-evaluation.
+                    entries[:] = [
+                        entry for entry in entries
+                        if entry.get('line_number') not in stream_guard_lines]
+        if not self._wave_phase_a_done:
+            self._run_wave_phase_a()
+        if line_number in self._wave_effects:
+            # Effects run as Phase-B rounds; if plain bindings are still
+            # ahead in the main loop, defer this effect until they finish.
+            entry = self._wave_effects[line_number]
+            if getattr(self, '_wave_remaining_bindings', None):
+                self._wave_deferred_effects.append(entry)
+            else:
+                self._execute_wave_effect_round(entry)
+            self.executed_global_for_lines.add(line_number)
+        return i + 1
+
+    def _flush_deferred_wave_effects(self):
+        """Run Phase-B effects that waited for the last binding to finish."""
+        deferred = getattr(self, '_wave_deferred_effects', None) or []
+        self._wave_deferred_effects = []
+        for entry in deferred:
+            self._execute_wave_effect_round(entry)
+            if entry.get('ln') is not None:
+                self.executed_global_for_lines.add(entry['ln'])
+
+    def _run_wave_phase_a(self):
+        """Phase A: advance every producer in lockstep and fire rules per
+        wave (guards gate fires, not advancement).  No Push/Print effects
+        run here - waves are recorded for the Phase-B consumer round.
+        Candidates, taint, and rule classification were settled at engage
+        time so a dropped line is never swallowed."""
+        self._wave_phase_a_done = True
+        collected = self._wave_collection
+        streams = collected['streams']
+        fp_producers = collected['fp_producers']
+        kept_rules = collected['rules']
+        guards = collected['guards']
+        # Lockstep wave loop: all producers advance together and stop at the
+        # first exhaustion.
+        min_len = min((len(stream) for stream in streams), default=0)
+        for fp in fp_producers:
+            min_len = min(min_len, len(fp['values']))
+        records = []
+        owner = getattr(self, 'compiler', None) or self
+        for w in range(min_len):
+            row = {}
+            for stream in streams:
+                row.update(stream[w])
+            for fp in fp_producers:
+                value = fp['values'][w]
+                self._set_var_value(fp['var'], value, fp['ln'])
+                row[fp['var']] = value
+            if any(is_error_value(value) for value in row.values()):
+                continue
+            self.push_scope(is_private=True, is_loop_scope=True)
+            try:
+                scope = self.current_scope()
+                for var, value in row.items():
+                    vtype = self.array_handler.infer_type(value, 0)
+                    if vtype == 'int':
+                        vtype = 'number'
+                    scope.define(var, value, vtype)
+                eval_scope = scope.get_evaluation_scope()
+                row_blocked = False
+                for guard in guards:
+                    if not self.control_flow._evaluate_if_condition(
+                            guard['data'], guard['ln']):
+                        row_blocked = True
+                        break
+                if row_blocked:
+                    continue
+                for rule in kept_rules:
+                    was_snapshot = getattr(
+                        owner, '_wave_snapshot_mode', False)
+                    was_listener = getattr(
+                        owner, '_wave_listener_mode', False)
+                    rule_mode = self._wave_rule_modes.get(rule['ln'])
+                    owner._wave_snapshot_mode = (rule_mode == 'snapshot')
+                    owner._wave_listener_mode = (rule_mode == 'listener')
+                    try:
+                        self.array_handler.evaluate_line_with_assignment(
+                            f"[{rule['target']}] := {rule['value_expr']}",
+                            rule['ln'], eval_scope)
+                    finally:
+                        owner._wave_snapshot_mode = was_snapshot
+                        owner._wave_listener_mode = was_listener
+                records.append(dict(row))
+            finally:
+                self.pop_scope()
+        self._wave_records = records
+        consumed = (
+            {p['ln'] for p in collected['producers']}
+            | {r['ln'] for r in kept_rules}
+            | {c['ln'] for c in collected['candidates']})
+        if not collected.get('streamless'):
+            consumed |= {g['ln'] for g in collected['guards']}
+        self.executed_global_for_lines |= consumed
+
+    def _execute_wave_effect_round(self, entry):
+        """Phase B consumer round: run one bare effect once per recorded
+        wave with that wave's values bound.  A streamless (bindings-only)
+        program has no waves: the effect runs once at its source position."""
+        records = getattr(self, '_wave_records', None) or []
+        if not records:
+            if not (getattr(self, '_wave_collection', None) or {}).get(
+                    'streamless'):
+                return
+            if entry['kind'] == 'push':
+                self._handle_push_assignment(
+                    entry['target'], entry['value_expr'], entry['ln'])
+            elif entry['kind'] == 'print':
+                self._handle_print_statement(entry['data'], entry['ln'])
+            else:
+                push_values = self._evaluate_push_expression(
+                    entry['data'], entry['ln'])
+                for value in push_values:
+                    self.output_values.setdefault('output', []).append(
+                        self._snapshot_value(value))
+                if 'output' not in self.output_variables:
+                    self.output_variables.append('output')
+            return
+        for row in records:
+            self.push_scope(is_private=True, is_loop_scope=True)
+            try:
+                scope = self.current_scope()
+                for var, value in row.items():
+                    vtype = self.array_handler.infer_type(value, 0)
+                    if vtype == 'int':
+                        vtype = 'number'
+                    scope.define(var, value, vtype)
+                if entry['kind'] == 'push':
+                    self._handle_push_assignment(
+                        entry['target'], entry['value_expr'], entry['ln'])
+                elif entry['kind'] == 'print':
+                    self._handle_print_statement(entry['data'], entry['ln'])
+                else:
+                    push_values = self._evaluate_push_expression(
+                        entry['data'], entry['ln'])
+                    for value in push_values:
+                        self.output_values.setdefault('output', []).append(
+                            self._snapshot_value(value))
+                    if 'output' not in self.output_variables:
+                        self.output_variables.append('output')
+            finally:
+                self.pop_scope()
 
     def _try_execute_row_stream_group(self, lines, i):
         """Execute a contiguous run of standalone For-in producers through the
@@ -4627,12 +5274,8 @@ class GridLangExecutor(GridLangBase):
                 if depth == 0:
                     i += 1
                     break
-            elif next_line_clean.startswith("for ") and " do" in next_line_clean.lower():
-                depth += 1
-            elif next_line_clean.startswith("let ") and " then " in next_line_clean:
-                depth += 1
-            elif next_line_clean.startswith("if ") and next_line_clean.endswith("then"):
-                depth += 1
+            else:
+                depth += block_nesting_delta(next_line_clean)
             for_block_lines.append(
                 (next_line, next_line_number))
             i += 1
@@ -4878,12 +5521,8 @@ class GridLangExecutor(GridLangBase):
                         continue
                     i += 1
                     break
-                elif next_line_clean.startswith("for ") and " do" in next_line_clean.lower():
-                    depth += 1
-                elif next_line_clean.startswith("if ") and next_line_clean.endswith("then"):
-                    depth += 1
-                elif next_line_clean.startswith("for ") and " do" in next_line_clean.lower():
-                    depth += 1
+                else:
+                    depth += block_nesting_delta(next_line_clean)
                 for_block_lines.append(
                     (next_line, next_line_number))
                 i += 1
@@ -5616,6 +6255,33 @@ class GridLangExecutor(GridLangBase):
         value_expr = m_return.group(1).strip()
         self._append_console_output(value_expr, line_number)
 
+    @contextmanager
+    def _unpoisoned_reads(self):
+        """Direct reads (Print) see through transient push poisons.
+
+        A rejected Push latches #VALUE on the target so its listeners
+        mirror the failure; a Print is a direct read, so the saved
+        originals are shown for its duration and the errors go back
+        afterwards.
+        """
+        owner = getattr(self, 'compiler', None) or self
+        poisons = getattr(owner, '_transient_poisons', None)
+        if not poisons:
+            yield
+            return
+        restored = []
+        for _poison_key, poison in list(poisons.items()):
+            defining_scope, actual_key, original = poison
+            restored.append(
+                (defining_scope, actual_key,
+                 defining_scope.variables.get(actual_key)))
+            defining_scope.variables[actual_key] = original
+        try:
+            yield
+        finally:
+            for defining_scope, actual_key, latched in restored:
+                defining_scope.variables[actual_key] = latched
+
     def _handle_print_statement(self, stripped, line_number):
         """Print <expr> — ambient console output (the module-level and
         top-level output statement). Pushes the evaluated value to the
@@ -5625,7 +6291,8 @@ class GridLangExecutor(GridLangBase):
         if not value_expr:
             raise SyntaxError(
                 f"Invalid PRINT syntax at line {line_number}. Use 'Print <expression>'")
-        self._append_console_output(value_expr, line_number, channel='_console')
+        with self._unpoisoned_reads():
+            self._append_console_output(value_expr, line_number, channel='_console')
 
     def _append_console_output(self, value_expr, line_number, channel='output'):
         """Evaluate an expression and append it to the given output channel
@@ -5884,6 +6551,20 @@ class GridLangExecutor(GridLangBase):
         if not self._evaluate_global_guards_pre_execution(guard_entries):
             return None
         self._execute_global_for_loops(lines)
+        # Wave-model state: the two-phase engine collects the global bodyless
+        # producers/rules/guards/effects on first encounter in the main loop.
+        self._wave_collection = None
+        self._wave_engaged = False
+        self._wave_claim_set = set()
+        self._wave_effects = {}
+        self._wave_records = []
+        self._wave_tainted = set()
+        self._wave_rule_modes = {}
+        self._wave_phase_a_done = False
+        self._wave_remaining_bindings = set()
+        self._wave_init_lines = set()
+        self._wave_deferred_effects = []
+        self._wave_flush_pending = False
         self.needed_line_numbers = self._determine_needed_lines()
         return guard_entries
 
@@ -6039,7 +6720,8 @@ class GridLangExecutor(GridLangBase):
                             v[iter_idx] if isinstance(v, list) else v)
                     if call['name'].lower() in func_defs:
                         outputs_map = self.call_function(
-                            call['name'], call_args, instance_type=member_of, collect_all=True) or {}
+                            call['name'], call_args, instance_type=member_of,
+                            collect_all=True, line_number=line_number) or {}
                         seq.extend(_pick_sequence(def_entry, outputs_map))
                     else:
                         outputs_map = self.call_subprocess(
@@ -6070,7 +6752,8 @@ class GridLangExecutor(GridLangBase):
                             call['name'], input_vals, instance_type=member_of, collect_all=True,
                             live_input_sources=live_sources,
                             live_output_bindings=live_bindings,
-                            caller_scope=self.current_scope()) or {}
+                            caller_scope=self.current_scope(),
+                            line_number=line_number) or {}
                         seq = _pick_sequence(def_entry, outputs_map)
                     else:
                         try:
@@ -6094,7 +6777,8 @@ class GridLangExecutor(GridLangBase):
                                 seq = []
                 elif call['name'].lower() in func_defs:
                     outputs_map = self.call_function(
-                        call['name'], eval_args, instance_type=member_of, collect_all=True) or {}
+                        call['name'], eval_args, instance_type=member_of,
+                        collect_all=True, line_number=line_number) or {}
                     seq = _pick_sequence(def_entry, outputs_map)
                 else:
                     outputs_map = self.call_subprocess(
@@ -6582,6 +7266,11 @@ class GridLangExecutor(GridLangBase):
                     continue
                 init_expr = constraints.get('init')
                 init_line = constraints.get('init_line')
+                # A wave-claimed Init defers its assignment to Phase 3 (as a
+                # push effect); do not materialize it lazily here.
+                if init_line in (getattr(self, '_wave_init_lines', None)
+                                 or set()):
+                    continue
                 deps = self._extract_dependencies_from_expression(
                     str(init_expr))
                 if any(self.has_unresolved_dependency(dep, scope=scope) for dep in deps):

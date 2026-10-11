@@ -1311,7 +1311,8 @@ class GridLangCompiler(GridLangExecutor):
         return new_lines, label_lines, dim_lines
 
     def call_function(self, name, args, instance_type=None, collect_all=False, vectorize=True,
-                      live_input_sources=None, live_output_bindings=None, caller_scope=None):
+                      live_input_sources=None, live_output_bindings=None, caller_scope=None,
+                      line_number=None):
         """Invoke a user-defined function by name with the given arguments.
 
         When collect_all is True, return all pushed output values (as lists)
@@ -1359,9 +1360,13 @@ class GridLangCompiler(GridLangExecutor):
             handle_type = func_def.get('handle_type')
             resource_instance = args[0] if args else None
             handle_args = args[1:] if len(args) > 1 else []
+            if line_number is None:
+                # Python-fallback wrappers call without line context; the AST
+                # walker records the call-site line here before dispatch.
+                line_number = getattr(self, '_current_call_line', None)
             # Instantiate handle with privileged resource access
             handle_val = self._instantiate_handle(
-                handle_type, resource_instance, handle_args, None,
+                handle_type, resource_instance, handle_args, line_number,
                 var_name=handle_type)
             return handle_val
 
@@ -1409,7 +1414,8 @@ class GridLangCompiler(GridLangExecutor):
                                     elem_args.append(arg)
                             results.append(self.call_function(
                                 name, elem_args, instance_type=instance_type,
-                                collect_all=False, vectorize=False))
+                                collect_all=False, vectorize=False,
+                                line_number=line_number))
                         return results
         for idx, input_def in enumerate(input_defs):
             if input_def.get('live'):
@@ -1837,6 +1843,11 @@ class GridLangCompiler(GridLangExecutor):
         handle_def = self.types_defined.get(handle_type.lower())
         if not isinstance(handle_def, dict):
             raise ValueError(f"Handle type '{handle_type}' not defined at line {line_number}")
+        if line_number is None:
+            # No call-site line available: fall back to the Handle type's
+            # definition line so constructor-body numbering and error
+            # messages stay anchored to real source lines.
+            line_number = handle_def.get('_declare_line') or 0
         if not (handle_def.get('_constraints') or {}).get('is_handle'):
             raise ValueError(f"Type '{handle_type}' is not a Handle at line {line_number}")
         public_fields = self._get_public_type_fields(handle_def)
@@ -4178,12 +4189,20 @@ class GridLangCompiler(GridLangExecutor):
                 return
             was_recomputing = getattr(self, '_in_cell_spill_recompute', False)
             self._in_cell_spill_recompute = True
+            # A wave snapshot rule re-establishes its cell on every re-fire
+            # (occupied + different latches #VALUE again); a listener rule
+            # keeps following its source through the registry path.
+            was_snapshot = getattr(self, '_wave_snapshot_mode', False)
+            rule_modes = getattr(self, '_wave_rule_modes', None) or {}
+            self._wave_snapshot_mode = (
+                rule_modes.get(record.get('line_number')) == 'snapshot')
             try:
                 self.array_handler.evaluate_line_with_assignment(
                     line, record.get('line_number'), scope.get_evaluation_scope())
             except Exception:
                 pass
             finally:
+                self._wave_snapshot_mode = was_snapshot
                 self._in_cell_spill_recompute = was_recomputing
             # Errors cascade eagerly: readers of an errored cell must latch
             # #VALUE now, not at the next wave end.
@@ -4858,6 +4877,7 @@ class GridLangCompiler(GridLangExecutor):
         type_name = None
         type_parent = None
         type_constraints = {}
+        type_def_start_line = None
         in_unit_source = False
         unit_source_name = None
         unit_source_target = None
@@ -4962,6 +4982,7 @@ class GridLangCompiler(GridLangExecutor):
                     type_name = parsed_name
                     type_parent = parsed_parent
                     type_constraints = parsed_constraints or {}
+                    type_def_start_line = line_number
                     type_def_lines = []
                     type_inner_requires = []
                     type_block_depth = 0
@@ -5002,7 +5023,7 @@ class GridLangCompiler(GridLangExecutor):
                     if is_end_match and type_block_depth == 0:
                         in_type_def = False
                         type_def = self._parse_type_def(
-                            type_def_lines, line_number, type_name)
+                            type_def_lines, type_def_start_line, type_name)
                         if type_parent:
                             type_def['_parent'] = type_parent
                         if type_constraints:

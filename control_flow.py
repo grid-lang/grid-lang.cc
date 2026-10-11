@@ -26,6 +26,24 @@ TOKEN_END_KEYWORD = re.compile(
     re.I)
 
 
+def block_nesting_delta(clean):
+    """Return 1 when a cleaned line opens a block closed by End, else 0.
+
+    Shared by every For/Let block body collector so nested blocks
+    (For/When/Let/If) never close the outer block early.
+    """
+    line = clean.strip().lower()
+    if line.startswith('for ') and line.endswith('do'):
+        return 1
+    if line.startswith('when ') and line.endswith('do'):
+        return 1
+    if HEADER_LET.match(line):
+        return 1
+    if HEADER_IF.match(line):
+        return 1
+    return 0
+
+
 class GridLangControlFlow:
     """Handles control flow constructs in GridLang."""
 
@@ -424,7 +442,8 @@ class GridLangControlFlow:
                 continue
             if (self._header_if.match(line_clean) or
                     self._header_for.match(line_clean) or
-                    self._header_when.match(line_clean)):
+                    self._header_when.match(line_clean) or
+                    self._header_let.match(line_clean)):
                 depth += 1
             elif self._token_end.match(line_clean):
                 if depth == 0:

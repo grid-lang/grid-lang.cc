@@ -708,6 +708,24 @@ class ArrayHandler:
         if self._update_bound_array_cell(target, value, line_number):
             self.compiler._set_grid_cell(target, value)
             return None
+        # Wave snapshot protocol: a rule whose address is wave-tainted
+        # establishes its cell per wave and never listens.  A free cell takes
+        # the computed value; an occupied cell reading the identical value is
+        # a no-op; an occupied cell reading a different value latches #VALUE.
+        # Re-fires (spill recomputes) re-establish the same way, so a later
+        # clash re-latches instead of silently following the source.
+        if getattr(self.compiler, '_wave_snapshot_mode', False) and \
+                value is not None and not is_error_value(value):
+            store = self.compiler._get_grid_store()
+            existing = store.get(target) if isinstance(target, tuple) else None
+            if existing is not None and not is_error_value(existing):
+                if constant_value_matches(
+                        existing, value, self.to_display_value):
+                    return None
+                self.compiler._set_grid_cell(target, error_value(VALUE_ERROR))
+                return None
+            self.compiler._set_grid_cell(target, value)
+            return None
         # A cell is a binding like any other: the ``:=`` constraint may bind
         # it again only to the identical value -- binding a different value
         # is a conflict and latches #VALUE.  A mirror recompute (its source
@@ -739,7 +757,11 @@ class ArrayHandler:
                         bind_values[target] = {'value': value, 'conflict': False}
                 elif not constant_value_matches(
                         value, bind_entry['value'], self.to_display_value):
-                    if not is_recompute:
+                    if getattr(self.compiler, '_wave_listener_mode', False):
+                        # A wave listener follows its source across waves:
+                        # the binding updates in place, never a conflict.
+                        bind_entry['value'] = value
+                    elif not is_recompute:
                         bind_entry['conflict'] = True
                         self.compiler._set_grid_cell(
                             target, error_value(VALUE_ERROR))
