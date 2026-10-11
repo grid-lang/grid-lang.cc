@@ -1,19 +1,17 @@
 """Row-stream core: the ordered part of the language.
 
-Standalone ``For x in ...`` lines are *producers*: each pushes a row stream,
-and consecutive producer lines zip together into merged rows. A dynamic cell
-binding ``[{i:A}{j}] := expr``, a ``Push`` or a ``Return`` is a *consumer* (an
-effect) that fires on every merged row and may appear before or after its
-producers (bindings may be out of order; producers and effects run in order).
-A standalone ``If <cond>`` line is a *guard*: its condition is re-evaluated per
-row, and consumers only run on rows where every guard holds. Guards are
-position-independent within the group (``If i <= 2`` may follow the consumers
-it guards). ``When`` blocks are triggers, not guards, and are handled by the
+Standalone ``For x in ...`` lines are *producers*: each expands to a row
+stream. A dynamic cell binding ``[{i:A}{j}] := expr``, a ``Push`` or a
+``Return`` is a *consumer* (an effect) that fires on every wave, and a
+standalone ``If <cond>`` line is a *guard* whose condition is re-evaluated
+per row. ``When`` blocks are triggers, not guards, and are handled by the
 executor separately.
 
-This module stays pure (no executor dependencies): it turns a run of
-producer/rule lines into merged row dicts. The executor then executes each
-merged row against the consumers with the row variables in scope.
+This module stays pure (no executor dependencies): it parses producer,
+guard and rule lines and expands producers into merged row dicts. The
+wave engine (executor.py) classifies the program's machinery order-
+independently, advances producers in lockstep, and fires consumers per
+wave with the row variables in scope.
 """
 
 import re
@@ -155,17 +153,6 @@ def row_sequences(clauses, env=None, resolve=None):
     return rows
 
 
-def zip_rows(row_lists):
-    """Zip consecutive producer row streams into merged rows (row = dict)."""
-    if not row_lists:
-        return []
-    rows = row_lists[0]
-    for row_list in row_lists[1:]:
-        rows = [dict(left, **right)
-                for left, right in zip(rows, row_list)]
-    return rows
-
-
 def parse_cell_rule(line, allow_static=False):
     """Parse a dynamic cell rule ``[{...}...] := expr``.
 
@@ -173,7 +160,7 @@ def parse_cell_rule(line, allow_static=False):
     rule with at least one ``{...}`` interpolation in the target.  With
     ``allow_static=True`` a fixed-address rule like ``[B2] := expr`` (no
     interpolation) also matches; the wave model claims those as per-wave
-    consumers while the legacy row-stream group leaves them to the main loop.
+    consumers while plain dispatch leaves them to the main loop.
     """
     m = _RULE_RE.match(line)
     if not m:

@@ -272,17 +272,6 @@ class GridLangExecutor(GridLangBase):
         ah = getattr(self, 'array_handler', None) or getattr(getattr(self, 'compiler', None), 'array_handler', None)
         return _common_apply(var_name, indices, dims, ah, line_number)
 
-    def _has_when_dependency(self, var_name):
-        var_lower = var_name.lower()
-        for node in self.dependency_graph.get('nodes', []):
-            data = node.get('data') or {}
-            if data.get('loop_type') != 'when':
-                continue
-            deps = node.get('depends_on') or []
-            for dep in deps:
-                if dep and dep.lower() == var_lower:
-                    return True
-        return False
 
     def _register_when_block(self, condition, block_lines, line_number):
         deps = self._extract_dependencies_from_expression(condition)
@@ -3768,11 +3757,6 @@ class GridLangExecutor(GridLangBase):
                 i = wave_next
                 continue
 
-            row_stream_next = self._try_execute_row_stream_group(lines, i)
-            if row_stream_next is not None:
-                i = row_stream_next
-                continue
-
             if stripped_lower.startswith("when ") and stripped_lower.endswith("do"):
                 handled, i = self._handle_when_block(
                     lines, i, line, line_number)
@@ -4347,24 +4331,11 @@ class GridLangExecutor(GridLangBase):
                 guard_condition,
             )
 
-        next_i = self._try_handle_consecutive_for_zip(
-            lines,
-            i,
-            line_number,
-            var_name,
-            values,
-        )
-        if next_i is not None:
-            return next_i
-
-        return self._execute_range_for_single_line(
-            lines,
-            i,
-            line_number,
-            var_name,
-            index_var,
-            values,
-        )
+        # A bodyless 'For x in ...' is a row-stream producer: the wave
+        # engine claims it, and when no wave applies the line only
+        # evaluates its range - legacy dispatch handles what follows,
+        # one line at a time.
+        return i + 1
 
     def _evaluate_for_range_values(self, range_expr, step, line_number):
         if ' to ' in range_expr:
@@ -4690,6 +4661,131 @@ class GridLangExecutor(GridLangBase):
             'init_lines': init_lines,
         }
 
+    def _prepare_wave_collection(self, collected):
+        """Split candidates, settle streamless/taint/rule modes.  Shared by
+        the top-level wave hook and the in-block wave."""
+        line_candidates = [
+            cand for cand in collected['candidates']
+            if cand.get('kind') == 'line']
+        collected['candidates'] = [
+            cand for cand in collected['candidates']
+            if cand.get('kind') != 'line']
+        collected['line_candidates'] = line_candidates
+        # No stream or function producer means no waves: effects run
+        # once at their source position, and rules and guards stay with
+        # the legacy main loop.
+        streamless = (
+            not collected['producers'] and not collected['candidates'])
+        collected['streamless'] = streamless
+        # Wave taint decides rule classification: a wave-tainted address
+        # snapshots (establishes per wave, never listens); otherwise a
+        # wave-tainted value follows in place; unrelated rules are handed
+        # back to the main loop.
+        seed_vars = set()
+        for producer in collected['producers']:
+            for var, _range_expr, index_var in producer['data']:
+                seed_vars.add(var)
+                if index_var:
+                    seed_vars.add(index_var)
+        for cand in collected['candidates']:
+            seed_vars.add(cand['var'])
+        self._wave_tainted = self._compute_wave_tainted_vars(seed_vars)
+        kept_rules = []
+        for rule in collected['rules']:
+            target_ids = self._wave_identifiers(rule['target'])
+            if any(name.lower() in self._wave_tainted
+                   for name in target_ids):
+                mode = 'snapshot'
+            else:
+                value_ids = self._wave_identifiers(rule['value_expr'])
+                if any(name.lower() in self._wave_tainted
+                       for name in value_ids):
+                    mode = 'listener'
+                else:
+                    continue
+            self._wave_rule_modes[rule['ln']] = mode
+            kept_rules.append(rule)
+        collected['rules'] = kept_rules
+        return collected
+
+    def _install_wave_claim_state(self, collected):
+        """Build the claim set and effect/bindings bookkeeping from a
+        prepared collection."""
+        claim = (
+            {p['ln'] for p in collected['producers']}
+            | {r['ln'] for r in collected['rules']}
+            | {c['ln'] for c in collected['candidates']}
+            | {e['ln'] for e in collected['effects']})
+        if not collected.get('streamless'):
+            claim |= {g['ln'] for g in collected['guards']}
+        self._wave_claim_set = claim
+        self._wave_effects = {
+            e['ln']: e for e in collected['effects']}
+        self._wave_remaining_bindings = {
+            c['ln'] for c in collected['line_candidates']
+            if not c.get('compile_time')}
+        self._wave_init_lines = collected.get('init_lines') or set()
+        self._wave_deferred_effects = []
+        self._wave_flush_pending = False
+
+    def _engage_wave_streams(self):
+        """Expand producer streams and evaluate fp candidates; sets
+        ``_wave_engaged``.  Returns False when a range is unresolvable so
+        the caller can settle the wave before any state mutates."""
+        from row_stream import row_sequences
+        collected = self._wave_collection
+        env = self.current_scope().get_evaluation_scope()
+        streams = []
+        for producer in collected['producers']:
+            rows = row_sequences(
+                producer['data'], env=env,
+                resolve=self._resolve_stream_range)
+            if rows is None:
+                return False
+            streams.append(rows)
+        collected['streams'] = streams
+        # Function producers: candidates whose call delivers a stream
+        # self-identify here; each wave rebinds the var to the next
+        # delivered value, and it ends on the last one delivered.
+        fp_producers = []
+        scope = self.current_scope()
+        for cand in collected['candidates']:
+            values = self._evaluate_push_expression(
+                cand['expr'], cand['ln'])
+            value = values[0] if values else None
+            inferred = self.array_handler.infer_type(value, cand['ln'])
+            if inferred == 'int':
+                inferred = 'number'
+            def_scope = scope.get_defining_scope(cand['var'])
+            if def_scope is not None:
+                def_scope.update(cand['var'], value, cand['ln'])
+            else:
+                scope.define(cand['var'], value, inferred, {}, False)
+            if len(values) > 1:
+                fp_producers.append({
+                    'var': cand['var'], 'values': values,
+                    'ln': cand['ln']})
+            else:
+                self._register_listeners(
+                    cand['var'], cand['expr'], scope)
+        collected['fp_producers'] = fp_producers
+        self._wave_engaged = True
+        # A stream guard filters rows inside the wave loop; it is not a
+        # whole-program output guard, so drop it from the global guard
+        # bookkeeping (which re-evaluates guards after the loop and would
+        # clear the grid, because the row variables do not exist globally).
+        if not collected.get('streamless'):
+            stream_guard_lines = {g['ln'] for g in collected['guards']}
+            self.global_guard_line_numbers -= stream_guard_lines
+            entries = getattr(self, 'global_guard_entries', None)
+            if entries is not None:
+                # In-place: run() captured the same list for its end-of-run
+                # guard re-evaluation.
+                entries[:] = [
+                    entry for entry in entries
+                    if entry.get('line_number') not in stream_guard_lines]
+        return True
+
     def _try_execute_wave_machinery(self, lines, i):
         """Engage the global two-phase wave engine at the first claimed line.
 
@@ -4704,7 +4800,6 @@ class GridLangExecutor(GridLangBase):
         if getattr(self, '_is_operation_runner', False) or \
                 getattr(self, '_parent_scope', None) is not None:
             return None
-        from row_stream import row_sequences
         line_number = lines[i][1]
         if not self._wave_engaged and self._wave_collection is None:
             collected = self._collect_global_wave_machinery(lines)
@@ -4717,65 +4812,9 @@ class GridLangExecutor(GridLangBase):
             # declarations) stay with the legacy main loop at their source
             # position; only effects defer until every one of them has run,
             # so Print/Push always observe the finished bindings.
-            line_candidates = [
-                cand for cand in collected['candidates']
-                if cand.get('kind') == 'line']
-            collected['candidates'] = [
-                cand for cand in collected['candidates']
-                if cand.get('kind') != 'line']
-            collected['line_candidates'] = line_candidates
-            # No stream or function producer means no waves: effects run
-            # once at their source position, and rules and guards stay with
-            # the legacy main loop.
-            streamless = (
-                not collected['producers'] and not collected['candidates'])
-            collected['streamless'] = streamless
-            # Wave taint decides rule classification: a wave-tainted address
-            # snapshots (establishes per wave, never listens); otherwise a
-            # wave-tainted value follows in place; unrelated rules are handed
-            # back to the main loop.
-            seed_vars = set()
-            for producer in collected['producers']:
-                for var, _range_expr, index_var in producer['data']:
-                    seed_vars.add(var)
-                    if index_var:
-                        seed_vars.add(index_var)
-            for cand in collected['candidates']:
-                seed_vars.add(cand['var'])
-            self._wave_tainted = self._compute_wave_tainted_vars(seed_vars)
-            kept_rules = []
-            for rule in collected['rules']:
-                target_ids = self._wave_identifiers(rule['target'])
-                if any(name.lower() in self._wave_tainted
-                       for name in target_ids):
-                    mode = 'snapshot'
-                else:
-                    value_ids = self._wave_identifiers(rule['value_expr'])
-                    if any(name.lower() in self._wave_tainted
-                           for name in value_ids):
-                        mode = 'listener'
-                    else:
-                        continue
-                self._wave_rule_modes[rule['ln']] = mode
-                kept_rules.append(rule)
-            collected['rules'] = kept_rules
+            collected = self._prepare_wave_collection(collected)
             self._wave_collection = collected
-            claim = (
-                {p['ln'] for p in collected['producers']}
-                | {r['ln'] for r in kept_rules}
-                | {c['ln'] for c in collected['candidates']}
-                | {e['ln'] for e in collected['effects']})
-            if not streamless:
-                claim |= {g['ln'] for g in collected['guards']}
-            self._wave_claim_set = claim
-            self._wave_effects = {
-                e['ln']: e for e in collected['effects']}
-            self._wave_remaining_bindings = {
-                c['ln'] for c in line_candidates
-                if not c.get('compile_time')}
-            self._wave_init_lines = collected.get('init_lines') or set()
-            self._wave_deferred_effects = []
-            self._wave_flush_pending = False
+            self._install_wave_claim_state(collected)
         if self._wave_collection is None or (
                 not self._wave_engaged and not self._wave_claim_set and
                 not getattr(self, '_wave_remaining_bindings', None)):
@@ -4801,62 +4840,13 @@ class GridLangExecutor(GridLangBase):
         if not self._wave_engaged:
             # Expand streams first: an unresolvable range falls back to the
             # legacy path before any state is mutated.
-            collected = self._wave_collection
-            env = self.current_scope().get_evaluation_scope()
-            streams = []
-            for producer in collected['producers']:
-                rows = row_sequences(
-                    producer['data'], env=env,
-                    resolve=self._resolve_stream_range)
-                if rows is None:
-                    self._wave_collection = {'producers': []}
-                    self._wave_claim_set = set()
-                    self._wave_effects = {}
-                    self._wave_remaining_bindings = set()
-                    self._wave_deferred_effects = []
-                    return None
-                streams.append(rows)
-            collected['streams'] = streams
-            # Function producers: candidates whose call delivers a stream
-            # self-identify here; each wave rebinds the var to the next
-            # delivered value, and it ends on the last one delivered.
-            fp_producers = []
-            scope = self.current_scope()
-            for cand in collected['candidates']:
-                values = self._evaluate_push_expression(
-                    cand['expr'], cand['ln'])
-                value = values[0] if values else None
-                inferred = self.array_handler.infer_type(value, cand['ln'])
-                if inferred == 'int':
-                    inferred = 'number'
-                def_scope = scope.get_defining_scope(cand['var'])
-                if def_scope is not None:
-                    def_scope.update(cand['var'], value, cand['ln'])
-                else:
-                    scope.define(cand['var'], value, inferred, {}, False)
-                if len(values) > 1:
-                    fp_producers.append({
-                        'var': cand['var'], 'values': values,
-                        'ln': cand['ln']})
-                else:
-                    self._register_listeners(
-                        cand['var'], cand['expr'], scope)
-            collected['fp_producers'] = fp_producers
-            self._wave_engaged = True
-            # A stream guard filters rows inside the wave loop; it is not a
-            # whole-program output guard, so drop it from the global guard
-            # bookkeeping (which re-evaluates guards after the loop and would
-            # clear the grid, because the row variables do not exist globally).
-            if not collected.get('streamless'):
-                stream_guard_lines = {g['ln'] for g in collected['guards']}
-                self.global_guard_line_numbers -= stream_guard_lines
-                entries = getattr(self, 'global_guard_entries', None)
-                if entries is not None:
-                    # In-place: run() captured the same list for its end-of-run
-                    # guard re-evaluation.
-                    entries[:] = [
-                        entry for entry in entries
-                        if entry.get('line_number') not in stream_guard_lines]
+            if not self._engage_wave_streams():
+                self._wave_collection = {'producers': []}
+                self._wave_claim_set = set()
+                self._wave_effects = {}
+                self._wave_remaining_bindings = set()
+                self._wave_deferred_effects = []
+                return None
         if not self._wave_phase_a_done:
             self._run_wave_phase_a()
         if line_number in self._wave_effects:
@@ -5000,132 +4990,97 @@ class GridLangExecutor(GridLangBase):
             finally:
                 self.pop_scope()
 
-    def _try_execute_row_stream_group(self, lines, i):
-        """Execute a contiguous run of standalone For-in producers through the
-        row-stream model, applying consumers (dynamic cell rules, Push, or
-        Return) to every merged row and honoring standalone If guards.
+    _WAVE_STATE_ATTRS = (
+        '_wave_collection', '_wave_engaged', '_wave_claim_set',
+        '_wave_effects', '_wave_records', '_wave_tainted',
+        '_wave_rule_modes', '_wave_phase_a_done',
+        '_wave_remaining_bindings', '_wave_init_lines',
+        '_wave_deferred_effects', '_wave_flush_pending',
+    )
 
-        Producers run in order and their row streams zip together; each merged
-        row is executed against the consumers with the row variables in scope.
-        Consumers and guards may sit before or after their producers (bindings
-        and guards may be out of order). Returns the next index to continue
-        from, or None so the legacy dispatch handles the line.
+    def _wave_state_snapshot(self):
+        """Capture every wave attribute so an enclosing wave (top-level or
+        outer block) survives an inner block wave."""
+        return {name: getattr(self, name, None)
+                for name in self._WAVE_STATE_ATTRS}
+
+    def _wave_state_reset(self):
+        """Install a fresh wave state (the values run() pre-seeds)."""
+        self._wave_collection = None
+        self._wave_engaged = False
+        self._wave_claim_set = set()
+        self._wave_effects = {}
+        self._wave_records = []
+        self._wave_tainted = set()
+        self._wave_rule_modes = {}
+        self._wave_phase_a_done = False
+        self._wave_remaining_bindings = set()
+        self._wave_init_lines = set()
+        self._wave_deferred_effects = []
+        self._wave_flush_pending = False
+
+    def _wave_state_restore(self, snapshot):
+        for name, value in snapshot.items():
+            setattr(self, name, value)
+
+    def _try_execute_block_wave(self, block_lines):
+        """Engage a self-contained wave inside a block body.
+
+        Mirrors the top-level engine, but eagerly: the body's depth-0 lines
+        are classified, streams expanded, and Phase A runs at body entry so
+        rules fire per wave before any body statement executes.  Bindings
+        then run one-by-one at their source positions and effects fire one
+        round per recorded wave at their position.  Returns the claim set,
+        or None when the body does not qualify and the plain one-by-one
+        walk applies.  The caller owns swapping ``self._wave*`` state
+        around this call.
         """
-        if i >= len(lines):
+        collected = self._collect_global_wave_machinery(block_lines)
+        if collected is None:
             return None
-        from row_stream import (parse_cell_rule, parse_guard, parse_producer,
-                                row_sequences, zip_rows)
-        group = []
-        ptr = i
-        while ptr < len(lines):
-            line, line_number = lines[ptr]
-            stripped = line.strip()
-            if not stripped:
-                break
-            producer = parse_producer(stripped)
-            if producer is not None:
-                group.append(
-                    {'kind': 'producer', 'data': producer, 'ln': line_number})
+        collected = self._prepare_wave_collection(collected)
+        if not collected['producers']:
+            # Bindings-only bodies have no waves: keep the one-by-one walk.
+            return None
+        self._wave_collection = collected
+        self._install_wave_claim_state(collected)
+        if not self._engage_wave_streams():
+            self._wave_collection = {'producers': []}
+            self._wave_claim_set = set()
+            self._wave_effects = {}
+            self._wave_remaining_bindings = set()
+            self._wave_deferred_effects = []
+            return None
+        self._run_wave_phase_a()
+        return self._wave_claim_set
+
+    def _wave_block_step(self, line_number):
+        """Advance the in-block wave for one body line.  Returns 'skip' when
+        the line was claimed (already Phase-A'd or its effect round ran),
+        'run' when the block handlers should execute it."""
+        if getattr(self, '_wave_flush_pending', False):
+            self._wave_flush_pending = False
+            self._flush_deferred_wave_effects()
+        if line_number in (getattr(self, '_wave_remaining_bindings', None)
+                           or set()):
+            self._wave_remaining_bindings.discard(line_number)
+            if line_number in self._wave_effects:
+                self._wave_deferred_effects.append(
+                    self._wave_effects[line_number])
+            if not self._wave_remaining_bindings:
+                self._wave_flush_pending = True
+            return 'run'
+        if line_number not in self._wave_claim_set:
+            return 'run'
+        if line_number in self._wave_effects:
+            entry = self._wave_effects[line_number]
+            if getattr(self, '_wave_remaining_bindings', None):
+                self._wave_deferred_effects.append(entry)
             else:
-                rule = parse_cell_rule(stripped)
-                if rule is not None:
-                    group.append(
-                        {'kind': 'rule', 'data': rule, 'ln': line_number})
-                else:
-                    push_match = self._match_push_assignment(stripped)
-                    return_match = (
-                        None if push_match is not None
-                        else self._match_return_statement(stripped))
-                    if push_match is not None:
-                        group.append({
-                            'kind': 'push',
-                            'data': self._unpack_push_assignment(push_match),
-                            'ln': line_number})
-                    elif return_match is not None:
-                        group.append({
-                            'kind': 'return',
-                            'data': return_match.group(1).strip(),
-                            'ln': line_number})
-                    else:
-                        guard = parse_guard(stripped)
-                        if guard is not None:
-                            group.append(
-                                {'kind': 'guard', 'data': guard,
-                                 'ln': line_number})
-                        else:
-                            break
-            ptr += 1
-        producers = [e for e in group if e['kind'] == 'producer']
-        consumers = [e for e in group
-                     if e['kind'] in ('rule', 'push', 'return')]
-        guards = [e for e in group if e['kind'] == 'guard']
-        if len(group) < 2 or not producers or not consumers:
-            return None
-        if guards:
-            # A stream guard filters rows inside the group; it is not a
-            # whole-program output guard, so drop it from the global guard
-            # bookkeeping (which re-evaluates guards after the loop and would
-            # clear the grid, because the row variables do not exist globally).
-            stream_guard_lines = {guard['ln'] for guard in guards}
-            self.global_guard_line_numbers -= stream_guard_lines
-            entries = getattr(self, 'global_guard_entries', None)
-            if entries is not None:
-                entries[:] = [
-                    entry for entry in entries
-                    if entry.get('line_number') not in stream_guard_lines]
-        env = self.current_scope().get_evaluation_scope()
-        stream_rows = []
-        for producer in producers:
-            rows = row_sequences(
-                producer['data'], env=env,
-                resolve=self._resolve_stream_range)
-            if rows is None:
-                return None
-            stream_rows.append(rows)
-        for row in zip_rows(stream_rows):
-            if any(is_error_value(value) for value in row.values()):
-                continue
-            self.push_scope(is_private=True, is_loop_scope=True)
-            try:
-                scope = self.current_scope()
-                for var, value in row.items():
-                    vtype = self.array_handler.infer_type(value, 0)
-                    if vtype == 'int':
-                        vtype = 'number'
-                    scope.define(var, value, vtype)
-                eval_scope = scope.get_evaluation_scope()
-                if guards:
-                    row_blocked = False
-                    for guard in guards:
-                        condition = self.control_flow._evaluate_if_condition(
-                            guard['data'], guard['ln'])
-                        if not condition:
-                            row_blocked = True
-                            break
-                    if row_blocked:
-                        continue
-                for consumer in consumers:
-                    if consumer['kind'] == 'rule':
-                        target, value_expr = consumer['data']
-                        self.array_handler.evaluate_line_with_assignment(
-                            f'[{target}] := {value_expr}',
-                            consumer['ln'], eval_scope)
-                    elif consumer['kind'] == 'push':
-                        target, value_expr = consumer['data']
-                        self._handle_push_assignment(
-                            target, value_expr, consumer['ln'])
-                    else:
-                        push_values = self._evaluate_push_expression(
-                            consumer['data'], consumer['ln'])
-                        for value in push_values:
-                            self.output_values.setdefault(
-                                'output', []).append(
-                                self._snapshot_value(value))
-                        if 'output' not in self.output_variables:
-                            self.output_variables.append('output')
-            finally:
-                self.pop_scope()
-        return ptr
+                self._execute_wave_effect_round(entry)
+            self.executed_global_for_lines.add(line_number)
+        return 'skip'
+
 
     def _resolve_stream_range(self, range_expr, row):
         """Resolve a producer range that is a bare identifier to an array of
@@ -5150,87 +5105,6 @@ class GridLangExecutor(GridLangBase):
         if value is None:
             return None
         return [value]
-
-    def _try_handle_consecutive_for_zip(
-            self,
-            lines,
-            i,
-            line_number,
-            var_name,
-            values):
-        if i + 1 >= len(lines):
-            return None
-
-        next_line, next_line_number = lines[i + 1]
-        if not next_line.strip().lower().startswith('for '):
-            return None
-
-        m2 = re.match(
-            r'^\s*FOR\s+([\w_]+)\s+in\s+(.+?)(?:\s+step\s+(-?\d+))?(?:\s+index\s+([\w_]+))?$',
-            next_line,
-            re.I,
-        )
-        if not m2:
-            return None
-
-        var2, range2, step2, _ = m2.groups()
-        step2 = int(step2) if step2 else 1
-        try:
-            vals2 = self._evaluate_for_range_values(
-                range2,
-                step2,
-                next_line_number,
-            )
-        except Exception:
-            vals2 = []
-
-        next_executable_line = None
-        next_executable_line_number = None
-        for j in range(i + 2, len(lines)):
-            candidate_line, candidate_line_number = lines[j]
-            if ':=' in candidate_line or self._has_push_action(candidate_line):
-                next_executable_line = candidate_line
-                next_executable_line_number = candidate_line_number
-                break
-        if not next_executable_line:
-            return None
-
-        for left_value, right_value in self._iterate_for_zip(values, vals2):
-            self.push_scope(
-                is_private=True, is_loop_scope=True)
-            self.current_scope().define(var_name, left_value, 'number')
-            self.current_scope().define(var2, right_value, 'number')
-            if ':=' in next_executable_line:
-                self.array_handler.evaluate_line_with_assignment(
-                    next_executable_line,
-                    next_executable_line_number,
-                    self.current_scope().get_evaluation_scope(),
-                )
-            elif self._has_push_action(next_executable_line):
-                return_match = self._match_return_statement(
-                    next_executable_line)
-                push_match = self._match_push_assignment(
-                    next_executable_line)
-                if return_match:
-                    value_expr = return_match.group(
-                        1).strip()
-                    push_values = self._evaluate_push_expression(
-                        value_expr, next_executable_line_number)
-                    for value in push_values:
-                        self.output_values.setdefault(
-                            'output', []).append(self._snapshot_value(value))
-                    if 'output' not in self.output_variables:
-                        self.output_variables.append(
-                            'output')
-                elif push_match:
-                    target, value_expr = self._unpack_push_assignment(push_match)
-                    self._handle_push_assignment(
-                        target, value_expr, next_executable_line_number)
-                else:
-                    raise SyntaxError(
-                        f"Unsupported push syntax in For loop at line {next_executable_line_number}. Use 'Push var = value' syntax instead.")
-            self.pop_scope()
-        return j + 1
 
     def _iter_for_values_skipping_errors(self, values):
         """Yield ``(idx, value)`` for For-loop iteration. Error elements are
@@ -5323,100 +5197,6 @@ class GridLangExecutor(GridLangBase):
                 break
         return i
 
-    def _execute_range_for_single_line(
-            self,
-            lines,
-            i,
-            line_number,
-            var_name,
-            index_var,
-            values):
-        use_when_push = self._has_when_dependency(var_name)
-        if index_var and not use_when_push:
-            use_when_push = self._has_when_dependency(index_var)
-        if use_when_push:
-            for idx, value in enumerate(values):
-                # Push updates to listeners even for error elements; the
-                # When guards filter them out.
-                self._set_var_value(var_name, value, line_number)
-                self._enqueue_push(var_name, value)
-                if index_var:
-                    self._set_var_value(
-                        index_var, idx + 1, line_number)
-                    self._enqueue_push(index_var, idx + 1)
-                self._process_when_triggers()
-            return i + 1
-
-        next_executable_line = None
-        next_executable_line_number = None
-        skip_lines = 0
-        for j in range(i + 1, len(lines)):
-            candidate_line, candidate_line_number = lines[j]
-            stripped_candidate = candidate_line.strip()
-            if re.match(r'^end\b', stripped_candidate, re.I):
-                # An inline body belongs to this loop only when it appears
-                # before 'end': reading past it would swallow the first
-                # statement after the loop and run it in the loop scope.
-                break
-            if ':=' in candidate_line or self._has_push_action(candidate_line):
-                next_executable_line = candidate_line
-                next_executable_line_number = candidate_line_number
-                skip_lines = j - i
-                break
-
-        if next_executable_line:
-            if ':=' in next_executable_line:
-                for idx, value in self._iter_for_values_skipping_errors(values):
-                    self.push_scope(
-                        is_private=True, is_loop_scope=True)
-                    self.current_scope().define(var_name, value, 'number')
-                    if index_var:
-                        if index_var in self.current_scope().variables:
-                            self.current_scope().update(index_var, idx + 1)
-                        else:
-                            self.current_scope().define(index_var, idx + 1, 'number')
-                    self.array_handler.evaluate_line_with_assignment(
-                        next_executable_line,
-                        next_executable_line_number,
-                        self.current_scope().get_evaluation_scope(),
-                    )
-                    self.pop_scope()
-                return i + skip_lines + 1
-            if self._has_push_action(next_executable_line):
-                for idx, value in self._iter_for_values_skipping_errors(values):
-                    self.push_scope(
-                        is_private=True, is_loop_scope=True)
-                    self.current_scope().define(var_name, value, 'number')
-                    if index_var:
-                        if index_var in self.current_scope().variables:
-                            self.current_scope().update(index_var, idx + 1)
-                        else:
-                            self.current_scope().define(index_var, idx + 1, 'number')
-                    return_match = self._match_return_statement(
-                        next_executable_line)
-                    push_match = self._match_push_assignment(
-                        next_executable_line)
-                    if return_match:
-                        value_expr = return_match.group(
-                            1).strip()
-                        push_values = self._evaluate_push_expression(
-                            value_expr, next_executable_line_number)
-                        for out_val in push_values:
-                            self.output_values.setdefault(
-                                'output', []).append(self._snapshot_value(out_val))
-                        if 'output' not in self.output_variables:
-                            self.output_variables.append(
-                                'output')
-                    elif push_match:
-                        target, value_expr = self._unpack_push_assignment(push_match)
-                        self._handle_push_assignment(
-                            target, value_expr, next_executable_line_number)
-                    else:
-                        raise SyntaxError(
-                            f"Unsupported push syntax in For loop at line {next_executable_line_number}. Use 'Push var = value' syntax instead.")
-                    self.pop_scope()
-                return i + skip_lines + 1
-        return i + 1
 
     def _handle_main_loop_nested_for_case(
             self,
@@ -6553,18 +6333,7 @@ class GridLangExecutor(GridLangBase):
         self._execute_global_for_loops(lines)
         # Wave-model state: the two-phase engine collects the global bodyless
         # producers/rules/guards/effects on first encounter in the main loop.
-        self._wave_collection = None
-        self._wave_engaged = False
-        self._wave_claim_set = set()
-        self._wave_effects = {}
-        self._wave_records = []
-        self._wave_tainted = set()
-        self._wave_rule_modes = {}
-        self._wave_phase_a_done = False
-        self._wave_remaining_bindings = set()
-        self._wave_init_lines = set()
-        self._wave_deferred_effects = []
-        self._wave_flush_pending = False
+        self._wave_state_reset()
         self.needed_line_numbers = self._determine_needed_lines()
         return guard_entries
 

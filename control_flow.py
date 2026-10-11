@@ -1436,107 +1436,123 @@ class GridLangControlFlow:
 
     def _process_block(self, block_lines, current_scope=None):
         block_pending = {}
-        # Guards come first: they gate every statement of this body, so they
-        # are evaluated before the walk and skipped during it.
-        guards = self._collect_block_guards(block_lines)
-        self._register_block_guards(block_lines, guards)
-        guard_line_numbers = {line_number for _, line_number, _ in guards}
-        if guards and not self._evaluate_block_guards(guards):
-            return block_pending
-        i = 0
-        while i < len(block_lines):
-            if self._should_break_block_processing():
-                break
-            refresh = getattr(self.compiler, '_refresh_live_inputs', None)
-            if refresh is not None:
-                refresh()
-            line, line_number, line_clean = self._prepare_block_line(
-                block_lines, i)
-            if not line_clean:
-                i += 1
-                continue
-            if line_number in guard_line_numbers:
-                # The guard was already evaluated for the whole body above.
-                # A guard is a bare 'If <cond>' line: it has no 'then' and no
-                # 'End' of its own, so only the guard line is skipped here and
-                # the 'End' that follows still closes the enclosing block.
-                i += 1
-                continue
-            if self._token_end.match(line_clean):
-                # A bare 'End' closes an enclosing block whose handler already
-                # ran its body; it is a terminator, not a statement.
-                i += 1
-                continue
+        compiler = self.compiler
+        saved_wave = compiler._wave_state_snapshot()
+        compiler._wave_state_reset()
+        try:
+            # A block body carries its own row stream, exactly as the program
+            # does at the top level: producers, rules, guards and effects are
+            # classified at body entry, rules fire per wave, and effects run
+            # one round per wave at their source positions.
+            wave_claim = compiler._try_execute_block_wave(block_lines)
+            # Guards come first: they gate every statement of this body, so they
+            # are evaluated before the walk and skipped during it.  Wave guards
+            # filter rows inside the wave instead and are not body gates.
+            guards = self._collect_block_guards(block_lines)
+            if wave_claim is not None:
+                guards = [
+                    guard for guard in guards
+                    if guard[1] not in wave_claim]
+            self._register_block_guards(block_lines, guards)
+            guard_line_numbers = {line_number for _, line_number, _ in guards}
+            if guards and not self._evaluate_block_guards(guards):
+                return block_pending
+            i = 0
+            while i < len(block_lines):
+                if self._should_break_block_processing():
+                    break
+                refresh = getattr(self.compiler, '_refresh_live_inputs', None)
+                if refresh is not None:
+                    refresh()
+                line, line_number, line_clean = self._prepare_block_line(
+                    block_lines, i)
+                if not line_clean:
+                    i += 1
+                    continue
+                if wave_claim is not None:
+                    if compiler._wave_block_step(line_number) == 'skip':
+                        i += 1
+                        continue
+                if line_number in guard_line_numbers:
+                    # The guard was already evaluated for the whole body above.
+                    # A guard is a bare 'If <cond>' line: it has no 'then' and no
+                    # 'End' of its own, so only the guard line is skipped here and
+                    # the 'End' that follows still closes the enclosing block.
+                    i += 1
+                    continue
+                if self._token_end.match(line_clean):
+                    # A bare 'End' closes an enclosing block whose handler already
+                    # ran its body; it is a terminator, not a statement.
+                    i += 1
+                    continue
 
-            # Producers, consumers and guards of a run share the block's row
-            # stream, exactly as they do at the top level.
-            row_stream = getattr(
-                self.compiler, '_try_execute_row_stream_group', None)
-            if row_stream is not None:
-                next_i = row_stream(block_lines, i)
-                if next_i is not None:
+                handled, next_i = self._handle_block_when_statement(
+                    block_lines, i, line, line_number, line_clean)
+                if handled:
+                    i = next_i
+                    continue
+                handled, next_i = self._handle_block_push_or_output_statement(
+                    i, line, line_number, line_clean)
+                if handled:
+                    i = next_i
+                    continue
+                handled, next_i = self._handle_block_direct_assignment_statement(
+                    i, line, line_number, line_clean)
+                if handled:
+                    i = next_i
+                    continue
+                handled, next_i = self._handle_block_if_dispatch(
+                    block_lines, i, line, line_number, line_clean)
+                if handled:
+                    i = next_i
+                    continue
+                handled, next_i = self._handle_block_for_statement(
+                    block_lines, i, line, line_number)
+                if handled:
+                    i = next_i
+                    continue
+                # Conditional block: 'Let <cond> then' is a guarded body, unlike
+                # the declaration form 'Let <var> = ...' handled by the tail.
+                if self._header_let.match(line_clean):
+                    i = self._handle_let_cond_block(block_lines, i, line_number)
+                    continue
+                handled, next_i = self._handle_block_cell_binding_or_assignment(
+                    block_pending, i, line, line_number, line_clean)
+                if handled:
+                    i = next_i
+                    continue
+                handled, next_i, should_return = self._handle_block_tail_statements(
+                    block_lines, i, line, line_number, line_clean)
+                if should_return:
+                    return
+                if handled:
                     i = next_i
                     continue
 
-            handled, next_i = self._handle_block_when_statement(
-                block_lines, i, line, line_number, line_clean)
-            if handled:
-                i = next_i
-                continue
-            handled, next_i = self._handle_block_push_or_output_statement(
-                i, line, line_number, line_clean)
-            if handled:
-                i = next_i
-                continue
-            handled, next_i = self._handle_block_direct_assignment_statement(
-                i, line, line_number, line_clean)
-            if handled:
-                i = next_i
-                continue
-            handled, next_i = self._handle_block_if_dispatch(
-                block_lines, i, line, line_number, line_clean)
-            if handled:
-                i = next_i
-                continue
-            handled, next_i = self._handle_block_for_statement(
-                block_lines, i, line, line_number)
-            if handled:
-                i = next_i
-                continue
-            # Conditional block: 'Let <cond> then' is a guarded body, unlike
-            # the declaration form 'Let <var> = ...' handled by the tail.
-            if self._header_let.match(line_clean):
-                i = self._handle_let_cond_block(block_lines, i, line_number)
-                continue
-            handled, next_i = self._handle_block_cell_binding_or_assignment(
-                block_pending, i, line, line_number, line_clean)
-            if handled:
-                i = next_i
-                continue
-            handled, next_i, should_return = self._handle_block_tail_statements(
-                block_lines, i, line, line_number, line_clean)
-            if should_return:
-                return
-            if handled:
-                i = next_i
-                continue
+                # 'name = expr' is a Let with the keyword left out. It is matched
+                # only once every explicit statement has declined the line, so no
+                # keyword form and no other assignment form can be shadowed by it.
+                handled, next_i = self._handle_block_optional_let_statement(
+                    block_lines, i, line, line_number, line_clean)
+                if handled:
+                    i = next_i
+                    continue
 
-            # 'name = expr' is a Let with the keyword left out. It is matched
-            # only once every explicit statement has declined the line, so no
-            # keyword form and no other assignment form can be shadowed by it.
-            handled, next_i = self._handle_block_optional_let_statement(
-                block_lines, i, line, line_number, line_clean)
-            if handled:
-                i = next_i
-                continue
+                self.compiler.expr_evaluator.eval_expr(
+                    line, self.compiler.current_scope().get_evaluation_scope(), line_number)
 
-            self.compiler.expr_evaluator.eval_expr(
-                line, self.compiler.current_scope().get_evaluation_scope(), line_number)
-
-            i += 1
-        if block_pending:
-            self.compiler.scopes[0].pending_assignments.update(block_pending)
-        return block_pending
+                i += 1
+            if wave_claim is not None and getattr(
+                    compiler, '_wave_flush_pending', False):
+                # The body ended right after its last binding: run the
+                # effects that were waiting for it.
+                compiler._wave_flush_pending = False
+                compiler._flush_deferred_wave_effects()
+            if block_pending:
+                self.compiler.scopes[0].pending_assignments.update(block_pending)
+            return block_pending
+        finally:
+            compiler._wave_state_restore(saved_wave)
 
     def _process_if_statement(self, line, line_number, lines, current_index):
         """Thin wrapper to keep public IF entrypoint compact."""
