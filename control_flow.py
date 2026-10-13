@@ -33,9 +33,9 @@ def block_nesting_delta(clean):
     (For/When/Let/If) never close the outer block early.
     """
     line = clean.strip().lower()
-    if line.startswith('for ') and line.endswith('do'):
+    if line.startswith('for ') and line.endswith(' do'):
         return 1
-    if line.startswith('when ') and line.endswith('do'):
+    if line.startswith('when ') and line.endswith(' do'):
         return 1
     if HEADER_LET.match(line):
         return 1
@@ -262,73 +262,135 @@ class GridLangControlFlow:
                              'dim': [(None, (start, end))]}, True)
             return
 
+        # ``For a = 20 and b = 4``: bind one definition per part. Split only
+        # when every part is itself an assignment, so an expression ``and``
+        # (``x = f(a and b)``) stays a single expression.
+        m_hdr = re.match(r'^\s*For\s+(.+?)(?:\s+DO\s*$|\s*$)', line, re.I)
+        if m_hdr and '=' in m_hdr.group(1):
+            var_defs = m_hdr.group(1).strip()
+            parts = split_var_defs(var_defs)
+            if len(parts) > 1 and all('=' in p for p in parts):
+                for var_name, type_name, constraints, expr in (
+                        self.executor._parse_for_declaration_var_list(
+                            var_defs, line_number)):
+                    if expr is None:
+                        continue
+                    self._bind_for_equality_definition(
+                        var_name, type_name, constraints, expr,
+                        line, line_number, scope)
+                return
+
         m = re.match(
             r'^\s*For\s+([\w_]+)\s*=\s*(.+?)(?:\s+DO\s*$|\s*$)', line, re.I)
         if m:
             var_name, expr = m.groups()
-
-            # Check if variable is already declared in the current scope or in a parent scope
-            # FOR assignment statements should be allowed to reuse variables from outer loop scopes
-            # but not from the same logical block (like LET blocks)
-            current_check_scope = scope
-            while current_check_scope:
-                if var_name in current_check_scope.variables:
-                    # If this is a loop scope, allow it (variables can be reused across loop iterations)
-                    # If this is not a loop scope, it's an error (like in LET blocks)
-                    if not hasattr(current_check_scope, 'is_loop_scope') or not current_check_scope.is_loop_scope:
-                        # If we're in a FOR loop context, allow variable reuse (this is the normal case for nested loops)
-                        # Only fail if we're not in a loop context (like in LET blocks)
-                        if not (hasattr(scope, 'is_loop_scope') and scope.is_loop_scope):
-                            error_msg = f"Error: FOR variable '{var_name}' is already declared in an outer scope at line {line_number}"
-                            print(error_msg)
-                            raise ValueError(error_msg)
-                    break
-                current_check_scope = current_check_scope.parent
-
-            value = self.compiler.expr_evaluator.eval_or_eval_array(
-                expr, scope.get_evaluation_scope(), line_number)
-
-            defining_scope = scope.get_defining_scope(var_name)
-            if defining_scope:
-                if defining_scope.types.get(var_name) == 'number' and not isinstance(value, (int, float)):
-                    raise TypeError(
-                        f"Cannot assign non-numeric value {value} to '{var_name}' at line {line_number}")
-                defining_scope.update(var_name, float(value) if isinstance(
-                    value, (int, float)) else value, line_number)
-            else:
-                inferred_type = self.compiler.array_handler.infer_type(
-                    value, line_number)
-                if inferred_type == 'int':
-                    inferred_type = 'number'
-                constraints = {'constant': value}
-                if isinstance(value, dict) and value.get('_handle'):
-                    # Engine-owned handle (e.g. `For t = clock.timer(3)`):
-                    # the engine rewrites it as it advances (`\.timer` /
-                    # `\.counter`), so it is not an immutable constant -
-                    # mirror the LET-handle binding which strips the pin.
-                    constraints = {}
-                scope.define(var_name, value, inferred_type,
-                             constraints, False)
-
-            pending = list(scope.pending_assignments.items())
-            for key, (expr, ln, deps) in pending:
-                current_scope = self.compiler.current_scope()
-                scope_pending = getattr(
-                    current_scope, 'pending_assignments', {})
-                unresolved = any(
-                    self.compiler.has_unresolved_dependency(
-                        dep, scope=current_scope, scope_pending=scope_pending)
-                    for dep in deps)
-                if not unresolved:
-                    try:
-                        self.compiler.array_handler.evaluate_line_with_assignment(
-                            expr, ln, scope.get_evaluation_scope())
-                        del scope.pending_assignments[key]
-                    except Exception as e:
-                        pass
+            self._bind_for_equality_definition(
+                var_name, None, {}, expr, line, line_number, scope)
             return
 
         raise SyntaxError(f"Invalid FOR syntax at line {line_number}")
+
+    def _bind_for_equality_definition(self, var_name, type_name, constraints,
+                                      expr, line, line_number, scope):
+        """Bind one ``For <var> = <expr>`` definition.
+
+        Handles the redeclarability check, the initializer evaluation, the
+        binding, pending-assignment flush and ``for_declared_names`` record.
+        """
+        # Check if variable is already declared in the current scope or in a parent scope
+        # FOR assignment statements should be allowed to reuse variables from outer loop scopes
+        # but not from the same logical block (like LET blocks)
+        current_check_scope = scope
+        while current_check_scope:
+            if var_name in current_check_scope.variables:
+                # If this is a loop scope, allow it (variables can be reused across loop iterations)
+                # If this is not a loop scope, it's an error (like in LET blocks)
+                if not hasattr(current_check_scope, 'is_loop_scope') or not current_check_scope.is_loop_scope:
+                    # If we're in a FOR loop context, allow variable reuse (this is the normal case for nested loops)
+                    # Only fail if we're not in a loop context (like in LET blocks)
+                    if not (hasattr(scope, 'is_loop_scope') and scope.is_loop_scope):
+                        # ``For ... do`` LHS must be fresh; a standalone
+                        # For may reuse a name it declared.
+                        if re.search(r'\sdo\s*$', line, re.I):
+                            redeclarable = False
+                        else:
+                            # A standalone For may reuse a name it declared,
+                            # or one the enclosing Let header bound: the
+                            # header's pin then reads back as #VALUE.
+                            redeclarable = (
+                                var_name.lower() in getattr(
+                                    self.compiler, 'for_declared_names', set())
+                                or getattr(
+                                    current_check_scope, 'let_block', False))
+                            if not redeclarable and (
+                                    var_name in current_check_scope.uninitialized
+                                    or current_check_scope.is_uninitialized(var_name)):
+                                redeclarable = True
+                        if not redeclarable:
+                            error_msg = (
+                                f"Variable '{var_name}' already defined "
+                                f"in scope at line {line_number}")
+                            raise ValueError(error_msg)
+                break
+            current_check_scope = current_check_scope.parent
+
+        value = self.compiler.expr_evaluator.eval_or_eval_array(
+            expr, scope.get_evaluation_scope(), line_number)
+
+        defining_scope = scope.get_defining_scope(var_name)
+        if defining_scope:
+            if defining_scope.types.get(var_name) == 'number' and not isinstance(value, (int, float)):
+                raise TypeError(
+                    f"Cannot assign non-numeric value {value} to '{var_name}' at line {line_number}")
+            defining_scope.update(var_name, float(value) if isinstance(
+                value, (int, float)) else value, line_number)
+        else:
+            inferred_type = type_name or self.compiler.array_handler.infer_type(
+                value, line_number)
+            if inferred_type == 'int':
+                inferred_type = 'number'
+            merged = dict(constraints or {})
+            if isinstance(value, dict) and value.get('_handle'):
+                # Engine-owned handle (e.g. `For t = clock.timer(3)`):
+                # the engine rewrites it as it advances (`\.timer` /
+                # `\.counter`), so it is not an immutable constant -
+                # mirror the LET-handle binding which strips the pin.
+                merged = {}
+            else:
+                merged['constant'] = value
+            scope.define(var_name, value, inferred_type,
+                         merged, False)
+
+        pending = list(scope.pending_assignments.items())
+        for key, (expr, ln, deps) in pending:
+            current_scope = self.compiler.current_scope()
+            scope_pending = getattr(
+                current_scope, 'pending_assignments', {})
+            unresolved = any(
+                self.compiler.has_unresolved_dependency(
+                    dep, scope=current_scope, scope_pending=scope_pending)
+                for dep in deps)
+            if not unresolved:
+                try:
+                    self.compiler.array_handler.evaluate_line_with_assignment(
+                        expr, ln, scope.get_evaluation_scope())
+                    del scope.pending_assignments[key]
+                except Exception as e:
+                    pass
+        # Remember For-declarations written inside a block so a later
+        # block may declare the same name again; a For written at the
+        # root level counts as declared outside every block. A For
+        # BLOCK's variable is local to its own scope, so a ``do`` header
+        # never marks the name as declared outside anything.
+        scopes = getattr(self.compiler, 'scopes', None)
+        if (scopes and scope is not scopes[0]
+                and not re.search(r'\sdo\s*$', line, re.I)):
+            names = getattr(self.compiler, 'for_declared_names', None)
+            if names is None:
+                names = set()
+                self.compiler.for_declared_names = names
+                names.add(var_name.lower())
+        return
 
     def _is_error_literal_for_header(self, line):
         """True when a block ``For x = <expr> do`` header uses an error code
@@ -342,10 +404,27 @@ class GridLangControlFlow:
     def _skip_equal_for_block_body(self, block_lines, i):
         """Skip the body of a ``For x = <expr> do ... End`` block and return
         the next index past its matching End."""
-        _, end_index = self._extract_block_body(block_lines, i)
+        body, end_index = self._extract_block_body(block_lines, i)
+        # The loop never runs, but its declarations still declare
+        # (unvalued); only the bindings are skipped with the body.
+        if body:
+            self._predeclare_block_assignment_targets(body)
         next_index = end_index + 1 if end_index < len(
             block_lines) else len(block_lines)
         return True, next_index
+
+    def _pop_for_block_scope(self, block_scope):
+        """End a For-block's private scope: everything it bound dies."""
+        self.compiler.pop_scope()
+
+    def _unwind_block_scope(self, block_scope):
+        """Pop down to (and including) ``block_scope`` when a For-block
+        exits through an exception an enclosing handler may swallow."""
+        while (self.compiler.current_scope() is not None
+               and self.compiler.current_scope() is not block_scope):
+            self.compiler.pop_scope()
+        if self.compiler.current_scope() is block_scope:
+            self.compiler.pop_scope()
 
     def identify_global_guard_lines(self, lines):
         """Return metadata for IF guard statements at global scope (no THEN)."""
@@ -396,16 +475,38 @@ class GridLangControlFlow:
             is_block_if = bool(self._header_if.match(stripped))
             is_block_for = bool(self._header_for.match(stripped))
             is_block_when = bool(self._header_when.match(stripped))
-            is_end = bool(self._token_end.match(stripped))
+            is_block_let = bool(self._header_let.match(stripped))
+            is_end = self._token_end.match(stripped)
 
             is_top_level_for = depth == 0 and lower.startswith("for ")
 
-            # Treat both simple FOR declarations and top-level FOR blocks as global pre-exec
-            if is_top_level_for and (" do" not in lower or is_block_for):
-                for_entries.append(
-                    {'line_number': line_number, 'line': stripped})
+            # Standalone FOR declarations pre-execute at wave 0.  Block-form
+            # ``For ... do`` bodies run in the main loop so a hoisted binding
+            # written after them is still live at the header; a function or
+            # subprocess stream keeps its wave-0 pre-pass.
+            if is_top_level_for:
+                if not lower.endswith(" do"):
+                    for_entries.append(
+                        {'line_number': line_number, 'line': stripped})
+                else:
+                    # Parse the header the way the m-branch does so types
+                    # and constraints (``For x as number = f() do``) are
+                    # handled; keep a wave-0 pass only for a function or
+                    # subprocess stream.
+                    parsed = self._parse_for_header(
+                        stripped, line_number, raise_on_error=False)
+                    if parsed:
+                        _defs, var_list, _block = parsed
+                        if any(
+                                expr is not None
+                                and self.executor._match_fp_call_name(
+                                    expr) is not None
+                                for _v, _t, _c, expr in var_list):
+                            for_entries.append(
+                                {'line_number': line_number,
+                                 'line': stripped})
 
-            if is_block_if or is_block_for or is_block_when:
+            if is_block_if or is_block_for or is_block_when or is_block_let:
                 depth += 1
             if is_end and depth > 0:
                 depth -= 1
@@ -466,7 +567,7 @@ class GridLangControlFlow:
 
     def _handle_block_when_statement(self, block_lines, i, line, line_number, line_clean):
         """Handle WHEN ... DO block registration."""
-        if not (line_clean.lower().startswith("when ") and line_clean.lower().endswith("do")):
+        if not (line_clean.lower().startswith("when ") and line_clean.lower().endswith(" do")):
             return False, i
         when_match = re.match(
             r'^\s*when\s+(.+?)\s+do\s*$', line, re.I)
@@ -541,15 +642,208 @@ class GridLangControlFlow:
             block_lines, i, line_number,
             on_done=lambda: self._sync_type_fields_from_scope(value_dict))
 
+    def _define_body_scope(self, scope=None):
+        """Nearest enclosing define-body scope (or the runner's root).
+
+        This is where declaration-only FOR variables are declared: the
+        function/type body scope, or global at top level. It is found by
+        walking the chain for a scope marked ``define_body`` (set by type and
+        builder bodies); function and top-level runners already run in their
+        root scope ``scopes[0]``, which is the fallback.
+        """
+        if scope is None:
+            scope = self.compiler.current_scope()
+        current = scope
+        while current is not None:
+            if getattr(current, 'define_body', False):
+                return current
+            current = current.parent
+        return self.compiler.scopes[0]
+
+    def _let_block_promote_scope(self, scope=None):
+        """Scope that receives For- and ':'-declared variables from inside
+        a Let block.
+
+        Promotion crosses every Let-block scope and lands on the nearest
+        define-body scope (a type/builder body scope, marked ``define_body``,
+        or the runner's root scope ``scopes[0]`` — global at top level, the
+        function/subprocess body scope inside a call). Intermediate loop or
+        If-block scopes do not intercept the promotion: the variable is
+        declared at the define level directly. When no Let block is in the
+        chain the scope is returned unchanged, so plain loop copy-backs are
+        unaffected.
+        """
+        if scope is None:
+            scope = self.compiler.current_scope()
+        crossed_let_block = False
+        current = scope
+        while current is not None:
+            if getattr(current, 'let_block', False):
+                crossed_let_block = True
+            if crossed_let_block and getattr(current, 'define_body', False):
+                return current
+            current = current.parent
+        if crossed_let_block:
+            return self.compiler.scopes[0]
+        return scope
+
+    def _parse_for_header(self, line, line_number, raise_on_error=True):
+        """``(var_defs, var_list, is_block)`` for a ``For`` header.
+
+        Delegates the variable-definition parse to the engine's canonical
+        ``_parse_for_declaration_var_list`` so types, constraints and
+        ``and``-lists behave identically everywhere. Returns ``None`` when
+        the line is not a For header (or, when *raise_on_error* is False,
+        when it does not parse).
+        """
+        m = re.match(r'^\s*FOR\s+(.+?)(?:\s+do\s*$|\s*$)', line, re.I)
+        if not m:
+            return None
+        var_defs = m.group(1).strip()
+        is_block = line.strip().lower().endswith(' do')
+        try:
+            var_list = self.executor._parse_for_declaration_var_list(
+                var_defs, line_number)
+        except Exception:
+            if raise_on_error:
+                raise
+            return None
+        return var_defs, var_list, is_block
+
+    def _promote_fresh_for_var(self, line, line_number):
+        """Move fresh For-equality bindings out of an enclosing Let block.
+
+        ``For x = expr`` binds where the initializer was evaluated (the
+        current scope, so a Let-block header variable is visible), then the
+        binding is moved to the promote scope because For-declared
+        variables outlive the Let block.
+        """
+        block_scope = self.compiler.current_scope()
+        promote = self._let_block_promote_scope()
+        if promote is block_scope:
+            return
+        parsed = self._parse_for_header(line, line_number,
+                                        raise_on_error=False)
+        if not parsed:
+            return
+        _var_defs, var_list, _is_block = parsed
+        for var_name, _t, _c, _e in var_list:
+            if not var_name:
+                continue
+            old_key = block_scope._get_case_insensitive_key(
+                var_name, block_scope.variables)
+            if old_key is None:
+                continue
+            value = block_scope.variables.pop(old_key)
+            type_name = block_scope.types.pop(old_key, None)
+            constraints = block_scope.constraints.pop(old_key, None)
+            existing = promote._get_case_insensitive_key(
+                old_key, promote.variables)
+            if existing is not None:
+                promote.update(existing, value, line_number)
+            else:
+                promote.define(
+                    old_key, value, type_name, constraints or {},
+                    is_uninitialized=False, line_number=line_number)
+
+    def _snapshot_var_entry(self, scope, var):
+        """Snapshot a scope entry (value/type/constraints/init) for rollback."""
+        key = scope._get_case_insensitive_key(var, scope.variables)
+        if key is None:
+            key = scope._get_case_insensitive_key(var, scope.types)
+        if key is None:
+            key = scope._get_case_insensitive_key(var, scope.constraints)
+        if key is None:
+            key = scope._get_case_insensitive_key(var, scope.uninitialized)
+        if key is None:
+            return None
+        return {
+            'key': key,
+            'has_value': key in scope.variables,
+            'value': scope.variables.get(key),
+            'has_type': key in scope.types,
+            'type': scope.types.get(key),
+            'has_constraints': key in scope.constraints,
+            'constraints': dict(scope.constraints.get(key, {})),
+            'uninit_key': scope._get_case_insensitive_key(
+                var, scope.uninitialized),
+        }
+
+    def _restore_var_entry(self, scope, var, snap):
+        """Restore a snapshot taken by :meth:`_snapshot_var_entry`."""
+        if snap is None:
+            return
+        key = snap['key']
+        if snap['has_value']:
+            scope.variables[key] = snap['value']
+        else:
+            scope.variables.pop(key, None)
+        if snap['has_type']:
+            scope.types[key] = snap['type']
+        else:
+            scope.types.pop(key, None)
+        if snap['has_constraints']:
+            scope.constraints[key] = snap['constraints']
+        else:
+            scope.constraints.pop(key, None)
+        if snap['uninit_key'] is not None:
+            scope.uninitialized.add(snap['uninit_key'])
+        else:
+            scope.uninitialized.discard(key)
+
+    @staticmethod
+    def _dict_member_key(d, name):
+        """Case-insensitive key lookup on a record dict."""
+        if name in d:
+            return name
+        lower = name.lower()
+        for k in d:
+            if str(k).lower() == lower:
+                return k
+        return None
+
+    def _let_header_target_missing(self, var):
+        """True when a member/index Let header names something absent.
+
+        A header that is not a plain identifier is only rejected when its
+        target does not already exist: a scope key such as ``a.top``, an
+        address into an existing array such as ``g![A2]``, or a member of
+        an existing object.
+        """
+        if not isinstance(var, str) or not var.strip():
+            return True
+        scope = self.compiler.current_scope()
+        if scope.get_defining_scope(var) is not None:
+            return False
+        base = re.match(r'^([A-Za-z_]\w*)', var)
+        if base is None:
+            return True
+        try:
+            value = scope.get(base.group(1))
+        except NameError:
+            return True
+        if '.' not in var:
+            return False
+        parts = [p.strip() for p in var.split('.') if p.strip()]
+        for part in parts[1:-1]:
+            if not isinstance(value, dict):
+                return True
+            key = self._dict_member_key(value, part)
+            if key is None:
+                return True
+            value = value[key]
+        return (not isinstance(value, dict)
+                or self._dict_member_key(value, parts[-1]) is None)
+
     def _handle_let_cond_block(self, block_lines, i, line_number,
                                value_dict=None, on_done=None):
         """Run a conditional ``Let <cond> then ... End`` block.
 
-        Declaration headers (``Let x = 2 then``) bind their variable first,
-        exactly like the main-loop LET, so the body can read it; guard
-        headers (``Let x > 10 then``) run the body only when the current
-        value satisfies the comparison. The body itself is ordinary code and
-        is executed by :meth:`_process_block`.
+        A fresh name binds block-local and dies at End; an existing name
+        is permanently updated like a standalone ``Let``, and the body
+        runs only when that update validates. A member/index header writes
+        through to the target it names; guard headers gate the body on the
+        current value.
         """
         line, ln, line_clean = self._prepare_block_line(block_lines, i)
         header = re.sub(r'^Let\s+', '', line_clean, count=1, flags=re.I)
@@ -557,68 +851,87 @@ class GridLangControlFlow:
         body, end_index = self._extract_block_body(block_lines, i)
         var, type_name, constraints, expr = self.compiler._parse_variable_def(
             header, ln)
-        condition_passed = True
-        block_local = False
         plain_var = bool(isinstance(var, str) and re.match(
             r'^[A-Za-z_]\w*$', var or ''))
-        if expr is not None and plain_var:
-            fresh = self.compiler.current_scope().get_defining_scope(var) is None
-            status = self.executor._bind_declared_var(
-                var, type_name, constraints, expr, ln,
-                shadow_keyword='LET', mark_implicit=True)
-            if status == 'deferred':
-                condition_passed = False
-            else:
-                if fresh and status == 'bound':
-                    # A block-form Let declares a new variable that is only
-                    # visible inside its block: record it where the enclosing
-                    # scope copy-back looks so it is dropped at End.
-                    self.compiler.current_scope().local_let_declarations.add(
-                        var.lower())
-                    block_local = True
+        if not plain_var and self._let_header_target_missing(var):
+            raise SyntaxError(
+                f"Name '{var}' is not defined at line {ln}")
+        condition_passed = True
+        self.compiler.push_scope(is_private=True)
+        block_scope = self.compiler.current_scope()
+        block_scope.let_block = True
+        try:
+            if expr is not None and not plain_var:
+                # Member/index target: apply the Let through the engine so
+                # the constraints land on the object or array it names
+                # rather than on a shadow variable.  The write goes to the
+                # object directly, so it outlives the block.
                 try:
-                    bound_value = self.compiler.current_scope().get(var)
-                except NameError:
-                    bound_value = None
-                # An error-valued or unresolved declaration skips the body,
-                # matching the main-loop LET block.
-                if bound_value is None or is_error_value(bound_value):
+                    self.executor._process_let_first_pass(
+                        [(var, type_name, constraints, expr)],
+                        block_scope.get_evaluation_scope(), ln)
+                except Exception:
                     condition_passed = False
-        elif expr is not None:
-            # Index/field writes are not bound here; keep the legacy
-            # truthiness gate so the body only runs on a real value.
-            try:
-                value = self.compiler.expr_evaluator.eval_or_eval_array(
-                    str(expr),
-                    self.compiler.current_scope().get_evaluation_scope(), ln)
-                condition_passed = bool(value)
-            except Exception:
-                condition_passed = False
-        elif constraints:
-            # Guard headers (``x > 10``, ``name <> "bob"``, ``q of peso``)
-            # are ordinary conditions: evaluate them with the shared If/'?'
-            # evaluator instead of re-implementing the operator table.
-            try:
-                condition_passed = bool(self._evaluate_if_condition(
-                    header, ln, warn_boolean=True))
-            except NameError:
-                condition_passed = False
-        if condition_passed and body:
-            self._process_block(body, self.compiler.current_scope())
-        if block_local:
-            # The header variable lives only inside the block. The main-loop
-            # LET drops it by popping the block scope; this path binds into
-            # the current scope, so drop it here instead of waiting for the
-            # enclosing scope's copy-back.
-            scope = self.compiler.current_scope()
-            old_key = scope._get_case_insensitive_key(
-                var, scope.variables)
-            if old_key is not None:
-                scope.variables.pop(old_key, None)
-                scope.types.pop(old_key, None)
-                scope.constraints.pop(old_key, None)
-            scope.local_let_declarations.discard(var.lower())
-            scope.clear_implicit_let(var)
+            elif expr is not None:
+                parent_scope = block_scope.parent
+                parent_def = parent_scope.get_defining_scope(var) \
+                    if parent_scope is not None else None
+                if parent_def is None:
+                    # Fresh name: bind block-local.
+                    status = self.executor._bind_declared_var(
+                        var, type_name, constraints, expr, ln,
+                        shadow_keyword='LET', mark_implicit=True)
+                    if status == 'deferred':
+                        condition_passed = False
+                    else:
+                        try:
+                            bound_value = block_scope.get(var)
+                        except NameError:
+                            bound_value = None
+                        # Error/unresolved value skips the body.
+                        if bound_value is None or is_error_value(
+                                bound_value):
+                            condition_passed = False
+                else:
+                    # Existing name: update it like a standalone Let;
+                    # the body runs only if the update validates.
+                    snap = self._snapshot_var_entry(parent_def, var)
+                    failed = False
+                    try:
+                        status = self.executor._bind_declared_var(
+                            var, type_name, constraints, expr, ln,
+                            shadow_keyword='LET', mark_implicit=True)
+                    except Exception:
+                        status = None
+                        failed = True
+                    if status == 'deferred':
+                        failed = True
+                    elif not failed:
+                        actual = parent_def._get_case_insensitive_key(
+                            var, parent_def.variables) or var
+                        bound_value = parent_def.variables.get(actual)
+                        if bound_value is None or is_error_value(
+                                bound_value):
+                            failed = True
+                    if failed:
+                        self._restore_var_entry(parent_def, var, snap)
+                        self.executor.pending_assignments.pop(var, None)
+                        condition_passed = False
+            elif constraints:
+                # Guard header: evaluate with the shared If/'?' evaluator.
+                try:
+                    condition_passed = bool(self._evaluate_if_condition(
+                        header, ln, warn_boolean=True))
+                except NameError:
+                    condition_passed = False
+            if condition_passed and body:
+                self._process_block(body, self.compiler.current_scope())
+            elif body and not condition_passed:
+                # The header guard failed: the body never runs, but its
+                # declarations still declare (unvalued).
+                self._predeclare_block_assignment_targets(body)
+        finally:
+            self.compiler.pop_scope()
         if callable(on_done):
             on_done()
         return end_index + 1
@@ -770,7 +1083,7 @@ class GridLangControlFlow:
             return True, i + 1
 
         # Block form:  if <cond> then <body> end
-        if line_clean.lower().endswith('then'):
+        if line_clean.lower().endswith(' then'):
             cond_match = re.match(
                 r'^\s*if\s+(.+?)\s*then\s*$', line, re.I)
             if not cond_match:
@@ -838,9 +1151,13 @@ class GridLangControlFlow:
             # whether or not the clause runs this time.
             self._add_block_guard_entries(
                 body_lines, [(condition, line_number)])
+            # Declarations in a branch that does not run still declare their
+            # variables (unvalued); the binding is skipped with the branch.
             if condition_result:
                 self._process_block(
                     body_lines, self.compiler.current_scope())
+            else:
+                self._predeclare_block_assignment_targets(body_lines)
             return True, end_index + 1
 
         # Inline THEN without a terminating END: legacy single-line IF.
@@ -857,26 +1174,20 @@ class GridLangControlFlow:
         if not line.strip().lower().startswith("for "):
             return False, i
 
-        if '=' in line and not re.search(r'\bin\b|\bas\b|\bdim\b', line.lower()):
+        if ('=' in line
+                and not re.search(r'\bin\b|\bas\b|\bdim\b', line.lower())
+                and not line.strip().lower().endswith(' do')):
             try:
+                # The initializer reads the current scope (an enclosing Let
+                # block's header variable must be visible), so bind there
+                # first; a fresh binding is then moved out of a Let block
+                # because For-declared variables outlive it.
                 self.process_for_statement(
                     line, line_number, self.compiler.current_scope())
-                # ``For x = <expr> do ... End`` inside a block: when the loop
-                # variable holds an error value, skip the block body.
-                if line.strip().lower().endswith('do'):
-                    m_var = re.match(
-                        r'^\s*For\s+([\w_]+)\s*=', line, re.I)
-                    if m_var:
-                        var_name = m_var.group(1)
-                        def_scope = self.compiler.current_scope(
-                        ).get_defining_scope(var_name)
-                        if def_scope is not None and is_error_value(
-                                def_scope.get(var_name)):
-                            return self._skip_equal_for_block_body(
-                                block_lines, i)
+                self._promote_fresh_for_var(line, line_number)
                 return True, i + 1
             except ValueError as e:
-                if "already declared in an outer scope" in str(e):
+                if "already defined in scope" in str(e):
                     raise e
                 if self._is_error_literal_for_header(line):
                     return self._skip_equal_for_block_body(
@@ -892,26 +1203,15 @@ class GridLangControlFlow:
         if not m:
             return True, i + 1
         var_defs = m.group(1).strip()
-        is_block = line.strip().lower().endswith('do')
+        is_block = line.strip().lower().endswith(' do')
         index_fallback = None
         index_match_line = re.search(
             r'\bindex\s+([A-Za-z_][A-Za-z0-9_]*)\b', var_defs, re.I)
         if index_match_line:
             index_fallback = index_match_line.group(1)
 
-        var_list = []
-        if ' and ' in var_defs.lower():
-            var_parts = re.split(
-                r'\s+and\s+', var_defs, flags=re.I)
-            for var_part in var_parts:
-                var, type_name, constraints, value = self.compiler._parse_variable_def(
-                    var_part, line_number)
-                var_list.append(
-                    (var, type_name, constraints, value))
-        else:
-            var, type_name, constraints, value = self.compiler._parse_variable_def(
-                var_defs, line_number)
-            var_list.append((var, type_name, constraints, value))
+        var_list = self.executor._parse_for_declaration_var_list(
+            var_defs, line_number)
 
         for var, _, constraints, value in var_list:
             defining_scope = self.compiler.current_scope().get_defining_scope(var)
@@ -919,8 +1219,21 @@ class GridLangControlFlow:
                 defining_scope.constraints[var] = constraints
                 continue
             if defining_scope and not getattr(self.compiler.current_scope(), 'is_loop_scope', False):
-                raise ValueError(
-                    f"Variable '{var}' already defined in scope at line {line_number}")
+                # A For block (``For x do``) may not use an already-declared
+                # var in LHS. A standalone ``For x`` declares at the
+                # define/global scope: a later block's declaration of the
+                # same name is fine, and an unvalued placeholder may be
+                # completed.
+                if is_block:
+                    redeclarable = False
+                else:
+                    redeclarable = var.lower() in getattr(
+                        self.compiler, 'for_declared_names', set())
+                    if not redeclarable and defining_scope.is_uninitialized(var):
+                        redeclarable = True
+                if not redeclarable:
+                    raise ValueError(
+                        f"Variable '{var}' already defined in scope at line {line_number}")
 
         loop_body = block_lines[i + 1:]
         loop_end_index = None
@@ -936,7 +1249,7 @@ class GridLangControlFlow:
         if handled_init:
             return True, next_i
 
-        for var, _, constraints, _ in var_list:
+        for var, type_name, constraints, _ in var_list:
             if 'in' in constraints:
                 values = constraints['in']
                 for val in values:
@@ -956,21 +1269,6 @@ class GridLangControlFlow:
                     self.compiler.current_scope().define(var, val, 'number')
                     self._process_block(
                         loop_body)
-                    parent_scope = self.compiler.current_scope().parent
-                    if parent_scope:
-                        loop_local_lets = getattr(
-                            self.compiler.current_scope(),
-                            'local_let_declarations', set())
-                        for name, value in self.compiler.current_scope().variables.items():
-                            if name.lower() in loop_local_lets:
-                                continue
-                            try:
-                                parent_scope.update(name, value)
-                            except Exception:
-                                inferred_type = self.compiler.array_handler.infer_type(
-                                    value, line_number)
-                                parent_scope.define(
-                                    name, value, inferred_type, {}, is_uninitialized=False)
                     self.compiler.pop_scope()
             elif 'range' in constraints:
                 range_constraint = constraints['range']
@@ -992,21 +1290,6 @@ class GridLangControlFlow:
                         self.compiler.current_scope().define(var, val, 'number')
                         self._process_block(
                             loop_body, self.compiler.current_scope())
-                        parent_scope = self.compiler.current_scope().parent
-                        if parent_scope:
-                            loop_local_lets = getattr(
-                                self.compiler.current_scope(),
-                                'local_let_declarations', set())
-                            for name, value in self.compiler.current_scope().variables.items():
-                                if name.lower() in loop_local_lets:
-                                    continue
-                                try:
-                                    parent_scope.update(name, value)
-                                except Exception:
-                                    inferred_type = self.compiler.array_handler.infer_type(
-                                        value, line_number)
-                                    parent_scope.define(
-                                        name, value, inferred_type, {}, is_uninitialized=False)
                         self.compiler.pop_scope()
                 except Exception as e:
                     raise SyntaxError(
@@ -1022,7 +1305,77 @@ class GridLangControlFlow:
                                     var, var_value, line_number)
                     except ValueError as e:
                         break
-                self._process_block(loop_body)
+                # Declaration-only FOR (``For x``) declares the variable so a
+                # later Push can bind it. A standalone For declares it at the
+                # define level (function/type body scope, or global) so it
+                # outlives any enclosing loop/If/Let block. A For block
+                # (``For x do``) runs its body in its own scope instead: the
+                # loop variable is declared there and dies with the block.
+                if is_block:
+                    self.compiler.push_scope(is_private=True)
+                    block_scope = self.compiler.current_scope()
+
+                    def _failed_header(predeclare):
+                        self._unwind_block_scope(block_scope)
+                        if predeclare:
+                            if loop_body:
+                                self._predeclare_block_assignment_targets(
+                                    loop_body)
+                            if loop_end_index is not None:
+                                return True, (loop_end_index + 1
+                                              if loop_end_index < len(
+                                                  block_lines)
+                                              else len(block_lines))
+                        return True, i + 1
+
+                    if value is not None:
+                        # Valued header: bind into the loop scope.
+                        try:
+                            self.process_for_statement(
+                                line, line_number, block_scope)
+                        except ValueError as e:
+                            if "already defined in scope" in str(e):
+                                self._unwind_block_scope(block_scope)
+                                raise
+                            return _failed_header(
+                                self._is_error_literal_for_header(line))
+                        except Exception:
+                            return _failed_header(
+                                self._is_error_literal_for_header(line))
+                        # Error value: skip the body, declare it unvalued.
+                        m_var = re.match(r'^\s*For\s+([\w_]+)\s*=', line,
+                                         re.I)
+                        if m_var:
+                            def_scope = block_scope.get_defining_scope(
+                                m_var.group(1))
+                            if def_scope is not None and is_error_value(
+                                    def_scope.get(m_var.group(1))):
+                                return _failed_header(True)
+                    elif block_scope.get_defining_scope(var) is None:
+                        block_scope.define(
+                            var, None, type_name, constraints or {},
+                            is_uninitialized=True,
+                            line_number=line_number)
+                    try:
+                        self._process_block(
+                            loop_body, self.compiler.current_scope())
+                    except BaseException:
+                        self._unwind_block_scope(block_scope)
+                        raise
+                    self._pop_for_block_scope(block_scope)
+                    if loop_end_index is not None:
+                        next_index = loop_end_index + 1 if loop_end_index < len(
+                            block_lines) else len(block_lines)
+                        return True, next_index
+                    return True, i + 1
+                if self.compiler.current_scope().get_defining_scope(var) is None:
+                    self._define_body_scope().define(
+                        var, None, type_name, constraints or {},
+                        is_uninitialized=True, line_number=line_number)
+                # A single-line declaration consumes only its own line: the
+                # remaining lines belong to the enclosing walk, which
+                # continues at i + 1.
+                return True, i + 1
 
         if is_block and loop_end_index is not None:
             next_index = loop_end_index + \
@@ -1078,12 +1431,23 @@ class GridLangControlFlow:
                     loop_scope.define(index_name, idx_val, 'number',
                                       {}, is_uninitialized=False)
                 self._process_block(loop_body)
-                parent_scope = loop_scope.parent
+                parent_scope = self._let_block_promote_scope(
+                    loop_scope.parent)
                 if parent_scope:
                     loop_local_lets = getattr(
                         loop_scope, 'local_let_declarations', set())
+                    # The block's own loop and index variables are local
+                    # to the For block and die with it.
+                    block_locals = {entry_var.lower()
+                                    for entry_var, _, _ in init_entries}
+                    if index_name:
+                        block_locals.add(index_name.lower())
+                    if index_fallback:
+                        block_locals.add(index_fallback.lower())
                     for name, value in loop_scope.variables.items():
                         if name.lower() in loop_local_lets:
+                            continue
+                        if name.lower() in block_locals:
                             continue
                         try:
                             parent_scope.update(name, value)
@@ -1109,7 +1473,7 @@ class GridLangControlFlow:
                 values = [self.compiler.expr_evaluator.eval_or_eval_array(
                     str(init_expr), self.compiler.current_scope().get_evaluation_scope(), line_number)]
             target_scope = self.compiler.current_scope().get_defining_scope(
-                var) or self.compiler.current_scope()
+                var) or self._let_block_promote_scope()
             for val in values:
                 try:
                     target_scope.update(var, val, line_number)
@@ -1260,9 +1624,15 @@ class GridLangControlFlow:
         return True, i + 1
 
     def _handle_block_tail_statements(self, block_lines, i, line, line_number, line_clean):
+        if re.match(r'^\[\s*\^?[A-Za-z]+\d+\s*\]\s*:\s*(.+)$', line) \
+                and '=' not in line.split(':', 1)[1]:
+            # A declaration-only cell binding (``[B1] : b``) declares the
+            # variable and maps it to the cell; it is not an expression.
+            self.compiler._process_cell_binding_declaration(line, line_number)
+            return True, i + 1, False
         if line_clean.lower().startswith('if '):
             try:
-                if re.match(r'^if\b.+\bthen\b', line_clean, re.I) and not line_clean.lower().endswith('then'):
+                if re.match(r'^if\b.+\bthen\b', line_clean, re.I) and not line_clean.lower().endswith(' then'):
                     consumed = self._process_if_statement(
                         line, line_number, block_lines, i)
                     return True, i + consumed, False
@@ -1275,6 +1645,19 @@ class GridLangControlFlow:
             assignment_line = line.strip()[2:]
             m = re.match(r'^([\w_]+)\s*=\s*(.+)$', assignment_line)
             if m:
+                promote = self._let_block_promote_scope()
+                if promote is not self.compiler.current_scope():
+                    # A ':' declaration outlives an enclosing Let block, so
+                    # it targets the promote scope directly; the keyword-less
+                    # assignment is a Let and stays block-local.
+                    scope_dict = self.compiler.current_scope(
+                    ).get_evaluation_scope()
+                    self.compiler._bind_declared_var(
+                        m.group(1), None, {}, m.group(2), line_number,
+                        search_scope=self.compiler.current_scope(),
+                        define_scope=promote, scope_dict=scope_dict,
+                        shadow_keyword='LET', mark_implicit=True)
+                    return True, i + 1, False
                 # A colon-let on a plain variable has the same shape as the
                 # keyword-less assignment ``name = expr``; reuse its in-block
                 # Let binder (the cell evaluator below rejects plain-variable
@@ -1283,6 +1666,27 @@ class GridLangControlFlow:
                     block_lines, i, assignment_line, line_number, assignment_line)
                 if handled:
                     return handled, next_i, False
+            promote = self._let_block_promote_scope()
+            if promote is not self.compiler.current_scope():
+                # A non-'=' ':' declaration (e.g. ``: x init expr``) inside a
+                # Let block also outlives it: parse it as a declaration and
+                # bind it in the promote scope.
+                try:
+                    var, type_name, constraints, expr = (
+                        self.compiler._parse_variable_def(
+                            assignment_line, line_number))
+                except Exception:
+                    var = None
+                if var and isinstance(var, str) and re.match(
+                        r'^[A-Za-z_]\w*$', var):
+                    scope_dict = self.compiler.current_scope(
+                    ).get_evaluation_scope()
+                    self.compiler._bind_declared_var(
+                        var, type_name, constraints, expr, line_number,
+                        search_scope=self.compiler.current_scope(),
+                        define_scope=promote, scope_dict=scope_dict,
+                        shadow_keyword='LET', mark_implicit=True)
+                    return True, i + 1, False
             try:
                 self.compiler.array_handler.evaluate_line_with_assignment(
                     assignment_line, line_number, self.compiler.current_scope().get_evaluation_scope())
@@ -1616,7 +2020,7 @@ class GridLangControlFlow:
         if not condition_match:
             raise SyntaxError(f"Invalid IF syntax at line {line_number}")
         condition = condition_match.group(1).strip()
-        has_block = line.lower().strip().endswith('then')
+        has_block = line.lower().strip().endswith(' then')
         return condition, has_block
 
     def _defer_pending_if(self, line, line_number, deps):
@@ -1676,13 +2080,20 @@ class GridLangControlFlow:
     def _process_if_block_statement(self, condition_result, lines, current_index, line_number):
         if_block_lines, else_block_lines, elseif_blocks, block_i = self._collect_if_blocks(
             lines, current_index, line_number)
-        # Same contract as the rich handler: targets assigned inside the
-        # block exist (as the ``""`` placeholder) even when the block is
-        # skipped, so reads after the IF do not raise NameError.
-        self._predeclare_block_assignment_targets(
-            if_block_lines + else_block_lines
-            + [ln for _, elseif_lines in elseif_blocks
-               for ln in elseif_lines])
+        # Same contract as the rich handler: declarations in a skipped
+        # clause exist (unvalued) even when that clause does not run, so
+        # reads after the IF do not raise NameError. Clauses that run
+        # declare when they execute.
+        if not condition_result:
+            self._predeclare_block_assignment_targets(if_block_lines)
+        for elseif_result, elseif_lines in elseif_blocks:
+            if not elseif_result:
+                self._predeclare_block_assignment_targets(elseif_lines)
+        if elseif_blocks or else_block_lines:
+            any_clause_ran = condition_result or any(
+                r for r, _ in elseif_blocks)
+            if not any_clause_ran:
+                self._predeclare_block_assignment_targets(else_block_lines)
         self._execute_if_block_choice(
             condition_result, if_block_lines, elseif_blocks, else_block_lines, line_number)
         return block_i - current_index - 1
@@ -1911,6 +2322,9 @@ class GridLangControlFlow:
                     var, expr, scope_dict, line_number):
                 continue
             if self._try_process_let_indexed_assignment(
+                    var, expr, scope_dict, line_number):
+                continue
+            if '.' in str(var) and self.compiler._try_handle_dotted_member_let(
                     var, expr, scope_dict, line_number):
                 continue
             self._bind_let_var_in_block(
@@ -2443,8 +2857,6 @@ class GridLangControlFlow:
                 v_clean = v.strip()
                 if v_clean.startswith('"') and v_clean.endswith('"'):
                     constraint_values.append(v_clean[1:-1])
-                elif v_clean.startswith("'") and v_clean.endswith("'"):
-                    constraint_values.append(v_clean[1:-1])
                 else:
                     try:
                         constraint_values.append(float(v_clean))
@@ -2689,6 +3101,18 @@ class GridLangControlFlow:
         if if_condition_result:
             in_active_clause = True
             clause_found = True
+        elif if_clause_lines:
+            # The IF clause did not run; its declarations still declare.
+            self._predeclare_block_assignment_targets(if_clause_lines)
+
+        # While in a skipped clause, this holds that clause's body so its
+        # declarations can be predeclared when the clause ends. The IF
+        # clause body is handled above.
+        pending_skip_lines = None
+
+        def flush_skipped_clause():
+            if pending_skip_lines:
+                self._predeclare_block_assignment_targets(pending_skip_lines)
 
         i = 0
         while i < len(block_lines):
@@ -2703,6 +3127,8 @@ class GridLangControlFlow:
                     active_clause_lines.append((line, line_number))
 
             elif depth == 0 and lower.startswith("elseif ") and lower.endswith(" then"):
+                flush_skipped_clause()
+                pending_skip_lines = []
                 if not clause_found:
                     cond = re.match(r'^\s*elseif\s+(.+?)\s+then\s*$',
                                     line, re.I).group(1).strip()
@@ -2714,22 +3140,27 @@ class GridLangControlFlow:
                         active_clause_lines = []
                         active_clause_condition = cond
                         active_clause_header = line_number
+                        pending_skip_lines = None
                     else:
                         in_active_clause = False
                 else:
                     in_active_clause = False
 
             elif depth == 0 and lower == "else":
+                flush_skipped_clause()
+                pending_skip_lines = []
                 if not clause_found:
                     in_active_clause = True
                     clause_found = True
                     active_clause_lines = []
                     active_clause_condition = None
                     active_clause_header = line_number
+                    pending_skip_lines = None
                 else:
                     in_active_clause = False
 
             elif depth == 0 and lower == "end":
+                flush_skipped_clause()
                 break
 
             else:
@@ -2737,10 +3168,14 @@ class GridLangControlFlow:
                 if lower == "end" and depth > 0:
                     if in_active_clause:
                         active_clause_lines.append((line, line_number))
+                    elif pending_skip_lines is not None:
+                        pending_skip_lines.append((line, line_number))
                     depth -= 1
                 else:
                     if in_active_clause:
                         active_clause_lines.append((line, line_number))
+                    elif pending_skip_lines is not None:
+                        pending_skip_lines.append((line, line_number))
                     # Inner block headers (nested IF at depth > 0, ``Let ...
                     # then``, ``For ... do``, ``When ... do``) own an ``End``;
                     # bump depth so their ``End`` does not terminate the
@@ -2750,6 +3185,8 @@ class GridLangControlFlow:
                         depth += 1
 
             i += 1
+
+        flush_skipped_clause()
 
         # Execute the chosen clause
         if active_clause_lines:
@@ -2897,16 +3334,14 @@ class GridLangControlFlow:
                 if line_num == if_block['end_line']:
                     break
 
-        # Predeclare variables that are assigned within the IF block so they exist
-        # even if the condition evaluates to False. This keeps downstream references
-        # (like cell bindings) consistent with programs that rely on defaulted values.
-        self._predeclare_block_assignment_targets(block_lines)
-
         # Check if this is a simple IF statement (no ELSEIF/ELSE clauses)
         if len(if_block['clauses']) == 1 and if_block['clauses'][0]['kind'] == 'if':
             # Simple IF statement - process the body directly
             if condition_result:
                 self._process_block(block_lines, self.compiler.current_scope())
+            else:
+                # A skipped branch still declares its variables (unvalued).
+                self._predeclare_block_assignment_targets(block_lines)
         else:
             # Complex IF-ELSEIF-ELSE block
             self._process_if_elseif_else_block(
@@ -2921,8 +3356,11 @@ class GridLangControlFlow:
         Predeclare variables that are assigned within an IF block so they exist even
         when the block is skipped. This avoids NameErrors and keeps outputs stable
         for programs that expect these identifiers to be present with default values.
+
+        A declaration in a branch that does not run still declares its variable at
+        the define level (uninitialized); only the binding (value assignment) is
+        skipped.
         """
-        current_scope = self.compiler.current_scope()
         for line_content, _ in block_lines:
             stripped = line_content.strip()
             # ``Let`` targets are NOT predeclared: the LET handler binds them
@@ -2930,17 +3368,28 @@ class GridLangControlFlow:
             # type into that bind (e.g. ``"" as text`` vs ``Let z = 1``).
             match = re.match(r'^:\s*([\w_]+)\s*=', stripped)
             if match:
-                var_name = match.group(1)
-                defining_scope = current_scope.get_defining_scope(var_name)
-                if not defining_scope:
-                    # The placeholder exists so a skipped block still reads
-                    # (as ``#N/A``, an unvalued declaration) instead of
-                    # raising NameError; it stays untyped so the real
-                    # assignment (number, text, ...) is not rejected.
-                    current_scope.define(
-                        var_name, None, None, {}, is_uninitialized=True)
-                # A variable already declared but unvalued keeps reading as
-                # #N/A; do not force it to "".
+                self._predeclare_skipped_var(match.group(1))
+                continue
+            # ``For`` targets (``For x = expr``, ``For x``, ``For x init …``)
+            # are declared the same way: the branch does not run, so the value
+            # is never bound, but the name exists.
+            match_for = re.match(r'^For\s+([\w_]+)\b', stripped, re.I)
+            if match_for:
+                self._predeclare_skipped_var(match_for.group(1))
+
+    def _predeclare_skipped_var(self, var_name):
+        """Declare *var_name* at the define level if it is not yet declared."""
+        current_scope = self.compiler.current_scope()
+        defining_scope = current_scope.get_defining_scope(var_name)
+        if not defining_scope:
+            # The placeholder exists so a skipped block still reads
+            # (as ``#N/A``, an unvalued declaration) instead of
+            # raising NameError; it stays untyped so the real
+            # assignment (number, text, ...) is not rejected.
+            self._define_body_scope().define(
+                var_name, None, None, {}, is_uninitialized=True)
+        # A variable already declared but unvalued keeps reading as
+        # #N/A; do not force it to "".
 
     def _process_if_statement_new(self, line, line_number, lines, current_index):
         """New simple IF processing using pre-scanned block map"""
@@ -2952,7 +3401,7 @@ class GridLangControlFlow:
             raise SyntaxError(f"Invalid IF syntax at line {line_number}")
 
         condition = condition_match.group(1).strip()
-        has_block = line.lower().strip().endswith('then')
+        has_block = line.lower().strip().endswith(' then')
 
         # Evaluate the condition
         condition_result = self._evaluate_if_condition(
@@ -3000,6 +3449,10 @@ class GridLangControlFlow:
                         if if_block_lines:
                             self._process_block(
                                 if_block_lines, self.compiler.current_scope())
+                    else:
+                        # A skipped branch still declares its variables (unvalued).
+                        self._predeclare_block_assignment_targets(
+                            block_lines[1:-1])
                 # Return the number of lines consumed (from IF to END)
                 # Only return full block length if this is a multi-line structure
                 if len(block_lines) > 1:

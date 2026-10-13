@@ -1677,9 +1677,10 @@ class ExpressionEvaluator:
                 result = self.compiler.array_handler.read_array_element(
                     field_val, indices, line_number, original_shape=original_shape, var_name=f"{var_name}.{field_name}")
                 return True, result
-            except (IndexError, ValueError) as e:
-                raise IndexError(
-                    f"Invalid index '{index_expr}' for '{var_name}.{field_name}': {e} at line {line_number}")
+            except ConstraintError as e:
+                return True, error_value(e.code)
+            except (IndexError, ValueError):
+                return True, error_value(REF_ERROR)
         try:
             self.compiler.current_scope().get(var_name)
         except NameError:
@@ -1689,9 +1690,10 @@ class ExpressionEvaluator:
                 var_name, self.compiler._to_index(index_expr), line_number)
         except (NameError, TypeError):
             return False, None
-        except (IndexError, ValueError) as e:
-            raise IndexError(
-                f"Invalid index '{index_expr}' for '{var_name}': {e} at line {line_number}")
+        except ConstraintError as e:
+            return True, error_value(e.code)
+        except (IndexError, ValueError):
+            return True, error_value(REF_ERROR)
 
     def _try_eval_indexed_member_call(self, expr, scope, line_number, depth):
         parsed_member = self._parse_indexed_member_call(expr)
@@ -2747,9 +2749,13 @@ class ExpressionEvaluator:
                     base = 0 if paren_index and paren_index.isdigit() else 1
                     return self._eval_array_element(
                         var_name, index_expr, scope, line_number, base=base)
-                except (IndexError, ValueError) as e:
-                    raise IndexError(
-                        f"Invalid index {index_expr} for '{var_name}': {e} at line {line_number}")
+                except ConstraintError as e:
+                    return error_value(e.code)
+                except (IndexError, ValueError):
+                    # A bad address is an invalid reference, not a hard
+                    # failure: out-of-range and a wrong index count both
+                    # read back as #REF, the way the curly form does.
+                    return error_value(REF_ERROR)
 
         handled, curly_result = self._try_eval_curly_indexing_variants(
             expr, scope, line_number)

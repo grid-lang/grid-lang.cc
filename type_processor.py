@@ -374,6 +374,11 @@ class GridLangTypeProcessor:
         # modify outer/global variables (reads still resolve through it).
         outer_scope = self.compiler.current_scope()
         self.compiler.push_scope()
+        # The body scope of a type/builder/function definition is a define
+        # scope: For- and ':'-declared variables promoted out of an enclosing
+        # Let block anchor here (or at global), not at an intermediate
+        # loop/If-block scope.
+        self.compiler.current_scope().define_body = True
         prev_hidden_access = getattr(
             self.compiler, '_allow_hidden_field_access', False)
         prev_hidden_member_calls = getattr(

@@ -4600,6 +4600,10 @@ class GridLangCompiler(GridLangExecutor):
         self.variables = self.scopes[0].variables
         self.types = self.scopes[0].types
         self.pending_assignments = {}
+        # Names For-declared inside any block this run: a later block may
+        # declare them again (a name declared outside every block may not
+        # be re-declared inside one).
+        self.for_declared_names = set()
         self._deferred_output_inits = {}
         self.dimensions.clear()
         self.dim_names.clear()
@@ -5918,7 +5922,64 @@ class GridLangCompiler(GridLangExecutor):
                 f"category '{bound_name}' is already defined")
         self.unit_sources[bound_key] = harvest['unit_sources'][raw_name.lower()]
 
+    def _check_static_redefinition(self, lines):
+        """Reject same-scope ``:``/``For`` redefinitions at compile time.
+
+        Inline pairs in one region are an error whichever nature leads;
+        across block boundaries the same nature is fine and a mixed
+        ``:``/``For`` pair is an error.  Define bodies are their own
+        scopes: shadowing across the barrier is allowed.
+        """
+        decls = {}
+        define_stack = []
+        block_depth = 0
+        region = 0
+        for line, line_number in lines:
+            # Apostrophe = comment: cut before any header/decl test.
+            stripped = self.control_flow._strip_inline_comment(line.strip())
+            lowered = stripped.lower()
+            if not stripped:
+                continue
+            if lowered == 'end' or lowered.startswith('end '):
+                if block_depth > 0:
+                    block_depth -= 1
+                elif define_stack:
+                    define_stack.pop()
+                region += 1
+                continue
+            if re.match(r'^define\s', stripped, re.I):
+                define_stack.append(True)
+                region += 1
+                continue
+            if (lowered.startswith('if ') and lowered.endswith('then')) or \
+                    (lowered.startswith('for ') and lowered.endswith('do')) or \
+                    (lowered.startswith('when ') and lowered.endswith('do')) or \
+                    (lowered.startswith('let ') and lowered.endswith('then')):
+                block_depth += 1
+                region += 1
+                continue
+            body = re.sub(r'"(?:\\.|[^"\\])*"', '""', stripped)
+            name = nature = None
+            m = re.match(r'^:\s*([A-Za-z_]\w*)\b', body)
+            if m:
+                name, nature = m.group(1).lower(), 'colon'
+            else:
+                m = re.match(r'^for\s+([A-Za-z_]\w*)', body, re.I)
+                if m:
+                    name, nature = m.group(1).lower(), 'for'
+            if not name:
+                continue
+            key = (name, tuple(define_stack))
+            for prev_region, prev_nature, _prev_ln in decls.get(key, []):
+                same_region = prev_region == region
+                if same_region or prev_nature != nature:
+                    raise SyntaxError(
+                        f"Variable '{name}' already defined in scope at "
+                        f"line {line_number}")
+            decls.setdefault(key, []).append((region, nature, line_number))
+
     def _process_declarations_and_labels(self, lines, label_lines, dim_lines):
+        self._check_static_redefinition(lines)
         self._process_module_imports(lines)
         for line, line_number in dim_lines:
             self._collect_global_declarations(line, line_number)
@@ -5966,7 +6027,8 @@ class GridLangCompiler(GridLangExecutor):
             is_block_start = (
                 (stripped.startswith('if ') and stripped.endswith('then')) or
                 (stripped.startswith('for ') and stripped.endswith('do')) or
-                (stripped.startswith('when ') and stripped.endswith('do'))
+                (stripped.startswith('when ') and stripped.endswith('do')) or
+                (stripped.startswith('let ') and stripped.endswith('then'))
             )
             is_end = stripped == 'end'
 

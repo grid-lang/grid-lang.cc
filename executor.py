@@ -113,6 +113,7 @@ class GridLangExecutor(GridLangBase):
         self._global_guards_pre_evaluated = False
         self.global_for_line_numbers = set()
         self.executed_global_for_lines = set()
+        self.hoisted_binding_lines = set()
         self.global_for_entries = []
         self.needed_line_numbers = set()
         self.when_blocks = []
@@ -1356,6 +1357,113 @@ class GridLangExecutor(GridLangBase):
         self._register_listeners(var, expr, self.current_scope())
         return True
 
+    def _is_root_binding_line(self, stripped):
+        """Whether a depth-0 line is a plain/`Let` binding that hoists.
+
+        Block headers (``Let ... then``) and statement keywords are not
+        bindings; member/index writes, multi-binding ``and`` forms, INIT
+        forms, cell references and function/subprocess calls stay with the
+        main loop because their evaluation is order-sensitive.
+        """
+        if not stripped or stripped.startswith('[') or ':=' in stripped:
+            return False
+        lower = stripped.lower()
+        is_let_keyword = lower.startswith('let ')
+        is_block = lower.endswith('then')
+        if is_let_keyword and is_block:
+            return False
+        if not is_let_keyword and not self.control_flow._is_optional_let_line(
+                stripped):
+            return False
+        body = stripped[4:].strip() if is_let_keyword else stripped
+        if ' and ' in body.lower():
+            return False
+        try:
+            var, type_name, constraints, expr = self._parse_variable_def(
+                body, 0)
+        except Exception:
+            return False
+        if not var or not re.fullmatch(r'[A-Za-z_]\w*', var):
+            return False
+        if not (expr or type_name or constraints):
+            return False
+        if constraints and 'init' in constraints:
+            return False
+        if expr is not None and not isinstance(expr, str):
+            return False
+        if expr is not None and self._match_fp_call_name(expr) is not None:
+            return False
+        return True
+
+    def _hoist_root_bindings(self, lines):
+        """Wave-0: apply root-level plain/`Let` bindings before the main loop.
+
+        A binding applies first: ``x = 1`` written after a Let block or a
+        For-do header is live when those headers run, so redefinition
+        checks and Let proposals observe the finished binding.  Lines
+        whose dependencies are not resolvable yet, or whose evaluation is
+        order-sensitive, stay with the main loop at their source position.
+        """
+        self.hoisted_binding_lines = set()
+        candidates = []
+        depth = 0
+        type_depth = 0
+        for line, line_number in lines:
+            stripped = line.strip()
+            lowered = stripped.lower()
+            is_block_start = (
+                (lowered.startswith('if ') and lowered.endswith('then')) or
+                (lowered.startswith('for ') and lowered.endswith('do')) or
+                (lowered.startswith('when ') and lowered.endswith('do')) or
+                (lowered.startswith('let ') and lowered.endswith('then'))
+            )
+            is_end = lowered == 'end'
+            if lowered.startswith("define ") and (
+                    " as type" in lowered or " as keytype" in lowered
+                    or " as resource" in lowered or " as handle" in lowered):
+                type_depth += 1
+            elif lowered.startswith("end") and type_depth > 0:
+                type_depth -= 1
+                continue
+            if depth == 0 and type_depth == 0 and stripped and (
+                    self._is_root_binding_line(stripped)):
+                candidates.append((stripped, line_number))
+            if is_block_start:
+                depth += 1
+            elif is_end and depth > 0:
+                depth -= 1
+        remaining = candidates
+        while remaining:
+            still = []
+            progressed = False
+            for stripped, line_number in remaining:
+                is_let_keyword = stripped.lower().startswith('let ')
+                body = stripped[4:].strip() if is_let_keyword else stripped
+                try:
+                    var, _t, _c, expr = self._parse_variable_def(
+                        body, line_number)
+                except Exception:
+                    continue
+                deps = self._compute_assignment_deps(
+                    expr) if expr is not None else set()
+                if any(self.has_unresolved_dependency(
+                        dep, scope=self.current_scope()) for dep in deps):
+                    still.append((stripped, line_number))
+                    continue
+                source = stripped if is_let_keyword else 'Let ' + stripped
+                try:
+                    self._handle_main_loop_let_statement(
+                        lines, 0, source, line_number,
+                        source if is_let_keyword else 'Let ' + stripped)
+                except Exception:
+                    still.append((stripped, line_number))
+                    continue
+                self.hoisted_binding_lines.add(line_number)
+                progressed = True
+            if not progressed:
+                break
+            remaining = still
+
     def _execute_global_for_loops(self, lines):
         """Evaluate global FOR declarations prior to main execution."""
         if not self.global_for_line_numbers:
@@ -1433,50 +1541,75 @@ class GridLangExecutor(GridLangBase):
                                     stream_expr = parsed_expr
                             except Exception:
                                 pass
+                            # The For block owns its scope: everything it
+                            # binds dies at End.
                             if self._match_fp_call_name(
                                     stream_expr) is not None:
                                 stream_values = self._evaluate_push_expression(
                                     stream_expr, line_number)
                                 if len(stream_values) > 1:
                                     wave_iterated = True
-                                    scope = self.current_scope()
-                                    for stream_value in stream_values:
-                                        if is_error_value(stream_value):
-                                            continue
-                                        inferred = self.array_handler.infer_type(
-                                            stream_value, line_number)
-                                        if inferred == 'int':
-                                            inferred = 'number'
-                                        def_scope = scope.get_defining_scope(
+                                    self.push_scope(is_private=True)
+                                    block_scope = self.current_scope()
+                                    try:
+                                        for stream_value in stream_values:
+                                            if is_error_value(stream_value):
+                                                continue
+                                            inferred = self.array_handler.infer_type(
+                                                stream_value, line_number)
+                                            if inferred == 'int':
+                                                inferred = 'number'
+                                            def_scope = block_scope.get_defining_scope(
+                                                stream_var)
+                                            if def_scope is not None:
+                                                def_scope.update(
+                                                    stream_var, stream_value,
+                                                    line_number)
+                                            else:
+                                                block_scope.define(
+                                                    stream_var, stream_value,
+                                                    inferred, {}, False)
+                                            self.control_flow._process_block(
+                                                body_lines)
+                                    except BaseException:
+                                        self.control_flow._unwind_block_scope(
+                                            block_scope)
+                                        raise
+                                    self.control_flow._pop_for_block_scope(block_scope)
+                            if not wave_iterated:
+                                # Define the loop variable in the block's own
+                                # scope so it does not outlive the block.
+                                self.push_scope(is_private=True)
+                                block_scope = self.current_scope()
+                                try:
+                                    self.control_flow.process_for_statement(
+                                        line, line_number, block_scope)
+                                    # Do not execute the block when the loop
+                                    # variable holds an error value
+                                    # (``For x = <error> do ... End``).
+                                    skip_block = False
+                                    if stream_var:
+                                        def_scope = block_scope.get_defining_scope(
                                             stream_var)
                                         if def_scope is not None:
-                                            def_scope.update(
-                                                stream_var, stream_value,
-                                                line_number)
-                                        else:
-                                            scope.define(
-                                                stream_var, stream_value,
-                                                inferred, {}, False)
+                                            var_value = def_scope.get(
+                                                stream_var)
+                                            if is_error_value(var_value):
+                                                skip_block = True
+                                    # Execute the block body once
+                                    if not skip_block:
                                         self.control_flow._process_block(
                                             body_lines)
-                            if not wave_iterated:
-                                # Define the loop variable in current scope
-                                self.control_flow.process_for_statement(
-                                    line, line_number, self.current_scope())
-                                # Do not execute the block when the loop
-                                # variable holds an error value
-                                # (``For x = <error> do ... End``).
-                                skip_block = False
-                                if stream_var:
-                                    def_scope = self.current_scope(
-                                    ).get_defining_scope(stream_var)
-                                    if def_scope is not None:
-                                        var_value = def_scope.get(stream_var)
-                                        if is_error_value(var_value):
-                                            skip_block = True
-                                # Execute the block body once
-                                if not skip_block:
-                                    self.control_flow._process_block(body_lines)
+                                    else:
+                                        # The loop never runs, but its
+                                        # declarations still declare (unvalued).
+                                        self.control_flow._predeclare_block_assignment_targets(
+                                            body_lines)
+                                except BaseException:
+                                    self.control_flow._unwind_block_scope(
+                                        block_scope)
+                                    raise
+                                self.control_flow._pop_for_block_scope(block_scope)
                             # Mark body lines as executed so main loop skips them
                             for _, body_ln in body_lines:
                                 self.executed_global_for_lines.add(body_ln)
@@ -1724,6 +1857,8 @@ class GridLangExecutor(GridLangBase):
                 f"'While' is not part of the language at line {line_number}; use 'When <condition> do ... End' instead")
 
         if line_number in self.executed_global_for_lines:
+            return {'action': 'continue', 'next_i': i + 1}
+        if line_number in getattr(self, 'hoisted_binding_lines', set()):
             return {'action': 'continue', 'next_i': i + 1}
         if not stripped:
             return {'action': 'continue', 'next_i': i + 1}
@@ -2339,12 +2474,14 @@ class GridLangExecutor(GridLangBase):
                 line_number=line_number)
             if mark_implicit:
                 define_scope.mark_implicit_let(var)
-            if (getattr(self.current_scope(), 'is_loop_scope', False)
+            if ((getattr(self.current_scope(), 'is_loop_scope', False)
+                    or getattr(self.current_scope(), 'let_block', False))
                     and define_scope is self.current_scope()):
-                # A declaration inside a loop body is scoped to that body and
-                # must not be copied back to the parent scope when the
-                # iteration ends. ``implicit_let`` is not consulted by the
-                # loop copy-back, so record it where that copy-back looks.
+                # A declaration inside a loop body or Let block is scoped
+                # to that body and must not be copied back to the parent
+                # scope when the iteration or block ends. ``implicit_let``
+                # is not consulted by the copy-back, so record it where
+                # that copy-back looks.
                 define_scope.local_let_declarations.add(var.lower())
             defining_scope = define_scope
 
@@ -2594,7 +2731,16 @@ class GridLangExecutor(GridLangBase):
 
     def _execute_let_block(self, lines, i, line_number, var_list,
                            member_writes=None):
+        for var, _type_name, _constraints, expr in var_list:
+            if expr is None:
+                continue
+            if not (isinstance(var, str)
+                    and re.match(r'^[A-Za-z_]\w*$', var)):
+                if self.control_flow._let_header_target_missing(var):
+                    raise SyntaxError(
+                        f"Name '{var}' is not defined at line {line_number}")
         self.push_scope(is_private=True)
+        self.current_scope().let_block = True
         block_lines = []
         depth = 1
         scan_i = i + 1
@@ -2613,29 +2759,54 @@ class GridLangExecutor(GridLangBase):
             raise SyntaxError(
                 f"Unclosed LET block starting at line {line_number}")
         block_end_i = scan_i
-        # Capture dotted header targets before the bind: the body may bind a
-        # field on the object, and a block-form binding must revert when the
-        # block ends (``Let a.top = 3 then ... End`` leaves the field as it
-        # was, exactly like the plain header variable is dropped).
-        captures = self._capture_member_writes(var_list, line_number)
+        # Snapshot existing names for rollback.
+        snapshots = {}
+        for var, _type_name, _constraints, expr in var_list:
+            if expr is None or not isinstance(var, str):
+                continue
+            if not re.match(r'^[A-Za-z_]\w*$', var):
+                # A member/index header writes through to its target; it
+                # neither reserves a name nor snapshots one.
+                continue
+            parent_scope = self.current_scope().parent
+            parent_def = parent_scope.get_defining_scope(var) \
+                if parent_scope is not None else None
+            if parent_def is not None:
+                snapshots[var] = (
+                    parent_def,
+                    self.control_flow._snapshot_var_entry(parent_def, var),
+                )
+
+        def _rollback_existing():
+            for snap_var, (snap_scope, snap) in snapshots.items():
+                self.control_flow._restore_var_entry(
+                    snap_scope, snap_var, snap)
+                self.pending_assignments.pop(snap_var, None)
+
+        def _skip_block():
+            # Roll back existing names, declare body decls unvalued,
+            # drop block-locals with the scope.  A member header has
+            # already written through to its object and stays written.
+            _rollback_existing()
+            self.control_flow._predeclare_block_assignment_targets(
+                block_lines)
+            self.pop_scope()
+            return block_end_i + 1
+
         scope_dict = self.current_scope().get_evaluation_scope()
         member_writes = self._process_let_first_pass(
             var_list, scope_dict, line_number)
         self._run_let_second_pass(var_list, line_number)
-        # Only new variables are declared here; anything already bound in an
-        # enclosing scope was a rebind and stays where it was defined.
+        # A deferred update failed: roll back and skip.
+        for snap_var in snapshots:
+            if snap_var in self.pending_assignments:
+                return _skip_block()
+        # Rebinds of enclosing names stay where they were defined.
         for var, _, _, _ in var_list:
             if var.lower() in member_writes:
                 continue
             if self.current_scope().get_defining_scope(var) is self.current_scope():
                 self.current_scope().local_let_declarations.add(var.lower())
-
-        def _skip_block():
-            # A skipped body still ran the header bind: revert the member
-            # bindings and drop the block-local variable with the scope.
-            self._restore_member_writes(captures)
-            self.pop_scope()
-            return block_end_i + 1
 
         for var, _, constraints, _ in var_list:
             if constraints and var.lower() not in member_writes:
@@ -2719,57 +2890,10 @@ class GridLangExecutor(GridLangBase):
                     except Exception:
                         pass
 
-        # The header's member binding lives only inside the block: put the
-        # field back the way it was before the block ran.
-        self._restore_member_writes(captures)
+        # A member header writes through to the object it names, so the
+        # field stays as the block left it.
         self.pop_scope()
         return block_end_i + 1
-
-    def _capture_member_writes(self, var_list, line_number):
-        """Snapshot the object fields a dotted Let header would bind.
-
-        Returns ``(leaf_parent, leaf_key, had_key, old_value, old_bounds)``
-        records taken before the bind runs, so the block form of ``Let`` can
-        revert the field (and the per-field binding registry) when the block
-        ends -- the binding exists only in the scope of the block.
-        """
-        captures = []
-        seen = set()
-        for var, _, _, expr in var_list:
-            if expr is None or '.' not in str(var):
-                continue
-            path_parts = [p.strip() for p in str(var).split('.') if p.strip()]
-            if len(path_parts) < 2 or not all(
-                    re.match(r'^[\w_]+$', p) for p in path_parts):
-                continue
-            try:
-                _, leaf_parent, _, leaf_key, _ = self._walk_member_path(
-                    path_parts[0], path_parts, line_number)
-            except Exception:
-                continue
-            marker = (id(leaf_parent), leaf_key)
-            if marker in seen:
-                continue
-            seen.add(marker)
-            captures.append((
-                leaf_parent, leaf_key,
-                leaf_key in leaf_parent,
-                copy.deepcopy(leaf_parent.get(leaf_key)),
-                copy.deepcopy(leaf_parent.get('_let_bounds')),
-            ))
-        return captures
-
-    def _restore_member_writes(self, captures):
-        """Put captured fields (and their binding registry) back in place."""
-        for leaf_parent, leaf_key, had_key, old_value, old_bounds in captures:
-            if had_key:
-                leaf_parent[leaf_key] = old_value
-            else:
-                leaf_parent.pop(leaf_key, None)
-            if old_bounds is None:
-                leaf_parent.pop('_let_bounds', None)
-            else:
-                leaf_parent['_let_bounds'] = old_bounds
 
     def _execute_let_inline(self, lines, i, line_number, var_list,
                             member_writes=None):
@@ -2983,6 +3107,12 @@ class GridLangExecutor(GridLangBase):
                 # Subprocesses/functions shadow caller variables locally.
                 defining_scope = None
             if defining_scope:
+                # Rule 2: a ``For ... do`` header over any live variable is
+                # a redefinition, whichever nature declared it first.
+                if has_block:
+                    raise SyntaxError(
+                        f"Variable '{var}' already defined in scope at line "
+                        f"{line_number}")
                 if constraints:
                     defining_scope.constraints[var] = constraints
                 if expr is None and var in defining_scope.variables and defining_scope.variables[var] is not None:
@@ -4253,7 +4383,21 @@ class GridLangExecutor(GridLangBase):
             i,
             line_number,
             var_list):
+        for var, _, _, _ in var_list:
+            defining_scope = self.current_scope().get_defining_scope(var)
+            if defining_scope is not None and \
+                    not self._is_outer_defining_scope(defining_scope):
+                # Rule 2: a ``For ... do`` header over any live variable is
+                # a redefinition, whichever nature declared it first.
+                raise SyntaxError(
+                    f"Variable '{var}' already defined in scope at line "
+                    f"{line_number}")
         self.push_scope(is_private=True, is_loop_scope=True)
+        # The loop variables are local to the For block: they are declared
+        # in the block's own scope and die at End (everything else the body
+        # binds is copied back out).
+        block_loop_vars = {var.lower() for var, _, _, _ in var_list}
+        block_scope = self.current_scope()
         evaluated_values = []
         for var, type_name, constraints, value in var_list:
             if value is not None:
@@ -4270,10 +4414,10 @@ class GridLangExecutor(GridLangBase):
                         var, evaluated_value, line_number)
                     evaluated_values.append(evaluated_value)
                 except NameError as e:
-                    self.get_global_scope().define(
+                    self.current_scope().define(
                         var, None, type_name, constraints, is_uninitialized=True)
             else:
-                self.get_global_scope().define(
+                self.current_scope().define(
                     var, None, type_name, constraints, is_uninitialized=True)
 
         for_block_lines = []
@@ -4297,7 +4441,7 @@ class GridLangExecutor(GridLangBase):
         if any(is_error_value(v) for v in evaluated_values):
             # The loop value is itself in error, so there is no iteration to
             # run - the same rule that skips an error element inside a For
-            # list. The bindings above stay in place for later references.
+            # list. The loop variable dies with the block like any other.
             self.pop_scope()
             return i
         init_entry = next(
@@ -4341,7 +4485,7 @@ class GridLangExecutor(GridLangBase):
                             var, val, tname, constraints, is_uninitialized=False)
                 self.control_flow._process_block(
                     for_block_lines, loop_scope)
-                self.pop_scope()
+                self.control_flow._pop_for_block_scope(loop_scope)
             return i
         for var, _, constraints, _ in var_list:
             if constraints:
@@ -4356,8 +4500,8 @@ class GridLangExecutor(GridLangBase):
                     for_block_lines = []
                     break
         self.control_flow._process_block(for_block_lines)
-        self.pop_scope()
-        return i + 1
+        self.control_flow._pop_for_block_scope(block_scope)
+        return i
 
     def _handle_main_loop_for_range_case(
             self,
@@ -4782,7 +4926,8 @@ class GridLangExecutor(GridLangBase):
             e['ln']: e for e in collected['effects']}
         self._wave_remaining_bindings = {
             c['ln'] for c in collected['line_candidates']
-            if not c.get('compile_time')}
+            if not c.get('compile_time')
+            and c['ln'] not in getattr(self, 'hoisted_binding_lines', set())}
         self._wave_init_lines = collected.get('init_lines') or set()
         self._wave_deferred_effects = []
         self._wave_flush_pending = False
@@ -5240,8 +5385,15 @@ class GridLangExecutor(GridLangBase):
             if parent_scope:
                 loop_local_lets = getattr(
                     loop_scope, 'local_let_declarations', set())
+                # The loop and index variables are local to the For block
+                # and die with it; everything else the body bound copies out.
+                block_vars = {var_name.lower()}
+                if index_var:
+                    block_vars.add(index_var.lower())
                 for name, val in loop_scope.variables.items():
                     if name.lower() in loop_local_lets:
+                        continue
+                    if name.lower() in block_vars:
                         continue
                     try:
                         parent_scope.update(name, val)
@@ -5375,21 +5527,21 @@ class GridLangExecutor(GridLangBase):
                     break
                 if self._combo_has_error(combo):
                     continue
+                # The For block owns its scope: the loop variables are
+                # local to the block (they die at End), everything else
+                # the body binds copies back out.
+                self.push_scope(is_private=True, is_loop_scope=True)
                 loop_scope = self.current_scope()
                 for var_idx, (var_name, _, index_var, _, _, _, _) in enumerate(loop_configs):
-                    defining_scope = loop_scope.get_defining_scope(
-                        var_name)
-                    if defining_scope:
-                        defining_scope.update(
+                    if var_name in loop_scope.variables:
+                        loop_scope.update(
                             var_name, combo[var_idx], line_number)
                     else:
                         loop_scope.define(
                             var_name, combo[var_idx], 'number')
                     if index_var:
-                        defining_index_scope = loop_scope.get_defining_scope(
-                            index_var)
-                        if defining_index_scope:
-                            defining_index_scope.update(
+                        if index_var in loop_scope.variables:
+                            loop_scope.update(
                                 index_var, var_idx + 1, line_number)
                         else:
                             loop_scope.define(
@@ -5399,8 +5551,13 @@ class GridLangExecutor(GridLangBase):
                 if parent_scope:
                     loop_local_lets = getattr(
                         loop_scope, 'local_let_declarations', set())
+                    block_vars = {cfg[0].lower() for cfg in loop_configs}
+                    block_vars.update(
+                        cfg[2].lower() for cfg in loop_configs if cfg[2])
                     for name, value in loop_scope.variables.items():
                         if name.lower() in loop_local_lets:
+                            continue
+                        if name.lower() in block_vars:
                             continue
                         try:
                             parent_scope.update(
@@ -5410,6 +5567,7 @@ class GridLangExecutor(GridLangBase):
                                 value, line_number)
                             parent_scope.define(
                                 name, value, inferred_type, {}, is_uninitialized=False)
+                self.pop_scope()
                 if self.exit_loop:
                     self.exit_loop = False
                     break
@@ -6390,6 +6548,10 @@ class GridLangExecutor(GridLangBase):
         if not self._evaluate_global_guards_pre_execution(guard_entries):
             return None
         self._execute_global_for_loops(lines)
+        # A binding is a binding: root-level plain/`Let` bindings apply
+        # before the main loop, so a Let block or For-do header written
+        # before them still observes the live name.
+        self._hoist_root_bindings(lines)
         # Wave-model state: the two-phase engine collects the global bodyless
         # producers/rules/guards/effects on first encounter in the main loop.
         self._wave_state_reset()
