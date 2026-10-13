@@ -3451,8 +3451,8 @@ class GridLangExecutor(GridLangBase):
                     for _ in range(dim_size)
                 ]
             else:
-                # Initialize array with zeros
-                initial_array = [0.0] * dim_size
+                # A blank cell reads as #N/A, not zero.
+                initial_array = [None] * dim_size
 
             # Define the variable with the initialized array
             self.current_scope().define(var_name, initial_array, type_name.lower(),

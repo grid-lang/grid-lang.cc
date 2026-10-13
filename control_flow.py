@@ -243,8 +243,8 @@ class GridLangControlFlow:
 
             # Create an array with the specified size
             dim_size = int(dim_size)
-            # Initialize array with zeros
-            initial_array = [0.0] * dim_size
+            # A blank cell reads as #N/A, not zero.
+            initial_array = [None] * dim_size
 
             # Define the variable with the initialized array
             scope.define(var_name, initial_array, type_name.lower(),
@@ -1174,31 +1174,6 @@ class GridLangControlFlow:
         if not line.strip().lower().startswith("for "):
             return False, i
 
-        if ('=' in line
-                and not re.search(r'\bin\b|\bas\b|\bdim\b', line.lower())
-                and not line.strip().lower().endswith(' do')):
-            try:
-                # The initializer reads the current scope (an enclosing Let
-                # block's header variable must be visible), so bind there
-                # first; a fresh binding is then moved out of a Let block
-                # because For-declared variables outlive it.
-                self.process_for_statement(
-                    line, line_number, self.compiler.current_scope())
-                self._promote_fresh_for_var(line, line_number)
-                return True, i + 1
-            except ValueError as e:
-                if "already defined in scope" in str(e):
-                    raise e
-                if self._is_error_literal_for_header(line):
-                    return self._skip_equal_for_block_body(
-                        block_lines, i)
-                return True, i + 1
-            except Exception:
-                if self._is_error_literal_for_header(line):
-                    return self._skip_equal_for_block_body(
-                        block_lines, i)
-                return True, i + 1
-
         m = re.match(r'^\s*FOR\s+(.+?)(?:\s+do\s*$|\s*$)', line, re.I)
         if not m:
             return True, i + 1
@@ -1227,8 +1202,14 @@ class GridLangControlFlow:
                 if is_block:
                     redeclarable = False
                 else:
-                    redeclarable = var.lower() in getattr(
-                        self.compiler, 'for_declared_names', set())
+                    # A standalone For may reuse a name it declared, or one
+                    # the enclosing Let header bound: the header's pin then
+                    # reads back as #VALUE.
+                    redeclarable = (
+                        var.lower() in getattr(
+                            self.compiler, 'for_declared_names', set())
+                        or getattr(self.compiler.current_scope(),
+                                   'let_block', False))
                     if not redeclarable and defining_scope.is_uninitialized(var):
                         redeclarable = True
                 if not redeclarable:
@@ -1249,7 +1230,7 @@ class GridLangControlFlow:
         if handled_init:
             return True, next_i
 
-        for var, type_name, constraints, _ in var_list:
+        for var, type_name, constraints, value in var_list:
             if 'in' in constraints:
                 values = constraints['in']
                 for val in values:
@@ -1368,10 +1349,32 @@ class GridLangControlFlow:
                             block_lines) else len(block_lines)
                         return True, next_index
                     return True, i + 1
-                if self.compiler.current_scope().get_defining_scope(var) is None:
-                    self._define_body_scope().define(
-                        var, None, type_name, constraints or {},
-                        is_uninitialized=True, line_number=line_number)
+                # A standalone For declares through the same binder a Let
+                # uses, so both accept the same constraints and value the
+                # header the same way.
+                current = self.compiler.current_scope()
+                if value is not None:
+                    # A valued header binds where its initializer is
+                    # evaluated, so a loop body rebinds on each pass and an
+                    # enclosing Let block's header stays visible; it is then
+                    # promoted out of the Let block like any For binding.
+                    self.executor._bind_declared_var(
+                        var, type_name, constraints or {}, value, line_number,
+                        search_scope=current,
+                        scope_dict=current.get_evaluation_scope(),
+                        shadow_keyword='FOR', mark_implicit=True)
+                    self._promote_fresh_for_var(line, line_number)
+                elif current.get_defining_scope(var) is None:
+                    # Declaration-only: declare at the define level so the
+                    # name outlives any enclosing loop/If/Let block, and
+                    # materialize any dim there with it.
+                    define_scope = self._define_body_scope()
+                    self.executor._bind_declared_var(
+                        var, type_name, constraints or {}, None, line_number,
+                        search_scope=define_scope,
+                        define_scope=define_scope,
+                        scope_dict=define_scope.get_evaluation_scope(),
+                        shadow_keyword='FOR', mark_implicit=True)
                 # A single-line declaration consumes only its own line: the
                 # remaining lines belong to the enclosing walk, which
                 # continues at i + 1.

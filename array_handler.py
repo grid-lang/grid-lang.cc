@@ -72,8 +72,13 @@ class ArrayHandler:
         :param line_number: Optional line number for error reporting.
         :return: Value at the resolved index.
         """
+        # A Let block scope is private and does not see its parent through
+        # ``get``; a For/':' declaration inside one still lands at the define
+        # level, so resolve through the scope that actually defines the name.
+        current = self.compiler.current_scope()
+        defining = current.get_defining_scope(var_name)
         try:
-            arr = self.compiler.current_scope().get(var_name)
+            arr = (defining if defining is not None else current).get(var_name)
         except NameError:
             raise NameError(
                 f"Variable '{var_name}' not defined at line {line_number}")
@@ -198,11 +203,17 @@ class ArrayHandler:
                 if flat_idx < 0 or flat_idx >= len(arr_pylist):
                     raise IndexError(
                         f"Calculated index {flat_idx} out of bounds for array length {len(arr_pylist)} at line {line_number}")
-                return arr_pylist[flat_idx]
+                value = arr_pylist[flat_idx]
+                if value is None:
+                    return self._array_unset_value(var_name, line_number)
+                return value
             try:
                 if isinstance(arr_pylist, list) and len(arr_pylist) > row_idx:
                     if isinstance(arr_pylist[row_idx], list) and len(arr_pylist[row_idx]) > col_idx:
-                        return arr_pylist[row_idx][col_idx]
+                        value = arr_pylist[row_idx][col_idx]
+                        if value is None:
+                            return self._array_unset_value(var_name, line_number)
+                        return value
                     else:
                         raise IndexError(
                             f"Column index {col_idx} out of bounds for row {row_idx} at line {line_number}")
