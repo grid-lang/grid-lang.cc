@@ -354,10 +354,9 @@ That property is essential to keep named variables and the grid consistent over 
 
 ## Event block
 
-We have seen that a variable can be updated with **push**.
-That instruction name is not innocent: it means that any point of use of that variable receives a notification about it, and it updates itself with the new value.
+A variable can be updated with a **push** instruction that notifies any point of use that it should update with the new value.
 
-The _n_ that appears in _result_ is an example of it.
+An example of such a point of use is _n_ that appears in _result_.
 
 For more complex uses we can define an event block. Try adding one at the end of the program and move the _result_ line inside:
 
@@ -387,7 +386,7 @@ Try adding a condition for the event block:
 n init 5
 value = 2
 Push n = n * 2.2
-When 3 * value > n do
+When value * 3 > n do
   Print result
   result = $"The result is {n - value}"
 End
