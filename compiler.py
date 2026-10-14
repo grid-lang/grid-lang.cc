@@ -5970,13 +5970,18 @@ class GridLangCompiler(GridLangExecutor):
             if not name:
                 continue
             key = (name, tuple(define_stack))
-            for prev_region, prev_nature, _prev_ln in decls.get(key, []):
+            for prev_region, prev_nature, _prev_ln, prev_depth in decls.get(key, []):
                 same_region = prev_region == region
-                if same_region or prev_nature != nature:
+                # A same-nature pair may straddle block boundaries only when
+                # every declaration sits in a child scope. A declaration in a
+                # parent scope re-entering the name is a redefinition.
+                both_in_child = prev_depth > 0 and block_depth > 0
+                if same_region or prev_nature != nature or not both_in_child:
                     raise SyntaxError(
                         f"Variable '{name}' already defined in scope at "
                         f"line {line_number}")
-            decls.setdefault(key, []).append((region, nature, line_number))
+            decls.setdefault(key, []).append(
+                (region, nature, line_number, block_depth))
 
     def _process_declarations_and_labels(self, lines, label_lines, dim_lines):
         self._check_static_redefinition(lines)

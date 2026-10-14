@@ -662,28 +662,28 @@ class GridLangControlFlow:
 
     def _let_block_promote_scope(self, scope=None):
         """Scope that receives For- and ':'-declared variables from inside
-        a Let block.
+        a private body scope (a Let block or a ``For ... do`` body).
 
-        Promotion crosses every Let-block scope and lands on the nearest
+        Promotion crosses every private body scope and lands on the nearest
         define-body scope (a type/builder body scope, marked ``define_body``,
         or the runner's root scope ``scopes[0]`` — global at top level, the
-        function/subprocess body scope inside a call). Intermediate loop or
-        If-block scopes do not intercept the promotion: the variable is
-        declared at the define level directly. When no Let block is in the
-        chain the scope is returned unchanged, so plain loop copy-backs are
-        unaffected.
+        function/subprocess body scope inside a call). Intermediate If-block
+        scopes do not intercept the promotion: the variable is declared at
+        the define level directly. When no private body is in the chain the
+        scope is returned unchanged, so plain loop copy-backs are unaffected.
         """
         if scope is None:
             scope = self.compiler.current_scope()
-        crossed_let_block = False
+        crossed_private_body = False
         current = scope
         while current is not None:
-            if getattr(current, 'let_block', False):
-                crossed_let_block = True
-            if crossed_let_block and getattr(current, 'define_body', False):
+            if (getattr(current, 'let_block', False)
+                    or getattr(current, 'is_loop_scope', False)):
+                crossed_private_body = True
+            if crossed_private_body and getattr(current, 'define_body', False):
                 return current
             current = current.parent
-        if crossed_let_block:
+        if crossed_private_body:
             return self.compiler.scopes[0]
         return scope
 
@@ -711,12 +711,12 @@ class GridLangControlFlow:
         return var_defs, var_list, is_block
 
     def _promote_fresh_for_var(self, line, line_number):
-        """Move fresh For-equality bindings out of an enclosing Let block.
+        """Move fresh For-equality bindings out of an enclosing private body.
 
         ``For x = expr`` binds where the initializer was evaluated (the
-        current scope, so a Let-block header variable is visible), then the
-        binding is moved to the promote scope because For-declared
-        variables outlive the Let block.
+        current scope, so a private-body header variable is visible), then the
+        binding is moved to the promote scope because For-declared variables
+        outlive the Let block or ``For ... do`` body that contains them.
         """
         block_scope = self.compiler.current_scope()
         promote = self._let_block_promote_scope()
