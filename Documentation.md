@@ -350,12 +350,52 @@ The result is 9
 
 Note how _result_ which depends on _n_ is being updated by `Push n`. A **Grid** program can contain **push** instructions that affect previously defined variables.
 
-A **push** can also name only the target, with no `=` at all:
+That property is essential to keep named variables and the grid consistent over time.
+
+## Event block
+
+We have seen that a variable can be updated with **push**.
+That instruction name is not innocent: it means that any point of use of that variable receives a notification about it, and it updates itself with the new value.
+
+The _n_ that appears in _result_ is an example of it.
+
+For more complex uses we can define an event block. Try adding one at the end of the program and move the _result_ line inside:
 
 ```vb
-Push n
+n init 5
+value = 2
+Push n = n * 2.2
+When n do
+  Print result
+  result = $"The result is {n - value}"
+End
 ```
 
-That form stores nothing — _n_ keeps the value it already has — but it re-sends the notification, so everything that depends on _n_ recomputes. Writing the `=` without a value after it (`Push n =`) is not valid syntax: the `=` needs an expression, and it is not a shorter way to write the form above.
+That example prints the result every time _n_ changes. The output is the same as before.
 
-That property is essential to keep named variables and the grid consistent over time.
+```bash
+> grid variables.grid
+The result is 3
+The result is 9
+```
+
+Note that value bindings like `result =` can be placed anywhere in the program and are reordered as needed when the program runs, which is why the result value gets printed.
+
+Try adding a condition for the event block:
+
+```vb
+n init 5
+value = 2
+Push n = n * 2.2
+When 3 * value > n do
+  Print result
+  result = $"The result is {n - value}"
+End
+```
+
+This time the first result is shown, but there is nothing that gets printed when _n_ becomes greater than 6.
+
+```bash
+> grid variables.grid
+The result is 3
+```

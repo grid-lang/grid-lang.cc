@@ -759,6 +759,26 @@ class Scope:
             current = current.parent
         return None
 
+    def get_constant_value(self, var):
+        """Current value of a constant-bound variable, else None.
+
+        A variable bound under a ``constant`` constraint holds a fixed value
+        that never changes and is never delivered through a Push queue.  A
+        When trigger that references it in its condition should read the value
+        directly instead of waiting for a push that will never arrive.
+        """
+        current = self
+        while current:
+            var_key = current._get_case_insensitive_key(var, current.variables)
+            constraint_key = current._get_case_insensitive_key(
+                var, current.constraints)
+            if constraint_key is not None:
+                constraints = current.constraints.get(constraint_key, {})
+                if 'constant' in constraints:
+                    return current.variables.get(var_key) if var_key else None
+            current = current.parent
+        return None
+
     def define_input(self, name, type_name=None, default_value=None, line_number=None, extra_constraints=None):
         """Define an input variable that can only receive values through pipes"""
         name_lower = name.lower()

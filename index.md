@@ -170,32 +170,32 @@ Notable methods:
 Also defines `SubprocessResult` (51): result container exposing `grid`,
 `variables`, `outputs`, and `_UnitSourceNamespace` (66) the UnitSource lookups.
 
-### `executor.py` (7524 lines) — the runtime loop
+### `executor.py` (7594 lines) — the runtime loop
 `class GridLangExecutor` is the **base class that owns the interpreter's
 dispatch loop and its per-run runtime state**. It is not instantiated directly
 as a facade (the old compiler→executor copy handoff was removed); `run` is the
 live entry. Key methods (the `compiler.py`/`grid_lang_common.py` layers call
 `super()`/override these):
-- `run` (3285): top-level sequence (acts on `self`; see Architecture).
-- `_run_setup` (6484), `_run_prepare_execution` (6523), `_print_outputs`
-  (4716), `_materialize_inits` (7251), `_process_deferred_assignments` (7396).
+- `run` (3309): top-level sequence (acts on `self`; see Architecture).
+- `_run_setup` (6554), `_run_prepare_execution` (6593), `_print_outputs`
+  (4716), `_materialize_inits` (7321), `_process_deferred_assignments` (7466).
   `_run_prepare_execution` now calls `_materialize_unit_source_constants` + `_register_top_level_converts`.
-- Main loop: `_run_main_loop` (3336) → `_run_main_loop_impl` (3884) →
-  `_run_main_loop_impl_body` (3932). `_handle_main_loop_*` methods dispatch
+- Main loop: `_run_main_loop` (3360) → `_run_main_loop_impl` (3925) →
+  `_run_main_loop_impl_body` (3973). `_handle_main_loop_*` methods dispatch
   statement kinds: `Let` (1128), `For` (1752 fallback), grid assignment (3903),
   `When` blocks (3956), `Push` (4152), `Return` (4108), misc (3724).
-- Dependency/guard machinery: `_build_dependency_network` (1180),
+- Dependency/guard machinery: `_build_dependency_network` (1204),
   `_determine_needed_lines`, `_evaluate_guard_conditions`,
   `_evaluate_global_guards_pre_execution`, `_execute_global_for_loops`,
   `_attempt_resolve_pending_var`, `_resolve_ready_pending_vars`.
-- `Let` semantics: first pass `_process_let_first_pass` (2004), binding
+- `Let` semantics: first pass `_process_let_first_pass` (2028), binding
   `_bind_declared_var` (1255, now `expected_unit`), standard assignment,
   second pass, generator values, `_materialize_inits`.
 - `For`: `_execute_simple_for_assignment` (749, now `expected_unit`), `Push` via `target_unit`.
-- `Push` semantics: `_handle_push_assignment` (6876), `_evaluate_push_expression`
+- `Push` semantics: `_handle_push_assignment` (6946), `_evaluate_push_expression`
   (4345, now `expected_unit`), `_handle_push_assignment_line`.
-- `When` blocks: `_register_when_block` (277), `_process_when_triggers` (749),
-  `_run_when_block` (765), `_handle_when_block`.
+- `When` blocks: `_register_when_block` (277), `_process_when_triggers` (759),
+  `_run_when_block` (775), `_handle_when_block`.
 - Cell mirrors / spill listeners: `_cell_spill_dependencies` (every free
   variable in the RHS, plus the spill root) and
   `_pre_register_cell_spill_constraints` (skips block-body lines, whose
@@ -272,18 +272,18 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
 - Grid-as-array: `get_grid_row` (2648), `get_grid_column` (2677); generic
   `get_array_element`/`set_array_element` handle `_GridStore` like any sparse array.
 
-### `control_flow.py` (3494 lines) — blocks: For / If / Let / When
+### `control_flow.py` (3568 lines) — blocks: For / If / Let / When
 `class GridLangControlFlow` executes block constructs. Module-level regexes
 (9–16) define `if...then`, `elseif...then`, `else`, `for...do`,
 `when...do`, `end`.
 - `process_for_statement` (203): For-loop handling (ranges, init, arrays).
-- Block engine: `_process_block` (1893), `_extract_block_body` (533),
-  `pre_scan_blocks` (2945), `_prepare_block_line` (563).
-- If: `_process_if_statement` (2013) and the "new"/"rich" variants (2011,
-  2113), `_parse_if_header` (2047), `_collect_if_blocks` (2131),
-  `_execute_if_block_choice` (2226), `_process_if_elseif_else_block` (3089);
-  condition evaluation helpers `_evaluate_if_*` (2473–2869).
-- Let: `_process_let_statement_inline` (2324), field/index assignment helpers
+- Block engine: `_process_block` (1913), `_extract_block_body` (533),
+  `pre_scan_blocks` (2970), `_prepare_block_line` (563).
+- If: `_process_if_statement` (2038) and the "new"/"rich" variants (2011,
+  2113), `_parse_if_header` (2072), `_collect_if_blocks` (2156),
+  `_execute_if_block_choice` (2251), `_process_if_elseif_else_block` (3114);
+  condition evaluation helpers `_evaluate_if_*` (2498–2894).
+- Let: `_process_let_statement_inline` (2349), field/index assignment helpers
   (1339, 1390). **One binder everywhere:** `_bind_let_var_in_block` delegates
   to `executor._bind_declared_var`, so a `Let` in a block body is the same
   instruction as a top-level `Let`. Equality bindings pin a `constant`
@@ -335,27 +335,27 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   expression parser to attempt the line and raise when it cannot recognize a
   construct; that is still to be designed.
 - `_handle_block_*` methods (343–960): per-statement handling inside blocks.
-- `_scan_local_if_block` (3252): derives `If`/`Elseif`/`Else` clause structure
+- `_scan_local_if_block` (3277): derives `If`/`Elseif`/`Else` clause structure
   from the lines at hand, for bodies that are not in the top-level pre-scan
   (constructor bodies, nested slices), so the shared clause-selection code
   runs unchanged.
 
-### `scope.py` (1321 lines) — scope + variable semantics
+### `scope.py` (1341 lines) — scope + variable semantics
 - `class Scope` (49): variable storage with constraints.
   - `define` (441), `update` (539), `get` (708), `is_uninitialized` (734),
     `get_defining_scope` (749).
-  - Inputs/outputs: `define_input` (762), `define_output` (590, now preserves `unit` from `Input` when `Output` shares name), `is_input`/`is_output` (518/527), `connect_pipe` (809), `push_value`
-    (555), `_propagate_wave` (851) — the publish/listen ripple.
+  - Inputs/outputs: `define_input` (782), `define_output` (590, now preserves `unit` from `Input` when `Output` shares name), `is_input`/`is_output` (518/527), `connect_pipe` (829), `push_value`
+    (555), `_propagate_wave` (871) — the publish/listen ripple.
   - Unit handling: `_unit_convert` (104, now tries `apply_conversion` before `#UNIT`), `_has_pending_assignment` (119).
-  - Constraints: `_re_evaluate_constraints` (904), `_check_constraints` (830, now unit-aware for `Let y of m = 5 of in`), `_validate_base_type` (975) — validates scalars AND, since the pyarrow
+  - Constraints: `_re_evaluate_constraints` (924), `_check_constraints` (830, now unit-aware for `Let y of m = 5 of in`), `_validate_base_type` (995) — validates scalars AND, since the pyarrow
     removal, element-by-element base types of `dim` arrays (via
     `array_handler.validate_array_element_types`), `_expression_depends_on`
     (651). `_array_unset_value` (array_handler.py:1504) resolves `None`
     sentinels for unset template array cells: checks the variable's
     `constraints['default']` (from `or = <expr>`) and evaluates it; falls back
     to `error_value(NA_ERROR)` (`#N/A`).
-  - Scoping: `is_shadowed` (865), `get_evaluation_scope` (873),
-    `get_full_scope` (1311), `_coerce_custom_type_value` (164).
+  - Scoping: `is_shadowed` (885), `get_evaluation_scope` (893),
+    `get_full_scope` (1331), `_coerce_custom_type_value` (164).
 - `class _GridStore` (49): dict backing `compiler.grid`; every cell write
   calls `compiler._notify_cell_changed` (compiler.py:3892). (The old
   `_ListenerGrid`/`GridLiveView` classes were removed — `_GridStore` is the

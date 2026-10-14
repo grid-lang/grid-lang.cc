@@ -276,10 +276,20 @@ class GridLangExecutor(GridLangBase):
 
     def _register_when_block(self, condition, block_lines, line_number):
         deps = self._extract_dependencies_from_expression(condition)
-        deps = [dep for dep in deps if dep]
+        deps = [d.lower() for d in deps if d]
+        # A condition mixing constants with pushable vars fires when every
+        # pushable var receives a push (the constants read their current
+        # value).  A condition on constants alone fires when any of them is
+        # pushed.  Classify here so the trigger knows which deps gate.
+        scope = self.current_scope()
+        const_deps = [
+            d for d in deps if scope.get_constant_value(d) is not None]
+        pushable = [d for d in deps if d not in set(const_deps)]
         entry = {
             'condition': condition,
-            'deps': [d.lower() for d in deps],
+            'deps': deps,
+            'const_deps': const_deps,
+            'pushable': pushable,
             'block_lines': block_lines,
             'line_number': line_number,
         }
@@ -767,13 +777,26 @@ class GridLangExecutor(GridLangBase):
         if not deps:
             return False
         queues = self._push_queues
-        if any(len(queues.get(dep, deque())) == 0 for dep in deps):
-            return False
-        consumed = {}
-        for dep in deps:
-            val = queues[dep].popleft()
-            consumed[dep] = val
-            self._set_var_value(dep, val, entry['line_number'])
+        const_deps = entry.get('const_deps') or []
+        pushable = entry.get('pushable') or deps
+        # A condition on constants alone fires when any constant is pushed.
+        # A mixed condition fires when every pushable var is pushed; a
+        # constant dep only supplies its current value, so it never gates.
+        if pushable:
+            if any(len(queues.get(dep, deque())) == 0 for dep in pushable):
+                return False
+            for dep in pushable:
+                self._set_var_value(
+                    dep, queues[dep].popleft(), entry['line_number'])
+        elif const_deps:
+            pushed = [
+                dep for dep in const_deps
+                if len(queues.get(dep, deque())) > 0]
+            if not pushed:
+                return False
+            for dep in pushed:
+                self._set_var_value(
+                    dep, queues[dep].popleft(), entry['line_number'])
         try:
             cond_ok = self.control_flow._evaluate_if_condition(
                 entry['condition'], entry['line_number'])
@@ -783,6 +806,7 @@ class GridLangExecutor(GridLangBase):
             return True
         self.push_scope(is_private=True, is_loop_scope=True)
         loop_scope = self.current_scope()
+        loop_scope.when_block = True
         self.control_flow._process_block(entry['block_lines'])
         parent_scope = loop_scope.parent
         if parent_scope:
@@ -4765,7 +4789,6 @@ class GridLangExecutor(GridLangBase):
         effects = []
         candidates = []
         init_lines = set()
-        has_global_when = False
         depth = 0
         control = self.control_flow
         for raw_line, line_number in lines:
@@ -4781,8 +4804,6 @@ class GridLangExecutor(GridLangBase):
             # Definitions close with the declared name ('End Point'), blocks
             # with the bare 'end' token; both leave the enclosing depth.
             is_end = bool(re.match(r'^\s*end\b', stripped, re.I))
-            if is_block_when and depth == 0:
-                has_global_when = True
             at_depth_zero = depth == 0 and not (
                 is_block_if or is_block_for or is_block_when or is_block_let
                 or is_define or is_end)
@@ -4876,7 +4897,7 @@ class GridLangExecutor(GridLangBase):
                 depth += 1
             if is_end and depth > 0:
                 depth -= 1
-        if has_global_when or (not producers and not candidates):
+        if not producers and not candidates:
             return None
         if not rules and not effects:
             return None
@@ -5289,8 +5310,11 @@ class GridLangExecutor(GridLangBase):
         if collected is None:
             return None
         collected = self._prepare_wave_collection(collected)
-        if not collected['producers']:
-            # Bindings-only bodies have no waves: keep the one-by-one walk.
+        # A producer-less body (bindings + effects) still claims: the bindings
+        # run one-by-one at source position, then deferred effects fire, so a
+        # Print reads the finished binding instead of the #N/A placeholder.
+        if not collected['producers'] and not collected['line_candidates'] \
+                and not collected['effects']:
             return None
         self._wave_collection = collected
         self._install_wave_claim_state(collected)

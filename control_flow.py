@@ -1523,8 +1523,18 @@ class GridLangControlFlow:
         return True, i + 1
 
     def _extract_rhs_vars(self, rhs):
+        if '$"' in rhs:
+            # A word before an interpolation ("... is {n}") is prose, not a
+            # dependency; the trailing-token lookahead would match it.  Strip
+            # the string literals and let the placeholder branch below pull
+            # deps from inside {...}, so only real deps outside the string
+            # reach the general regex.
+            rhs_wo_strings = re.sub(r'\$"([^"\\]|\\.)*"', ' ', rhs)
+            rhs_wo_strings = re.sub(r"'[^']*'", ' ', rhs_wo_strings)
+        else:
+            rhs_wo_strings = rhs
         rhs_vars = set(re.findall(
-            r'(?<![\w.])\b[\w_]+\b(?=\s*(?:[\[\{]|!\w+\s*\(|(?:\.\w+)?\s*$))', rhs))
+            r'(?<![\w.])\b[\w_]+\b(?=\s*(?:[\[\{]|!\w+\s*\(|(?:\.\w+)?\s*$))', rhs_wo_strings))
         if '$"' in rhs:
             placeholders = re.findall(r'\{\s*([^}]*?)\s*\}', rhs)
             for ph in placeholders:
