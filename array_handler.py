@@ -82,6 +82,10 @@ class ArrayHandler:
         except NameError:
             raise NameError(
                 f"Variable '{var_name}' not defined at line {line_number}")
+        # A sticky error stored on the variable outranks the address: a `!`
+        # read returns it rather than raising or recomputing another code.
+        if is_error_value(arr):
+            return error_value(arr if isinstance(arr, str) else arr.error_code)
         if isinstance(cell_ref, str) and is_wildcard_address(cell_ref):
             if var_name.lower() == 'grid':
                 return self.read_grid_wildcard(cell_ref, line_number)
@@ -109,14 +113,11 @@ class ArrayHandler:
             row, col = parse_address(cell_ref)[:2]
             return self.get_array_element(
                 arr, [row - 1, col - 1], line_number, var_name=var_name)
-        # Convert to Python list for indexing
         nd_shape = None
-        sparse_arr = False
         if isinstance(arr, dict) and 'array' in arr:
             nd_shape = list(arr.get('shape') or arr.get('original_shape') or [])
-            arr = arr['array']
         elif isinstance(arr, dict) and 'grid' in arr:
-            # Tensor object with grid field — read from its grid
+            # Tensor object with grid field -- read from its grid.
             tensor_grid = arr['grid']
             original_shape = arr.get('original_shape')
             if isinstance(cell_ref, str) and '.' in cell_ref:
@@ -130,103 +131,27 @@ class ArrayHandler:
                     original_shape=original_shape, var_name=var_name)
             raise TypeError(
                 f"Variable '{var_name}' is not an array at line {line_number}")
-        else:
-            sparse_arr = is_sparse_array(arr) or (
-                isinstance(arr, dict) and not arr)
-        if isinstance(arr, list) or sparse_arr:
-            arr_pylist = arr
-        else:
+        elif not (isinstance(arr, list)
+                  or is_sparse_array(arr)
+                  or (isinstance(arr, dict) and not arr)):
             raise TypeError(
                 f"Variable '{var_name}' is not an array at line {line_number}")
 
-        # Extended (N-D) addresses resolve directly to array indices.
-        if isinstance(cell_ref, (tuple, list)) and len(cell_ref) > 2:
-            indices = [i + 1 for i in cell_ref]
-            return self.get_array_element(
-                arr, [i - 1 for i in indices], line_number,
-                original_shape=nd_shape, var_name=var_name)
-
-        # Sparse arrays are unbound: any cell is a valid address and an
-        # unset one reads as #N/A (or the declared default).
+        # Convert the cell reference to a 0-based index list and hand it to
+        # the standard element reader. That reader owns bounds checks, blank
+        # cells and sticky errors for every storage form, so a `!` read
+        # stays identical to the `{i}` / `(i)` forms instead of reimplementing
+        # the flat index here.
         if isinstance(cell_ref, (tuple, list)):
-            row_idx, col_idx = cell_ref
-            if sparse_arr:
-                value = arr.get((row_idx, col_idx))
-                if value is None:
-                    return self._array_unset_value(var_name, line_number)
-                return value
+            indices = [int(i) for i in cell_ref]
         else:
-            # Validate and parse cell reference
+            # Validate and parse the cell reference before splitting it.
             parse_address(cell_ref)
-            col, _ = split_cell(cell_ref)
-            col_to_num(col)  # 1-based column number (A=1, B=2, etc.)
-
-        if isinstance(cell_ref, str) and sparse_arr:
             col, row = split_cell(cell_ref)
-            col_idx = col_to_num(col) - 1  # 0-based column index
-            row_idx = int(row) - 1  # 0-based row index
-            value = arr.get((row_idx, col_idx))
-            if value is None:
-                return self._array_unset_value(var_name, line_number)
-            return value
-
-        # Get array dimensions
-        dims = self.compiler.dimensions.get(var_name, [])
-        shape = self.get_array_shape(arr, line_number)
-        if nd_shape is not None:
-            shape = nd_shape
-
-        # Handle general 2D arrays
-        if len(shape) == 2:
-            rows, cols = shape
-            # Convert cell reference to row and column indices
-            if isinstance(cell_ref, (tuple, list)):
-                row_idx, col_idx = cell_ref
-            else:
-                col, row = split_cell(cell_ref)
-                col_idx = col_to_num(col) - 1  # 0-based column index
-                row_idx = int(row) - 1  # 0-based row index
-
-            if row_idx < 0 or row_idx >= rows:
-                raise IndexError(
-                    f"Row index {row_idx + 1} out of bounds for dimension size {rows} at line {line_number}")
-            if col_idx < 0 or col_idx >= cols:
-                raise IndexError(
-                    f"Column index {col_idx + 1} out of bounds for dimension size {cols} at line {line_number}")
-
-            # Access the element.  The grid maps the fastest (first) declared
-            # dim to grid rows and the slowest (last) dim to grid columns, so a
-            # cell reference (row, col) maps to indices [row_idx, col_idx] and
-            # the flat buffer is column-major: flat = row + rows*col.
-            if nd_shape is not None:
-                flat_idx = row_idx + rows * col_idx
-                if flat_idx < 0 or flat_idx >= len(arr_pylist):
-                    raise IndexError(
-                        f"Calculated index {flat_idx} out of bounds for array length {len(arr_pylist)} at line {line_number}")
-                value = arr_pylist[flat_idx]
-                if value is None:
-                    return self._array_unset_value(var_name, line_number)
-                return value
-            try:
-                if isinstance(arr_pylist, list) and len(arr_pylist) > row_idx:
-                    if isinstance(arr_pylist[row_idx], list) and len(arr_pylist[row_idx]) > col_idx:
-                        value = arr_pylist[row_idx][col_idx]
-                        if value is None:
-                            return self._array_unset_value(var_name, line_number)
-                        return value
-                    else:
-                        raise IndexError(
-                            f"Column index {col_idx} out of bounds for row {row_idx} at line {line_number}")
-                else:
-                    raise IndexError(
-                        f"Row index {row_idx} out of bounds at line {line_number}")
-            except Exception as e:
-                raise IndexError(
-                    f"Error accessing '{var_name}' at index derived from '{cell_ref}': {e} at line {line_number}")
-        else:
-            raise ValueError(
-                f"Expected 2D array for cell-based indexing, got shape {shape} at line {line_number}")
-
+            indices = [int(row) - 1, col_to_num(col) - 1]
+        return self.get_array_element(
+            arr, indices, line_number, original_shape=nd_shape,
+            var_name=var_name)
     def read_array_range(self, arr, s_addr, e_addr, line_number=None):
         """Read a hyper-rectangle sub-block from an N-D array variable.
 
@@ -236,6 +161,9 @@ class ArrayHandler:
         ({'array'/'grid' + shape}) or as nested lists.
         ``s_addr``/``e_addr`` are 0-based index tuples.
         """
+        # A sticky error stored on the variable outranks the address.
+        if is_error_value(arr):
+            return error_value(arr if isinstance(arr, str) else arr.error_code)
         s_idx = [i + 1 for i in s_addr]
         e_idx = [i + 1 for i in e_addr]
         if len(s_idx) != len(e_idx):
@@ -2586,6 +2514,10 @@ class ArrayHandler:
         :param line_number: Line number for error reporting.
         :return: Updated array.
         """
+        # A write into a variable holding a sticky error cannot succeed; the
+        # error outranks the write and stays put.
+        if is_error_value(array):
+            return array
 
         # N-D arrays are stored as a flat Python list buffer wrapped in a dict
         # with the declared shape ({'array', 'shape', 'original_shape'}).  The

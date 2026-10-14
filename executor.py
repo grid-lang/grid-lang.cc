@@ -9,7 +9,7 @@ from expression import ExpressionEvaluator
 from array_handler import ArrayHandler, constant_value_matches
 from control_flow import GridLangControlFlow, block_nesting_delta
 from parser import GridLangParser
-from units import VALUE_ERROR, TYPE_ERROR, ConstraintError, error_value, is_error_value
+from units import DIM_ERROR, VALUE_ERROR, TYPE_ERROR, ConstraintError, error_value, is_error_value
 from utils import col_to_num, split_cell, offset_cell, parse_address, public_type_fields, object_public_keys, format_display_value, split_var_defs, is_address, is_sparse_array, strip_array_cell_indices, is_wildcard_address
 from grid_lang_common import GridLangBase, _STATEMENT_KEYWORDS, _first_keyword, _DEPENDENCY_IGNORED_TOKENS, _strip_constraint_operands, _strip_builder_arrows, _strip_cell_address_tokens, resolve_text_constant_token, mask_text_constant_tokens, match_push_assignment, unpack_push_assignment, match_return_statement, is_definition_body_error
 DEPENDENCY_IGNORED_TOKENS = _DEPENDENCY_IGNORED_TOKENS
@@ -2448,6 +2448,18 @@ class GridLangExecutor(GridLangBase):
             if old_constraints_key:
                 old_constant = defining_scope.constraints[old_constraints_key].get(
                     'constant')
+                # Re-declaring a variable with a different dim is a conflict,
+                # not a silent re-shape. Store a sticky #DIM so every later
+                # read of the variable reports it.
+                old_dim = defining_scope.constraints[old_constraints_key].get(
+                    'dim')
+                new_dim = constraints.get('dim')
+                if old_dim is not None and new_dim is not None and old_dim != new_dim:
+                    err = error_value(DIM_ERROR)
+                    defining_scope.update(var, err, line_number)
+                    if scope_dict is not None:
+                        scope_dict[var] = err
+                    return 'bound'
             if old_key:
                 old_value = defining_scope.variables[old_key]
             if var in defining_scope.constraints:
