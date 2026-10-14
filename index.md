@@ -123,7 +123,7 @@ no duplication to keep in sync across two live objects anymore.
   `1` is special: `UnitValue._is_one`, `__mul__` treats `1` as unitless, `_divide` `m/1→m` `m/m→1`, `__pow__` allows exponent `1`.
 - `UnitValue` overloads: `+`/`-` same unit or one side unitless; `*` with `1`; `/`/`\`/`mod` with `1`; `^` with `1`.
 
-### `compiler.py` (7375 lines) — state + orchestration, public API
+### `compiler.py` (7380 lines) — state + orchestration, public API
 `class GridLangCompiler` is the engine's **state holder and public surface**. It
 is the only class `main.py` constructs. It inherits the runtime loop from
 `GridLangExecutor` and holds nearly all persistent state created in `__init__`:
@@ -160,11 +160,11 @@ Notable methods:
 - `_instantiate_type` (1669), `_evaluate_with_value` (2082), `_apply_with_clause`
   (1246): type/`with` object construction; now handles `:` field unit conversion.
 - `call_subprocess` (2807): runs a sub-`GridLangCompiler` in isolation.
-- `_process_grid_assignment` (5398), `_process_declarations_and_labels` (5981),
-  `_collect_global_declarations` (6157): top-level statement handling; now handles `of 1` and `"ox" of animal`.
-- `export_to_csv` (7162): `--debug` CSV export (grid as matrix, or outputs as
+- `_process_grid_assignment` (5398), `_process_declarations_and_labels` (5986),
+  `_collect_global_declarations` (6162): top-level statement handling; now handles `of 1` and `"ox" of animal`.
+- `export_to_csv` (7167): `--debug` CSV export (grid as matrix, or outputs as
   one column when the grid is empty).
-- `set_input_values` (7185): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
+- `set_input_values` (7190): binds CLI/keyboard args to `Input`s; now evaluates `"5 of in"` before `update` so `Input a of m` converts.
 - `_seed_globals` (1670): for sub-compilers; **skips redefining `grid`**.
 
 Also defines `SubprocessResult` (51): result container exposing `grid`,
@@ -272,18 +272,18 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
 - Grid-as-array: `get_grid_row` (2648), `get_grid_column` (2677); generic
   `get_array_element`/`set_array_element` handle `_GridStore` like any sparse array.
 
-### `control_flow.py` (3467 lines) — blocks: For / If / Let / When
+### `control_flow.py` (3494 lines) — blocks: For / If / Let / When
 `class GridLangControlFlow` executes block constructs. Module-level regexes
 (9–16) define `if...then`, `elseif...then`, `else`, `for...do`,
 `when...do`, `end`.
 - `process_for_statement` (203): For-loop handling (ranges, init, arrays).
-- Block engine: `_process_block` (1866), `_extract_block_body` (533),
-  `pre_scan_blocks` (2918), `_prepare_block_line` (563).
-- If: `_process_if_statement` (1986) and the "new"/"rich" variants (2011,
-  2113), `_parse_if_header` (2020), `_collect_if_blocks` (2104),
-  `_execute_if_block_choice` (2199), `_process_if_elseif_else_block` (3062);
-  condition evaluation helpers `_evaluate_if_*` (2446–2842).
-- Let: `_process_let_statement_inline` (2297), field/index assignment helpers
+- Block engine: `_process_block` (1893), `_extract_block_body` (533),
+  `pre_scan_blocks` (2945), `_prepare_block_line` (563).
+- If: `_process_if_statement` (2013) and the "new"/"rich" variants (2011,
+  2113), `_parse_if_header` (2047), `_collect_if_blocks` (2131),
+  `_execute_if_block_choice` (2226), `_process_if_elseif_else_block` (3089);
+  condition evaluation helpers `_evaluate_if_*` (2473–2869).
+- Let: `_process_let_statement_inline` (2324), field/index assignment helpers
   (1339, 1390). **One binder everywhere:** `_bind_let_var_in_block` delegates
   to `executor._bind_declared_var`, so a `Let` in a block body is the same
   instruction as a top-level `Let`. Equality bindings pin a `constant`
@@ -335,7 +335,7 @@ Single source of truth for every predefined GridLang function (`SUM`/`MIN`/`MAX`
   expression parser to attempt the line and raise when it cannot recognize a
   construct; that is still to be designed.
 - `_handle_block_*` methods (343–960): per-statement handling inside blocks.
-- `_scan_local_if_block` (3225): derives `If`/`Elseif`/`Else` clause structure
+- `_scan_local_if_block` (3252): derives `If`/`Elseif`/`Else` clause structure
   from the lines at hand, for bodies that are not in the top-level pre-scan
   (constructor bodies, nested slices), so the shared clause-selection code
   runs unchanged.
@@ -458,7 +458,7 @@ grants, request/response, `ReadAll`/`Reply`).
 > connection/server concerns; consolidating them would make the resource
 > layer a single, auditable unit.
 
-### `test_runner.py` (4235 lines) — inline test suite
+### `test_runner.py` (4266 lines) — inline test suite
 `class GridLangTestRunner` with `run_tests_independent(tests)` — runs 525 tests (Tests 282–293 unit tests, Tests 331–349 push/cell-mirror/subprocess semantics, Tests 350–357d resource/`Require`/grant semantics, Tests 385–405b module/`use`/instance-state/dotted-Require/ModuleVersion/runnable-module-run/unknown-call/init-never-fires-on-import semantics, Tests 452–465 live pipes + user-function vectorization/element-access, Tests 479–488 Net LISTEN/server routing + `ReadAll`/`Reply` semantics via the fake listener transport). At the bottom of the file it runs itself when executed directly:
 `python test_runner.py [names...]`. Failing names are printed.
 

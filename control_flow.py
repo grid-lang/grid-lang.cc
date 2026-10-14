@@ -737,10 +737,24 @@ class GridLangControlFlow:
             value = block_scope.variables.pop(old_key)
             type_name = block_scope.types.pop(old_key, None)
             constraints = block_scope.constraints.pop(old_key, None)
+            # A loop body re-runs its header every pass, so the promoted
+            # binding is re-declared rather than contradicted. Drop the
+            # header's constant pin, or a later pass's new value would be
+            # rejected as a mismatch against the previous pass.
+            is_loop_header = getattr(block_scope, 'is_loop_scope', False)
+            if is_loop_header and constraints:
+                constraints = dict(constraints)
+                constraints.pop('constant', None)
+                constraints.pop('init', None)
             existing = promote._get_case_insensitive_key(
                 old_key, promote.variables)
             if existing is not None:
                 promote.update(existing, value, line_number)
+                outer_key = promote._get_case_insensitive_key(
+                    old_key, promote.constraints)
+                if outer_key is not None and is_loop_header:
+                    promote.constraints[outer_key].pop('constant', None)
+                    promote.constraints[outer_key].pop('init', None)
             else:
                 promote.define(
                     old_key, value, type_name, constraints or {},
@@ -1247,7 +1261,8 @@ class GridLangControlFlow:
 
                     self.compiler.push_scope(
                         is_private=True, is_loop_scope=True)
-                    self.compiler.current_scope().define(var, val, 'number')
+                    self.compiler.current_scope().define(
+                        var, val, 'number', {'constant': val})
                     self._process_block(
                         loop_body)
                     self.compiler.pop_scope()
@@ -1268,7 +1283,8 @@ class GridLangControlFlow:
                             break
                         self.compiler.push_scope(
                             is_private=True, is_loop_scope=True)
-                        self.compiler.current_scope().define(var, val, 'number')
+                        self.compiler.current_scope().define(
+                            var, val, 'number', {'constant': val})
                         self._process_block(
                             loop_body, self.compiler.current_scope())
                         self.compiler.pop_scope()
@@ -1364,6 +1380,19 @@ class GridLangControlFlow:
                         scope_dict=current.get_evaluation_scope(),
                         shadow_keyword='FOR', mark_implicit=True)
                     self._promote_fresh_for_var(line, line_number)
+                    # The header pins its expression constant, but a loop body
+                    # re-declares the name every pass with that pass's values.
+                    # The pin must not survive onto a loop-owned binding, or the
+                    # next pass's value is rejected as a contradiction.
+                    if getattr(current, 'is_loop_scope', False):
+                        for pinned in (current, self._define_body_scope()):
+                            pinned_key = pinned._get_case_insensitive_key(
+                                var, pinned.constraints)
+                            if pinned_key is not None:
+                                pinned.constraints[pinned_key].pop(
+                                    'constant', None)
+                                pinned.constraints[pinned_key].pop(
+                                    'init', None)
                 elif current.get_defining_scope(var) is None:
                     # Declaration-only: declare at the define level so the
                     # name outlives any enclosing loop/If/Let block, and
@@ -1433,6 +1462,14 @@ class GridLangControlFlow:
                 if index_name and index_name not in loop_scope.variables:
                     loop_scope.define(index_name, idx_val, 'number',
                                       {}, is_uninitialized=False)
+                # Every binding the header made in this fresh iteration
+                # scope is a loop variable: freeze each to this iteration's
+                # value so a body rebind reads #VALUE instead of moving it.
+                for pin_name, pin_val in loop_scope.variables.items():
+                    pin_key = loop_scope._get_case_insensitive_key(
+                        pin_name, loop_scope.constraints) or pin_name
+                    loop_scope.constraints.setdefault(
+                        pin_key, {})['constant'] = pin_val
                 self._process_block(loop_body)
                 parent_scope = self._let_block_promote_scope(
                     loop_scope.parent)

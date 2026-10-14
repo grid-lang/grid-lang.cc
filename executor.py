@@ -3554,9 +3554,11 @@ class GridLangExecutor(GridLangBase):
 
         for idx, value in self._iter_for_values_skipping_errors(values):
             self.push_scope(is_private=True, is_loop_scope=True)
-            self.current_scope().define(var_name, value, 'number')
+            self.current_scope().define(
+                var_name, value, 'number', {'constant': value})
             if index_var:
-                self.current_scope().define(index_var, idx + 1, 'number')
+                self.current_scope().define(
+                    index_var, idx + 1, 'number', {'constant': idx + 1})
 
             return_match = self._match_return_statement(executable_part)
             push_match = self._match_push_assignment(executable_part)
@@ -3600,6 +3602,15 @@ class GridLangExecutor(GridLangBase):
                     else:
                         self.current_scope().define(
                             index_var, loop_idx + 1, 'number')
+            # Every binding the combo made in this fresh scope is a loop
+            # variable: freeze each to this combination's value so a body
+            # rebind reads #VALUE instead of moving it.
+            combo_scope = self.current_scope()
+            for pin_name, pin_val in combo_scope.variables.items():
+                pin_key = combo_scope._get_case_insensitive_key(
+                    pin_name, combo_scope.constraints) or pin_name
+                combo_scope.constraints.setdefault(
+                    pin_key, {})['constant'] = pin_val
             self.array_handler.evaluate_line_with_assignment(
                 assignment_line, assignment_line_number, self.current_scope().get_evaluation_scope())
             self.pop_scope()
@@ -3856,6 +3867,12 @@ class GridLangExecutor(GridLangBase):
                     self.push_scope(is_private=True, is_loop_scope=True)
                     self.current_scope().define(var1, a, 'number')
                     self.current_scope().define(var2, b, 'number')
+                    zip_scope = self.current_scope()
+                    for pin_name, pin_val in zip_scope.variables.items():
+                        pin_key = zip_scope._get_case_insensitive_key(
+                            pin_name, zip_scope.constraints) or pin_name
+                        zip_scope.constraints.setdefault(
+                            pin_key, {})['constant'] = pin_val
                     self.array_handler.evaluate_line_with_assignment(
                         assignment_line, assignment_line_number, self.current_scope().get_evaluation_scope())
                     self.pop_scope()
@@ -4424,6 +4441,15 @@ class GridLangExecutor(GridLangBase):
                         var, evaluated_value, inferred_type, constraints)
                     self.current_scope().update(
                         var, evaluated_value, line_number)
+                    # A valued For header binds a constant, like the same
+                    # header does through the shared declaration binder;
+                    # pin on the scope's stored copy so the parsed dict
+                    # stays reusable by the per-value init path below.
+                    decl_scope = self.current_scope()
+                    decl_key = decl_scope._get_case_insensitive_key(
+                        var, decl_scope.constraints) or var
+                    decl_scope.constraints.setdefault(
+                        decl_key, {})['constant'] = evaluated_value
                     evaluated_values.append(evaluated_value)
                 except NameError as e:
                     self.current_scope().define(
@@ -4495,6 +4521,14 @@ class GridLangExecutor(GridLangBase):
                     else:
                         loop_scope.define(
                             var, val, tname, constraints, is_uninitialized=False)
+                # Every binding the header made in this fresh iteration
+                # scope is a loop variable: freeze each to this iteration's
+                # value so a body rebind reads #VALUE instead of moving it.
+                for pin_name, pin_val in loop_scope.variables.items():
+                    pin_key = loop_scope._get_case_insensitive_key(
+                        pin_name, loop_scope.constraints) or pin_name
+                    loop_scope.constraints.setdefault(
+                        pin_key, {})['constant'] = pin_val
                 self.control_flow._process_block(
                     for_block_lines, loop_scope)
                 self.control_flow._pop_for_block_scope(loop_scope)
@@ -5387,6 +5421,16 @@ class GridLangExecutor(GridLangBase):
                     loop_scope.update(index_var, idx + 1)
                 else:
                     loop_scope.define(index_var, idx + 1, 'number')
+            # The loop and index variables hold this iteration's value and
+            # are frozen for it: a body Push or rebind reads #VALUE instead
+            # of moving the binding.
+            for pin_name in ((var_name, index_var) if index_var
+                             else (var_name,)):
+                pin_val = loop_scope.get(pin_name)
+                pin_key = loop_scope._get_case_insensitive_key(
+                    pin_name, loop_scope.constraints) or pin_name
+                loop_scope.constraints.setdefault(
+                    pin_key, {})['constant'] = pin_val
             if guard_condition:
                 if not self.control_flow._evaluate_if_condition(
                         guard_condition, line_number):
@@ -6439,9 +6483,11 @@ class GridLangExecutor(GridLangBase):
 
     def _process_for_push_iteration(self, var_name, index_var, idx, value, executable_part, line_number):
         self.push_scope(is_private=True, is_loop_scope=True)
-        self.current_scope().define(var_name, value, 'number')
+        self.current_scope().define(
+            var_name, value, 'number', {'constant': value})
         if index_var:
-            self.current_scope().define(index_var, idx + 1, 'number')
+            self.current_scope().define(
+                index_var, idx + 1, 'number', {'constant': idx + 1})
 
         return_match = self._match_return_statement(
             executable_part)
