@@ -6,7 +6,7 @@ import sys
 import copy
 from expression import ExpressionEvaluator
 from array_handler import ArrayHandler
-from utils import col_to_num, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT, is_sparse_array, strip_array_cell_indices
+from utils import col_to_num, split_cell, offset_cell, validate_cell_ref, object_public_keys, public_object_view, format_display_value, iter_interpolation_placeholders, is_address, parse_address, indices_to_address, _ADDRESS_FRAGMENT, is_sparse_array, strip_array_cell_indices, split_var_defs
 from scope import Scope
 from units import (
     UNIT_ERROR, UNIVERSAL_ZERO, TYPE_ERROR, VALUE_ERROR, UnitValue, ConstraintError, error_value,
@@ -5922,6 +5922,181 @@ class GridLangCompiler(GridLangExecutor):
                 f"category '{bound_name}' is already defined")
         self.unit_sources[bound_key] = harvest['unit_sources'][raw_name.lower()]
 
+    def _check_delayed_bindings(self, lines):
+        """Reject delayed bindings of non-local vars at compile time.
+
+        A delayed binding rebinds a var inside a block body. A var bound
+        at root before effects may not be rebound inside a block; a var
+        with an earlier Push event may not be bound inside a later block;
+        a When body may not bind a var bound or declared anywhere outside
+        that When. Push events are Push, init and a bodyless For-In; the
+        Define barrier is already stripped when this runs.
+        """
+        cf = self.control_flow
+        bound = {}
+        declared = {}
+        pushed = {}
+        decl_sites = {}
+        when_stack = []
+        block_depth = [0]
+
+        def record(name, line, valued, is_push):
+            key = name.lower()
+            when_id = when_stack[-1] if when_stack else None
+            decl_sites.setdefault(key, []).append((line, when_id))
+            if valued and block_depth[0] == 0:
+                bound.setdefault(key, line)
+            declared.setdefault(key, line)
+            if is_push:
+                pushed.setdefault(key, line)
+
+        def check(name, line):
+            key = name.lower()
+            if when_stack:
+                for site_line, site_when in decl_sites.get(key, ()):
+                    if site_when is None:
+                        raise SyntaxError(
+                            f"Cannot bind '{name}' inside a When block at "
+                            f"line {line}: '{name}' is bound or declared at "
+                            f"line {site_line}")
+            push_line = pushed.get(key)
+            if push_line is not None and push_line < line:
+                raise SyntaxError(
+                    f"Cannot bind '{name}' inside a block at line {line}: "
+                    f"a Push event for '{name}' occurred at line {push_line}")
+            bind_line = bound.get(key)
+            if bind_line is not None and bind_line < line:
+                raise SyntaxError(
+                    f"Variable '{name}' is bound at line {bind_line} and "
+                    f"cannot be rebound inside a block at line {line}")
+
+        def handle_bind(name, line, has_value, has_init):
+            if has_init:
+                record(name, line, False, True)
+                return
+            if block_depth[0] > 0:
+                check(name, line)
+            record(name, line, has_value, False)
+
+        def scan_binding(def_str, line):
+            try:
+                var, _type_name, constraints, expr = (
+                    self._parse_variable_def(def_str, line))
+            except Exception:
+                return
+            if not var or not re.match(r'^\$?[A-Za-z_]\w*$', var):
+                return
+            handle_bind(
+                var, line,
+                expr is not None or 'default' in constraints,
+                'init' in constraints)
+
+        def scan_stmt(cleaned, line):
+            if not cleaned:
+                return
+            m = re.match(r'^push\s+([A-Za-z_]\w*)', cleaned, re.I)
+            if m:
+                pushed.setdefault(m.group(1).lower(), line)
+                return
+            if re.match(r'^:\s*\$?[A-Za-z_]\w*', cleaned):
+                scan_binding(cleaned, line)
+                return
+            m = re.match(r'^for\s+(.+)$', cleaned, re.I)
+            if m:
+                try:
+                    var_list = self._parse_for_declaration_var_list(
+                        m.group(1), line)
+                except Exception:
+                    return
+                for name, _t, constraints, expr in var_list:
+                    if 'range' in constraints or 'in' in constraints:
+                        # Bodyless For-In is a wave push; its index var
+                        # is pushed by the same mechanism.
+                        record(name, line, False, True)
+                        idx = constraints.get('index')
+                        if idx:
+                            record(idx, line, False, True)
+                    else:
+                        handle_bind(
+                            name, line,
+                            expr is not None or 'default' in constraints,
+                            'init' in constraints)
+                return
+            m = re.match(r'^let\s+(.+)$', cleaned, re.I)
+            if m:
+                for part in split_var_defs(m.group(1)):
+                    scan_binding(part, line)
+                return
+            if re.match(
+                    r'^([A-Za-z_]\w*)(\s+(?:as|of|dim|init)\b|\s*=)',
+                    cleaned):
+                scan_binding(cleaned, line)
+                return
+            m = re.match(r'^input\s+(.+)$', cleaned, re.I)
+            if m:
+                for name in re.findall(
+                        r'([A-Za-z_]\w*)\s+as\b', m.group(1), re.I):
+                    record(name, line, False, False)
+
+        def scan_branch(rest, line):
+            block_depth[0] += 1
+            for part in re.split(r'\s+else\s+', rest, maxsplit=1, flags=re.I):
+                scan_stmt(part.strip(), line)
+            block_depth[0] -= 1
+
+        for raw_line, line_number in lines:
+            stripped = cf._strip_inline_comment(raw_line).strip()
+            if not stripped:
+                continue
+            lowered = stripped.lower()
+            if lowered == 'end' or lowered.startswith('end '):
+                if when_stack:
+                    when_stack.pop()
+                if block_depth[0] > 0:
+                    block_depth[0] -= 1
+                continue
+            header_for = cf._header_for.match(stripped)
+            if cf._header_if.match(stripped) or header_for or \
+                    cf._header_when.match(stripped) or \
+                    cf._header_let.match(stripped):
+                if header_for:
+                    rest = header_for.group(1).strip()
+                    try:
+                        var_list = self._parse_for_declaration_var_list(
+                            rest, line_number)
+                    except Exception:
+                        var_list = []
+                    for name, _t, constraints, _expr in var_list:
+                        if 'range' in constraints or 'in' in constraints:
+                            # Loop/index vars of a For-do block are
+                            # block-local: declared only, no push.
+                            record(name, line_number, False, False)
+                            idx = constraints.get('index')
+                            if idx:
+                                record(idx, line_number, False, False)
+                        else:
+                            record(name, line_number, False,
+                                   'init' in constraints)
+                if cf._header_when.match(stripped):
+                    when_stack.append(line_number)
+                block_depth[0] += 1
+                continue
+            m = re.match(r'^if\b(.+?)\bthen\b(.*)$', stripped, re.I)
+            if m:
+                if m.group(2).strip():
+                    scan_branch(m.group(2), line_number)
+                continue
+            m = re.match(r'^elseif\b(.+?)\bthen\b(.*)$', stripped, re.I)
+            if m:
+                if m.group(2).strip():
+                    for part in re.split(
+                            r'\s+else\s+', m.group(2), maxsplit=1, flags=re.I):
+                        scan_stmt(part.strip(), line_number)
+                continue
+            if lowered.startswith('else') or lowered.startswith('if '):
+                continue
+            scan_stmt(stripped, line_number)
+
     def _check_static_redefinition(self, lines):
         """Reject same-scope ``:``/``For`` redefinitions at compile time.
 
@@ -5985,6 +6160,7 @@ class GridLangCompiler(GridLangExecutor):
 
     def _process_declarations_and_labels(self, lines, label_lines, dim_lines):
         self._check_static_redefinition(lines)
+        self._check_delayed_bindings(lines)
         self._process_module_imports(lines)
         for line, line_number in dim_lines:
             self._collect_global_declarations(line, line_number)

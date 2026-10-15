@@ -4,7 +4,7 @@ Handles FOR loops, IF statements, LET statements, and block processing.
 """
 
 import re
-from units import UNIVERSAL_ZERO, ERROR_CODES, is_error_value
+from units import UNIVERSAL_ZERO, ERROR_CODES, is_error_value, error_value, VALUE_ERROR
 from utils import num_to_col, split_var_defs, is_sparse_array
 from grid_lang_common import _STATEMENT_KEYWORDS, _first_keyword, match_push_assignment, unpack_push_assignment, match_return_statement, is_definition_body_error
 
@@ -2280,9 +2280,46 @@ class GridLangControlFlow:
                 # LET-declared variables are block-local: they must not leak
                 # into the enclosing scope (unlike For and ":" declarations).
                 continue
-            parent_scope.variables[var_name] = var_value
-            if var_name in parent_scope.uninitialized:
-                parent_scope.uninitialized.remove(var_name)
+            self._transfer_block_var_back(parent_scope, block_scope,
+                                          var_name, var_value)
+
+    def _transfer_block_var_back(self, parent_scope, block_scope,
+                                 var_name, var_value):
+        """Copy one block-body binding out to the enclosing scope.
+
+        The binding carries its type and constraints (the equality pin)
+        so a second block binding the same name to a different value
+        conflicts with the first and reads #VALUE instead of overwriting.
+        """
+        key = parent_scope._get_case_insensitive_key(
+            var_name, parent_scope.variables)
+        block_constraints = block_scope.constraints.get(var_name)
+        if block_constraints is None:
+            block_constraints = block_scope.constraints.get(
+                parent_scope._get_case_insensitive_key(
+                    var_name, block_scope.constraints), {})
+        block_type = block_scope.types.get(var_name)
+        if key:
+            old_value = parent_scope.variables[key]
+            if (
+                block_constraints.get('constant') is not None
+                and old_value is not None
+                and not self.compiler._let_values_match(old_value, var_value)
+            ):
+                parent_scope.variables[key] = error_value(VALUE_ERROR)
+            else:
+                parent_scope.variables[key] = var_value
+                if block_constraints:
+                    parent_scope.constraints[key] = dict(block_constraints)
+                if block_type is not None:
+                    parent_scope.types[key] = block_type
+            if key in parent_scope.uninitialized:
+                parent_scope.uninitialized.remove(key)
+            return
+        parent_scope.define(
+            var_name, var_value, block_type,
+            dict(block_constraints) if block_constraints else {},
+            is_uninitialized=False)
 
     def _process_single_line_if_statement(self, condition_result, line, line_number, lines, current_index):
         if not condition_result:
