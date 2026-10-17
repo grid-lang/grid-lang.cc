@@ -2389,9 +2389,12 @@ class ExpressionEvaluator:
         if uexpr == '#N/A':
             return True, error_value(NA_ERROR)
 
-        # Handle numeric literals (integers, floats, scientific notation)
+        # Handle numeric literals (integers, floats, scientific notation;
+        # '_' may separate digits, e.g. 1_000)
         try:
-            nm = re.match(r'^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$', expr)
+            nm = re.match(
+                r'^[+-]?(?:\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)'
+                r'(?:[eE][+-]?\d(?:_?\d)*)?$', expr)
             if nm:
                 parsed = float(expr) if '.' in expr or 'e' in expr.lower() else int(expr)
                 if isinstance(parsed, float) and (math.isinf(parsed) or math.isnan(parsed)):
@@ -2402,7 +2405,9 @@ class ExpressionEvaluator:
 
         # Handle number sequences (e.g., 1 to 10 step 2)
         sm = re.match(
-            r'^(-?\d+(?:\.\d+)?)\s+to\s+(-?\d+(?:\.\d+)?)(?:\s+step\s+(-?\d+(?:\.\d+)?))?$', expr, re.I)
+            r'^(-?\d(?:_?\d)*(?:\.\d(?:_?\d)*)?)\s+to\s+'
+            r'(-?\d(?:_?\d)*(?:\.\d(?:_?\d)*)?)'
+            r'(?:\s+step\s+(-?\d(?:_?\d)*(?:\.\d(?:_?\d)*)?))?$', expr, re.I)
         if sm:
             return True, self._build_sequence(expr, line_number)
 
@@ -4074,7 +4079,9 @@ class ExpressionEvaluator:
         :return: Pyarrow array of sequence values.
         """
         m = re.match(
-            r'^(-?\d+(?:\.\d+)?)\s+to\s+(-?\d+(?:\.\d+)?)(?:\s+step\s+(-?\d+(?:\.\d+)?))?$', expr, re.I)
+            r'^(-?\d(?:_?\d)*(?:\.\d(?:_?\d)*)?)\s+to\s+'
+            r'(-?\d(?:_?\d)*(?:\.\d(?:_?\d)*)?)'
+            r'(?:\s+step\s+(-?\d(?:_?\d)*(?:\.\d(?:_?\d)*)?))?$', expr, re.I)
         if m:
             start, end, step = m.groups()
             start = float(start)
@@ -4096,7 +4103,7 @@ class ExpressionEvaluator:
             r'(?<![\w.])("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')\s+of\s+([\w1][\w0-9./]*)',
             r"gridlang_of_unit(\1, '\2')", expr, flags=re.I)
         return re.sub(
-            r'(?<![\w.])(\d+(?:\.\d*)?|\.\d+)\s+of\s+([\w1][\w0-9./]*)',
+            r'(?<![\w.])(\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)\s+of\s+([\w1][\w0-9./]*)',
             r"gridlang_of_unit(\1, '\2')", expr, flags=re.I)
 
     def _replace_operators(self, expr, line_number=None):

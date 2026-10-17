@@ -23,9 +23,9 @@ class GridLangParser:
         so numeric and boolean tokens are converted here and everything else
         is left as text.
         """
-        if re.match(r'^[+-]?\d+$', token):
+        if re.match(r'^[+-]?\d(?:_?\d)*$', token):
             return int(token)
-        if re.match(r'^[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?$', token):
+        if re.match(r'^[+-]?(?:\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)(?:[eE][+-]?\d(?:_?\d)*)?$', token):
             return float(token)
         if token.lower() in ('true', 'false'):
             return token.lower() == 'true'
@@ -495,14 +495,13 @@ class GridLangParser:
             return None
         return field, value, spec
 
-    def _apply_with_clause(self, with_content_str, constraints, line_number):
-        if not with_content_str:
-            return
+    @staticmethod
+    def _split_with_clause_parts(with_inner_content):
+        """Split a with-clause body on top-level commas (quote/paren aware).
 
-        with_inner_content = with_content_str[1:-1].strip()
-        with_constraints = {}
-        with_specs = {}
-        dim_constraint = None
+        Shared by the declaration with-clause applier and the use-pin
+        parser in modules.py.
+        """
         wc_parts = []
         current = ""
         in_quotes = False
@@ -525,6 +524,17 @@ class GridLangParser:
                 current = ""
             else:
                 current += char
+        return wc_parts
+
+    def _apply_with_clause(self, with_content_str, constraints, line_number):
+        if not with_content_str:
+            return
+
+        with_inner_content = with_content_str[1:-1].strip()
+        with_constraints = {}
+        with_specs = {}
+        dim_constraint = None
+        wc_parts = self._split_with_clause_parts(with_inner_content)
 
         for wc in wc_parts:
             wc = wc.strip()

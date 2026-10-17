@@ -37,19 +37,22 @@ Module Mymodule [runnable] [shared]
   versioned `use Mymodule.v1` is required instead.
 - `shared`: the module is instantiated **once per program** instead of once per
   importer. Importing the same `shared` module must always resolve to the same
-  physical copy; a version pin selecting a different copy is a load error.
+  physical copy; a release pin selecting a different copy is a load error.
 - A module with no `Version` blocks *(see §4)* and no `runnable` flag has
   neither surface nor body — it is definitionless.
 
-## 3. Module version
+## 3. Module release
 
 ```grid
-: version = "rel12.3-5"     ' Text   → strict equality ( = ) only
-: version = 12.3            ' Number → equals and ordered ( = , >= )
-: version = <a date>        ' Date   → ordered ( = , >= )
+: release = "rel12.3-5"     ' Text   → strict equality ( = ) only
+: release = 12.3            ' Number → equals and ordered ( = , >= )
+: release = <a date>        ' Date   → ordered ( = , >= )
 ```
 
-The version is a **build pin**: it identifies a physical revision of the file.
+The `release` GV is a **build pin**: it identifies a physical revision of the
+file. It is distinct from the API `Version` tag (§4) — the tag names an export
+façade, the release value pins the build; `release` is always pinnable — a
+`use` pin can read it even on a versionless import (§5), no export needed.
 Comparison power derives from the declared type:
 
 - **Text**: only `=` is meaningful. Use it for label-like revisions.
@@ -96,12 +99,23 @@ there is no default/latest.
 
 ```grid
 use Mymodule.v1                            ' flat: exports land in scope
-use Mymodule.v1 with (version="rel12.3-5") ' module pin (module version)
-use Mymodule.v1 with (version>=12.3)       ' ordered pin (Number/Date)
+use Mymodule.v1 with (release="rel12.3-5") ' release pin (build revision)
+use Mymodule.v1 with (release>=12.3)       ' ordered pin (Number/Date)
+use Mymodule.v1 with (channel="beta", release>=12) ' combined pins
 For B use Mymodule.v1                      ' namespaced: B.Foo, B.bar
-For B use Mymodule.v1 with (version>=12)   ' namespaced + pin
+For B use Mymodule.v1 with (release>=12)   ' namespaced + pin
 use Mymodule                               ' runnable modules only (§7)
+use Mymodule with (release>=12.3)          ' versionless pin (§7)
 ```
+
+A pin names a top-level GV of the module: `with (<gv><op><value>)`. Several
+GVs may be combined in one clause, comma-separated; every pin must hold. Pins
+read the module's top-level GVs directly — the `Version exports` list (§4)
+gates only what a flat import binds, never what a pin may read — so a GV does
+not need to be exported to be pinned, and exporting one only so it can be
+pinned is discouraged (two flat imports would collide on the name). A
+versionless import may pin any top-level GV — the pin constrains which
+module build is loaded and binds nothing (§7).
 
 The instruction lead and namespace stay in sync across `For`, `Let` and `:`:
 all three accept `B as ModuleVersion use <module>.<vN>`, and each may be
@@ -349,11 +363,11 @@ module in the consuming program, and exported subprocesses mutate it. The
 
 ## 10. Version resolution
 
-- Text pin `version="x"`: the copy's version must equal `x`.
-- Ordered pin `version>=n` (Number/Date): the newest available copy
+- Text pin `release="x"`: the copy's release must equal `x`.
+- Ordered pin `release>=n` (Number/Date): the newest available copy
   satisfying the bound is selected.
 - When a module is **shared** and a copy is already selected, a later
-  `version>=n` import is accepted **iff the already-selected copy satisfies
+  `release>=n` import is accepted **iff the already-selected copy satisfies
   the bound** — consistency over newest.
 
 *(Not yet implemented.)*
@@ -457,14 +471,14 @@ delegate Point.move, Point.area to center
 
 ## 15. Versioning / manifest
 
-- The **module version** is a build pin (§3). The **API version** is semantic
+- The **release** GV is a build pin (§3). The **API version** is semantic
   and pinned at every `Use` (§5). There is no cross-version migration — vN
   keeps its definitions, consumers move when they choose.
 - Versioning applies to importable (exported) modules; a runnable-only module
   is a process whose manifest is empty.
 - Each `Version vN` block digests its own mapping: exported names → definitions
   (with signatures), committed top-level variable values, and the category
-  rules it carries. The digest is checked at `Use`; a module-version mismatch
+  rules it carries. The digest is checked at `Use`; a release mismatch
   refuses to load.
 
 *(Not yet implemented.)*
@@ -481,13 +495,14 @@ delegate Point.move, Point.area to center
 
 ```grid
 Module <name> [runnable] [shared]
-: version = <text | number | date>
+: release = <text | number | date>
 
 Version <vN> exports <names...>
 
 use <module>                                 ' runnable modules (§7); no exports bound
-use <module>.<vN> [with (version=<pin>)]
-[For | Let | :] <ns> as ModuleVersion use <module>.<vN> [with (version=<pin>)]
+use <module> [with (<gv><op><value>[, ...])]   ' versionless pin: constrains the load, binds nothing (§5)
+use <module>.<vN> [with (<gv><op><value>[, <gv><op><value>...])]
+[For | Let | :] <ns> as ModuleVersion use <module>.<vN> [with (<gv><op><value>[, ...])]
 
 Print <expr>
 Return <expr>            ' functions and operations only

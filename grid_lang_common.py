@@ -120,7 +120,7 @@ def _strip_constraint_operands(expr):
     cleaned = re.sub(r'\b(?:as)\s+(?:[A-Za-z][A-Za-z0-9_.]*)\b', ' ', cleaned)
     cleaned = re.sub(r'\b(?:of)\s+(?:[\w1][\w0-9./]*)\b', ' ', cleaned)
     cleaned = re.sub(
-        r'\bdim\s+(?:\d+(?:\.\d*)?|[A-Za-z][A-Za-z0-9_.]*)',
+        r'\bdim\s+(?:\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|[A-Za-z][A-Za-z0-9_.]*)',
         ' ', cleaned, flags=re.I)
     cleaned = re.sub(r'\bnot\s+null\b', ' ', cleaned, flags=re.I)
     return cleaned
@@ -135,7 +135,7 @@ def _strip_cell_address_tokens(text):
     return re.sub(r'\[\s*[A-Za-z]+\d+(?::[A-Za-z]+\d+)?\s*\]', ' ', text)
 
 def _is_numeric_token(token):
-    return bool(re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', token, re.I)) or \
+    return bool(re.match(r'^[+-]?(?:\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)(?:e[+-]?\d(?:_?\d)*)?$', token, re.I)) or \
            bool(re.match(r'^e[+-]?\d+$', token, re.I))
 
 def _filter_var_tokens(tokens):

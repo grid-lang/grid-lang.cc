@@ -52,10 +52,10 @@ def _strip_cell_address_tokens(line, var_set):
 
 
 def _is_numeric_token(token: str) -> bool:
-    """Return True if token looks like a numeric literal (int/float/scientific)."""
+    """Return True if token looks like a numeric literal (int/float/scientific; '_' may separate digits)."""
     if not token:
         return False
-    if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', token, re.I):
+    if re.match(r'^[+-]?(?:\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)(?:e[+-]?\d(?:_?\d)*)?$', token, re.I):
         return True
     if re.match(r'^e[+-]?\d+$', token, re.I):
         return True

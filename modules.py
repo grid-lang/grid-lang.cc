@@ -29,10 +29,11 @@ _USE_RE = re.compile(
     r'([A-Za-z_][A-Za-z0-9_]*\s+)?'
     r'(?:as\s+([A-Za-z_][A-Za-z0-9_]*)\s+)?'
     r'use\s+([A-Za-z_][A-Za-z0-9_]*)(?:\.([A-Za-z_][A-Za-z0-9_]*))?'
-    r'((?:\s+with\s*\(.*?\))?)\s*$', re.I)
+    r'((?:\s+with\s*\(.*\))?)\s*$', re.I)
 _USE_LEAD_RE = re.compile(r'^\s*(?:(?:for|let)\s+|:\s*)', re.I)
-_PIN_RE = re.compile(r'\s*version\s*([<>=]+)\s*(.+)$', re.I)
-_RE_NUMBER = re.compile(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', re.I)
+_RE_NUMBER = re.compile(
+    r'^[+-]?(?:\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)'
+    r'(?:e[+-]?\d(?:_?\d)*)?$', re.I)
 
 
 def parse_module_header(line):
@@ -101,7 +102,13 @@ def strip_version_tag(name, tag):
     return name, False
 
 
-def parse_use_line(line):
+# Comparison operators a pin entry may carry; the with-clause parser puts
+# them into the field constraint dict, a plain ``=`` assignment comes back
+# as the unevaluated value text instead.
+_PIN_OPS = ('>=', '<=', '<>', '<', '>', '=')
+
+
+def parse_use_line(line, parser=None, line_number=None):
     """Parse a ``use`` import statement.
 
     The instruction lead and namespace stay in sync across ``For``, ``Let``
@@ -109,14 +116,23 @@ def parse_use_line(line):
     and a bare ``use M.v`` performs a flat import. A lead without a namespace
     (``For use M.v``) is not an import statement. The API version tag is
     optional: a bare ``use M`` (no tag) imports a *runnable* module and
-    exposes it as the module-run subprocess ``M`` (see docs §7).
+    exposes it as the module-run subprocess ``M`` (see docs §7). A
+    versionless import may pin any top-level GV — the pin constrains which
+    module build is loaded and binds nothing (docs §5).
+
+    A ``with (...)`` clause may combine several GV pins, comma-separated;
+    every pin must hold (docs §5). Pins are read with the shared
+    with-constraint machinery (``parser`` supplies
+    ``_split_with_clause_parts`` and ``_parse_with_field_spec``), so a pin
+    entry is an ordinary ``<gv><op>value`` field spec.
 
     Returns a dict with keys:
       - namespace: bound namespace name or None (flat import),
       - module:    module name,
       - tag:       API version tag or None (versionless runnable import),
-      - pin_op:    '=' / '>=' / ... or None,
-      - pin_value: raw pin expression or None,
+      - pins:      list of {'pin_name', 'pin_op', 'pin_value'} (empty list),
+      - pin_name / pin_op / pin_value: the first pin, or None (mirrored
+        for single-pin consumers),
     or None when the line is not a use statement.
     """
     m = _USE_RE.match(line)
@@ -130,30 +146,55 @@ def parse_use_line(line):
         raise ModuleImportError(
             f"Invalid module import type in '{line.strip()}'; "
             "only 'as ModuleVersion' is supported")
-    pin_op = None
-    pin_value = None
+    invalid = ModuleImportError(
+        f"Invalid pin in '{line.strip()}'; "
+        "expected 'with (<name><op>value)'")
+    pins = []
     if with_clause:
-        pm = _PIN_RE.search(with_clause)
-        if not pm:
-            raise ModuleImportError(
-                f"Invalid version pin in '{line.strip()}'; "
-                "expected 'with (version<op>value)'")
-        pin_op = pm.group(1).strip()
-        pin_value = pm.group(2).strip().rstrip(')').strip()
-    if pin_op is not None and tag is None:
-        raise ModuleImportError(
-            f"Version pin 'version{pin_op}{pin_value}' in '{line.strip()}' "
-            "requires a 'use M.<tag>' version tag")
+        if parser is None:
+            raise invalid
+        span = parser._find_with_clause_balanced(line)
+        if span is None:
+            raise invalid
+        parts = parser._split_with_clause_parts(line[span[1] + 1:span[2]])
+        for part in parts:
+            try:
+                spec = parser._parse_with_field_spec(part, line_number)
+            except SyntaxError:
+                spec = None
+            if spec is None:
+                raise invalid
+            field, value, field_spec = spec
+            op, op_value = None, None
+            if value is not None:
+                op, op_value = '=', value
+            else:
+                for candidate in _PIN_OPS:
+                    if candidate in field_spec:
+                        op, op_value = candidate, str(field_spec[candidate])
+                        break
+            if op is None:
+                raise invalid
+            pins.append({
+                'pin_name': field,
+                'pin_op': op,
+                'pin_value': op_value,
+            })
+        if not pins:
+            raise invalid
     if namespace and tag is None:
         raise ModuleImportError(
             f"Versionless 'use {module}' in '{line.strip()}' cannot bind a "
             "namespace; use '<ns> use M.<tag>'")
+    first = pins[0] if pins else {}
     return {
         'namespace': namespace,
         'module': module,
         'tag': tag,
-        'pin_op': pin_op,
-        'pin_value': pin_value,
+        'pins': pins,
+        'pin_name': first.get('pin_name'),
+        'pin_op': first.get('pin_op'),
+        'pin_value': first.get('pin_value'),
     }
 
 
@@ -164,37 +205,58 @@ def parse_version_value(raw):
     return parse_module_version_line(f': version = {raw}')
 
 
-def version_pin_matches(pin, module_version, line_number=None):
-    """Check that a module's declared ``: version`` satisfies a ``use`` pin.
+def pin_target_from_module_vars(module_vars, name):
+    """Resolve a pin target GV to a ``{kind, value}`` entry (or None).
 
-    - Text versions: only ``=`` (strict equality) is meaningful.
-    - Number versions: ``=`` and ``>=``.
+    The target is any of the module's top-level GVs (its instance state,
+    excluding Input/Output); values are the engine-evaluated ones, so text
+    comes back unquoted and numbers as floats.
+    """
+    meta = (module_vars or {}).get((name or '').lower())
+    if not meta or meta.get('uninitialized'):
+        return None
+    value = meta.get('value')
+    if isinstance(value, str):
+        return {'kind': 'text', 'value': value}
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return {'kind': 'number', 'value': float(value)}
+    return None
+
+
+def version_pin_matches(pin, module_version, line_number=None):
+    """Check that a module GV satisfies a ``use`` pin.
+
+    - Text values: only ``=`` (strict equality) is meaningful.
+    - Number values: ``=`` and ``>=``.
     Raises ``ModuleImportError`` for unsupported operators/kinds.
     """
     if pin is None:
         return True
     pin_op = pin.get('pin_op')
+    pin_name = pin['pin_name']
+    pin_value = pin.get('pin_value') or ''
     pin_entry = parse_version_value(pin.get('pin_value') or '')
     if module_version is None:
         raise ModuleImportError(
-            f"Version pin 'version{pin_op}...' requested but the module "
-            "declares no ': version'")
+            f"Pin '{pin_name}{pin_op}{pin_value}' requested but the module "
+            f"defines no '{pin_name}'")
     kind = module_version.get('kind', 'text')
     if kind == 'text' and pin_op not in ('=',):
         raise ModuleImportError(
-            f"Text module versions support only '=' pins, got 'version{pin_op}'")
+            f"Text pin targets support only '=' pins, "
+            f"got '{pin_name}{pin_op}'")
     if kind == 'number' and pin_op not in ('=', '>='):
         raise ModuleImportError(
-            f"Number module versions support only '=' and '>=' pins, got "
-            f"'version{pin_op}'")
+            f"Number pin targets support only '=' and '>=' pins, got "
+            f"'{pin_name}{pin_op}'")
     if kind != pin_entry.get('kind'):
-        # e.g. pin compares a text module version to a number literal: only
-        # exact string equality could ever hold; treat mismatched kinds as no.
+        # e.g. pin compares a text GV to a number literal: only exact string
+        # equality could ever hold; treat mismatched kinds as no.
         if pin_op == '=':
             return False
         raise ModuleImportError(
-            f"Version pin compares a {kind} module version to a "
-            f"{pin_entry.get('kind')} literal")
+            f"Pin '{pin_name}{pin_op}...' compares a {kind} module value "
+            f"to a {pin_entry.get('kind')} literal")
     if kind == 'number':
         mod_val = float(module_version.get('value', 0))
         pin_val = float(pin_entry.get('value', 0))

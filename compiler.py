@@ -28,9 +28,9 @@ from grid_lang_common import (
 )
 from builtin_functions import BUILTINS, KEYWORDS, RESOURCES
 from modules import (
-    ModuleImportError, parse_module_header, parse_module_version_line,
+    ModuleImportError, parse_module_header,
     parse_version_block, parse_use_line, strip_version_tag,
-    version_pin_matches, resolve_module_source,
+    version_pin_matches, pin_target_from_module_vars, resolve_module_source,
 )
 
 
@@ -3661,7 +3661,7 @@ class GridLangCompiler(GridLangExecutor):
         # Remove '<number> of <unit>' RHS literals so the unit name and the
         # 'of' connector are not mistaken for dependency variables.
         cleaned = re.sub(
-            r'(?<![\w.])(\d+(?:\.\d*)?|\.\d+)\s+of\s+(?:[A-Za-z_][A-Za-z0-9_]*|1)',
+            r'(?<![\w.])(\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)\s+of\s+(?:[A-Za-z_][A-Za-z0-9_]*|1)',
             r'\1', cleaned, flags=re.I)
         # Remove member accesses like "obj.field" or "obj.method" to avoid
         # treating field/method names as standalone dependencies.
@@ -3669,7 +3669,7 @@ class GridLangCompiler(GridLangExecutor):
         tokens = re.findall(r'[A-Za-z][A-Za-z0-9_]*', cleaned)
         filtered = set()
         for tok in tokens:
-            if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', tok, re.I):
+            if _is_numeric_token(tok):
                 continue
             if re.match(r'^e[+-]?\d*$', tok, re.I):
                 continue
@@ -3780,7 +3780,7 @@ class GridLangCompiler(GridLangExecutor):
                 continue
             if lower in self.functions or lower in self.subprocesses:
                 continue
-            if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', base, re.I):
+            if _is_numeric_token(base):
                 continue
             deps.add(base)
         cell_refs = self._extract_cell_refs(str(expr))
@@ -5422,10 +5422,13 @@ class GridLangCompiler(GridLangExecutor):
         with:
 
           - header: parsed `Module <name>` header or None,
-          - module_version: parsed `: version` entry or None,
           - exports_by_tag: tag.lower() -> list of exported definition names,
           - functions / subprocesses: code tables of the module (raw names),
           - types_defined / unit_sources: type and unit-category tables.
+
+        The module's top-level GVs (including its release GV) instantiate
+        into `state_scope` / `module_vars` like any other declaration; a
+        `use` pin reads them back by name (see `pin_target_from_module_vars`).
 
         Results are cached per import (per compiler x physical copy).
         """
@@ -5441,8 +5444,7 @@ class GridLangCompiler(GridLangExecutor):
             raise ModuleImportError(
                 f"Module '{module_name}' is empty (no source text but an "
                 "empty module cannot export definitions)")
-        metadata = {'header': None, 'module_version': None,
-                    'exports_by_tag': {}}
+        metadata = {'header': None, 'exports_by_tag': {}}
         body_source = []
         for raw_line in source.splitlines():
             stripped = raw_line.strip()
@@ -5451,10 +5453,6 @@ class GridLangCompiler(GridLangExecutor):
             header = parse_module_header(stripped)
             if header is not None:
                 metadata['header'] = header
-                continue
-            version = parse_module_version_line(stripped)
-            if version is not None:
-                metadata['module_version'] = version
                 continue
             version_block = parse_version_block(stripped)
             if version_block is not None:
@@ -5607,7 +5605,7 @@ class GridLangCompiler(GridLangExecutor):
         type_depth = 0
         if getattr(self, '_is_module_loader', False):
             for line, line_number in lines:
-                if parse_use_line(line) is not None:
+                if parse_use_line(line, self.parser, line_number) is not None:
                     raise ModuleImportError(
                         f"A module cannot import another module yet; 'use' "
                         f"inside module source at line {line_number} is not "
@@ -5628,7 +5626,7 @@ class GridLangCompiler(GridLangExecutor):
             elif lower.startswith("end") and type_depth > 0:
                 type_depth -= 1
 
-            parsed = parse_use_line(line)
+            parsed = parse_use_line(line, self.parser, line_number)
             if parsed is not None:
                 if depth != 0 or type_depth != 0:
                     raise ModuleImportError(
@@ -5662,13 +5660,17 @@ class GridLangCompiler(GridLangExecutor):
         harvest = self._load_module_harvest(module_name, line_number)
         header = harvest.get('header') or {}
 
-        if parsed['pin_op'] is not None:
-            matched = version_pin_matches(
-                parsed, harvest['module_version'], line_number)
+        for pin in parsed.get('pins') or []:
+            pin_name = pin['pin_name']
+            # Any top-level module GV may be pinned; the exports list gates
+            # only what a flat import binds, never what a pin may read.
+            target = pin_target_from_module_vars(
+                harvest.get('module_vars'), pin_name)
+            matched = version_pin_matches(pin, target, line_number)
             if not matched:
                 raise ModuleImportError(
-                    f"Module '{module_name}' does not satisfy version pin "
-                    f"'version{parsed['pin_op']}{parsed['pin_value']}' at "
+                    f"Module '{module_name}' does not satisfy {pin_name} pin "
+                    f"'{pin_name}{pin['pin_op']}{pin['pin_value']}' at "
                     f"line {line_number}")
 
         if tag is None:
@@ -6871,7 +6873,7 @@ class GridLangCompiler(GridLangExecutor):
                     expr_no_quotes = re.sub(
                         r'->\s*\$?[A-Za-z][A-Za-z0-9_.]*\s*\(', '(', expr_no_quotes)
                     expr_no_numbers = re.sub(
-                        r'(?<![\w.])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?(?![\w.])',
+                        r'(?<![\w.])[+-]?(?:\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)(?:e[+-]?\d(?:_?\d)*)?(?![\w.])',
                         ' ', expr_no_quotes, flags=re.I)
                     expr_no_numbers = re.sub(r'\[[^\]]*\]', ' ', expr_no_numbers)
                     # Remove member accesses like "obj.field" so the field name
@@ -6888,7 +6890,7 @@ class GridLangCompiler(GridLangExecutor):
                                        for name in known_funcs if '.' in name}
                     deps = set()
                     for dep in potential_deps:
-                        if re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', dep, re.I) or re.match(r'^e[+-]?\d+$', dep, re.I):
+                        if _is_numeric_token(dep):
                             continue
                         dep_lower = dep.lower()
                         if dep_lower in built_in_functions:
@@ -6904,10 +6906,10 @@ class GridLangCompiler(GridLangExecutor):
             is_simple_literal = (
                 expr.startswith('"') and expr.endswith('"') or
                 expr.startswith("'") and expr.endswith("'") or
-                expr.replace('.', '').replace('-', '').isdigit() or
+                _is_numeric_token(expr) or
                 (expr.startswith('{') and expr.endswith('}') and
                  all(
-                     (item.strip().replace('-', '').replace('.', '').isdigit() or
+                     (_is_numeric_token(item.strip()) or
                       (item.strip().startswith('"') and item.strip().endswith('"')) or
                       (item.strip().startswith("'") and item.strip().endswith("'")))
                      for item in expr[1:-1].split(',')

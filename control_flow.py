@@ -6,7 +6,7 @@ Handles FOR loops, IF statements, LET statements, and block processing.
 import re
 from units import UNIVERSAL_ZERO, ERROR_CODES, is_error_value, error_value, VALUE_ERROR
 from utils import num_to_col, split_var_defs, is_sparse_array
-from grid_lang_common import _STATEMENT_KEYWORDS, _first_keyword, match_push_assignment, unpack_push_assignment, match_return_statement, is_definition_body_error
+from grid_lang_common import _STATEMENT_KEYWORDS, _first_keyword, match_push_assignment, unpack_push_assignment, match_return_statement, is_definition_body_error, _is_numeric_token
 
 # Regex patterns for block parsing
 HEADER_IF = re.compile(r'^\s*if\b(.+?)\bthen\s*$', re.I)
@@ -1556,8 +1556,7 @@ class GridLangControlFlow:
         rhs_vars.update(field_vars)
         rhs_vars = {
             var for var in rhs_vars
-            if not (re.match(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$', var, re.I) or
-                    re.match(r'^e[+-]?\d+$', var, re.I))
+            if not _is_numeric_token(var)
         }
         return rhs_vars
 
